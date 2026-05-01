@@ -26,22 +26,28 @@ NUTRIENT_LABELS = {
 
 
 def format_plan_response(plan: MealPlan, validation: ValidationResult) -> str:
+    return "\n\n".join(format_plan_messages(plan, validation))
+
+
+def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[str, ...]:
     if not plan.safety.can_generate_plan:
         red_flags = ", ".join(plan.safety.red_flags) or "медицинские ограничения"
-        return "\n".join(
+        return (
+            "\n".join(
             [
                 "Я не буду составлять персональный рацион по этим данным.",
                 f"Причина: {red_flags}.",
                 *plan.safety.disclaimers,
             ]
+            ),
         )
 
-    lines: list[str] = []
-    lines.append("Ваш расчет")
-    lines.append(f"ИМТ: {plan.targets.bmi} ({_bmi_ru(plan.targets.bmi_category)})")
-    lines.append(f"Поддерживающая калорийность: {plan.targets.tdee_kcal:.0f} ккал")
-    lines.append(f"Цель на день: {plan.targets.targets.get('energy_kcal'):.0f} ккал")
-    lines.append(
+    calculation: list[str] = []
+    calculation.append("Ваш расчет")
+    calculation.append(f"ИМТ: {plan.targets.bmi} ({_bmi_ru(plan.targets.bmi_category)})")
+    calculation.append(f"Поддерживающая калорийность: {plan.targets.tdee_kcal:.0f} ккал")
+    calculation.append(f"Цель на день: {plan.targets.targets.get('energy_kcal'):.0f} ккал")
+    calculation.append(
         "БЖУ: "
         f"{plan.targets.targets.get('protein_g'):.0f} г белка, "
         f"{plan.targets.targets.get('fat_g'):.0f} г жиров, "
@@ -49,19 +55,17 @@ def format_plan_response(plan: MealPlan, validation: ValidationResult) -> str:
     )
 
     if plan.safety.caution_notes:
-        lines.append("")
-        lines.append("Ограничения, которые я учел")
-        lines.extend(f"- {note}" for note in plan.safety.caution_notes)
+        calculation.append("")
+        calculation.append("Ограничения, которые я учел")
+        calculation.extend(f"- {note}" for note in plan.safety.caution_notes)
 
-    lines.append("")
-    lines.append("Рацион на день")
+    meals: list[str] = ["Рацион на день"]
     for meal in plan.meals:
-        lines.append(f"\n{meal.name}")
-        lines.extend(f"- {format_ingredient(portion)}" for portion in meal.portions)
-        lines.append(f"Рецепт: {meal.recipe}")
+        meals.append(f"\n{meal.name}")
+        meals.extend(f"- {format_ingredient(portion)}" for portion in meal.portions)
+        meals.append(f"Рецепт: {meal.recipe}")
 
-    lines.append("")
-    lines.append("Итого за день")
+    totals: list[str] = ["Итого за день"]
     for key in (
         "energy_kcal",
         "protein_g",
@@ -79,29 +83,18 @@ def format_plan_response(plan: MealPlan, validation: ValidationResult) -> str:
         value = plan.totals.get(key)
         target = plan.targets.targets.get(key)
         if value or target:
-            lines.append(f"- {NUTRIENT_LABELS[key]}: {value:.1f} / {target:.1f}")
+            totals.append(f"- {NUTRIENT_LABELS[key]}: {value:.1f} / {target:.1f}")
 
-    if validation.warnings:
-        lines.append("")
-        lines.append("Что осталось доработать")
-        lines.extend(f"- {warning}" for warning in validation.warnings)
-
-    lines.append("")
-    lines.append("Список покупок")
+    shopping: list[str] = ["Список покупок"]
     for item in build_shopping_list(plan):
-        lines.append(f"- {item.food_name}: {item.grams:.0f} г")
+        shopping.append(f"- {item.food_name}: {item.grams:.0f} г")
 
     if plan.safety.disclaimers:
-        lines.append("")
-        lines.append("Важно")
-        lines.extend(plan.safety.disclaimers)
+        shopping.append("")
+        shopping.append("Важно")
+        shopping.extend(plan.safety.disclaimers)
 
-    if validation.errors:
-        lines.append("")
-        lines.append("Техническая проверка нашла ошибки")
-        lines.extend(f"- {error}" for error in validation.errors)
-
-    return "\n".join(lines)
+    return ("\n".join(calculation), "\n".join(meals), "\n".join(totals), "\n".join(shopping))
 
 
 def _bmi_ru(category: str) -> str:

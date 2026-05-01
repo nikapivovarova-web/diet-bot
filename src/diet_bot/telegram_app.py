@@ -6,66 +6,83 @@ import os
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from .builder import build_one_day_plan
-from .presentation import format_plan_response
+from .domain import UserProfile
+from .presentation import format_plan_messages
 from .questionnaire import QuestionnaireSession, start_session
 from .validation import validate_plan
 
 
 SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
+PROFILE_BY_CHAT_ID: dict[int, UserProfile] = {}
+PLAN_COUNT_BY_CHAT_ID: dict[int, int] = {}
 router = Router()
+
+START_PLAN_TEXT = "Составить план"
+REPEAT_PLAN_TEXT = "Составить еще один рацион"
+NEW_PROFILE_TEXT = "Новая анкета"
 
 
 @router.message(Command("start"))
 async def start(message: Message) -> None:
     await message.answer(
         "Привет. Я помогу собрать рацион на 1 день по вашим данным.\n\n"
-        "Важно: бот не заменяет врача и не назначает лечебные диеты. "
-        "Чтобы начать, отправьте /plan."
+        "Важно: бот не заменяет врача и не назначает лечебные диеты.",
+        reply_markup=_start_keyboard(),
     )
 
 
 @router.message(Command("plan"))
 async def plan(message: Message) -> None:
-    session = start_session()
-    SESSION_BY_CHAT_ID[message.chat.id] = session
-    await message.answer(session.current_question.prompt)
+    await _start_questionnaire(message)
 
 
 @router.message(Command("cancel"))
 async def cancel(message: Message) -> None:
     SESSION_BY_CHAT_ID.pop(message.chat.id, None)
-    await message.answer("Анкета сброшена. Чтобы начать заново, отправьте /plan.")
+    await message.answer("Анкета сброшена.", reply_markup=_start_keyboard())
 
 
 @router.message()
 async def handle_answer(message: Message) -> None:
     chat_id = message.chat.id
-    session = SESSION_BY_CHAT_ID.get(chat_id)
-    if session is None:
-        await message.answer("Чтобы составить рацион, отправьте /plan.")
+    text = (message.text or "").strip()
+    if text in {START_PLAN_TEXT, NEW_PROFILE_TEXT}:
+        await _start_questionnaire(message)
+        return
+    if text == REPEAT_PLAN_TEXT:
+        await _repeat_plan(message)
         return
 
-    next_session, error = session.receive(message.text or "")
+    session = SESSION_BY_CHAT_ID.get(chat_id)
+    if session is None:
+        await message.answer("Нажмите кнопку, чтобы составить рацион.", reply_markup=_start_keyboard())
+        return
+
+    next_session, error = session.receive(text)
     if error:
         await message.answer(error)
-        await message.answer(session.current_question.prompt)
+        await message.answer(
+            session.current_question.prompt,
+            reply_markup=_question_keyboard(session.current_question),
+        )
         return
 
     SESSION_BY_CHAT_ID[chat_id] = next_session
     if not next_session.is_complete:
-        await message.answer(next_session.current_question.prompt)
+        await message.answer(
+            next_session.current_question.prompt,
+            reply_markup=_question_keyboard(next_session.current_question),
+        )
         return
 
-    await message.answer("Считаю рацион и проверяю ограничения...")
     profile = next_session.build_profile()
-    plan_result = build_one_day_plan(profile)
-    validation = validate_plan(plan_result)
-    response = format_plan_response(plan_result, validation)
+    PROFILE_BY_CHAT_ID[chat_id] = profile
+    PLAN_COUNT_BY_CHAT_ID[chat_id] = 0
     SESSION_BY_CHAT_ID.pop(chat_id, None)
-    for chunk in _telegram_chunks(response):
-        await message.answer(chunk)
+    await _send_plan(message, profile)
 
 
 def create_dispatcher() -> Dispatcher:
@@ -99,6 +116,66 @@ def _telegram_chunks(text: str, limit: int = 3900) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+async def _start_questionnaire(message: Message) -> None:
+    session = start_session()
+    SESSION_BY_CHAT_ID[message.chat.id] = session
+    await message.answer(
+        session.current_question.prompt,
+        reply_markup=_question_keyboard(session.current_question),
+    )
+
+
+async def _repeat_plan(message: Message) -> None:
+    profile = PROFILE_BY_CHAT_ID.get(message.chat.id)
+    if profile is None:
+        await _start_questionnaire(message)
+        return
+    await _send_plan(message, profile)
+
+
+async def _send_plan(message: Message, profile: UserProfile) -> None:
+    chat_id = message.chat.id
+    seed = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
+    PLAN_COUNT_BY_CHAT_ID[chat_id] = seed + 1
+    await message.answer("Считаю рацион и проверяю ограничения...", reply_markup=ReplyKeyboardRemove())
+    plan_result = build_one_day_plan(profile, variety_seed=seed)
+    validation = validate_plan(plan_result)
+    messages = format_plan_messages(plan_result, validation)
+    for index, response in enumerate(messages):
+        markup = _after_plan_keyboard() if index == len(messages) - 1 else None
+        chunks = _telegram_chunks(response)
+        for chunk_index, chunk in enumerate(chunks):
+            chunk_markup = markup if chunk_index == len(chunks) - 1 else None
+            await message.answer(chunk, reply_markup=chunk_markup)
+
+
+def _start_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=START_PLAN_TEXT)]],
+        resize_keyboard=True,
+    )
+
+
+def _after_plan_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=REPEAT_PLAN_TEXT)],
+            [KeyboardButton(text=NEW_PROFILE_TEXT)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def _question_keyboard(question) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    if not question or not question.options:
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=option)] for option in question.options],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 if __name__ == "__main__":

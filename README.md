@@ -29,6 +29,8 @@ MVP commands:
 - `/plan`
 - `/cancel`
 
+The bot also shows reply-keyboard buttons for starting a plan, choosing sex, goal, activity, meal count, and generating another one-day plan from the same profile.
+
 ## Run Tests
 
 ```bash

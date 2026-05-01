@@ -35,6 +35,38 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
     assert profile.restrictions[0].value == "яблоко"
 
 
+def test_button_questions_have_options() -> None:
+    questions = {question.key: question for question in QUESTIONS}
+
+    assert questions["sex"].options == ("Мужчина", "Женщина")
+    assert questions["goal"].options == ("Похудение", "Поддержание", "Набор")
+    assert questions["meal_count"].options == ("3", "4", "5")
+    assert "Очень высокая" in questions["activity"].options
+
+
+def test_questionnaire_accepts_decimal_comma_weight() -> None:
+    session = start_session()
+    answers = [
+        "29",
+        "женщина",
+        "165",
+        "62,5",
+        "поддержание",
+        "легкая",
+        "3",
+        "нет",
+        "нет",
+        "нет",
+        "нет",
+    ]
+
+    for answer in answers:
+        session, error = session.receive(answer)
+        assert error is None
+
+    assert session.build_profile().weight_kg == 62.5
+
+
 def test_questionnaire_rejects_invalid_meal_count() -> None:
     session = start_session()
     for answer in ["32", "женщина", "165", "60", "поддержание", "легкая"]:
@@ -73,4 +105,6 @@ def test_presentation_contains_plan_sections_and_shopping_list() -> None:
     assert "Ваш расчет" in text
     assert "Рацион на день" in text
     assert "Список покупок" in text
+    assert "Что осталось доработать" not in text
+    assert "Техническая проверка" not in text
     assert "яблоко" not in {portion.food.name for meal in plan.meals for portion in meal.portions}

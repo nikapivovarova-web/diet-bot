@@ -56,6 +56,7 @@ class MealSpec:
 def build_one_day_plan(
     profile: UserProfile,
     foods: list[Food] | None = None,
+    variety_seed: int = 0,
 ) -> MealPlan:
     safety = evaluate_safety(profile)
     targets = calculate_targets(profile)
@@ -84,6 +85,7 @@ def build_one_day_plan(
                 used_grams=used_grams,
                 used_counts=used_counts,
                 meal_categories=meal_categories,
+                variety_seed=variety_seed,
             )
             if food is None:
                 continue
@@ -99,7 +101,7 @@ def build_one_day_plan(
             running_total = running_total.plus(portion.nutrients)
         meals.append(Meal(spec.name, tuple(portions), recipe_for(spec.name, tuple(portions))))
 
-    meals = _top_up_if_needed(meals, candidates, targets.targets, used_grams, used_counts)
+    meals = _top_up_if_needed(meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
     return MealPlan(meals=tuple(meals), targets=targets, safety=safety)
 
 
@@ -135,6 +137,7 @@ def _select_food(
     used_grams: dict[str, float],
     used_counts: Counter[str],
     meal_categories: set[str],
+    variety_seed: int,
 ) -> Food | None:
     preferred = PREFERRED_CATEGORIES.get(role, ())
     role_candidates = [
@@ -158,8 +161,14 @@ def _select_food(
     scored = [item for item in scored if item[0] > -1000]
     if not scored:
         return None
-    scored.sort(key=lambda item: item[0], reverse=True)
+    scored.sort(key=lambda item: (item[0] + _variety_bonus(item[1].id, variety_seed), item[1].id), reverse=True)
     return scored[0][1]
+
+
+def _variety_bonus(food_id: str, variety_seed: int) -> float:
+    if variety_seed <= 0:
+        return 0.0
+    return ((sum(ord(char) for char in food_id) + variety_seed * 17) % 7) * 0.08
 
 
 def _category_allowed_in_meal(food: Food, role: MealRole, meal_categories: set[str]) -> bool:
@@ -244,18 +253,19 @@ def _top_up_if_needed(
     target: NutrientVector,
     used_grams: dict[str, float],
     used_counts: Counter[str],
+    variety_seed: int,
 ) -> list[Meal]:
     total = NutrientVector.sum(meal.nutrients for meal in meals)
-    lower_energy = target.get("energy_kcal") * 0.88
+    lower_energy = target.get("energy_kcal") * 0.96
     if total.get("energy_kcal") >= lower_energy:
         return meals
 
     dinner = meals[-1]
     portions = list(dinner.portions)
-    for role in (MealRole.FAT, MealRole.CARB, MealRole.PROTEIN):
+    for role in (MealRole.FAT, MealRole.CARB, MealRole.FAT, MealRole.CARB):
         deficit = target.minus(NutrientVector.sum(meal.nutrients for meal in meals)).clipped_positive()
         meal_categories = {portion.food.category for portion in portions}
-        food = _select_food(candidates, role, deficit, used_grams, used_counts, meal_categories)
+        food = _select_food(candidates, role, deficit, used_grams, used_counts, meal_categories, variety_seed)
         if food is None:
             continue
         grams = _portion_for(food, role, deficit, used_grams)
@@ -269,4 +279,62 @@ def _top_up_if_needed(
         total = NutrientVector.sum(meal.nutrients for meal in meals)
         if total.get("energy_kcal") >= lower_energy:
             break
+    return _increase_existing_portions(meals, target, used_grams)
+
+
+def _increase_existing_portions(
+    meals: list[Meal],
+    target: NutrientVector,
+    used_grams: dict[str, float],
+) -> list[Meal]:
+    lower_energy = target.get("energy_kcal") * 0.96
+    upper_energy = target.get("energy_kcal") * 1.04
+    priority_categories = ("grains", "fat", "nuts_seeds", "dairy", "fruit", "protein")
+
+    for _ in range(12):
+        changed_any = False
+        for category in priority_categories:
+            for meal_index, meal in enumerate(list(meals)):
+                portions = list(meal.portions)
+                changed = False
+                for portion_index, portion in enumerate(list(portions)):
+                    total = NutrientVector.sum(current_meal.nutrients for current_meal in meals)
+                    if total.get("energy_kcal") >= lower_energy:
+                        return meals
+                    food = portion.food
+                    if food.category != category:
+                        continue
+                    step = _increase_step(food.category)
+                    room_meal = food.max_per_meal_g - portion.grams
+                    room_day = food.max_per_day_g - used_grams[food.id]
+                    grams = max(0.0, min(step, room_meal, room_day))
+                    if grams <= 0:
+                        continue
+                    energy_per_g = food.nutrients_per_100g.get("energy_kcal") / 100
+                    if energy_per_g <= 0:
+                        continue
+                    added_energy = energy_per_g * grams
+                    if total.get("energy_kcal") + added_energy > upper_energy:
+                        grams = max(0.0, (upper_energy - total.get("energy_kcal")) / energy_per_g)
+                    if grams <= 0:
+                        continue
+                    portions[portion_index] = FoodPortion(food=food, grams=round(portion.grams + grams, 1))
+                    used_grams[food.id] += grams
+                    changed = True
+                    changed_any = True
+                if changed:
+                    meals[meal_index] = Meal(meal.name, tuple(portions), recipe_for(meal.name, tuple(portions)))
+        if not changed_any:
+            return meals
     return meals
+
+
+def _increase_step(category: str) -> float:
+    return {
+        "grains": 20,
+        "protein": 25,
+        "dairy": 40,
+        "fat": 5,
+        "nuts_seeds": 5,
+        "fruit": 30,
+    }.get(category, 20)

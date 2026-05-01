@@ -74,3 +74,10 @@ def test_red_flag_under_18_stops_plan_generation() -> None:
 
     assert not plan.safety.can_generate_plan
     assert plan.meals == ()
+
+
+def test_gain_plan_stays_close_to_calorie_target() -> None:
+    profile = profile_with(weight_kg=75, goal=Goal.GAIN)
+    plan = build_one_day_plan(profile)
+
+    assert plan.totals.get("energy_kcal") >= plan.targets.targets.get("energy_kcal") * 0.96
