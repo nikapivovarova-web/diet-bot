@@ -44,7 +44,7 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
 
     calculation: list[str] = []
     calculation.append("🧮 Ваш расчет")
-    calculation.append(f"📌 ИМТ: {plan.targets.bmi} ({_bmi_ru(plan.targets.bmi_category)})")
+    calculation.append(f"📌 ИМТ (индекс массы тела): {plan.targets.bmi} ({_bmi_ru(plan.targets.bmi_category)})")
     calculation.append(f"🔥 Поддерживающая калорийность: {plan.targets.tdee_kcal:.0f} ккал")
     calculation.append(f"🎯 Цель на день: {plan.targets.targets.get('energy_kcal'):.0f} ккал")
     calculation.append(

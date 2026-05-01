@@ -70,6 +70,13 @@ def build_one_day_plan(
 
     recipe_meals = _build_recipe_plan(candidates, targets.targets, profile.meal_count, variety_seed)
     if recipe_meals:
+        used_grams = _used_grams(recipe_meals)
+        used_counts = Counter(
+            portion.food.id
+            for meal in recipe_meals
+            for portion in meal.portions
+        )
+        recipe_meals = _top_up_if_needed(recipe_meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
         return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
 
     used_grams: dict[str, float] = defaultdict(float)
@@ -133,7 +140,8 @@ def _build_recipe_plan(
     slots = _recipe_slots(meal_count)
 
     for index, (slot, ratio) in enumerate(slots):
-        recipe = _select_recipe(recipes, slot, used_recipe_ids, used_food_ids, variety_seed, index)
+        current_total = NutrientVector.sum(meal.nutrients for meal in meals)
+        recipe = _select_recipe(recipes, slot, used_recipe_ids, used_food_ids, current_total, target, variety_seed, index)
         if recipe is None:
             continue
         resolved = _resolve_recipe_ingredients(recipe, food_by_id)
@@ -178,6 +186,8 @@ def _select_recipe(
     slot: str,
     used_recipe_ids: set[str],
     used_food_ids: Counter[str],
+    current_total: NutrientVector,
+    target: NutrientVector,
     variety_seed: int,
     index: int,
 ) -> RecipeTemplate | None:
@@ -188,9 +198,30 @@ def _select_recipe(
     def score(recipe: RecipeTemplate) -> float:
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
         seed_score = ((sum(ord(char) for char in recipe.id) + variety_seed * 31 + index * 11) % 100) / 100
-        return seed_score - overlap * 0.35
+        nutrient_bonus = _recipe_nutrient_bonus(recipe, current_total, target)
+        return seed_score + nutrient_bonus - overlap * 0.35
 
     return max(candidates, key=score)
+
+
+def _recipe_nutrient_bonus(recipe: RecipeTemplate, current_total: NutrientVector, target: NutrientVector) -> float:
+    bonus = 0.0
+    vitamin_d_gap = target.get("vitamin_d_mcg") - current_total.get("vitamin_d_mcg")
+    omega_3_gap = target.get("omega_3_mg") - current_total.get("omega_3_mg")
+    ingredients = set(recipe.ingredients_g)
+    if vitamin_d_gap > target.get("vitamin_d_mcg") * 0.50:
+        if "salmon" in ingredients:
+            bonus += 1.2
+        if "egg" in ingredients:
+            bonus += 0.35
+        if "tuna" in ingredients:
+            bonus += 0.25
+    if omega_3_gap > target.get("omega_3_mg") * 0.50:
+        if "salmon" in ingredients:
+            bonus += 1.2
+        if "tuna" in ingredients:
+            bonus += 0.3
+    return bonus
 
 
 def _resolve_recipe_ingredients(
@@ -260,6 +291,14 @@ def filter_foods(foods: list[Food], safety: SafetyResult) -> list[Food]:
             continue
         eligible.append(food)
     return eligible
+
+
+def _used_grams(meals: list[Meal]) -> dict[str, float]:
+    used: dict[str, float] = defaultdict(float)
+    for meal in meals:
+        for portion in meal.portions:
+            used[portion.food.id] += portion.grams
+    return used
 
 
 def _meal_specs(meal_count: int) -> tuple[MealSpec, ...]:

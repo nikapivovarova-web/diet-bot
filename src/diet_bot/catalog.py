@@ -505,7 +505,7 @@ def built_in_foods() -> list[Food]:
             category="fat",
             roles=frozenset({MealRole.FAT, MealRole.BOOSTER}),
             max_per_meal_g=120,
-            max_per_day_g=160,
+            max_per_day_g=220,
             nutrients_per_100g=n(
                 energy_kcal=160,
                 protein_g=2,
@@ -524,8 +524,8 @@ def built_in_foods() -> list[Food]:
             category="grains",
             tags=frozenset({"gluten"}),
             roles=frozenset({MealRole.CARB}),
-            max_per_meal_g=100,
-            max_per_day_g=160,
+            max_per_meal_g=130,
+            max_per_day_g=240,
             nutrients_per_100g=n(
                 energy_kcal=247,
                 protein_g=13,
@@ -542,7 +542,7 @@ def built_in_foods() -> list[Food]:
             category="grains",
             roles=frozenset({MealRole.CARB}),
             max_per_meal_g=120,
-            max_per_day_g=180,
+            max_per_day_g=240,
             nutrients_per_100g=n(
                 energy_kcal=218,
                 protein_g=5.7,
@@ -581,8 +581,8 @@ def built_in_foods() -> list[Food]:
             name="оливковое масло",
             category="fat",
             roles=frozenset({MealRole.FAT}),
-            max_per_meal_g=15,
-            max_per_day_g=35,
+            max_per_meal_g=25,
+            max_per_day_g=55,
             nutrients_per_100g=n(
                 energy_kcal=884,
                 protein_g=0,

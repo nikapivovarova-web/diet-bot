@@ -80,6 +80,15 @@ def test_questionnaire_rejects_invalid_meal_count() -> None:
     assert error is not None
 
 
+def test_questionnaire_stops_under_18_after_age_answer() -> None:
+    session = start_session()
+    session, error = session.receive("17")
+
+    assert error is None
+    assert session.should_stop_after_answer()
+    assert session.step_index == 1
+
+
 def test_presentation_contains_plan_sections_and_shopping_list() -> None:
     session = start_session()
     for answer in [
@@ -103,6 +112,7 @@ def test_presentation_contains_plan_sections_and_shopping_list() -> None:
     text = format_plan_response(plan, validation)
 
     assert "Ваш расчет" in text
+    assert "ИМТ (индекс массы тела)" in text
     assert "Рацион на день" in text
     assert "Список покупок" in text
     assert "Что осталось доработать" not in text
@@ -134,3 +144,28 @@ def test_meal_card_includes_photo_credit_when_available() -> None:
 
     assert "Фото:" in card
     assert "Wikimedia Commons" in card
+
+
+def test_meal_card_can_hide_photo_credit() -> None:
+    session = start_session()
+    for answer in [
+        "32",
+        "мужчина",
+        "178",
+        "86",
+        "похудение",
+        "умеренная",
+        "4",
+        "нет",
+        "нет",
+        "нет",
+        "нет",
+    ]:
+        session, error = session.receive(answer)
+        assert error is None
+
+    plan = build_one_day_plan(session.build_profile())
+    meal = next(item for item in plan.meals if item.image_url)
+    card = format_meal_card(meal, include_photo_credit=False)
+
+    assert "Фото:" not in card

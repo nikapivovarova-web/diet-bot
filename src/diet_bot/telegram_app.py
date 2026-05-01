@@ -4,7 +4,6 @@ import asyncio
 import os
 
 from aiogram import Bot, Dispatcher, Router
-from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -69,6 +68,12 @@ async def handle_answer(message: Message) -> None:
             session.current_question.prompt,
             reply_markup=_question_keyboard(session.current_question),
         )
+        return
+
+    early_stop = next_session.should_stop_after_answer()
+    if early_stop:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        await message.answer(early_stop, reply_markup=_start_keyboard())
         return
 
     SESSION_BY_CHAT_ID[chat_id] = next_session
@@ -150,7 +155,7 @@ async def _send_plan(message: Message, profile: UserProfile) -> None:
 
     await _send_text_chunks(message, messages[0])
     for meal in plan_result.meals:
-        await _send_meal_card(message, meal)
+        await _send_text_chunks(message, format_meal_card(meal, include_photo_credit=False))
     for index, response in enumerate(messages[2:]):
         markup = _after_plan_keyboard() if index == len(messages[2:]) - 1 else None
         await _send_text_chunks(message, response, markup)
@@ -192,19 +197,6 @@ async def _send_text_chunks(
     for index, chunk in enumerate(chunks):
         markup = reply_markup if index == len(chunks) - 1 else None
         await message.answer(chunk, reply_markup=markup)
-
-
-async def _send_meal_card(message: Message, meal) -> None:
-    caption = format_meal_card(meal)
-    if meal.image_url:
-        try:
-            await message.answer_photo(photo=meal.image_url, caption=caption[:1024])
-            if len(caption) > 1024:
-                await _send_text_chunks(message, caption[1024:])
-            return
-        except TelegramAPIError:
-            pass
-    await _send_text_chunks(message, caption)
 
 
 if __name__ == "__main__":

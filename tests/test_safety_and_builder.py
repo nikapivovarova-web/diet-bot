@@ -111,3 +111,11 @@ def test_recipe_plan_includes_open_license_image_metadata() -> None:
     assert image_meals
     assert all("wikimedia" in (meal.source_url or "") for meal in image_meals)
     assert all(meal.image_attribution for meal in image_meals)
+
+
+def test_recipe_plan_prefers_vitamin_d_and_omega3_sources() -> None:
+    profile = profile_with(meal_count=4)
+    plan = build_one_day_plan(profile, variety_seed=0)
+
+    assert plan.totals.get("omega_3_mg") >= plan.targets.targets.get("omega_3_mg")
+    assert plan.totals.get("vitamin_d_mcg") > 0

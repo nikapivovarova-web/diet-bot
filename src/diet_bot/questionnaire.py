@@ -89,6 +89,18 @@ class QuestionnaireSession:
         next_answers[question.key] = answer.strip()
         return QuestionnaireSession(next_answers, self.step_index + 1), None
 
+    def should_stop_after_answer(self) -> str | None:
+        age_answer = self.answers.get("age")
+        if age_answer is None:
+            return None
+        try:
+            age = int(_number(age_answer))
+        except ValueError:
+            return None
+        if age < 18:
+            return "Рационы составляются только для взрослых 18+. Лучше обсудить питание с родителями и врачом."
+        return None
+
     def build_profile(self) -> UserProfile:
         if not self.is_complete:
             raise ValueError("Questionnaire is not complete.")
