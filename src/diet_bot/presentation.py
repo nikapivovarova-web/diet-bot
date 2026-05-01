@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .chef import format_ingredient
-from .domain import MealPlan
+from .domain import Meal, MealPlan
 from .shopping import build_shopping_list
 from .validation import ValidationResult
 
@@ -95,6 +95,19 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
         shopping.extend(plan.safety.disclaimers)
 
     return ("\n".join(calculation), "\n".join(meals), "\n".join(totals), "\n".join(shopping))
+
+
+def format_meal_card(meal: Meal, include_photo_credit: bool = True) -> str:
+    lines = [meal.name]
+    lines.extend(f"- {format_ingredient(portion)}" for portion in meal.portions)
+    lines.append(f"👨‍🍳 Как приготовить: {meal.recipe}")
+    if include_photo_credit and meal.image_attribution:
+        lines.append("")
+        credit = f"Фото: {meal.image_attribution}"
+        if meal.source_url:
+            credit += f"\n{meal.source_url}"
+        lines.append(credit)
+    return "\n".join(lines)
 
 
 def _bmi_ru(category: str) -> str:

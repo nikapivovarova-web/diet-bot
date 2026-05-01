@@ -1,6 +1,6 @@
 from diet_bot.builder import build_one_day_plan
 from diet_bot.domain import ConditionCode, Goal, Sex
-from diet_bot.presentation import format_plan_response
+from diet_bot.presentation import format_meal_card, format_plan_response
 from diet_bot.questionnaire import QUESTIONS, start_session
 from diet_bot.validation import validate_plan
 
@@ -108,3 +108,29 @@ def test_presentation_contains_plan_sections_and_shopping_list() -> None:
     assert "Что осталось доработать" not in text
     assert "Техническая проверка" not in text
     assert "яблоко" not in {portion.food.name for meal in plan.meals for portion in meal.portions}
+
+
+def test_meal_card_includes_photo_credit_when_available() -> None:
+    session = start_session()
+    for answer in [
+        "32",
+        "мужчина",
+        "178",
+        "86",
+        "похудение",
+        "умеренная",
+        "4",
+        "нет",
+        "нет",
+        "нет",
+        "нет",
+    ]:
+        session, error = session.receive(answer)
+        assert error is None
+
+    plan = build_one_day_plan(session.build_profile())
+    meal = next(item for item in plan.meals if item.image_url)
+    card = format_meal_card(meal)
+
+    assert "Фото:" in card
+    assert "Wikimedia Commons" in card

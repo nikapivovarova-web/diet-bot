@@ -168,6 +168,9 @@ class Meal:
     name: str
     portions: tuple[FoodPortion, ...]
     recipe: str
+    image_url: str | None = None
+    image_attribution: str | None = None
+    source_url: str | None = None
 
     @property
     def nutrients(self) -> NutrientVector:

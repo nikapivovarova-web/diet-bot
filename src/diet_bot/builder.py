@@ -153,6 +153,9 @@ def _build_recipe_plan(
                 name=f"{_meal_emoji(slot, index)} {_meal_name(slot, index)}: {recipe.title}",
                 portions=tuple(portions),
                 recipe=recipe.instructions,
+                image_url=recipe.image_url,
+                image_attribution=recipe.image_attribution,
+                source_url=recipe.source_url,
             )
         )
 
@@ -418,7 +421,14 @@ def _top_up_if_needed(
         portions.append(portion)
         used_grams[food.id] += grams
         used_counts[food.id] += 1
-        meals[-1] = Meal(dinner.name, tuple(portions), recipe_for(dinner.name, tuple(portions)))
+        meals[-1] = Meal(
+            dinner.name,
+            tuple(portions),
+            dinner.recipe,
+            dinner.image_url,
+            dinner.image_attribution,
+            dinner.source_url,
+        )
         total = NutrientVector.sum(meal.nutrients for meal in meals)
         if total.get("energy_kcal") >= lower_energy:
             break
@@ -466,7 +476,14 @@ def _increase_existing_portions(
                     changed = True
                     changed_any = True
                 if changed:
-                    meals[meal_index] = Meal(meal.name, tuple(portions), meal.recipe)
+                    meals[meal_index] = Meal(
+                        meal.name,
+                        tuple(portions),
+                        meal.recipe,
+                        meal.image_url,
+                        meal.image_attribution,
+                        meal.source_url,
+                    )
         if not changed_any:
             return meals
     return meals

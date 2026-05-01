@@ -4,13 +4,14 @@ import asyncio
 import os
 
 from aiogram import Bot, Dispatcher, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from .builder import build_one_day_plan
 from .domain import UserProfile
-from .presentation import format_plan_messages
+from .presentation import format_meal_card, format_plan_messages
 from .questionnaire import QuestionnaireSession, start_session
 from .validation import validate_plan
 
@@ -143,12 +144,16 @@ async def _send_plan(message: Message, profile: UserProfile) -> None:
     plan_result = build_one_day_plan(profile, variety_seed=seed)
     validation = validate_plan(plan_result)
     messages = format_plan_messages(plan_result, validation)
-    for index, response in enumerate(messages):
-        markup = _after_plan_keyboard() if index == len(messages) - 1 else None
-        chunks = _telegram_chunks(response)
-        for chunk_index, chunk in enumerate(chunks):
-            chunk_markup = markup if chunk_index == len(chunks) - 1 else None
-            await message.answer(chunk, reply_markup=chunk_markup)
+    if not plan_result.safety.can_generate_plan:
+        await _send_text_chunks(message, messages[0], _after_plan_keyboard())
+        return
+
+    await _send_text_chunks(message, messages[0])
+    for meal in plan_result.meals:
+        await _send_meal_card(message, meal)
+    for index, response in enumerate(messages[2:]):
+        markup = _after_plan_keyboard() if index == len(messages[2:]) - 1 else None
+        await _send_text_chunks(message, response, markup)
 
 
 def _start_keyboard() -> ReplyKeyboardMarkup:
@@ -176,6 +181,30 @@ def _question_keyboard(question) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+
+
+async def _send_text_chunks(
+    message: Message,
+    text: str,
+    reply_markup: ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None,
+) -> None:
+    chunks = _telegram_chunks(text)
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
+        await message.answer(chunk, reply_markup=markup)
+
+
+async def _send_meal_card(message: Message, meal) -> None:
+    caption = format_meal_card(meal)
+    if meal.image_url:
+        try:
+            await message.answer_photo(photo=meal.image_url, caption=caption[:1024])
+            if len(caption) > 1024:
+                await _send_text_chunks(message, caption[1024:])
+            return
+        except TelegramAPIError:
+            pass
+    await _send_text_chunks(message, caption)
 
 
 if __name__ == "__main__":

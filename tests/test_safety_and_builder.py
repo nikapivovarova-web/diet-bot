@@ -101,3 +101,13 @@ def test_recipe_plan_has_no_empty_meals_or_placeholder_recipe_text() -> None:
     text = "\n".join(meal.recipe for meal in plan.meals)
     assert "припустите" not in text
     assert "белковый продукт" not in text
+
+
+def test_recipe_plan_includes_open_license_image_metadata() -> None:
+    profile = profile_with(meal_count=5)
+    plan = build_one_day_plan(profile)
+
+    image_meals = [meal for meal in plan.meals if meal.image_url]
+    assert image_meals
+    assert all("wikimedia" in (meal.source_url or "") for meal in image_meals)
+    assert all(meal.image_attribution for meal in image_meals)
