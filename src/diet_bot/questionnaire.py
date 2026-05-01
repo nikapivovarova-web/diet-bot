@@ -25,37 +25,37 @@ class Question:
 
 
 QUESTIONS: tuple[Question, ...] = (
-    Question("age", "Сколько вам лет? Бот составляет рацион только для взрослых 18+."),
-    Question("sex", "Ваш пол?", ("Мужчина", "Женщина")),
-    Question("height_cm", "Ваш рост в сантиметрах? Например: 178."),
-    Question("weight_kg", "Ваш вес в килограммах? Например: 86."),
-    Question("goal", "Какая цель?", ("Похудение", "Поддержание", "Набор")),
+    Question("age", "🎂 Сколько вам лет? Бот составляет рацион только для взрослых 18+."),
+    Question("sex", "Кто вы? 👇", ("👨 Мужчина", "👩 Женщина")),
+    Question("height_cm", "📏 Ваш рост в сантиметрах? Например: 178."),
+    Question("weight_kg", "⚖️ Ваш вес в килограммах? Например: 86 или 62,5."),
+    Question("goal", "🎯 Какая цель?", ("⬇️ Похудение", "⚖️ Поддержание", "💪 Набор")),
     Question(
         "activity",
-        "Выберите активность:\n"
-        "Сидячая - в основном сидите, мало ходьбы, тренировок нет.\n"
-        "Легкая - 5-7 тыс. шагов в день или 1-2 легкие тренировки в неделю.\n"
-        "Умеренная - 7-10 тыс. шагов или 3-4 тренировки в неделю.\n"
-        "Высокая - 10-14 тыс. шагов или 4-5 интенсивных тренировок.\n"
-        "Очень высокая - физическая работа, спорт почти каждый день или 15 тыс.+ шагов.",
-        ("Сидячая", "Легкая", "Умеренная", "Высокая", "Очень высокая"),
+        "🏃 Выберите активность:\n"
+        "🪑 Сидячая - в основном сидите, мало ходьбы, тренировок нет.\n"
+        "🚶 Легкая - 5-7 тыс. шагов в день или 1-2 легкие тренировки в неделю.\n"
+        "🏋️ Умеренная - 7-10 тыс. шагов или 3-4 тренировки в неделю.\n"
+        "🔥 Высокая - 10-14 тыс. шагов или 4-5 интенсивных тренировок.\n"
+        "⚡ Очень высокая - физическая работа, спорт почти каждый день или 15 тыс.+ шагов.",
+        ("🪑 Сидячая", "🚶 Легкая", "🏋️ Умеренная", "🔥 Высокая", "⚡ Очень высокая"),
     ),
-    Question("meal_count", "Сколько приемов пищи в день вы хотите?", ("3", "4", "5")),
+    Question("meal_count", "🍽️ Сколько приемов пищи в день вы хотите?", ("3", "4", "5")),
     Question(
         "allergies",
-        "Есть аллергии на продукты? Перечислите через запятую или напишите 'нет'.",
+        "🚫 Есть аллергии на продукты? Перечислите через запятую или напишите 'нет'.",
     ),
     Question(
         "intolerances",
-        "Есть непереносимости? Например: лактоза, глютен. Если нет - напишите 'нет'.",
+        "🥛 Есть непереносимости? Например: лактоза, глютен. Если нет - напишите 'нет'.",
     ),
     Question(
         "conditions",
-        "Есть хронические заболевания или важные состояния? Например: целиакия, ХПН, диабет, гипертония. Если нет - напишите 'нет'.",
+        "🩺 Есть хронические заболевания или важные состояния? Например: целиакия, ХПН, диабет, гипертония. Если нет - напишите 'нет'.",
     ),
     Question(
         "excluded_foods",
-        "Какие продукты вы просто не едите? Через запятую или 'нет'.",
+        "🙅 Какие продукты вы просто не едите? Через запятую или 'нет'.",
     ),
 )
 
@@ -158,9 +158,9 @@ def _number(value: str) -> float:
 
 def _parse_sex(value: str) -> Sex:
     normalized = normalize_text(value)
-    if normalized in {"м", "муж", "мужчина", "мужской", "male"}:
+    if normalized in {"м", "male"} or "муж" in normalized:
         return Sex.MALE
-    if normalized in {"ж", "жен", "женщина", "женский", "female"}:
+    if normalized in {"ж", "female"} or "жен" in normalized:
         return Sex.FEMALE
     raise ValueError("Напишите 'мужчина' или 'женщина'.")
 
@@ -178,15 +178,15 @@ def _parse_goal(value: str) -> Goal:
 
 def _parse_activity(value: str) -> ActivityLevel:
     normalized = normalize_text(value)
-    if normalized in {"1", "сидячая", "низкая", "малоподвижная", "sedentary"}:
+    if normalized in {"1", "sedentary"} or "сидяч" in normalized or "низк" in normalized or "малоподвиж" in normalized:
         return ActivityLevel.SEDENTARY
-    if normalized in {"2", "легкая", "легкий", "light"}:
+    if normalized in {"2", "light"} or "легк" in normalized:
         return ActivityLevel.LIGHT
-    if normalized in {"3", "умеренная", "средняя", "moderate"}:
+    if normalized in {"3", "moderate"} or "умерен" in normalized or "средн" in normalized:
         return ActivityLevel.MODERATE
-    if normalized in {"4", "высокая", "активная", "active"}:
+    if normalized in {"4", "active"} or ("высок" in normalized and "очень" not in normalized) or "активная" in normalized:
         return ActivityLevel.ACTIVE
-    if normalized in {"5", "очень высокая", "очень активная", "very active", "very_active"}:
+    if normalized in {"5", "very active", "very_active"} or "очень высок" in normalized or "очень актив" in normalized:
         return ActivityLevel.VERY_ACTIVE
     raise ValueError("Выберите активность: сидячая, легкая, умеренная, высокая или очень высокая.")
 

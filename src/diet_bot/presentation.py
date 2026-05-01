@@ -35,7 +35,7 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
         return (
             "\n".join(
             [
-                "Я не буду составлять персональный рацион по этим данным.",
+                "🩺 Я не буду составлять персональный рацион по этим данным.",
                 f"Причина: {red_flags}.",
                 *plan.safety.disclaimers,
             ]
@@ -43,12 +43,12 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
         )
 
     calculation: list[str] = []
-    calculation.append("Ваш расчет")
-    calculation.append(f"ИМТ: {plan.targets.bmi} ({_bmi_ru(plan.targets.bmi_category)})")
-    calculation.append(f"Поддерживающая калорийность: {plan.targets.tdee_kcal:.0f} ккал")
-    calculation.append(f"Цель на день: {plan.targets.targets.get('energy_kcal'):.0f} ккал")
+    calculation.append("🧮 Ваш расчет")
+    calculation.append(f"📌 ИМТ: {plan.targets.bmi} ({_bmi_ru(plan.targets.bmi_category)})")
+    calculation.append(f"🔥 Поддерживающая калорийность: {plan.targets.tdee_kcal:.0f} ккал")
+    calculation.append(f"🎯 Цель на день: {plan.targets.targets.get('energy_kcal'):.0f} ккал")
     calculation.append(
-        "БЖУ: "
+        "🥩 БЖУ: "
         f"{plan.targets.targets.get('protein_g'):.0f} г белка, "
         f"{plan.targets.targets.get('fat_g'):.0f} г жиров, "
         f"{plan.targets.targets.get('carbohydrate_g'):.0f} г углеводов"
@@ -56,16 +56,16 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
 
     if plan.safety.caution_notes:
         calculation.append("")
-        calculation.append("Ограничения, которые я учел")
+        calculation.append("🛡️ Ограничения, которые я учел")
         calculation.extend(f"- {note}" for note in plan.safety.caution_notes)
 
-    meals: list[str] = ["Рацион на день"]
+    meals: list[str] = ["🍽️ Рацион на день"]
     for meal in plan.meals:
         meals.append(f"\n{meal.name}")
         meals.extend(f"- {format_ingredient(portion)}" for portion in meal.portions)
-        meals.append(f"Рецепт: {meal.recipe}")
+        meals.append(f"👨‍🍳 Как приготовить: {meal.recipe}")
 
-    totals: list[str] = ["Итого за день"]
+    totals: list[str] = ["📊 Итого за день"]
     for key in (
         "energy_kcal",
         "protein_g",
@@ -85,13 +85,13 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
         if value or target:
             totals.append(f"- {NUTRIENT_LABELS[key]}: {value:.1f} / {target:.1f}")
 
-    shopping: list[str] = ["Список покупок"]
+    shopping: list[str] = ["🛒 Список покупок"]
     for item in build_shopping_list(plan):
         shopping.append(f"- {item.food_name}: {item.grams:.0f} г")
 
     if plan.safety.disclaimers:
         shopping.append("")
-        shopping.append("Важно")
+        shopping.append("⚠️ Важно")
         shopping.extend(plan.safety.disclaimers)
 
     return ("\n".join(calculation), "\n".join(meals), "\n".join(totals), "\n".join(shopping))

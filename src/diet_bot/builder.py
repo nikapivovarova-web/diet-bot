@@ -16,6 +16,7 @@ from .domain import (
     SafetyResult,
     UserProfile,
 )
+from .recipe_catalog import RecipeTemplate, built_in_recipes
 from .safety import evaluate_safety, is_name_excluded
 
 
@@ -67,6 +68,10 @@ def build_one_day_plan(
     if not candidates:
         raise ValueError("No eligible foods after restrictions.")
 
+    recipe_meals = _build_recipe_plan(candidates, targets.targets, profile.meal_count, variety_seed)
+    if recipe_meals:
+        return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
+
     used_grams: dict[str, float] = defaultdict(float)
     used_counts: Counter[str] = Counter()
     used_categories: Counter[str] = Counter()
@@ -103,6 +108,144 @@ def build_one_day_plan(
 
     meals = _top_up_if_needed(meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
     return MealPlan(meals=tuple(meals), targets=targets, safety=safety)
+
+
+def _build_recipe_plan(
+    candidates: list[Food],
+    target: NutrientVector,
+    meal_count: int,
+    variety_seed: int,
+) -> list[Meal]:
+    food_by_id = {food.id: food for food in candidates}
+    recipes = [
+        recipe
+        for recipe in built_in_recipes()
+        if _resolve_recipe_ingredients(recipe, food_by_id) is not None
+    ]
+    if not recipes:
+        return []
+
+    used_recipe_ids: set[str] = set()
+    used_food_ids: Counter[str] = Counter()
+    used_grams: dict[str, float] = defaultdict(float)
+    meals: list[Meal] = []
+    total_energy = target.get("energy_kcal")
+    slots = _recipe_slots(meal_count)
+
+    for index, (slot, ratio) in enumerate(slots):
+        recipe = _select_recipe(recipes, slot, used_recipe_ids, used_food_ids, variety_seed, index)
+        if recipe is None:
+            continue
+        resolved = _resolve_recipe_ingredients(recipe, food_by_id)
+        if resolved is None:
+            continue
+        base_energy = NutrientVector.sum(food.portion(grams).nutrients for food, grams in resolved).get("energy_kcal")
+        scale = _recipe_scale((total_energy * ratio), base_energy)
+        portions = _scaled_recipe_portions(resolved, scale, used_grams)
+        if not portions:
+            continue
+        used_recipe_ids.add(recipe.id)
+        for portion in portions:
+            used_food_ids[portion.food.id] += 1
+            used_grams[portion.food.id] += portion.grams
+        meals.append(
+            Meal(
+                name=f"{_meal_emoji(slot, index)} {_meal_name(slot, index)}: {recipe.title}",
+                portions=tuple(portions),
+                recipe=recipe.instructions,
+            )
+        )
+
+    if len(meals) < min(3, meal_count):
+        return []
+    return _increase_existing_portions(meals, target, used_grams)
+
+
+def _recipe_slots(meal_count: int) -> tuple[tuple[str, float], ...]:
+    count = min(5, max(3, meal_count))
+    if count == 3:
+        return (("breakfast", 0.30), ("main", 0.38), ("main", 0.32))
+    if count == 4:
+        return (("breakfast", 0.27), ("main", 0.34), ("snack", 0.16), ("main", 0.23))
+    return (("breakfast", 0.25), ("main", 0.30), ("snack", 0.14), ("main", 0.23), ("snack", 0.08))
+
+
+def _select_recipe(
+    recipes: list[RecipeTemplate],
+    slot: str,
+    used_recipe_ids: set[str],
+    used_food_ids: Counter[str],
+    variety_seed: int,
+    index: int,
+) -> RecipeTemplate | None:
+    candidates = [recipe for recipe in recipes if recipe.slot == slot and recipe.id not in used_recipe_ids]
+    if not candidates:
+        return None
+
+    def score(recipe: RecipeTemplate) -> float:
+        overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
+        seed_score = ((sum(ord(char) for char in recipe.id) + variety_seed * 31 + index * 11) % 100) / 100
+        return seed_score - overlap * 0.35
+
+    return max(candidates, key=score)
+
+
+def _resolve_recipe_ingredients(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+) -> tuple[tuple[Food, float], ...] | None:
+    substitutions = {
+        "greek_yogurt": "lactose_free_yogurt",
+        "cottage_cheese": "lactose_free_cottage_cheese",
+        "whole_grain_bread": "corn_tortilla",
+        "whole_wheat_pasta": "rice",
+    }
+    resolved: list[tuple[Food, float]] = []
+    for food_id, grams in recipe.ingredients_g.items():
+        food = food_by_id.get(food_id)
+        if food is None and food_id in substitutions:
+            food = food_by_id.get(substitutions[food_id])
+        if food is None:
+            return None
+        resolved.append((food, grams))
+    return tuple(resolved)
+
+
+def _recipe_scale(target_energy: float, base_energy: float) -> float:
+    if base_energy <= 0:
+        return 1.0
+    return max(0.70, min(1.75, target_energy / base_energy))
+
+
+def _scaled_recipe_portions(
+    resolved: tuple[tuple[Food, float], ...],
+    scale: float,
+    used_grams: dict[str, float],
+) -> tuple[FoodPortion, ...]:
+    portions: list[FoodPortion] = []
+    for food, base_grams in resolved:
+        grams = round(base_grams * scale, 1)
+        grams = min(grams, food.max_per_meal_g, max(0.0, food.max_per_day_g - used_grams[food.id]))
+        if grams <= 0:
+            continue
+        portions.append(food.portion(grams))
+    return tuple(portions)
+
+
+def _meal_emoji(slot: str, index: int) -> str:
+    if slot == "breakfast":
+        return "🍳"
+    if slot == "snack":
+        return "🥣"
+    return "🍽️" if index == 1 else "🌙"
+
+
+def _meal_name(slot: str, index: int) -> str:
+    if slot == "breakfast":
+        return "Завтрак"
+    if slot == "snack":
+        return "Перекус" if index < 4 else "Второй перекус"
+    return "Обед" if index == 1 else "Ужин"
 
 
 def filter_foods(foods: list[Food], safety: SafetyResult) -> list[Food]:
@@ -323,7 +466,7 @@ def _increase_existing_portions(
                     changed = True
                     changed_any = True
                 if changed:
-                    meals[meal_index] = Meal(meal.name, tuple(portions), recipe_for(meal.name, tuple(portions)))
+                    meals[meal_index] = Meal(meal.name, tuple(portions), meal.recipe)
         if not changed_any:
             return meals
     return meals

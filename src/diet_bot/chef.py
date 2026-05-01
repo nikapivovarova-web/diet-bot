@@ -41,13 +41,13 @@ def _main_meal_recipe(portions: tuple[FoodPortion, ...]) -> str:
     vegetables = [portion.food.name for portion in portions if portion.food.category == "vegetable"]
     fats = [portion.food.name for portion in portions if portion.food.category in {"fat", "nuts_seeds"}]
     ingredients = _ingredient_sentence(portions)
-    protein_text = protein.food.name if protein else "белковый продукт"
+    protein_text = protein.food.name if protein else "основу блюда"
     grain_text = grain.food.name if grain else "гарнир"
-    veg_text = ", ".join(vegetables) if vegetables else "овощи"
+    veg_text = ", ".join(vegetables) if vegetables else "свежие овощи"
     fat_text = f" Заправьте: {', '.join(fats)}." if fats else ""
     return (
-        f"Сделайте тарелку-конструктор: приготовьте {protein_text} до готовности, отдельно сварите {grain_text}, "
-        f"овощи ({veg_text}) слегка припустите или оставьте свежими.{fat_text} Ингредиенты: {ingredients}."
+        f"Соберите аккуратное горячее блюдо: приготовьте {protein_text}, отдельно доведите до готовности {grain_text}, "
+        f"овощи ({veg_text}) подайте свежими или быстро прогрейте на сковороде.{fat_text} Ингредиенты: {ingredients}."
     )
 
 

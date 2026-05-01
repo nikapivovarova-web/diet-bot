@@ -20,16 +20,16 @@ PROFILE_BY_CHAT_ID: dict[int, UserProfile] = {}
 PLAN_COUNT_BY_CHAT_ID: dict[int, int] = {}
 router = Router()
 
-START_PLAN_TEXT = "Составить план"
-REPEAT_PLAN_TEXT = "Составить еще один рацион"
-NEW_PROFILE_TEXT = "Новая анкета"
+START_PLAN_TEXT = "🥗 Составить план"
+REPEAT_PLAN_TEXT = "🔄 Составить еще один рацион"
+NEW_PROFILE_TEXT = "📝 Новая анкета"
 
 
 @router.message(Command("start"))
 async def start(message: Message) -> None:
     await message.answer(
-        "Привет. Я помогу собрать рацион на 1 день по вашим данным.\n\n"
-        "Важно: бот не заменяет врача и не назначает лечебные диеты.",
+        "Привет! 🥗 Я помогу собрать рацион на 1 день по вашим данным.\n\n"
+        "Важно: бот не заменяет врача и не назначает лечебные диеты 🩺",
         reply_markup=_start_keyboard(),
     )
 
@@ -42,7 +42,7 @@ async def plan(message: Message) -> None:
 @router.message(Command("cancel"))
 async def cancel(message: Message) -> None:
     SESSION_BY_CHAT_ID.pop(message.chat.id, None)
-    await message.answer("Анкета сброшена.", reply_markup=_start_keyboard())
+    await message.answer("Анкета сброшена ✅", reply_markup=_start_keyboard())
 
 
 @router.message()
@@ -58,7 +58,7 @@ async def handle_answer(message: Message) -> None:
 
     session = SESSION_BY_CHAT_ID.get(chat_id)
     if session is None:
-        await message.answer("Нажмите кнопку, чтобы составить рацион.", reply_markup=_start_keyboard())
+        await message.answer("Нажмите кнопку, чтобы составить рацион 👇", reply_markup=_start_keyboard())
         return
 
     next_session, error = session.receive(text)
@@ -139,7 +139,7 @@ async def _send_plan(message: Message, profile: UserProfile) -> None:
     chat_id = message.chat.id
     seed = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
     PLAN_COUNT_BY_CHAT_ID[chat_id] = seed + 1
-    await message.answer("Считаю рацион и проверяю ограничения...", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Считаю рацион и проверяю ограничения... 🧮", reply_markup=ReplyKeyboardRemove())
     plan_result = build_one_day_plan(profile, variety_seed=seed)
     validation = validate_plan(plan_result)
     messages = format_plan_messages(plan_result, validation)

@@ -81,3 +81,23 @@ def test_gain_plan_stays_close_to_calorie_target() -> None:
     plan = build_one_day_plan(profile)
 
     assert plan.totals.get("energy_kcal") >= plan.targets.targets.get("energy_kcal") * 0.96
+
+
+def test_repeat_generation_changes_recipes() -> None:
+    profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
+    first = build_one_day_plan(profile, variety_seed=0)
+    second = build_one_day_plan(profile, variety_seed=1)
+
+    first_names = {meal.name for meal in first.meals}
+    second_names = {meal.name for meal in second.meals}
+    assert first_names != second_names
+
+
+def test_recipe_plan_has_no_empty_meals_or_placeholder_recipe_text() -> None:
+    profile = profile_with(meal_count=5)
+    plan = build_one_day_plan(profile)
+
+    assert all(meal.portions for meal in plan.meals)
+    text = "\n".join(meal.recipe for meal in plan.meals)
+    assert "припустите" not in text
+    assert "белковый продукт" not in text

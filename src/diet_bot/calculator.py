@@ -67,7 +67,7 @@ def calculate_targets(profile: UserProfile) -> NutritionTargets:
         targets=targets,
         calorie_bounds=(energy * 0.92, energy * 1.08),
         macro_bounds={
-            "protein_g": (protein_g * 0.85, protein_g * 1.20),
+            "protein_g": (protein_g * 0.85, protein_g * 1.50),
             "fat_g": (fat_g * 0.80, fat_g * 1.25),
             "carbohydrate_g": (carb_g * 0.80, carb_g * 1.25),
         },

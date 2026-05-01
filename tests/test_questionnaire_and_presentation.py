@@ -38,10 +38,10 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
 def test_button_questions_have_options() -> None:
     questions = {question.key: question for question in QUESTIONS}
 
-    assert questions["sex"].options == ("Мужчина", "Женщина")
-    assert questions["goal"].options == ("Похудение", "Поддержание", "Набор")
+    assert questions["sex"].options == ("👨 Мужчина", "👩 Женщина")
+    assert questions["goal"].options == ("⬇️ Похудение", "⚖️ Поддержание", "💪 Набор")
     assert questions["meal_count"].options == ("3", "4", "5")
-    assert "Очень высокая" in questions["activity"].options
+    assert "⚡ Очень высокая" in questions["activity"].options
 
 
 def test_questionnaire_accepts_decimal_comma_weight() -> None:
