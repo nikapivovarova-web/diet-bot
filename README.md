@@ -9,8 +9,25 @@ The current build focuses on the deterministic nutrition core:
 - A small built-in food catalog.
 - A one-day nutrition builder with portion and diversity guardrails.
 - Deterministic meal templates and shopping-list aggregation.
+- Telegram `/start`, `/plan`, and `/cancel` flow using `aiogram`.
 
-The Telegram and OpenAI adapters will sit on top of this core after the engine is stable.
+The OpenAI chef/dietitian adapters will sit on top of this core after the deterministic engine is stable.
+
+## Run Telegram Bot
+
+Create a bot in BotFather and set the token:
+
+```powershell
+$env:DIET_BOT_TOKEN = "123456:telegram-token"
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m diet_bot.telegram_app
+```
+
+MVP commands:
+
+- `/start`
+- `/plan`
+- `/cancel`
 
 ## Run Tests
 

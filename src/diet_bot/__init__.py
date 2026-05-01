@@ -8,4 +8,6 @@ __all__ = [
     "chef",
     "shopping",
     "validation",
+    "questionnaire",
+    "presentation",
 ]
