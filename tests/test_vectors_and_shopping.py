@@ -1,5 +1,19 @@
 from diet_bot.builder import build_one_day_plan
-from diet_bot.domain import ActivityLevel, Food, Goal, MealRole, NutrientVector, Sex, UserProfile
+from diet_bot.domain import (
+    ActivityLevel,
+    Food,
+    FoodPortion,
+    Goal,
+    Meal,
+    MealPlan,
+    MealRole,
+    NutrientVector,
+    NutritionTargets,
+    SafetyResult,
+    Sex,
+    UserProfile,
+)
+from diet_bot.presentation import format_week_shopping_list
 from diet_bot.shopping import build_shopping_list
 
 
@@ -46,3 +60,97 @@ def test_shopping_list_aggregates_ingredients() -> None:
     assert item_names
     assert len(item_names) == len(items)
     assert all(item.grams > 0 for item in items)
+
+
+def test_shopping_list_omits_tiny_rounded_zero_items() -> None:
+    salt = Food(
+        id="salt",
+        name="соль",
+        category="spice",
+        nutrients_per_100g=NutrientVector(),
+    )
+    cinnamon = Food(
+        id="cinnamon",
+        name="корица",
+        category="spice",
+        nutrients_per_100g=NutrientVector(),
+    )
+    rice = Food(
+        id="rice",
+        name="рис",
+        category="grains",
+        nutrients_per_100g=NutrientVector(),
+    )
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector({"energy_kcal": 2000}),
+        calorie_bounds=(1800, 2200),
+        macro_bounds={},
+    )
+    plan = MealPlan(
+        meals=(
+            Meal(
+                name="Тест",
+                portions=(
+                    FoodPortion(salt, 0.4),
+                    FoodPortion(cinnamon, 0.5),
+                    FoodPortion(rice, 120),
+                ),
+                recipe="",
+            ),
+        ),
+        targets=targets,
+        safety=SafetyResult(can_generate_plan=True),
+    )
+
+    item_names = {item.food_name for item in build_shopping_list(plan)}
+
+    assert item_names == {"рис"}
+
+
+def test_week_shopping_list_aggregates_all_day_plans() -> None:
+    rice = Food(
+        id="rice",
+        name="рис",
+        category="grains",
+        nutrients_per_100g=NutrientVector(),
+    )
+    chicken = Food(
+        id="chicken",
+        name="куриная грудка",
+        category="protein",
+        nutrients_per_100g=NutrientVector(),
+    )
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector({"energy_kcal": 2000}),
+        calorie_bounds=(1800, 2200),
+        macro_bounds={},
+    )
+    safety = SafetyResult(can_generate_plan=True)
+    first_day = MealPlan(
+        meals=(Meal("День 1", (FoodPortion(rice, 100), FoodPortion(chicken, 120)), ""),),
+        targets=targets,
+        safety=safety,
+    )
+    second_day = MealPlan(
+        meals=(Meal("День 2", (FoodPortion(rice, 150), FoodPortion(chicken, 80)), ""),),
+        targets=targets,
+        safety=safety,
+    )
+
+    text = format_week_shopping_list((first_day, second_day))
+
+    assert "Общий список покупок на неделю" in text
+    assert "Крупы, хлеб и гарниры" in text
+    assert "Мясо, рыба, яйца и белок" in text
+    assert "рис: 250 г" in text
+    assert "куриная грудка: 200 г" in text

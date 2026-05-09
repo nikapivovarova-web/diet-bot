@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .domain import (
     ConditionCode,
+    Food,
     RestrictionType,
     SafetyResult,
     UserProfile,
@@ -26,6 +27,68 @@ RED_FLAG_CONDITIONS = {
 }
 
 
+FOOD_EXCLUSION_ALIASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("гриб", "шампиньон", "mushroom"),
+        ("гриб", "грибы", "шампиньон", "шампиньоны", "mushroom", "mushrooms", "шиитаке", "shiitake"),
+    ),
+    (
+        ("орех", "nuts"),
+        (
+            "орех",
+            "орехи",
+            "грецкий орех",
+            "грецкие орехи",
+            "миндаль",
+            "арахис",
+            "кешью",
+            "пекан",
+            "фисташки",
+            "walnut",
+            "walnuts",
+            "almond",
+            "almonds",
+            "peanut",
+            "peanuts",
+            "cashew",
+            "cashews",
+            "pecan",
+            "pecans",
+            "pistachio",
+            "pistachios",
+            "nuts",
+        ),
+    ),
+    (
+        ("арахис", "peanut"),
+        ("арахис", "арахисовая паста", "peanut", "peanuts", "peanut butter"),
+    ),
+    (
+        ("молок", "молоч", "dairy", "milk"),
+        (
+            "молоко",
+            "молочные продукты",
+            "творог",
+            "йогурт",
+            "сыр",
+            "milk",
+            "dairy",
+            "cottage cheese",
+            "yogurt",
+            "cheese",
+        ),
+    ),
+    (
+        ("рыб", "fish"),
+        ("рыба", "лосось", "тунец", "треска", "fish", "salmon", "tuna", "cod", "white fish"),
+    ),
+    (
+        ("морепродукт", "кревет", "seafood", "shrimp"),
+        ("морепродукты", "креветки", "мидии", "кальмар", "seafood", "shrimp", "mussels", "calamari"),
+    ),
+)
+
+
 def evaluate_safety(profile: UserProfile) -> SafetyResult:
     excluded_tags: set[str] = set()
     excluded_food_names: set[str] = set()
@@ -35,10 +98,6 @@ def evaluate_safety(profile: UserProfile) -> SafetyResult:
 
     if profile.age < 18:
         red_flags.append("age under 18")
-
-    bmi = profile.weight_kg / ((profile.height_cm / 100) ** 2)
-    if bmi < 16:
-        red_flags.append("very low BMI")
 
     for condition in profile.conditions:
         if condition in RED_FLAG_CONDITIONS:
@@ -74,12 +133,11 @@ def _apply_restrictions(
     for restriction in profile.restrictions:
         value = restriction.normalized_value
         if restriction.type in {RestrictionType.ALLERGY, RestrictionType.EXCLUDED_FOOD}:
-            excluded_food_names.add(value)
-        if restriction.type == RestrictionType.INTOLERANCE:
-            if "лактоз" in value or "lactose" in value:
-                excluded_tags.add("lactose")
-            if "глютен" in value or "gluten" in value:
-                excluded_tags.add("gluten")
+            excluded_food_names.update(_expanded_excluded_food_names(value))
+        if "лактоз" in value or "lactose" in value:
+            excluded_tags.add("lactose")
+        if "глютен" in value or "gluten" in value:
+            excluded_tags.add("gluten")
 
 
 def _apply_conditions(
@@ -101,6 +159,8 @@ def _apply_conditions(
         excluded_tags.add("lactose")
         if profile.allow_lactose_free_dairy:
             caution_notes.append("Обычные молочные продукты с лактозой исключены; допустимы безлактозные аналоги.")
+        else:
+            excluded_tags.add("lactose_free")
 
     if ConditionCode.CKD in conditions:
         excluded_tags.add("high_sodium")
@@ -130,3 +190,22 @@ def _apply_conditions(
 def is_name_excluded(food_name: str, excluded_names: frozenset[str]) -> bool:
     normalized = normalize_text(food_name)
     return any(name in normalized or normalized in name for name in excluded_names)
+
+
+def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
+    return any(
+        is_name_excluded(value, excluded_names)
+        for value in (
+            food.name,
+            food.id,
+            food.id.replace("_", " "),
+        )
+    )
+
+
+def _expanded_excluded_food_names(value: str) -> set[str]:
+    names = {value}
+    for needles, aliases in FOOD_EXCLUSION_ALIASES:
+        if any(needle in value for needle in needles):
+            names.update(normalize_text(alias) for alias in aliases)
+    return {name for name in names if name}

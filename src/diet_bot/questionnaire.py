@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from .domain import (
     ActivityLevel,
     ConditionCode,
+    CookingTimePreference,
     Goal,
     Restriction,
     RestrictionType,
@@ -42,20 +43,29 @@ QUESTIONS: tuple[Question, ...] = (
     ),
     Question("meal_count", "🍽️ Сколько приемов пищи в день вы хотите?", ("3", "4", "5")),
     Question(
+        "cooking_time",
+        "⏱️ Сколько времени вы готовы тратить на готовку в день?",
+        ("до 15 минут", "15–30 минут", "более 30 минут"),
+    ),
+    Question(
         "allergies",
         "🚫 Есть аллергии на продукты? Перечислите через запятую или напишите 'нет'.",
+        ("Нет",),
     ),
     Question(
         "intolerances",
         "🥛 Есть непереносимости? Например: лактоза, глютен. Если нет - напишите 'нет'.",
+        ("Нет",),
     ),
     Question(
         "conditions",
         "🩺 Есть хронические заболевания или важные состояния? Например: целиакия, ХПН, диабет, гипертония. Если нет - напишите 'нет'.",
+        ("Нет",),
     ),
     Question(
         "excluded_foods",
         "🙅 Какие продукты вы просто не едите? Через запятую или 'нет'.",
+        ("Нет",),
     ),
 )
 
@@ -128,6 +138,7 @@ class QuestionnaireSession:
             goal=_parse_goal(self.answers["goal"]),
             activity=_parse_activity(self.answers["activity"]),
             meal_count=int(_number(self.answers["meal_count"])),
+            cooking_time=_parse_cooking_time(self.answers["cooking_time"]),
             restrictions=tuple(restrictions),
             conditions=all_conditions,
             allow_lactose_free_dairy=True,
@@ -158,6 +169,8 @@ def _validate_answer(key: str, answer: str) -> None:
         _parse_goal(answer)
     elif key == "activity":
         _parse_activity(answer)
+    elif key == "cooking_time":
+        _parse_cooking_time(answer)
 
 
 def _number(value: str) -> float:
@@ -201,6 +214,17 @@ def _parse_activity(value: str) -> ActivityLevel:
     if normalized in {"5", "very active", "very_active"} or "очень высок" in normalized or "очень актив" in normalized:
         return ActivityLevel.VERY_ACTIVE
     raise ValueError("Выберите активность: сидячая, легкая, умеренная, высокая или очень высокая.")
+
+
+def _parse_cooking_time(value: str) -> CookingTimePreference:
+    normalized = normalize_text(value).replace("–", "-").replace("—", "-")
+    if normalized in {"1", "quick"} or "до 15" in normalized or "до15" in normalized:
+        return CookingTimePreference.QUICK
+    if normalized in {"2", "medium"} or "15-30" in normalized or "15 - 30" in normalized:
+        return CookingTimePreference.MEDIUM
+    if normalized in {"3", "long"} or "более 30" in normalized or "больше 30" in normalized:
+        return CookingTimePreference.LONG
+    raise ValueError("Выберите время готовки: до 15 минут, 15–30 минут или более 30 минут.")
 
 
 def _split_list(value: str) -> list[str]:

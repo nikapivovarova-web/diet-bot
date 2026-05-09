@@ -43,7 +43,7 @@ def calculate_targets(profile: UserProfile) -> NutritionTargets:
     bmr = calculate_bmr(profile)
     tdee = calculate_tdee(profile)
     energy = _goal_energy(profile.goal, tdee)
-    protein_g = _protein_target(profile)
+    protein_g = _protein_target(profile, bmi)
     fat_g = round((energy * 0.30) / 9)
     carb_g = round((energy - protein_g * 4 - fat_g * 9) / 4)
     fiber_g = 38 if profile.sex == Sex.MALE and profile.age <= 50 else 25
@@ -54,6 +54,8 @@ def calculate_targets(profile: UserProfile) -> NutritionTargets:
         "fat_g": round(fat_g),
         "carbohydrate_g": round(carb_g),
         "fiber_g": fiber_g,
+        "saturated_fat_g": round((energy * 0.10) / 9, 1),
+        "added_sugar_g": round((energy * 0.10) / 4, 1),
     }
     micronutrients = _micronutrient_targets(profile)
     targets = NutrientVector(macros | micronutrients)
@@ -64,6 +66,7 @@ def calculate_targets(profile: UserProfile) -> NutritionTargets:
         bmi_category=bmi_category(bmi),
         bmr_kcal=round(bmr),
         tdee_kcal=round(tdee),
+        water_l=_drinking_water_target(profile, bmi),
         targets=targets,
         calorie_bounds=(energy * 0.92, energy * 1.08),
         macro_bounds={
@@ -82,12 +85,43 @@ def _goal_energy(goal: Goal, tdee: float) -> float:
     return tdee
 
 
-def _protein_target(profile: UserProfile) -> float:
+def _protein_target(profile: UserProfile, bmi: float) -> float:
+    reference_weight = _protein_reference_weight(profile, bmi)
     if profile.goal == Goal.LOSE:
-        return profile.weight_kg * 1.6
+        return reference_weight * 1.6
     if profile.goal == Goal.GAIN:
-        return profile.weight_kg * 1.8
-    return profile.weight_kg * 1.1
+        return reference_weight * 1.8
+    return reference_weight * 1.1
+
+
+def _protein_reference_weight(profile: UserProfile, bmi: float) -> float:
+    if bmi < 30:
+        return profile.weight_kg
+
+    healthy_weight = 25 * (profile.height_cm / 100) ** 2
+    return healthy_weight + (profile.weight_kg - healthy_weight) * 0.25
+
+
+def _drinking_water_target(profile: UserProfile, bmi: float) -> float:
+    weight_for_water = profile.weight_kg
+    if bmi >= 30:
+        healthy_weight = 25 * (profile.height_cm / 100) ** 2
+        weight_for_water = healthy_weight + (profile.weight_kg - healthy_weight) * 0.25
+
+    ml_per_kg = 30 if profile.sex == Sex.MALE else 28
+    if profile.age >= 60:
+        ml_per_kg -= 2
+
+    activity_bonus_l = {
+        ActivityLevel.SEDENTARY: 0.0,
+        ActivityLevel.LIGHT: 0.15,
+        ActivityLevel.MODERATE: 0.25,
+        ActivityLevel.ACTIVE: 0.40,
+        ActivityLevel.VERY_ACTIVE: 0.55,
+    }[profile.activity]
+
+    liters = weight_for_water * ml_per_kg / 1000 + activity_bonus_l
+    return round(min(3.5, max(1.5, liters)), 1)
 
 
 def _micronutrient_targets(profile: UserProfile) -> dict[str, float]:
@@ -99,13 +133,20 @@ def _micronutrient_targets(profile: UserProfile) -> dict[str, float]:
         "magnesium_mg": 420 if profile.sex == Sex.MALE else 320,
         "iron_mg": 18 if female_19_to_50 else 8,
         "zinc_mg": 11 if profile.sex == Sex.MALE else 8,
+        "iodine_mcg": 150,
+        "selenium_mcg": 55,
+        "phosphorus_mg": 700,
         "vitamin_c_mg": 90 if profile.sex == Sex.MALE else 75,
         "vitamin_d_mcg": 15,
         "vitamin_b12_mcg": 2.4,
         "folate_mcg_dfe": 400,
+        "vitamin_b1_mg": 1.2 if profile.sex == Sex.MALE else 1.1,
+        "vitamin_b2_mg": 1.3 if profile.sex == Sex.MALE else 1.1,
+        "vitamin_b3_mg": 16 if profile.sex == Sex.MALE else 14,
         "vitamin_b6_mg": 1.3 if profile.age <= 50 else 1.7,
         "vitamin_a_mcg_rae": 900 if profile.sex == Sex.MALE else 700,
         "vitamin_e_mg": 15,
+        "vitamin_k_mcg": 120 if profile.sex == Sex.MALE else 90,
         "omega_3_mg": 1000,
     }
 

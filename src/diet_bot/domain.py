@@ -24,6 +24,12 @@ class ActivityLevel(StrEnum):
     VERY_ACTIVE = "very_active"
 
 
+class CookingTimePreference(StrEnum):
+    QUICK = "quick"
+    MEDIUM = "medium"
+    LONG = "long"
+
+
 class RestrictionType(StrEnum):
     ALLERGY = "allergy"
     INTOLERANCE = "intolerance"
@@ -68,6 +74,7 @@ class UserProfile:
     goal: Goal
     activity: ActivityLevel
     meal_count: int = 4
+    cooking_time: CookingTimePreference = CookingTimePreference.LONG
     restrictions: tuple["Restriction", ...] = ()
     conditions: tuple[ConditionCode, ...] = ()
     allow_lactose_free_dairy: bool = True
@@ -143,11 +150,27 @@ class FoodPortion:
 
 
 @dataclass(frozen=True)
+class BatchPrep:
+    total_units: int
+    serving_units: int
+    unit_forms: tuple[str, str, str]
+    batch_portions: tuple[FoodPortion, ...]
+    is_carryover: bool = False
+
+    @property
+    def serving_count(self) -> int:
+        if self.serving_units <= 0:
+            return 1
+        return max(1, self.total_units // self.serving_units)
+
+
+@dataclass(frozen=True)
 class NutritionTargets:
     bmi: float
     bmi_category: str
     bmr_kcal: float
     tdee_kcal: float
+    water_l: float
     targets: NutrientVector
     calorie_bounds: tuple[float, float]
     macro_bounds: dict[str, tuple[float, float]]
@@ -171,6 +194,9 @@ class Meal:
     image_url: str | None = None
     image_attribution: str | None = None
     source_url: str | None = None
+    recipe_id: str | None = None
+    recipe_key: str | None = None
+    batch: BatchPrep | None = None
 
     @property
     def nutrients(self) -> NutrientVector:

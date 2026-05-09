@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from .domain import MealPlan
-from .safety import is_name_excluded
+from .safety import is_food_excluded
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ def validate_plan(plan: MealPlan) -> ValidationResult:
                 errors.append(f"{food.name} exceeds max per meal.")
             if food.has_any_tag(set(plan.safety.excluded_tags)):
                 errors.append(f"{food.name} contains excluded tag.")
-            if is_name_excluded(food.name, plan.safety.excluded_food_names):
+            if is_food_excluded(food, plan.safety.excluded_food_names):
                 errors.append(f"{food.name} is excluded by name.")
 
     for meal in plan.meals:

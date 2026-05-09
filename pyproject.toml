@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
     "openai>=1.0.0",
+    "reportlab>=4.0.0",
 ]
 
 [project.scripts]
@@ -16,6 +17,7 @@ diet-bot-telegram = "diet_bot.telegram_app:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pypdf>=4.0.0",
 ]
 
 [tool.pytest.ini_options]

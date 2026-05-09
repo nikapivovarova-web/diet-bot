@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .curated_data import curated_foods
 from .domain import Food, MealRole, NutrientVector
 
 
@@ -7,8 +8,8 @@ def n(**amounts: float) -> NutrientVector:
     return NutrientVector(dict(amounts))
 
 
-def built_in_foods() -> list[Food]:
-    return [
+def built_in_foods(include_curated: bool = True) -> list[Food]:
+    foods = [
         Food(
             id="oats",
             name="овсяные хлопья",
@@ -627,3 +628,9 @@ def built_in_foods() -> list[Food]:
             ),
         ),
     ]
+    if not include_curated:
+        return foods
+
+    curated = list(curated_foods())
+    curated_ids = {food.id for food in curated}
+    return curated + [food for food in foods if food.id not in curated_ids]

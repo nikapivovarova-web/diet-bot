@@ -19,6 +19,7 @@ Create a bot in BotFather and set the token:
 
 ```powershell
 $env:DIET_BOT_TOKEN = "123456:telegram-token"
+$env:TELEGRAM_PROVIDER_TOKEN = "123456:TEST:telegram-provider-token" # YooKassa payments via Telegram
 $env:PYTHONPATH = "src"
 .\.venv\Scripts\python.exe -m diet_bot.telegram_app
 ```

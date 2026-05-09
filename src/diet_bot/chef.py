@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import re
+
 from .domain import FoodPortion
+
+
+GRAM_OR_ML_RE = re.compile(r"(?P<number>\d+(?:[,.]\d+)?)\s*(?P<unit>г|мл)\b")
+SPOON_RE = re.compile(r"(?P<number>\d+(?:[,.]\d+)?)\s*(?P<unit>ч\. л\.|ст\. л\.)")
+CUP_RE = re.compile(r"(?P<number>\d+(?:[,.]\d+)?)\s*стакан(?:а|ов)?\b")
 
 
 def recipe_for(meal_name: str, portions: tuple[FoodPortion, ...]) -> str:
@@ -71,5 +78,380 @@ def _ingredient_sentence(portions: tuple[FoodPortion, ...]) -> str:
 
 
 def format_ingredient(portion: FoodPortion) -> str:
-    grams = round(portion.grams)
-    return f"{portion.food.name} - {grams} г"
+    if portion.food.id == "egg":
+        return _format_egg_ingredient(portion)
+    tiny_text = _tiny_ingredient_text(portion)
+    if tiny_text:
+        return tiny_text
+    food_name = _display_food_name(portion)
+    grams = format_display_grams(portion.grams)
+    hint = _portion_hint(portion)
+    if hint:
+        return f"{food_name} - {grams} г ({hint})"
+    return f"{food_name} - {grams} г"
+
+
+def format_display_grams(grams: float) -> str:
+    if 0 < grams < 1:
+        return "менее 1"
+    if grams <= 0:
+        return "0"
+    return _format_number(_round_kitchen_grams(grams))
+
+
+def clean_recipe_instruction_text(text: str) -> str:
+    text = SPOON_RE.sub(lambda match: _format_instruction_spoon(_parse_number(match["number"]), match["unit"]), text)
+    text = CUP_RE.sub(lambda match: _format_instruction_cup(_parse_number(match["number"])), text)
+    return GRAM_OR_ML_RE.sub(
+        lambda match: _format_instruction_weight_or_volume(_parse_number(match["number"]), match["unit"]),
+        text,
+    )
+
+
+def _format_egg_ingredient(portion: FoodPortion) -> str:
+    count = max(1, int(portion.grams / 50 + 0.5))
+    return f"{portion.food.name} - {count} шт."
+
+
+def _display_food_name(portion: FoodPortion) -> str:
+    if portion.food.id == "vegetable_broth" and portion.grams <= 10:
+        return "овощной бульонный порошок"
+    return portion.food.name
+
+
+def _tiny_ingredient_text(portion: FoodPortion) -> str | None:
+    if not 0 < portion.grams < 1:
+        return None
+    if portion.food.id == "garlic":
+        return f"{portion.food.name} - по вкусу"
+    if portion.food.category == "spice":
+        return f"{portion.food.name} - щепотка"
+    return None
+
+
+def _portion_hint(portion: FoodPortion) -> str | None:
+    food_id = portion.food.id
+    category = portion.food.category
+    name = portion.food.name.lower()
+    grams = _round_kitchen_grams(portion.grams) if portion.grams >= 1 else portion.grams
+
+    if category == "spice":
+        return _spice_hint(grams)
+    if food_id == "egg":
+        return _about_whole_units(grams / 50, ("яйцо", "яйца", "яиц"))
+    if food_id == "banana":
+        return _about_units(grams / 120, ("банан", "банана", "бананов"))
+    if food_id == "apple":
+        return _about_units(grams / 170, ("яблоко", "яблока", "яблок"), allow_quarters=True)
+    if food_id == "orange":
+        return _citrus_hint(grams, 200, ("апельсин", "апельсина", "апельсинов"))
+    if food_id == "mandarins":
+        return _citrus_hint(grams, 75, ("мандарин", "мандарина", "мандаринов"), small_hint="несколько долек")
+    if food_id == "grapefruit":
+        return _citrus_hint(grams, 280, ("грейпфрут", "грейпфрута", "грейпфрутов"))
+    if food_id == "tomato":
+        return _about_units(grams / 120, ("помидор", "помидора", "помидоров"), allow_quarters=True)
+    if food_id == "cucumber":
+        return _about_units(grams / 150, ("огурец", "огурца", "огурцов"), allow_quarters=True)
+    if food_id == "bell_pepper":
+        return _about_units(grams / 150, ("сладкий перец", "сладкого перца", "сладких перцев"), allow_quarters=True)
+    if food_id == "potato":
+        return _potato_hint(grams)
+    if food_id == "whole_grain_bread":
+        return _about_units(grams / 35, ("ломтик хлеба", "ломтика хлеба", "ломтиков хлеба"))
+    if food_id == "corn_tortilla":
+        return _about_units(grams / 60, ("тортилья", "тортильи", "тортилий"))
+    if food_id == "berries":
+        return _about_units(grams / 80, ("горсть ягод", "горсти ягод", "горстей ягод"))
+    if food_id == "broccoli":
+        return _about_units(grams / 80, ("горсть соцветий", "горсти соцветий", "горстей соцветий"))
+    if food_id == "spinach":
+        return _about_units(grams / 30, ("горсть шпината", "горсти шпината", "горстей шпината"))
+    if food_id in {"greek_yogurt", "lactose_free_yogurt"} or "йогурт" in name:
+        return _dairy_hint(grams, "йогурта", 200)
+    if food_id in {"cottage_cheese", "lactose_free_cottage_cheese"} or "творог" in name:
+        return _dairy_hint(grams, "творога", 180)
+    if food_id in {"milk", "almond_milk", "soy_milk", "kefir", "buttermilk"} or any(
+        word in name for word in ("молоко", "кефир", "пахта")
+    ):
+        return _dairy_hint(grams, "напитка", 200)
+    if food_id in {"olive_oil", "vegetable_oil", "canola_oil", "sesame_oil", "coconut_oil"}:
+        if grams < 9:
+            return _about_units(
+                grams / 5,
+                ("чайная ложка", "чайной ложки", "чайные ложки", "чайных ложек"),
+                allow_quarters=True,
+            )
+        return _about_units(
+            grams / 14,
+            ("столовая ложка", "столовой ложки", "столовые ложки", "столовых ложек"),
+            allow_quarters=True,
+        )
+    if food_id == "tahini":
+        return _sauce_hint(grams)
+    if food_id == "pumpkin_seeds" or category == "nuts_seeds":
+        return _nut_seed_hint(grams, name)
+    if food_id == "avocado":
+        return _about_units(grams / 150, ("авокадо", "авокадо", "авокадо"), allow_quarters=True)
+    if food_id == "whole_wheat_pasta" or _is_pasta_like(name):
+        return _about_units(
+            grams / 70,
+            (
+                "небольшая порция сухой пасты",
+                "небольшой порции сухой пасты",
+                "небольшие порции сухой пасты",
+                "небольших порций сухой пасты",
+            ),
+        )
+    if food_id in {"buckwheat", "rice", "quinoa", "oats"} or _is_dry_grain_like(name):
+        return _about_units(
+            grams / 15,
+            (
+                "столовая ложка сухой крупы",
+                "столовой ложки сухой крупы",
+                "столовые ложки сухой крупы",
+                "столовых ложек сухой крупы",
+            ),
+        )
+    if category == "grains" and _is_bread_like(name):
+        return _about_units(
+            grams / 40,
+            ("кусок хлеба или лаваша", "куска хлеба или лаваша", "куска хлеба или лаваша", "кусков хлеба или лаваша"),
+        )
+    if food_id in {"chicken_breast", "turkey", "salmon"}:
+        return _about_units(
+            grams / 120,
+            ("кусок размером с ладонь", "куска размером с ладонь", "кусков размером с ладонь"),
+        )
+    if food_id == "tuna":
+        return _about_units(
+            grams / 120,
+            ("небольшая банка без жидкости", "небольшие банки без жидкости", "небольших банок без жидкости"),
+        )
+    if food_id == "tofu":
+        return _about_units(grams / 180, ("стандартный блок тофу", "стандартных блока тофу", "стандартных блоков тофу"))
+    if category in {"sauce", "sweetener"}:
+        return _sauce_hint(grams)
+    if category == "vegetable" and grams >= 50:
+        return _about_units(grams / 80, ("горсть", "горсти", "горстей"))
+    if category == "fruit" and grams >= 80:
+        return _about_units(grams / 120, ("порция фрукта", "порции фрукта", "порций фруктов"))
+    if category == "protein" and grams >= 60:
+        return _about_units(grams / 120, ("порция белковой основы", "порции белковой основы", "порций белковой основы"))
+    return None
+
+
+def _round_kitchen_grams(grams: float) -> float:
+    if grams < 10:
+        return _round_to_step(grams, 1)
+    if grams < 100:
+        return _round_to_step(grams, 5)
+    return _round_to_step(grams, 10)
+
+
+def _round_kitchen_volume(ml: float) -> float:
+    if ml < 10:
+        return _round_to_step(ml, 1)
+    if ml < 100:
+        return _round_to_step(ml, 5)
+    if ml < 250:
+        return _round_to_step(ml, 10)
+    return _round_to_step(ml, 25)
+
+
+def _round_to_step(value: float, step: float) -> float:
+    return max(step, int(value / step + 0.5) * step)
+
+
+def _dairy_hint(grams: float, product_genitive: str, cup_grams: float) -> str | None:
+    if grams < cup_grams * 0.20:
+        return _about_units(
+            grams / 15,
+            ("столовая ложка", "столовой ложки", "столовые ложки", "столовых ложек"),
+        )
+    return _about_cups(grams / cup_grams, product_genitive)
+
+
+def _sauce_hint(grams: float) -> str | None:
+    if grams < 15:
+        return _about_units(
+            grams / 5,
+            ("чайная ложка", "чайной ложки", "чайные ложки", "чайных ложек"),
+            allow_quarters=True,
+        )
+    return _about_units(
+        grams / 15,
+        ("столовая ложка", "столовой ложки", "столовые ложки", "столовых ложек"),
+        allow_quarters=True,
+    )
+
+
+def _nut_seed_hint(grams: float, name: str) -> str | None:
+    if any(word in name for word in ("сем", "кунжут", "чиа", "лен", "кокос")):
+        forms = ("столовая ложка семян", "столовой ложки семян", "столовые ложки семян", "столовых ложек семян")
+    else:
+        forms = ("столовая ложка орехов", "столовой ложки орехов", "столовые ложки орехов", "столовых ложек орехов")
+    return _about_units(grams / 10, forms, allow_quarters=True)
+
+
+def _citrus_hint(
+    grams: float,
+    whole_edible_grams: float,
+    forms: tuple[str, str, str],
+    *,
+    small_hint: str = "несколько долек",
+) -> str | None:
+    if grams < whole_edible_grams * 0.35:
+        return small_hint if grams >= 30 else None
+    return _about_whole_units(grams / whole_edible_grams, forms)
+
+
+def _potato_hint(grams: float) -> str | None:
+    if grams < 75:
+        return None
+    if grams <= 155:
+        return "примерно 1 небольшая картофелина"
+    if grams <= 240:
+        return "примерно 1 средняя картофелина"
+    return _about_whole_units(grams / 150, ("картофелина", "картофелины", "картофелин"))
+
+
+def _spice_hint(grams: float) -> str | None:
+    if 0 < grams < 1:
+        return "щепотка"
+    if grams < 2:
+        return "щепотка"
+    if grams < 4:
+        return "примерно 1/2 чайной ложки"
+    return _about_units(
+        grams / 5,
+        ("чайная ложка", "чайной ложки", "чайные ложки", "чайных ложек"),
+        allow_quarters=True,
+    )
+
+
+def _is_pasta_like(name: str) -> bool:
+    return any(word in name for word in ("паста", "макарон", "спагетти", "лапша", "орзо", "ньокки"))
+
+
+def _is_dry_grain_like(name: str) -> bool:
+    return any(word in name for word in ("рис", "булгур", "киноа", "овся", "греч", "круп", "кус-кус", "кускус"))
+
+
+def _is_bread_like(name: str) -> bool:
+    return any(
+        word in name
+        for word in ("хлеб", "лаваш", "тортиль", "лепеш", "лепёш", "булочка", "бейгл", "чиабатта", "багет")
+    )
+
+
+def _about_cups(value: float, product_genitive: str) -> str | None:
+    if value < 0.35:
+        return "несколько столовых ложек"
+    amount = _friendly_amount(value, allow_quarters=True)
+    if amount is None:
+        return None
+    forms = (
+        f"стакан {product_genitive}",
+        f"стакана {product_genitive}",
+        f"стакана {product_genitive}",
+        f"стаканов {product_genitive}",
+    )
+    return f"примерно {amount} {_choose_form(amount, forms)}"
+
+
+def _about_units(
+    value: float,
+    forms: tuple[str, str, str] | tuple[str, str, str, str],
+    *,
+    allow_quarters: bool = False,
+) -> str | None:
+    amount = _friendly_amount(value, allow_quarters=allow_quarters)
+    if amount is None:
+        return None
+    return f"примерно {amount} {_choose_form(amount, forms)}"
+
+
+def _about_whole_units(value: float, forms: tuple[str, str, str]) -> str | None:
+    if value < 0.70:
+        return None
+    amount = "1" if value <= 1.25 else str(round(value))
+    return f"примерно {amount} {_choose_form(amount, forms)}"
+
+
+def _friendly_amount(value: float, *, allow_quarters: bool = False) -> str | None:
+    if value < 0.18:
+        return None
+    if allow_quarters:
+        if value <= 0.65:
+            return "1/2"
+    elif value <= 0.65:
+        return "1/2"
+    if value <= 1.25:
+        return "1"
+    if value <= 1.75:
+        return "1,5"
+    return str(round(value))
+
+
+def _choose_form(amount: str, forms: tuple[str, str, str] | tuple[str, str, str, str]) -> str:
+    if "/" in amount or amount == "1,5":
+        return forms[1]
+    if amount == "1":
+        return forms[0]
+    number = int(amount)
+    if number % 10 == 1 and number % 100 != 11:
+        return forms[0]
+    if 2 <= number % 10 <= 4 and not 12 <= number % 100 <= 14:
+        return forms[2] if len(forms) == 4 else forms[1]
+    return forms[3] if len(forms) == 4 else forms[2]
+
+
+def _format_instruction_weight_or_volume(value: float, unit: str) -> str:
+    if 0 < value < 1:
+        return f"менее 1 {unit}"
+    rounded = _round_kitchen_volume(value) if unit == "мл" else _round_kitchen_grams(value)
+    return f"{_format_number(rounded)} {unit}"
+
+
+def _format_instruction_spoon(value: float, unit: str) -> str:
+    if unit == "ст. л." and value < 0.75:
+        return _format_common_spoon_amount(value * 3, "ч. л.")
+    return _format_common_spoon_amount(value, unit)
+
+
+def _format_instruction_cup(value: float) -> str:
+    if value < 0.20:
+        return _format_common_spoon_amount(value * 16, "ст. л.")
+    if value < 0.35:
+        return "несколько столовых ложек"
+    amount = _friendly_amount(value, allow_quarters=True)
+    if amount is None:
+        return "несколько столовых ложек"
+    if amount == "1":
+        return "1 стакан"
+    return f"{amount} стакана"
+
+
+def _format_common_spoon_amount(value: float, unit: str) -> str:
+    if value <= 0:
+        return f"0 {unit}"
+    if unit == "ч. л." and value < 0.25:
+        return "щепотку"
+    if value < 0.63:
+        return f"1/2 {unit}"
+    if value < 1.25:
+        return f"1 {unit}"
+    if value < 1.75:
+        return f"1,5 {unit}"
+    return f"{round(value)} {unit}"
+
+
+def _parse_number(value: str) -> float:
+    return float(value.replace(",", "."))
+
+
+def _format_number(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.1f}".rstrip("0").rstrip(".").replace(".", ",")
