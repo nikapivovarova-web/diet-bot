@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 from .domain import (
     ConditionCode,
     Food,
@@ -25,6 +27,9 @@ RED_FLAG_CONDITIONS = {
     ConditionCode.ONCOLOGY: "oncology treatment",
     ConditionCode.SEVERE_LIVER_DISEASE: "severe liver disease",
 }
+
+
+MIN_EXCLUDED_NAME_MATCH_LENGTH = 3
 
 
 FOOD_EXCLUSION_ALIASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
@@ -77,6 +82,10 @@ FOOD_EXCLUSION_ALIASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
             "yogurt",
             "cheese",
         ),
+    ),
+    (
+        (" сыр ", "сырн", "сыров", "cheese"),
+        ("сыр", "сырн", "сыров", "cheese"),
     ),
     (
         ("рыб", "fish"),
@@ -132,7 +141,7 @@ def _apply_restrictions(
 ) -> None:
     for restriction in profile.restrictions:
         value = restriction.normalized_value
-        if restriction.type in {RestrictionType.ALLERGY, RestrictionType.EXCLUDED_FOOD}:
+        if restriction.type in {RestrictionType.ALLERGY, RestrictionType.INTOLERANCE, RestrictionType.EXCLUDED_FOOD}:
             excluded_food_names.update(_expanded_excluded_food_names(value))
         if "лактоз" in value or "lactose" in value:
             excluded_tags.add("lactose")
@@ -189,7 +198,17 @@ def _apply_conditions(
 
 def is_name_excluded(food_name: str, excluded_names: frozenset[str]) -> bool:
     normalized = normalize_text(food_name)
-    return any(name in normalized or normalized in name for name in excluded_names)
+    return any(name in normalized for name in _matchable_excluded_names(excluded_names))
+
+
+@lru_cache(maxsize=128)
+def _matchable_excluded_names(excluded_names: frozenset[str]) -> frozenset[str]:
+    return frozenset(
+        expanded_name
+        for name in excluded_names
+        for expanded_name in _expanded_excluded_food_names(name)
+        if len(expanded_name) >= MIN_EXCLUDED_NAME_MATCH_LENGTH
+    )
 
 
 def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
@@ -204,8 +223,10 @@ def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
 
 
 def _expanded_excluded_food_names(value: str) -> set[str]:
+    value = normalize_text(value)
+    search_value = f" {value} "
     names = {value}
     for needles, aliases in FOOD_EXCLUSION_ALIASES:
-        if any(needle in value for needle in needles):
+        if any(needle in search_value for needle in needles):
             names.update(normalize_text(alias) for alias in aliases)
     return {name for name in names if name}

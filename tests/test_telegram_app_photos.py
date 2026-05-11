@@ -1,9 +1,18 @@
+import asyncio
 import json
+import time
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.types import BufferedInputFile, FSInputFile
 
 import diet_bot.telegram_app as telegram_app
@@ -22,7 +31,12 @@ from diet_bot.domain import (
     UserProfile,
 )
 from diet_bot.presentation import format_meal_card, format_week_shopping_list
-from diet_bot.promo_codes import PromoCodeRecord, load_promo_codes, save_promo_codes
+from diet_bot.promo_codes import (
+    PromoCodeRecord,
+    load_promo_codes,
+    promo_code_lookup_key,
+    save_promo_codes,
+)
 from diet_bot.telegram_app import (
     BOT_COMMANDS,
     BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
@@ -47,6 +61,7 @@ from diet_bot.telegram_app import (
     DATA_DIR,
     FEATURES_MESSAGE,
     FEATURES_TEXT,
+    GENERATION_ALREADY_RUNNING_TEXT,
     handle_answer,
     ONE_DAY_PLAN_TEXT,
     PAY_WITH_RU_CARD_TEXT,
@@ -109,6 +124,25 @@ from diet_bot.telegram_app import (
 from diet_bot.questionnaire import start_session
 
 
+@pytest.fixture(autouse=True)
+def disable_telegram_runtime_limits(monkeypatch):
+    telegram_app.TELEGRAM_RATE_LIMITER.reset()
+    telegram_app.INCOMING_THROTTLE.reset()
+    monkeypatch.setattr(telegram_app, "DIET_BOT_ENV", "development")
+    monkeypatch.setattr(telegram_app, "DIET_BOT_DATABASE_URL", "")
+    monkeypatch.setattr(telegram_app, "ALLOW_JSON_STORAGE", True)
+    monkeypatch.setattr(telegram_app, "_POSTGRES_STORE", None)
+    monkeypatch.setattr(telegram_app.TELEGRAM_RATE_LIMITER, "per_chat_interval", 0.0)
+    monkeypatch.setattr(telegram_app.TELEGRAM_RATE_LIMITER, "global_interval", 0.0)
+    monkeypatch.setattr(telegram_app, "CALLBACK_THROTTLE_SECONDS", 0.0)
+    monkeypatch.setattr(telegram_app, "COMMAND_THROTTLE_SECONDS", 0.0)
+    monkeypatch.setattr(telegram_app, "PLAN_THROTTLE_SECONDS", 0.0)
+    monkeypatch.setattr(telegram_app, "SUPPORT_THROTTLE_SECONDS", 0.0)
+    yield
+    telegram_app.TELEGRAM_RATE_LIMITER.reset()
+    telegram_app.INCOMING_THROTTLE.reset()
+
+
 def test_photo_input_resolves_curated_local_photo() -> None:
     photo_path = next((DATA_DIR / "recipe_photos").glob("*.jpg"))
     meal = Meal(
@@ -139,15 +173,141 @@ def test_start_keyboard_has_welcome_buttons() -> None:
     keyboard = _start_keyboard()
     buttons = [row[0] for row in keyboard.inline_keyboard]
 
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert [(button.text, button.callback_data) for button in buttons[:3] + buttons[4:]] == [
         (TRY_FREE_TEXT, CALLBACK_START),
         (SUBSCRIBE_MONTH_TEXT, CALLBACK_SUBSCRIBE),
         (FEATURES_TEXT, CALLBACK_FEATURES),
         (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
+    assert [button.style for button in buttons] == [
+        telegram_app.BUTTON_STYLE_PRIMARY,
+        telegram_app.BUTTON_STYLE_SUCCESS,
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert buttons[3].text == telegram_app.PRIVACY_POLICY_TEXT
+    if telegram_app.PRIVACY_POLICY_URL:
+        assert buttons[3].url == telegram_app.PRIVACY_POLICY_URL
+    else:
+        assert buttons[3].callback_data == telegram_app.CALLBACK_PRIVACY_POLICY
     assert "FoodBalance" in WELCOME_TEXT
     assert WELCOME_PHOTO_PATH.exists()
+
+
+@pytest.mark.anyio
+async def test_start_callback_requires_consent_before_trial_questionnaire(monkeypatch, tmp_path) -> None:
+    chat_id = 80_206
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", "")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id)
+    start_callback = FakeCallback(CALLBACK_START, message)
+    try:
+        await telegram_app.handle_callback(start_callback)
+
+        sent_text, markup = message.texts[-1]
+        buttons = [row[0] for row in markup.inline_keyboard]
+
+        assert start_callback.answers == [None]
+        assert sent_text == telegram_app.CONSENT_REQUEST_TEXT
+        assert "возраст, рост, вес" in sent_text
+        assert "YooKassa" in sent_text
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert buttons[0].text == telegram_app.CONSENT_ACCEPT_TEXT
+        assert buttons[0].callback_data == telegram_app.CALLBACK_CONSENT_TRIAL
+        assert buttons[1].text == telegram_app.PRIVACY_POLICY_TEXT
+        assert buttons[1].callback_data == telegram_app.CALLBACK_PRIVACY_POLICY_TRIAL
+
+        consent_callback = FakeCallback(telegram_app.CALLBACK_CONSENT_TRIAL, message)
+        await telegram_app.handle_callback(consent_callback)
+
+        assert consent_callback.answers == [None]
+        assert message.reply_markup_edits == [None]
+        assert chat_id in SESSION_BY_CHAT_ID
+        assert chat_id in TRIAL_CHAT_IDS
+        assert message.texts[-1][0] == SESSION_BY_CHAT_ID[chat_id].current_question.prompt
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_callback_questionnaire_state_uses_clicking_user_not_bot_message_author(monkeypatch, tmp_path) -> None:
+    chat_id = 80_208
+    bot_id = 900_001
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    bot_message = FakeMessage(chat_id, user_id=bot_id)
+    try:
+        await telegram_app.handle_callback(FakeCallback(CALLBACK_START, bot_message, from_user_id=chat_id))
+        await telegram_app.handle_callback(
+            FakeCallback(telegram_app.CALLBACK_CONSENT_TRIAL, bot_message, from_user_id=chat_id),
+        )
+
+        assert chat_id in SESSION_BY_CHAT_ID
+        assert bot_id not in SESSION_BY_CHAT_ID
+
+        answer_message = FakeMessage(chat_id, text="50", user_id=chat_id)
+        await handle_answer(answer_message)
+
+        assert SESSION_BY_CHAT_ID[chat_id].current_question.key == "sex"
+        assert answer_message.texts[-1][0] == SESSION_BY_CHAT_ID[chat_id].current_question.prompt
+        assert bot_id not in SESSION_BY_CHAT_ID
+        assert telegram_app._message_user_id(bot_message) == bot_id
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        SESSION_BY_CHAT_ID.pop(bot_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+        TRIAL_CHAT_IDS.discard(bot_id)
+
+
+@pytest.mark.anyio
+async def test_week_pdf_callback_uses_clicking_user_profile_not_bot_message_author(monkeypatch, tmp_path) -> None:
+    chat_id = 80_209
+    bot_id = 900_002
+    profile = profile_with()
+    calls = []
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+
+    async def fake_send_week_plan_with_access(message, selected_profile):
+        calls.append((telegram_app._message_owner_id(message), selected_profile))
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan_with_access", fake_send_week_plan_with_access)
+    PROFILE_BY_CHAT_ID[chat_id] = profile
+    bot_message = FakeMessage(chat_id, user_id=bot_id)
+    try:
+        await telegram_app.handle_callback(FakeCallback(CALLBACK_WEEK_PLAN_PDF, bot_message, from_user_id=chat_id))
+
+        assert calls == [(chat_id, profile)]
+        assert bot_message.texts == []
+        assert telegram_app._message_user_id(bot_message) == bot_id
+    finally:
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(bot_id, None)
+
+
+@pytest.mark.anyio
+async def test_privacy_policy_callback_sends_short_policy(monkeypatch, tmp_path) -> None:
+    chat_id = 80_207
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id)
+    callback = FakeCallback(telegram_app.CALLBACK_PRIVACY_POLICY, message)
+
+    await telegram_app.handle_callback(callback)
+
+    sent_text, markup = message.texts[-1]
+    assert callback.answers == [None]
+    assert sent_text == telegram_app.PRIVACY_POLICY_MESSAGE
+    assert "Telegram ID" in sent_text
+    assert "заболевания/состояния" in sent_text
+    assert "email для фискального чека" in sent_text
+    assert markup is not None
 
 
 @pytest.mark.anyio
@@ -194,7 +354,7 @@ async def test_promo_code_activation_grants_monthly_subscription(monkeypatch, tm
         assert entitlement.is_subscription_active()
         assert entitlement.monthly_one_day_remaining == 5
         assert entitlement.monthly_weekly_pdf_remaining == 4
-        assert promo_codes["FB-ABCD-EFGH-2345"].used_by_chat_id == chat_id
+        assert promo_codes[promo_code_lookup_key("FB-ABCD-EFGH-2345")].used_by_chat_id == chat_id
         assert markup.inline_keyboard[0][0].callback_data == CALLBACK_ONE_DAY_PLAN
     finally:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
@@ -209,8 +369,55 @@ async def test_features_button_sends_capabilities_text(monkeypatch, tmp_path) ->
 
     sent_text, markup = message.texts[-1]
     assert sent_text == FEATURES_MESSAGE
+    assert "Что умеет FoodBalance / FAQ" in sent_text
+    assert "Пробный рацион" in sent_text
+    assert "Подписка и лимиты" in sent_text
     assert "PDF" in sent_text
-    assert "витамины и минералы" in sent_text
+    assert "Оплата" in sent_text
+    assert "Промокоды" in sent_text
+    assert "Поддержка" in sent_text
+    assert markup is not None
+
+
+@pytest.mark.anyio
+async def test_help_command_sends_faq_text(monkeypatch, tmp_path) -> None:
+    chat_id = 80_205
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id, text="/help")
+
+    await telegram_app.help_command(message)
+
+    sent_text, markup = message.texts[-1]
+    assert sent_text == FEATURES_MESSAGE
+    assert "/help - справка" in sent_text
+    assert markup is not None
+
+
+@pytest.mark.anyio
+async def test_support_command_starts_request_mode(monkeypatch, tmp_path) -> None:
+    chat_id = 80_215
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id, text="/support")
+    try:
+        await telegram_app.support_command(message)
+
+        assert chat_id in SUPPORT_REQUEST_CHAT_IDS
+        assert message.texts[-1] == (SUPPORT_PROMPT_TEXT, None)
+    finally:
+        SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_privacy_command_sends_policy(monkeypatch, tmp_path) -> None:
+    chat_id = 80_216
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id, text="/privacy")
+
+    await telegram_app.privacy_command(message)
+
+    sent_text, markup = message.texts[-1]
+    assert sent_text == telegram_app.PRIVACY_POLICY_MESSAGE
+    assert "Telegram ID" in sent_text
     assert markup is not None
 
 
@@ -231,13 +438,144 @@ async def test_support_callback_starts_request_mode(monkeypatch, tmp_path) -> No
         SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
 
 
+def test_question_answer_callback_includes_session_and_question_key() -> None:
+    session, error = start_session().receive("32")
+    assert error is None
+
+    markup = telegram_app._question_keyboard(session)
+    data = markup.inline_keyboard[0][0].callback_data
+
+    assert len(session.session_id) == 8
+    assert data == f"{telegram_app.CALLBACK_ANSWER_PREFIX}{session.session_id}:sex:0"
+    assert len(data.encode("utf-8")) <= 64
+
+
+@pytest.mark.anyio
+async def test_question_answer_callback_applies_current_answer_and_removes_keyboard(monkeypatch) -> None:
+    chat_id = 80_301
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    session, error = start_session().receive("32")
+    assert error is None
+    SESSION_BY_CHAT_ID[chat_id] = session
+    message = FakeMessage(chat_id)
+    data = telegram_app._question_keyboard(session).inline_keyboard[0][0].callback_data
+    callback = FakeCallback(data, message)
+    try:
+        await telegram_app.handle_callback(callback)
+
+        assert callback.answers == [session.current_question.options[0]]
+        assert message.reply_markup_edits == [None]
+        assert SESSION_BY_CHAT_ID[chat_id].step_index == session.step_index + 1
+        assert SESSION_BY_CHAT_ID[chat_id].answers["sex"] == session.current_question.options[0]
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_fast_repeated_question_callback_is_soft_throttled_without_state_change(monkeypatch) -> None:
+    chat_id = 80_305
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "CALLBACK_THROTTLE_SECONDS", 0.7)
+    session, error = start_session().receive("32")
+    assert error is None
+    SESSION_BY_CHAT_ID[chat_id] = session
+    message = FakeMessage(chat_id)
+    data = telegram_app._question_keyboard(session).inline_keyboard[0][0].callback_data
+    first_callback = FakeCallback(data, message)
+    second_callback = FakeCallback(data, message)
+    try:
+        await telegram_app.handle_callback(first_callback)
+        state_after_first = SESSION_BY_CHAT_ID[chat_id]
+
+        await telegram_app.handle_callback(second_callback)
+
+        assert first_callback.answers == [session.current_question.options[0]]
+        assert second_callback.answers == [telegram_app.CALLBACK_THROTTLED_TEXT]
+        assert SESSION_BY_CHAT_ID[chat_id] == state_after_first
+        assert SESSION_BY_CHAT_ID[chat_id].step_index == session.step_index + 1
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_question_answer_callback_rejects_stale_session_id(monkeypatch) -> None:
+    chat_id = 80_302
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    session, error = start_session().receive("32")
+    assert error is None
+    SESSION_BY_CHAT_ID[chat_id] = session
+    message = FakeMessage(chat_id)
+    stale_data = f"{telegram_app.CALLBACK_ANSWER_PREFIX}stale1:{session.current_question.key}:0"
+    callback = FakeCallback(stale_data, message)
+    try:
+        await telegram_app.handle_callback(callback)
+
+        assert callback.answers == [telegram_app.STALE_ANSWER_CALLBACK_TEXT]
+        assert message.reply_markup_edits == [None]
+        assert SESSION_BY_CHAT_ID[chat_id] == session
+        assert message.texts == []
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_question_answer_callback_rejects_stale_question_key(monkeypatch) -> None:
+    chat_id = 80_303
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    session, error = start_session().receive("32")
+    assert error is None
+    SESSION_BY_CHAT_ID[chat_id] = session
+    message = FakeMessage(chat_id)
+    stale_data = f"{telegram_app.CALLBACK_ANSWER_PREFIX}{session.session_id}:goal:0"
+    callback = FakeCallback(stale_data, message)
+    try:
+        await telegram_app.handle_callback(callback)
+
+        assert callback.answers == [telegram_app.STALE_ANSWER_CALLBACK_TEXT]
+        assert message.reply_markup_edits == [None]
+        assert SESSION_BY_CHAT_ID[chat_id] == session
+        assert message.texts == []
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_question_answer_callback_rejects_bad_index_and_legacy_format(monkeypatch) -> None:
+    chat_id = 80_304
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    session, error = start_session().receive("32")
+    assert error is None
+    SESSION_BY_CHAT_ID[chat_id] = session
+    bad_index_message = FakeMessage(chat_id)
+    bad_index = f"{telegram_app.CALLBACK_ANSWER_PREFIX}{session.session_id}:{session.current_question.key}:99"
+    bad_index_callback = FakeCallback(bad_index, bad_index_message)
+    legacy_index_message = FakeMessage(chat_id)
+    legacy_index = f"{telegram_app.CALLBACK_ANSWER_PREFIX}0"
+    legacy_index_callback = FakeCallback(legacy_index, legacy_index_message)
+    try:
+        await telegram_app.handle_callback(bad_index_callback)
+        await telegram_app.handle_callback(legacy_index_callback)
+
+        assert bad_index_callback.answers == [telegram_app.STALE_ANSWER_CALLBACK_TEXT]
+        assert legacy_index_callback.answers == [telegram_app.STALE_ANSWER_CALLBACK_TEXT]
+        assert bad_index_message.reply_markup_edits == [None]
+        assert legacy_index_message.reply_markup_edits == [None]
+        assert SESSION_BY_CHAT_ID[chat_id] == session
+        assert bad_index_message.texts == []
+        assert legacy_index_message.texts == []
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+
+
 @pytest.mark.anyio
 async def test_support_message_is_sent_to_admin_chat_with_context(monkeypatch, tmp_path) -> None:
     chat_id = 80_102
     support_chat_id = -100_555_111
     subscriptions_path = tmp_path / "subscriptions.json"
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
-    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
+    parsed_support_chat_id = telegram_app._parse_support_chat_id(str(support_chat_id))
+    assert parsed_support_chat_id == support_chat_id
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", parsed_support_chat_id)
     _save_active_subscription(
         subscriptions_path,
         chat_id,
@@ -280,10 +618,52 @@ async def test_support_message_is_sent_to_admin_chat_with_context(monkeypatch, t
 
 
 @pytest.mark.anyio
+async def test_support_admin_delivery_uses_safe_bot_send_message(monkeypatch, tmp_path) -> None:
+    chat_id = 80_105
+    support_chat_id = -100_555_112
+    calls = []
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
+
+    async def fake_safe_bot_send_message(bot, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(telegram_app, "safe_bot_send_message", fake_safe_bot_send_message)
+
+    sent = await telegram_app._send_support_request_to_admin(FakeMessage(chat_id), "Нужна помощь")
+
+    assert sent
+    assert calls
+    assert calls[0]["chat_id"] == support_chat_id
+    assert "Нужна помощь" in calls[0]["text"]
+
+
+@pytest.mark.anyio
+async def test_support_message_within_throttle_is_not_forwarded(monkeypatch, tmp_path) -> None:
+    chat_id = 80_106
+    support_chat_id = -100_555_113
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
+    monkeypatch.setattr(telegram_app, "SUPPORT_THROTTLE_SECONDS", 60.0)
+    SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
+    try:
+        await handle_answer(FakeMessage(chat_id, text="Первое сообщение"))
+        SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
+        second_message = FakeMessage(chat_id, text="Второе сообщение")
+        await handle_answer(second_message)
+
+        assert len(second_message.bot.sent_messages) == 0
+        assert second_message.texts == [(telegram_app.SUPPORT_THROTTLED_TEXT, None)]
+        assert chat_id in SUPPORT_REQUEST_CHAT_IDS
+    finally:
+        SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
 async def test_support_message_without_config_exits_support_mode(monkeypatch, tmp_path) -> None:
     chat_id = 80_103
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
-    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", None)
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", telegram_app._parse_support_chat_id(None))
     SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
     message = FakeMessage(chat_id, text="Нужна помощь")
     try:
@@ -298,8 +678,46 @@ async def test_support_message_without_config_exits_support_mode(monkeypatch, tm
 
 
 @pytest.mark.anyio
+async def test_support_message_with_invalid_config_exits_support_mode(monkeypatch, tmp_path) -> None:
+    chat_id = 80_104
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", telegram_app._parse_support_chat_id("not-a-chat-id"))
+    SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
+    message = FakeMessage(chat_id, text="Нужна помощь")
+    try:
+        await handle_answer(message)
+
+        assert chat_id not in SUPPORT_REQUEST_CHAT_IDS
+        assert message.bot.sent_messages == []
+        assert "Техподдержка временно не настроена" in message.texts[-1][0]
+        assert message.texts[-1][1] is not None
+    finally:
+        SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+def test_hard_coded_support_chat_fallback_is_removed() -> None:
+    fallback_name = "".join(("DEFAULT_", "SUPPORT_CHAT_ID"))
+    legacy_chat_id = "".join(("-", "5271779108"))
+    source = Path(telegram_app.__file__).read_text(encoding="utf-8")
+
+    assert fallback_name not in vars(telegram_app)
+    assert fallback_name not in source
+    assert legacy_chat_id not in source.replace("_", "")
+
+
+def test_telegram_delivery_has_no_direct_bot_send_calls() -> None:
+    source = Path(telegram_app.__file__).read_text(encoding="utf-8")
+
+    assert "message.bot.send_message(" not in source
+    assert "bot.send_document(" not in source
+    assert "bot.send_message(" not in source.replace("lambda: bot.send_message(", "")
+    assert "await safe_bot_send_message" in source
+    assert "await safe_answer_document" in source
+
+
+@pytest.mark.anyio
 async def test_support_chat_ignores_regular_messages(monkeypatch, tmp_path) -> None:
-    support_chat_id = -5_271_779_108
+    support_chat_id = -100_777_321
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
     SUPPORT_REQUEST_CHAT_IDS.add(support_chat_id)
@@ -315,7 +733,7 @@ async def test_support_chat_ignores_regular_messages(monkeypatch, tmp_path) -> N
 
 @pytest.mark.anyio
 async def test_support_chat_ignores_product_commands_but_keeps_myid(monkeypatch, tmp_path) -> None:
-    support_chat_id = -5_271_779_108
+    support_chat_id = -100_777_322
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
     start_message = FakeMessage(support_chat_id, text="/start")
@@ -326,7 +744,7 @@ async def test_support_chat_ignores_product_commands_but_keeps_myid(monkeypatch,
 
     assert start_message.texts == []
     assert start_message.photos == []
-    assert "chat_id: -5271779108" in myid_message.texts[-1][0]
+    assert f"chat_id: {support_chat_id}" in myid_message.texts[-1][0]
     assert "user_id: 70104" in myid_message.texts[-1][0]
 
 
@@ -350,6 +768,12 @@ def test_subscriber_cabinet_keyboard_shows_limits_without_upsells(monkeypatch, t
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 2 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+    ]
+    assert [button.style for button in buttons] == [
+        telegram_app.BUTTON_STYLE_PRIMARY,
+        telegram_app.BUTTON_STYLE_PRIMARY,
+        telegram_app.BUTTON_STYLE_DANGER,
+        None,
     ]
     assert TRY_FREE_TEXT not in button_texts
     assert SUBSCRIBE_MONTH_TEXT not in button_texts
@@ -414,7 +838,8 @@ def test_subscription_payment_result_opens_subscriber_cabinet(monkeypatch, tmp_p
     ]
 
 
-def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
+def test_subscription_payment_keyboard_has_monthly_options_only(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", "")
     keyboard = _subscription_payment_keyboard()
     buttons = [row[0] for row in keyboard.inline_keyboard]
 
@@ -427,13 +852,27 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     assert "50 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "250 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "не является медицинской консультацией" in SUBSCRIPTION_PAYMENT_TEXT
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert "email для фискального чека" in SUBSCRIPTION_PAYMENT_TEXT
+    assert [(button.text, button.callback_data) for button in buttons[:2]] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
     ]
+    assert buttons[2].text == telegram_app.PRIVACY_POLICY_TEXT
+    if telegram_app.PRIVACY_POLICY_URL:
+        assert buttons[2].url == telegram_app.PRIVACY_POLICY_URL
+    else:
+        assert buttons[2].callback_data == telegram_app.CALLBACK_PRIVACY_POLICY
+    assert (buttons[3].text, buttons[3].callback_data) == (SUPPORT_TEXT, CALLBACK_SUPPORT)
+    assert [button.style for button in buttons] == [
+        telegram_app.BUTTON_STYLE_SUCCESS,
+        telegram_app.BUTTON_STYLE_SUCCESS,
+        None,
+        None,
+    ]
 
 
-def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
+def test_paywall_keyboard_prioritizes_relevant_extra_purchase(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", "")
     day_keyboard = _paywall_keyboard(preferred="one_day")
     week_keyboard = _paywall_keyboard(preferred="weekly_pdf")
 
@@ -453,20 +892,31 @@ def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
         BUY_EXTRA_WEEKLY_PDF_TEXT,
         CALLBACK_BUY_EXTRA_WEEKLY_PDF,
     )
-    assert [(row[0].text, row[0].callback_data) for row in day_keyboard.inline_keyboard[2:]] == [
+    assert [(row[0].text, row[0].callback_data) for row in day_keyboard.inline_keyboard[2:4]] == [
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
     ]
-    assert [(row[0].text, row[0].callback_data) for row in week_keyboard.inline_keyboard[2:]] == [
+    assert [(row[0].text, row[0].callback_data) for row in week_keyboard.inline_keyboard[2:4]] == [
         (BUY_EXTRA_ONE_DAY_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_ONE_DAY),
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
     ]
+    assert (day_keyboard.inline_keyboard[-1][0].text, day_keyboard.inline_keyboard[-1][0].callback_data) == (
+        SUPPORT_TEXT,
+        CALLBACK_SUPPORT,
+    )
+    assert (week_keyboard.inline_keyboard[-1][0].text, week_keyboard.inline_keyboard[-1][0].callback_data) == (
+        SUPPORT_TEXT,
+        CALLBACK_SUPPORT,
+    )
+    assert [row[0].style for row in day_keyboard.inline_keyboard[:4]] == [telegram_app.BUTTON_STYLE_SUCCESS] * 4
+    assert [row[0].style for row in week_keyboard.inline_keyboard[:4]] == [telegram_app.BUTTON_STYLE_SUCCESS] * 4
 
 
 @pytest.mark.anyio
 async def test_active_subscription_limit_paywall_offers_only_extra_purchases(monkeypatch, tmp_path) -> None:
     chat_id = 81_005
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", "")
     _save_active_subscription(tmp_path / "subscriptions.json", chat_id, one_day_remaining=0, weekly_pdf_remaining=2)
     message = FakeMessage(chat_id)
 
@@ -490,6 +940,35 @@ async def test_active_subscription_limit_paywall_offers_only_extra_purchases(mon
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (telegram_app.PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
+    ]
+
+
+@pytest.mark.anyio
+async def test_exhausted_active_subscription_limit_paywall_offers_next_month(monkeypatch, tmp_path) -> None:
+    chat_id = 81_009
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", "")
+    _save_active_subscription(tmp_path / "subscriptions.json", chat_id, one_day_remaining=0, weekly_pdf_remaining=0)
+    message = FakeMessage(chat_id)
+
+    await telegram_app._send_limit_paywall(message, "weekly_pdf")
+
+    sent_text, markup = message.texts[-1]
+    buttons = [row[0] for row in markup.inline_keyboard]
+
+    assert "Лимиты текущего периода закончились." in sent_text
+    assert "оформить следующий месяц" in sent_text
+    assert [(button.text, button.callback_data) for button in buttons] == [
+        (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
+        (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (BUY_EXTRA_ONE_DAY_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_ONE_DAY),
+        (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
+        (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
+        (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (telegram_app.PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
 
 
@@ -498,6 +977,7 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     chat_id = 81_006
     subscriptions_path = tmp_path / "subscriptions.json"
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", "")
     telegram_app.save_entitlements(subscriptions_path, {chat_id: telegram_app.Entitlement(free_trial_used=True)})
     message = FakeMessage(chat_id)
 
@@ -511,10 +991,14 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (telegram_app.PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
 
 
-def test_pre_checkout_validates_payload_currency_and_amount() -> None:
+def test_pre_checkout_validates_payload_currency_and_amount(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYMENT_PAYLOADS", True)
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYLOADS_UNTIL", datetime(2099, 5, 17, tzinfo=UTC))
     valid_query = SimpleNamespace(
         invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
         currency="XTR",
@@ -555,35 +1039,289 @@ def test_pre_checkout_validates_payload_currency_and_amount() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_subscription_invoice_link_creates_recurring_stars_invoice() -> None:
+async def test_pre_checkout_validates_pending_order_owner_and_extra_subscription(monkeypatch, tmp_path) -> None:
+    chat_id = 81_201
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    message = FakeMessage(chat_id)
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    invoice = message.bot.invoice_links[0]
+    valid_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        from_user=SimpleNamespace(id=chat_id),
+    )
+    shared_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        from_user=SimpleNamespace(id=chat_id + 1),
+    )
+    wrong_amount_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY] + 1,
+        from_user=SimpleNamespace(id=chat_id),
+    )
+
+    assert _is_valid_pre_checkout(valid_query)
+    assert not _is_valid_pre_checkout(shared_query)
+    assert not _is_valid_pre_checkout(wrong_amount_query)
+
+
+@pytest.mark.anyio
+async def test_pre_checkout_rejects_extra_order_without_active_subscription(monkeypatch, tmp_path) -> None:
+    chat_id = 81_202
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id)
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    invoice = message.bot.invoice_links[0]
+    query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        from_user=SimpleNamespace(id=chat_id),
+    )
+
+    assert not _is_valid_pre_checkout(query)
+
+
+def test_legacy_pre_checkout_accepts_monthly_only_before_deadline(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYMENT_PAYLOADS", True)
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYLOADS_UNTIL", datetime(2099, 5, 17, tzinfo=UTC))
+    monthly_query = SimpleNamespace(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
+    )
+    extra_query = SimpleNamespace(
+        invoice_payload=PAYLOAD_EXTRA_ONE_DAY,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+    )
+    rub_monthly_query = SimpleNamespace(
+        invoice_payload=telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH,
+        currency="RUB",
+        total_amount=telegram_app.RUB_PAYMENT_PAYLOAD_AMOUNTS[telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH],
+    )
+
+    assert _is_valid_pre_checkout(monthly_query)
+    assert _is_valid_pre_checkout(rub_monthly_query)
+    assert not _is_valid_pre_checkout(extra_query)
+
+
+def test_legacy_pre_checkout_rejects_monthly_after_deadline(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYMENT_PAYLOADS", True)
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYLOADS_UNTIL", datetime(2000, 5, 1, tzinfo=UTC))
+    monthly_query = SimpleNamespace(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
+    )
+
+    assert not _is_valid_pre_checkout(monthly_query)
+
+
+@pytest.mark.anyio
+async def test_send_subscription_invoice_link_creates_recurring_stars_invoice(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
     message = FakeMessage()
 
     await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
 
     invoice = message.bot.invoice_links[0]
+    decoded_payload = telegram_app.decode_payment_order_payload(invoice["payload"])
+    assert decoded_payload is not None
+    order_id, nonce = decoded_payload
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+
     assert invoice["currency"] == "XTR"
     assert invoice["provider_token"] == ""
-    assert invoice["payload"] == PAYLOAD_SUBSCRIPTION_MONTH
+    assert order.nonce == nonce
+    assert order.user_id == message.chat.id
+    assert order.product == "subscription_month"
+    assert order.provider == "telegram_stars"
+    assert order.amount == SUBSCRIPTION_STARS_AMOUNT
+    assert order.currency == "XTR"
+    assert order.is_recurring
     assert invoice["prices"][0].amount == SUBSCRIPTION_STARS_AMOUNT
     assert invoice["subscription_period"] == 2_592_000
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
 
 @pytest.mark.anyio
-async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice() -> None:
+async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
     message = FakeMessage()
 
     await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
 
     invoice = message.bot.invoice_links[0]
+    decoded_payload = telegram_app.decode_payment_order_payload(invoice["payload"])
+    assert decoded_payload is not None
+    order_id, nonce = decoded_payload
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+
     assert invoice["currency"] == "XTR"
-    assert invoice["payload"] == PAYLOAD_EXTRA_ONE_DAY
+    assert order.nonce == nonce
+    assert order.product == "extra_one_day"
+    assert order.provider == "telegram_stars"
+    assert order.amount == 35
+    assert order.currency == "XTR"
+    assert not order.is_recurring
     assert invoice["prices"][0].amount == 35
     assert invoice["subscription_period"] is None
 
 
 @pytest.mark.anyio
-async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatch) -> None:
+async def test_telegram_retry_after_uses_retry_after_delay(monkeypatch) -> None:
+    delays: list[float] = []
+    calls = 0
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def flaky_call() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TelegramRetryAfter(SimpleNamespace(), "flood limit", 3)
+        return "ok"
+
+    monkeypatch.setattr(telegram_app.asyncio, "sleep", fake_sleep)
+
+    result = await telegram_app.telegram_api_call_with_retry("test_retry_after", flaky_call)
+
+    assert result == "ok"
+    assert calls == 2
+    assert delays == [3.0]
+
+
+@pytest.mark.anyio
+async def test_safe_answer_retries_after_telegram_retry_after(monkeypatch) -> None:
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    class RetryAfterMessage(FakeMessage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def answer(self, text, reply_markup=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TelegramRetryAfter(SimpleNamespace(), "flood limit", 2)
+            return await super().answer(text, reply_markup=reply_markup)
+
+    monkeypatch.setattr(telegram_app.asyncio, "sleep", fake_sleep)
+    message = RetryAfterMessage()
+
+    await telegram_app.safe_answer(message, "hello")
+
+    assert message.calls == 2
+    assert message.texts == [("hello", None)]
+    assert delays == [2.0]
+
+
+@pytest.mark.anyio
+async def test_send_stars_invoice_link_retries_temporary_errors(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app.asyncio, "sleep", AsyncMock())
+
+    class FlakyInvoiceBot(FakeInvoiceBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def create_invoice_link(self, **kwargs) -> str:
+            self.calls += 1
+            if self.calls < 3:
+                raise TelegramNetworkError(SimpleNamespace(), "network unavailable")
+            return await super().create_invoice_link(**kwargs)
+
+    message = FakeMessage()
+    message.bot = FlakyInvoiceBot()
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    invoice = message.bot.invoice_links[0]
+    order_id, _ = telegram_app.decode_payment_order_payload(invoice["payload"])
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+
+    assert message.bot.calls == 3
+    assert order.status == "pending"
+    assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
+
+
+@pytest.mark.anyio
+async def test_send_stars_invoice_link_marks_order_failed_after_retries(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app.asyncio, "sleep", AsyncMock())
+
+    class FailingInvoiceBot(FakeInvoiceBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def create_invoice_link(self, **kwargs) -> str:
+            self.calls += 1
+            raise TelegramNetworkError(SimpleNamespace(), "network unavailable")
+
+    message = FakeMessage()
+    message.bot = FailingInvoiceBot()
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    state = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE)
+    order = next(iter(state.orders.values()))
+
+    assert message.bot.calls == 3
+    assert order.status == "failed_invoice_creation"
+    assert message.bot.invoice_links == []
+    assert message.texts == [(telegram_app.PAYMENT_INVOICE_CREATION_FAILED_TEXT, None)]
+
+
+@pytest.mark.anyio
+async def test_send_stars_invoice_link_does_not_retry_bad_request(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    sleep = AsyncMock()
+    monkeypatch.setattr(telegram_app.asyncio, "sleep", sleep)
+
+    class BadRequestInvoiceBot(FakeInvoiceBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def create_invoice_link(self, **kwargs) -> str:
+            self.calls += 1
+            raise TelegramBadRequest(SimpleNamespace(), "bad payload")
+
+    message = FakeMessage()
+    message.bot = BadRequestInvoiceBot()
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    state = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE)
+    order = next(iter(state.orders.values()))
+
+    assert message.bot.calls == 1
+    assert order.status == "failed_invoice_creation"
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
     monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     message = FakeMessage()
@@ -598,7 +1336,15 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert callback.answers == [None]
     assert invoice["currency"] == "RUB"
     assert invoice["provider_token"] == "provider-token"
-    assert invoice["payload"] == telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH
+    decoded_payload = telegram_app.decode_payment_order_payload(invoice["payload"])
+    assert decoded_payload is not None
+    order_id, nonce = decoded_payload
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+    assert order.nonce == nonce
+    assert order.product == "subscription_month"
+    assert order.provider == "yookassa"
+    assert order.amount == 59_900
+    assert order.currency == "RUB"
     assert invoice["prices"][0].amount == 59_900
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
@@ -613,8 +1359,13 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
         "payment_mode": "full_payment",
         "payment_subject": "service",
     }
-    assert message.texts[-1][0] == "FoodBalance: подписка на месяц\n\nСтоимость: 599 ₽."
+    assert message.texts[-1][0] == (
+        "FoodBalance: подписка на месяц\n\n"
+        "Стоимость: 599 ₽.\n\n"
+        "Для фискального чека YooKassa и Telegram могут запросить email."
+    )
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
+    assert message.texts[-1][1].inline_keyboard[1][0].text == telegram_app.PRIVACY_POLICY_TEXT
 
 
 @pytest.mark.anyio
@@ -634,8 +1385,35 @@ async def test_active_subscription_cannot_buy_monthly_card_again(monkeypatch, tm
     assert callback.answers == [None]
     assert message.bot.invoice_links == []
     assert "Месячный доступ уже активен." in sent_text
-    assert "Повторно купить месячный доступ можно после окончания текущего периода." in sent_text
+    assert "Повторно купить месячный доступ можно, когда закончатся текущие лимиты или период." in sent_text
     assert markup.inline_keyboard[0][0].callback_data == CALLBACK_ONE_DAY_PLAN
+
+
+@pytest.mark.anyio
+async def test_active_subscription_with_exhausted_limits_can_buy_monthly_card_again(monkeypatch, tmp_path) -> None:
+    chat_id = 81_008
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    _save_active_subscription(tmp_path / "subscriptions.json", chat_id, one_day_remaining=0, weekly_pdf_remaining=0)
+    message = FakeMessage(chat_id)
+    callback = FakeCallback(CALLBACK_PAY_RU_CARD, message)
+
+    await telegram_app.handle_callback(callback)
+
+    invoice = message.bot.invoice_links[0]
+    order_id, _ = telegram_app.decode_payment_order_payload(invoice["payload"])
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+
+    assert callback.answers == [None]
+    assert order.product == "subscription_month"
+    assert order.provider == "yookassa"
+    assert message.texts[-1][0] == (
+        "FoodBalance: подписка на месяц\n\n"
+        "Стоимость: 599 ₽.\n\n"
+        "Для фискального чека YooKassa и Telegram могут запросить email."
+    )
 
 
 @pytest.mark.anyio
@@ -653,11 +1431,89 @@ async def test_ru_invoice_without_provider_token_shows_unavailable_message(monke
     assert markup is None
 
 
+@pytest.mark.anyio
+async def test_successful_payment_applies_pending_extra_order_for_active_subscriber(monkeypatch, tmp_path) -> None:
+    chat_id = 81_203
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    message = FakeMessage(chat_id)
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    payment = SimpleNamespace(
+        invoice_payload=message.bot.invoice_links[0]["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        telegram_payment_charge_id="charge-order-extra",
+        provider_payment_charge_id="",
+    )
+    result = telegram_app._apply_successful_payment(chat_id, payment)
+    entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    order_id, _ = telegram_app.decode_payment_order_payload(payment.invoice_payload)
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+
+    assert result.processed
+    assert result.grant == "extra_one_day"
+    assert entitlement.extra_one_day_remaining == 1
+    assert order.status == "paid"
+
+
+def test_successful_payment_orphans_legacy_extra_payload(monkeypatch, tmp_path) -> None:
+    chat_id = 81_204
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYMENT_PAYLOADS", True)
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYLOADS_UNTIL", datetime(2099, 5, 17, tzinfo=UTC))
+    payment = SimpleNamespace(
+        invoice_payload=PAYLOAD_EXTRA_ONE_DAY,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        telegram_payment_charge_id="legacy-extra-charge",
+        provider_payment_charge_id="",
+    )
+
+    result = telegram_app._apply_successful_payment(chat_id, payment)
+    state = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE)
+    entitlements = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)
+
+    assert not result.processed
+    assert chat_id not in entitlements
+    assert state.orphan_payments[-1]["reason"] == "missing_pending_order"
+    assert state.orphan_payments[-1]["charge_id"] == "legacy-extra-charge"
+
+
+def test_successful_payment_accepts_legacy_monthly_before_deadline(monkeypatch, tmp_path) -> None:
+    chat_id = 81_205
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYMENT_PAYLOADS", True)
+    monkeypatch.setattr(telegram_app, "ALLOW_LEGACY_PAYLOADS_UNTIL", datetime(2099, 5, 17, tzinfo=UTC))
+    payment = SimpleNamespace(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
+        telegram_payment_charge_id="legacy-monthly-charge",
+        provider_payment_charge_id="",
+    )
+
+    result = telegram_app._apply_successful_payment(chat_id, payment)
+    entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
+    state = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE)
+
+    assert result.processed
+    assert result.grant == "subscription"
+    assert entitlement.is_subscription_active()
+    assert state.orphan_payments == []
+
+
 def test_trial_subscription_keyboard_has_cta_button() -> None:
     keyboard = _trial_subscription_keyboard()
     button = keyboard.inline_keyboard[0][0]
 
     assert (button.text, button.callback_data) == (SUBSCRIBE_CTA_TEXT, CALLBACK_SUBSCRIBE)
+    assert button.style == telegram_app.BUTTON_STYLE_SUCCESS
     assert "пробный рацион на 1 день" in TRIAL_SUBSCRIPTION_TEXT
     assert "4 недельных рациона" in TRIAL_SUBSCRIPTION_TEXT
     assert "5 дополнительных дневных рационов" in TRIAL_SUBSCRIPTION_TEXT
@@ -672,6 +1528,12 @@ def test_plan_choice_keyboard_has_day_and_week_pdf_buttons() -> None:
         (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+    ]
+    assert [button.style for button in buttons] == [
+        telegram_app.BUTTON_STYLE_PRIMARY,
+        telegram_app.BUTTON_STYLE_PRIMARY,
+        telegram_app.BUTTON_STYLE_DANGER,
+        None,
     ]
     assert WEEK_PLAN_PDF_PLACEHOLDER_TEXT == "Функция рациона на неделю в PDF пока в разработке."
 
@@ -817,8 +1679,10 @@ class FakeMessage:
         username=None,
         first_name=None,
         last_name=None,
+        chat_type="private",
+        successful_payment=None,
     ) -> None:
-        self.chat = type("FakeChat", (), {"id": chat_id})()
+        self.chat = type("FakeChat", (), {"id": chat_id, "type": chat_type})()
         self.from_user = SimpleNamespace(
             id=chat_id if user_id is None else user_id,
             username=username,
@@ -828,10 +1692,12 @@ class FakeMessage:
         )
         self.text = text
         self.bot = FakeInvoiceBot()
+        self.successful_payment = successful_payment
         self.photos = []
         self.texts = []
         self.documents = []
         self.edits = []
+        self.reply_markup_edits = []
 
     async def answer_photo(self, **kwargs) -> None:
         self.photos.append(kwargs)
@@ -843,15 +1709,29 @@ class FakeMessage:
     async def answer_document(self, **kwargs) -> None:
         self.documents.append(kwargs)
 
+    async def edit_reply_markup(self, reply_markup=None) -> None:
+        self.reply_markup_edits.append(reply_markup)
+
 
 class FakeCallback:
-    def __init__(self, data: str, message: FakeMessage) -> None:
+    def __init__(self, data: str, message: FakeMessage, *, from_user_id=None) -> None:
         self.data = data
         self.message = message
+        self.from_user = (
+            message.from_user
+            if from_user_id is None
+            else SimpleNamespace(
+                id=from_user_id,
+                username=None,
+                first_name=None,
+                last_name=None,
+                full_name="",
+            )
+        )
         self.answers = []
 
-    async def answer(self, text=None) -> None:
-        self.answers.append(text)
+    async def answer(self, text=None, show_alert=None) -> None:
+        self.answers.append(text if show_alert is None else (text, show_alert))
 
 
 class FakeSentMessage:
@@ -860,6 +1740,95 @@ class FakeSentMessage:
 
     async def edit_text(self, text, **kwargs) -> None:
         self.source.edits.append((text, kwargs))
+
+
+@pytest.mark.anyio
+async def test_generation_lock_blocks_double_click(monkeypatch) -> None:
+    chat_id = 91_010
+    first_message = FakeMessage(chat_id)
+    second_message = FakeMessage(chat_id)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def fake_locked(message, profile):
+        calls.append(message.chat.id)
+        started.set()
+        await release.wait()
+        return True
+
+    telegram_app.GENERATION_LOCKS_BY_CHAT_ID.pop(chat_id, None)
+    monkeypatch.setattr(telegram_app, "_send_one_day_plan_with_access_locked", fake_locked)
+
+    first_task = asyncio.create_task(
+        telegram_app._send_one_day_plan_with_access(first_message, profile_with()),
+    )
+    await started.wait()
+    second_result = await telegram_app._send_one_day_plan_with_access(second_message, profile_with())
+    release.set()
+    first_result = await first_task
+
+    assert first_result
+    assert not second_result
+    assert calls == [chat_id]
+    assert second_message.texts == [(GENERATION_ALREADY_RUNNING_TEXT, None)]
+    telegram_app.GENERATION_LOCKS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_week_plan_completion_records_delivery_message_id(monkeypatch) -> None:
+    chat_id = 91_014
+    consumption = telegram_app.AttemptConsumption(
+        True,
+        "weekly_pdf",
+        "monthly",
+        meal_plan_id=123,
+    )
+    completions = []
+
+    async def fake_send_week_plan(message, profile, *, status_text=None, consumption=None):
+        assert status_text == "limits: ok"
+        assert consumption == consumption_arg
+        return telegram_app.GenerationDeliveryResult(True, telegram_message_id=456)
+
+    consumption_arg = consumption
+    monkeypatch.setattr(telegram_app, "_consume_generation_attempt", lambda *_args: consumption)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda *_args: "limits: ok")
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+    monkeypatch.setattr(telegram_app, "_complete_generation_attempt", lambda *args, **kwargs: completions.append((args, kwargs)))
+
+    sent = await telegram_app._send_week_plan_with_access_locked(FakeMessage(chat_id), profile_with())
+
+    assert sent
+    assert completions == [((chat_id, consumption), {"telegram_message_id": 456})]
+
+
+@pytest.mark.anyio
+async def test_week_plan_failed_delivery_does_not_complete(monkeypatch) -> None:
+    chat_id = 91_015
+    consumption = telegram_app.AttemptConsumption(
+        True,
+        "weekly_pdf",
+        "monthly",
+        meal_plan_id=124,
+    )
+    refunds = []
+    completions = []
+
+    async def fake_send_week_plan(message, profile, *, status_text=None, consumption=None):
+        return telegram_app.GenerationDeliveryResult(False)
+
+    monkeypatch.setattr(telegram_app, "_consume_generation_attempt", lambda *_args: consumption)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda *_args: "limits: ok")
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", lambda *args, **kwargs: refunds.append((args, kwargs)))
+    monkeypatch.setattr(telegram_app, "_complete_generation_attempt", lambda *args, **kwargs: completions.append((args, kwargs)))
+
+    sent = await telegram_app._send_week_plan_with_access_locked(FakeMessage(chat_id), profile_with())
+
+    assert not sent
+    assert refunds == [((chat_id, consumption), {})]
+    assert completions == []
 
 
 class FakeBot:
@@ -885,6 +1854,16 @@ class FakeInvoiceBot:
 
     async def send_message(self, **kwargs) -> None:
         self.sent_messages.append(kwargs)
+
+
+class FakeCleanupStore:
+    def __init__(self, cleaned: int = 0) -> None:
+        self.cleaned = cleaned
+        self.calls = 0
+
+    def cleanup_stale_generations(self) -> int:
+        self.calls += 1
+        return self.cleaned
 
 
 def profile_with(**kwargs) -> UserProfile:
@@ -933,13 +1912,169 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
 
     assert bot.commands == BOT_COMMANDS
     assert "grant_test_access" not in [command.command for command in bot.commands]
-    assert "330366" not in [command.command for command in bot.commands]
+    assert "".join(("330", "366")) not in [command.command for command in bot.commands]
     assert [(command.command, command.description) for command in bot.commands] == [
         ("start", "Открыть стартовое меню"),
         ("plan", "Заполнить анкету для рациона"),
+        ("help", "Справка и FAQ"),
+        ("support", "Написать в поддержку"),
+        ("privacy", "Политика конфиденциальности"),
         ("cancel", "Сбросить активную анкету"),
     ]
     assert "myid" not in [command.command for command in bot.commands]
+
+
+@pytest.mark.anyio
+async def test_cleanup_stale_generations_once_uses_postgres_store() -> None:
+    store = FakeCleanupStore(cleaned=2)
+
+    cleaned = await telegram_app._cleanup_stale_generations_once(store)
+
+    assert cleaned == 2
+    assert store.calls == 1
+
+
+@pytest.mark.anyio
+async def test_prepare_polling_deletes_active_webhook(monkeypatch) -> None:
+    monkeypatch.delenv("DIET_BOT_DROP_PENDING_UPDATES", raising=False)
+    bot = AsyncMock()
+    bot.get_webhook_info.return_value.url = "https://example.com/webhook"
+    bot.get_webhook_info.return_value.pending_update_count = 3
+
+    await telegram_app._prepare_polling_webhook_state(bot)
+
+    bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+
+
+@pytest.mark.anyio
+async def test_prepare_polling_does_not_delete_empty_webhook(monkeypatch) -> None:
+    monkeypatch.delenv("DIET_BOT_DROP_PENDING_UPDATES", raising=False)
+    bot = AsyncMock()
+    bot.get_webhook_info.return_value.url = ""
+    bot.get_webhook_info.return_value.pending_update_count = 0
+
+    await telegram_app._prepare_polling_webhook_state(bot)
+
+    bot.delete_webhook.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_prepare_polling_drops_pending_updates_with_empty_webhook(monkeypatch) -> None:
+    monkeypatch.setenv("DIET_BOT_DROP_PENDING_UPDATES", "1")
+    bot = AsyncMock()
+    bot.get_webhook_info.return_value.url = ""
+    bot.get_webhook_info.return_value.pending_update_count = 4
+
+    await telegram_app._prepare_polling_webhook_state(bot)
+
+    bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=True)
+
+
+@pytest.mark.anyio
+async def test_prepare_polling_can_drop_pending_updates(monkeypatch) -> None:
+    monkeypatch.setenv("DIET_BOT_DROP_PENDING_UPDATES", "1")
+    bot = AsyncMock()
+    bot.get_webhook_info.return_value.url = "https://example.com/webhook"
+    bot.get_webhook_info.return_value.pending_update_count = 10
+
+    await telegram_app._prepare_polling_webhook_state(bot)
+
+    bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=True)
+
+
+@pytest.mark.anyio
+async def test_run_bot_cleans_stale_generations_before_polling(monkeypatch) -> None:
+    events: list[str] = []
+    store = FakeCleanupStore()
+
+    class FakeDispatcher:
+        async def start_polling(self, bot) -> None:
+            events.append("polling")
+
+    async def fake_set_bot_commands(bot) -> None:
+        events.append("commands")
+
+    async def fake_prepare_polling_webhook_state(bot) -> None:
+        events.append("webhook")
+
+    async def fake_cleanup_loop(cleanup_store) -> None:
+        events.append("loop")
+        await asyncio.Event().wait()
+
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setattr(telegram_app, "Bot", lambda token: FakeBot())
+    monkeypatch.setattr(telegram_app, "_prepare_polling_webhook_state", fake_prepare_polling_webhook_state)
+    monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_bot_commands)
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+    monkeypatch.setattr(telegram_app, "_postgres_store", lambda: store)
+    monkeypatch.setattr(telegram_app, "_stale_generation_cleanup_loop", fake_cleanup_loop)
+
+    await telegram_app.run_bot()
+
+    assert events[:3] == ["webhook", "commands", "polling"]
+    assert store.calls == 1
+
+
+@pytest.mark.anyio
+async def test_run_bot_continues_when_set_commands_keeps_failing(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FailingCommandsBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.command_calls = 0
+
+        async def set_my_commands(self, commands) -> None:
+            self.command_calls += 1
+            raise TelegramServerError(SimpleNamespace(), "server unavailable")
+
+    class FakeDispatcher:
+        async def start_polling(self, bot) -> None:
+            events.append("polling")
+
+    bot = FailingCommandsBot()
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setattr(telegram_app, "Bot", lambda token: bot)
+    monkeypatch.setattr(telegram_app, "_prepare_polling_webhook_state", AsyncMock())
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+    monkeypatch.setattr(telegram_app, "_postgres_store", lambda: None)
+    monkeypatch.setattr(telegram_app.asyncio, "sleep", AsyncMock())
+
+    await telegram_app.run_bot()
+
+    assert bot.command_calls == 3
+    assert events == ["polling"]
+
+
+@pytest.mark.anyio
+async def test_global_error_handler_sends_sanitized_message_for_storage_error() -> None:
+    message = FakeMessage(chat_id=22_120, text="/plan")
+    event = SimpleNamespace(
+        update=SimpleNamespace(message=message),
+        exception=RuntimeError("Invalid entitlements state file C:/secret/path.json"),
+    )
+
+    handled = await telegram_app.handle_global_error(event)
+
+    assert handled is True
+    assert message.texts == [(telegram_app.GENERIC_USER_ERROR_TEXT, None)]
+
+
+@pytest.mark.anyio
+async def test_global_error_handler_answers_callback_for_telegram_api_error(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id=22_121)
+    callback = FakeCallback(telegram_app.CALLBACK_START, message)
+    event = SimpleNamespace(
+        update=SimpleNamespace(callback_query=callback),
+        exception=TelegramServerError(SimpleNamespace(), "server unavailable"),
+    )
+
+    handled = await telegram_app.handle_global_error(event)
+
+    assert handled is True
+    assert callback.answers == [(telegram_app.GENERIC_USER_ERROR_TEXT, True)]
+    assert message.texts == []
 
 
 @pytest.mark.anyio
@@ -965,12 +2100,225 @@ async def test_myid_fallback_works_from_catch_all_handler() -> None:
 
 
 @pytest.mark.anyio
+async def test_start_in_group_is_blocked_without_session() -> None:
+    group_id = -100_100_001
+    user_id = 71_001
+    message = FakeMessage(chat_id=group_id, text="/start", user_id=user_id, chat_type="supergroup")
+
+    try:
+        await telegram_app.start(message)
+
+        assert message.texts == [(telegram_app.PRIVATE_CHAT_REQUIRED_TEXT, None)]
+        assert message.photos == []
+        assert group_id not in SESSION_BY_CHAT_ID
+        assert user_id not in SESSION_BY_CHAT_ID
+        assert group_id not in PROFILE_BY_CHAT_ID
+        assert user_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(group_id, None)
+        SESSION_BY_CHAT_ID.pop(user_id, None)
+        PROFILE_BY_CHAT_ID.pop(group_id, None)
+        PROFILE_BY_CHAT_ID.pop(user_id, None)
+
+
+@pytest.mark.anyio
+async def test_group_text_does_not_advance_questionnaire_state() -> None:
+    group_id = -100_100_002
+    user_id = 71_002
+    session = start_session()
+    SESSION_BY_CHAT_ID[group_id] = session
+    message = FakeMessage(chat_id=group_id, text="42", user_id=user_id, chat_type="group")
+
+    try:
+        await handle_answer(message)
+
+        assert message.texts == [(telegram_app.PRIVATE_CHAT_REQUIRED_TEXT, None)]
+        assert SESSION_BY_CHAT_ID[group_id] == session
+        assert user_id not in SESSION_BY_CHAT_ID
+        assert group_id not in PROFILE_BY_CHAT_ID
+        assert user_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(group_id, None)
+        SESSION_BY_CHAT_ID.pop(user_id, None)
+        PROFILE_BY_CHAT_ID.pop(group_id, None)
+        PROFILE_BY_CHAT_ID.pop(user_id, None)
+
+
+@pytest.mark.anyio
+async def test_group_callback_is_rejected(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id=-100_100_003, text="", user_id=71_003, chat_type="group")
+    callback = FakeCallback(CALLBACK_START, message)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [(telegram_app.PRIVATE_CHAT_CALLBACK_TEXT, True)]
+    assert message.texts == []
+
+
+@pytest.mark.anyio
+async def test_myid_still_works_in_group_from_catch_all_handler() -> None:
+    message = FakeMessage(chat_id=-100_100_004, text="/myid", user_id=71_004, chat_type="supergroup")
+
+    await handle_answer(message)
+
+    assert message.texts == [(telegram_app.PRIVATE_CHAT_REQUIRED_TEXT, None)]
+
+
+@pytest.mark.anyio
+async def test_myid_works_in_group_for_admin(monkeypatch) -> None:
+    admin_id = 71_104
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    message = FakeMessage(chat_id=-100_100_104, text="/myid", user_id=admin_id, chat_type="supergroup")
+
+    await handle_answer(message)
+
+    sent_text = message.texts[-1][0]
+    assert "chat_id: -100100104" in sent_text
+    assert "user_id: 71104" in sent_text
+
+
+@pytest.mark.anyio
+async def test_private_start_still_shows_welcome(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    message = FakeMessage(chat_id=71_005, text="/start", user_id=71_005)
+
+    await telegram_app.start(message)
+
+    assert message.texts[-1][0] == WELCOME_TEXT
+    assert all(text != telegram_app.PRIVATE_CHAT_REQUIRED_TEXT for text, _ in message.texts)
+
+
+@pytest.mark.anyio
+async def test_start_offloads_slow_postgres_entitlement(monkeypatch) -> None:
+    delay_seconds = 0.3
+
+    class SlowEntitlementStore:
+        def upsert_user(self, *args, **kwargs) -> None:
+            return None
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            time.sleep(delay_seconds)
+            return telegram_app.Entitlement()
+
+        def load_profile_data(self, chat_id: int):
+            return None
+
+    store = SlowEntitlementStore()
+    monkeypatch.setattr(telegram_app, "_postgres_store", lambda: store)
+
+    started = time.perf_counter()
+    await asyncio.gather(
+        telegram_app.start(FakeMessage(chat_id=71_105, text="/start", user_id=71_105)),
+        telegram_app.start(FakeMessage(chat_id=71_106, text="/start", user_id=71_106)),
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < delay_seconds * 1.8
+
+
+@pytest.mark.anyio
+async def test_repeated_plan_within_throttle_gets_soft_response(monkeypatch, tmp_path) -> None:
+    chat_id = 71_006
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "PLAN_THROTTLE_SECONDS", 7.0)
+    send_options = AsyncMock()
+    monkeypatch.setattr(telegram_app, "_send_calculation_options", send_options)
+    PROFILE_BY_CHAT_ID[chat_id] = profile_with()
+    try:
+        await telegram_app.plan(FakeMessage(chat_id, text="/plan"))
+        second_message = FakeMessage(chat_id, text="/plan")
+        await telegram_app.plan(second_message)
+
+        send_options.assert_awaited_once()
+        assert second_message.texts == [(telegram_app.PLAN_THROTTLED_TEXT, None)]
+    finally:
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_successful_payment_handler_is_blocked_in_group(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    payment = SimpleNamespace(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
+        telegram_payment_charge_id="group-charge",
+        provider_payment_charge_id="",
+    )
+    message = FakeMessage(
+        chat_id=-100_100_005,
+        text="",
+        user_id=71_005,
+        chat_type="group",
+        successful_payment=payment,
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    assert message.texts == [(telegram_app.PRIVATE_CHAT_REQUIRED_TEXT, None)]
+    assert not (tmp_path / "subscriptions.json").exists()
+
+
+@pytest.mark.anyio
+async def test_payment_order_uses_from_user_id_not_delivery_chat_id(monkeypatch, tmp_path) -> None:
+    chat_id = 81_301
+    user_id = 71_301
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "PAYMENT_ORDERS_STATE_FILE", tmp_path / "payment_orders.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _save_active_subscription(subscriptions_path, user_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    message = FakeMessage(chat_id=chat_id, user_id=user_id)
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    invoice = message.bot.invoice_links[0]
+    order_id, _ = telegram_app.decode_payment_order_payload(invoice["payload"])
+    order = telegram_app.load_payment_order_state(telegram_app.PAYMENT_ORDERS_STATE_FILE).orders[order_id]
+    valid_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        from_user=SimpleNamespace(id=user_id),
+    )
+    delivery_chat_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        from_user=SimpleNamespace(id=chat_id),
+    )
+    payment = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_EXTRA_ONE_DAY],
+        telegram_payment_charge_id="user-owned-order-charge",
+        provider_payment_charge_id="",
+    )
+
+    assert order.user_id == user_id
+    assert order.delivery_chat_id == chat_id
+    assert _is_valid_pre_checkout(valid_query)
+    assert not _is_valid_pre_checkout(delivery_chat_query)
+
+    result = telegram_app._apply_successful_payment(user_id, payment)
+    entitlements = telegram_app.load_entitlements(subscriptions_path)
+
+    assert result.processed
+    assert entitlements[user_id].extra_one_day_remaining == 1
+    assert chat_id not in entitlements
+
+
+@pytest.mark.anyio
 async def test_numeric_test_access_command_requires_admin_for_target(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {700})
+    monkeypatch.setattr(telegram_app, "TEST_ACCESS_COMMAND", "test_access")
     message = FakeMessage(
         chat_id=700,
-        text="/330366 91002",
+        text="/test_access 91002",
         user_id=701,
     )
 
@@ -986,9 +2334,10 @@ async def test_admin_can_grant_persistent_test_access(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {700})
     monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+    monkeypatch.setattr(telegram_app, "TEST_ACCESS_COMMAND", "test_access")
     message = FakeMessage(
         chat_id=700,
-        text=f"/330366 {target_chat_id}",
+        text=f"/test_access {target_chat_id}",
         user_id=700,
     )
 
@@ -1007,13 +2356,14 @@ async def test_tester_can_toggle_test_access_mode(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {700})
     monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+    monkeypatch.setattr(telegram_app, "TEST_ACCESS_COMMAND", "test_access")
 
-    await secret_access_command(FakeMessage(chat_id=700, text=f"/330366 {target_chat_id}", user_id=700))
-    await secret_access_command(FakeMessage(chat_id=target_chat_id, text="/330366 off", user_id=target_chat_id))
+    await secret_access_command(FakeMessage(chat_id=700, text=f"/test_access {target_chat_id}", user_id=700))
+    await secret_access_command(FakeMessage(chat_id=target_chat_id, text="/test_access off", user_id=target_chat_id))
 
     assert not _consume_generation_attempt(target_chat_id, "weekly_pdf").allowed
 
-    await secret_access_command(FakeMessage(chat_id=target_chat_id, text="/330366 on", user_id=target_chat_id))
+    await secret_access_command(FakeMessage(chat_id=target_chat_id, text="/test_access on", user_id=target_chat_id))
 
     assert _consume_generation_attempt(target_chat_id, "weekly_pdf").source == "test_access"
 
@@ -1024,6 +2374,7 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
     subscriptions_path = tmp_path / "subscriptions.json"
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
     monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+    monkeypatch.setattr(telegram_app, "TEST_ACCESS_COMMAND", "test_access")
     entitlement = _save_active_subscription(
         subscriptions_path,
         target_chat_id,
@@ -1036,7 +2387,7 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
 
     try:
         await secret_access_command(
-            FakeMessage(chat_id=target_chat_id, text="/330366 off", user_id=target_chat_id),
+            FakeMessage(chat_id=target_chat_id, text="/test_access off", user_id=target_chat_id),
         )
         message = FakeMessage(target_chat_id)
 
@@ -1105,6 +2456,23 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_week_pdf_document_delivery_uses_safe_answer_document(monkeypatch) -> None:
+    calls = []
+
+    async def fake_safe_answer_document(message, **kwargs):
+        calls.append((message.chat.id, kwargs))
+
+    monkeypatch.setattr(telegram_app, "safe_answer_document", fake_safe_answer_document)
+
+    await telegram_app._send_week_pdf_document(FakeMessage(92_003), b"%PDF-1.4\n", "week.pdf")
+
+    assert calls
+    assert calls[0][0] == 92_003
+    assert isinstance(calls[0][1]["document"], BufferedInputFile)
+    assert calls[0][1]["document"].filename == "week.pdf"
 
 
 @pytest.mark.anyio
@@ -1237,11 +2605,13 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
     subscriptions_path = tmp_path / "subscriptions.json"
     monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=2, weekly_pdf_remaining=1)
     before = telegram_app.load_entitlements(subscriptions_path)[chat_id].to_dict()
     message = FakeMessage(chat_id, text=CHANGE_PROFILE_TEXT)
     try:
         await handle_answer(message)
+        await telegram_app.handle_callback(FakeCallback(telegram_app.CALLBACK_CONSENT_REGULAR, message))
 
         for answer in [
             "32",

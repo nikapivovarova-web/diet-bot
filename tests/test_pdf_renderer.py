@@ -11,9 +11,12 @@ from pypdf import PdfReader
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult
-from diet_bot.pdf_renderer import EMOJI_RE, _clean_text, render_week_plan_pdf, resolve_local_meal_image_path
+from diet_bot.pdf_renderer import EMOJI_RE, _clean_text, _coverage_level, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
+
+
+pytestmark = pytest.mark.slow_pdf_builder
 
 
 @pytest.fixture(scope="module")
@@ -48,23 +51,31 @@ def test_week_pdf_contains_full_week_content(tmp_path: Path, sample_week_plans, 
 
     assert "Рацион на неделю" in text
     assert "Ваш расчет" in text
-    assert "Меню на неделю" in text
-    assert "Подготовка на неделю" in text
     assert "День 1" in text
     assert _compact_text(first_meal_title) in _compact_text(text)
     assert "Ингредиенты" in text
-    assert "Продукт" in text
-    assert "Бытовая мера" in text
+    assert "Ингредиент" in text
+    assert "Примерная мера" in text
     assert "Как приготовить" in text
-    assert "Подробный нутриентный отчет" in text
+    assert "Итого за день" in text
     assert "Нутриент" in text
     assert "Факт" in text
     assert "Цель" in text
-    assert "Список покупок" in text
-    assert "[ ]" in text
-    assert "Дисклеймер" in text
-    assert "ориентировочный расчёт" in text
+    assert "Список продуктов на неделю" in text
+    assert "Медицинский дисклеймер" in text
+    assert "В реальности значения могут немного отличаться" in text
+    assert "Ориентир по питьевой воде для этого рациона" not in text
+    assert "Важные ограничения автоматического рациона" not in text
     assert not EMOJI_RE.search(text)
+
+
+def test_week_pdf_nutrient_color_thresholds_follow_agreed_ranges() -> None:
+    assert _coverage_level(30, 100) == "alert"
+    assert _coverage_level(44.9, 100) == "alert"
+    assert _coverage_level(45, 100) == "moderate"
+    assert _coverage_level(89.9, 100) == "moderate"
+    assert _coverage_level(90, 100) == "good"
+    assert _coverage_level(170, 100) == "good"
 
 
 def test_local_meal_photo_can_be_resolved(sample_week_plans) -> None:
@@ -96,6 +107,50 @@ def test_week_pdf_ignores_missing_meal_photo(
 
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 1_000
+
+
+def test_week_pdf_can_render_single_day(tmp_path: Path, sample_week_dates) -> None:
+    recipe = built_in_recipes()[0]
+    plan = _plan_for_recipe(recipe)
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "one-day.pdf")
+
+    assert pdf_path.exists()
+    assert pdf_path.stat().st_size > 1_000
+    assert len(PdfReader(str(pdf_path)).pages) >= 1
+
+
+def test_week_pdf_long_token_does_not_break_renderer(tmp_path: Path, sample_week_dates) -> None:
+    token = "TOKEN" + "A" * 900
+    food = replace(
+        curated_foods()[0],
+        id="long_token_food",
+        name=f"Ingredient {token}",
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    meal = Meal(
+        name=f"Завтрак: {token}",
+        portions=(food.portion(80),),
+        recipe=f"Mix {token}. Serve.",
+    )
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=meal.nutrients,
+        calorie_bounds=(0, 10_000),
+        macro_bounds={},
+    )
+    plan = MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "long-token.pdf")
+
+    assert pdf_path.exists()
+    assert pdf_path.stat().st_size > 1_000
+    assert len(PdfReader(str(pdf_path)).pages) >= 1
 
 
 def test_week_pdf_contains_fixed_soup_recipe_to_the_end(tmp_path: Path, sample_week_dates) -> None:

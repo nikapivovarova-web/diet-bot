@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      TZ: ${TZ:-UTC}
+      PGTZ: UTC
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    stop_grace_period: 30s
+
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DIET_BOT_DATABASE_URL: ${DIET_BOT_DATABASE_URL:?set DIET_BOT_DATABASE_URL in .env}
+      DIET_BOT_POLLING_HEARTBEAT_FILE: /tmp/diet_bot_polling_heartbeat.json
+      DIET_BOT_POLLING_HEARTBEAT_INTERVAL_SECONDS: ${DIET_BOT_POLLING_HEARTBEAT_INTERVAL_SECONDS:-15}
+      TZ: ${TZ:-UTC}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command: diet-bot-telegram
+    init: true
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "-m", "diet_bot.healthcheck", "--strict", "--polling-liveness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+
+  bot-smoke:
+    profiles:
+      - smoke
+    build: .
+    env_file:
+      - .env
+    environment:
+      DIET_BOT_DATABASE_URL: ${DIET_BOT_DATABASE_URL:?set DIET_BOT_DATABASE_URL in .env}
+      DIET_BOT_POLLING_HEARTBEAT_FILE: /tmp/diet_bot_polling_heartbeat.json
+      TZ: ${TZ:-UTC}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "diet_bot.healthcheck", "--strict", "--telegram"]
+    restart: "no"
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  postgres_data:

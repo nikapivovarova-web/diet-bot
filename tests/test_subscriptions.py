@@ -6,6 +6,7 @@ from diet_bot.subscriptions import (
     Entitlement,
     apply_extra_one_day_payment,
     apply_extra_weekly_pdf_payment,
+    apply_payment_reversal,
     apply_subscription_payment,
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
@@ -63,6 +64,32 @@ def test_subscription_payment_resets_monthly_limits_without_accumulation() -> No
     assert entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
 
 
+def test_subscription_payment_extends_active_period_from_current_end() -> None:
+    now = datetime(2026, 5, 8, tzinfo=UTC)
+    entitlement = Entitlement()
+    first_end = now + timedelta(days=30)
+    second_payment_time = now + timedelta(days=10)
+
+    apply_subscription_payment(
+        entitlement,
+        "charge-1",
+        now=now,
+        subscription_expiration_timestamp=int(first_end.timestamp()),
+    )
+    apply_subscription_payment(
+        entitlement,
+        "charge-2",
+        now=second_payment_time,
+        subscription_expiration_timestamp=int((second_payment_time + timedelta(days=30)).timestamp()),
+    )
+
+    subscription_end = datetime.fromisoformat(entitlement.subscription_period_end or "")
+
+    assert subscription_end == first_end + timedelta(days=30)
+    assert entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
+    assert entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+
+
 def test_duplicate_payment_charge_does_not_grant_twice() -> None:
     entitlement = Entitlement()
 
@@ -93,6 +120,92 @@ def test_extra_attempts_are_consumed_after_monthly_attempts() -> None:
     assert extra.source == "extra"
     assert entitlement.monthly_one_day_remaining == 0
     assert entitlement.extra_one_day_remaining == 0
+
+
+def test_extra_attempts_require_active_subscription_to_consume() -> None:
+    now = datetime(2026, 5, 8, tzinfo=UTC)
+    entitlement = Entitlement(
+        free_trial_used=True,
+        subscription_period_start=(now - timedelta(days=31)).isoformat(),
+        subscription_period_end=(now - timedelta(days=1)).isoformat(),
+        extra_one_day_remaining=1,
+        extra_weekly_pdf_remaining=1,
+    )
+
+    one_day = consume_one_day_attempt(entitlement, now)
+    weekly_pdf = consume_weekly_pdf_attempt(entitlement, now)
+
+    assert not one_day.allowed
+    assert not weekly_pdf.allowed
+    assert entitlement.extra_one_day_remaining == 1
+    assert entitlement.extra_weekly_pdf_remaining == 1
+
+
+def test_extra_attempts_unlock_after_subscription_renewal() -> None:
+    now = datetime(2026, 5, 8, tzinfo=UTC)
+    entitlement = Entitlement(
+        free_trial_used=True,
+        extra_one_day_remaining=1,
+        extra_weekly_pdf_remaining=1,
+    )
+    assert not consume_one_day_attempt(entitlement, now).allowed
+    assert not consume_weekly_pdf_attempt(entitlement, now).allowed
+
+    apply_subscription_payment(
+        entitlement,
+        "charge-sub",
+        now=now,
+        subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
+    )
+    entitlement.monthly_one_day_remaining = 0
+    entitlement.monthly_weekly_pdf_remaining = 0
+
+    one_day = consume_one_day_attempt(entitlement, now)
+    weekly_pdf = consume_weekly_pdf_attempt(entitlement, now)
+
+    assert one_day.source == "extra"
+    assert weekly_pdf.source == "extra"
+    assert entitlement.extra_one_day_remaining == 0
+    assert entitlement.extra_weekly_pdf_remaining == 0
+
+
+def test_extra_reversal_reports_already_consumed_when_no_remaining_quota() -> None:
+    now = datetime(2026, 5, 8, tzinfo=UTC)
+    entitlement = Entitlement()
+    apply_subscription_payment(
+        entitlement,
+        "charge-sub",
+        now=now,
+        subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
+    )
+    apply_extra_one_day_payment(entitlement, "charge-extra-day")
+    entitlement.monthly_one_day_remaining = 1
+
+    consume_one_day_attempt(entitlement, now)
+    extra = consume_one_day_attempt(entitlement, now)
+    result = apply_payment_reversal(entitlement, "extra_one_day", "refund", now=now)
+
+    assert extra.source == "extra"
+    assert not result.processed
+    assert result.reason == "extra_already_consumed"
+    assert entitlement.extra_one_day_remaining == 0
+
+    weekly_entitlement = Entitlement(extra_weekly_pdf_remaining=0)
+    weekly_result = apply_payment_reversal(weekly_entitlement, "extra_weekly_pdf", "refund", now=now)
+
+    assert not weekly_result.processed
+    assert weekly_result.reason == "extra_already_consumed"
+    assert weekly_entitlement.extra_weekly_pdf_remaining == 0
+
+
+def test_extra_reversal_decrements_available_weekly_pdf_quota() -> None:
+    entitlement = Entitlement(extra_weekly_pdf_remaining=1)
+
+    result = apply_payment_reversal(entitlement, "extra_weekly_pdf", "refund")
+
+    assert result.processed
+    assert result.reason is None
+    assert entitlement.extra_weekly_pdf_remaining == 0
 
 
 def test_refund_restores_consumed_attempt() -> None:
@@ -186,3 +299,15 @@ def test_subscription_state_round_trips_json(tmp_path) -> None:
     assert loaded[123].test_access_enabled
     assert loaded[123].extra_one_day_remaining == 1
     assert loaded[123].processed_payment_charge_ids == ["charge-1"]
+
+
+def test_corrupt_subscription_state_raises_instead_of_returning_empty(tmp_path) -> None:
+    path = tmp_path / "subscriptions.json"
+    path.write_text("{broken", encoding="utf-8")
+
+    try:
+        load_entitlements(path)
+    except RuntimeError as exc:
+        assert "Invalid entitlements state file" in str(exc)
+    else:
+        raise AssertionError("Expected corrupt subscription JSON to raise")

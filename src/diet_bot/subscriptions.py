@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+
+from .json_storage import json_storage_transaction
 
 
 MONTHLY_ONE_DAY_LIMIT = 5
@@ -15,7 +20,28 @@ PROCESSED_CHARGE_ID_LIMIT = 200
 
 RationKind = Literal["one_day", "weekly_pdf"]
 AttemptSource = Literal["monthly", "extra", "free_trial", "test_access"]
+AttemptDenialReason = Literal["paywall", "already_generating"]
 PaymentGrant = Literal["subscription", "extra_one_day", "extra_weekly_pdf"]
+PaymentReversalType = Literal["refund", "chargeback", "cancel_subscription"]
+PaymentReversalReason = Literal["extra_already_consumed", "unsupported_product_for_event"]
+LedgerSource = Literal[
+    "free_trial_one_day",
+    "monthly_one_day",
+    "monthly_weekly_pdf",
+    "extra_one_day",
+    "extra_weekly_pdf",
+    "test_access",
+]
+
+LEDGER_EVENT_CONSUME = "consume"
+LEDGER_EVENT_REFUND = "refund"
+LEDGER_EVENT_TYPES = {LEDGER_EVENT_CONSUME, LEDGER_EVENT_REFUND}
+LEDGER_SOURCE_FREE_TRIAL_ONE_DAY = "free_trial_one_day"
+LEDGER_SOURCE_MONTHLY_ONE_DAY = "monthly_one_day"
+LEDGER_SOURCE_MONTHLY_WEEKLY_PDF = "monthly_weekly_pdf"
+LEDGER_SOURCE_EXTRA_ONE_DAY = "extra_one_day"
+LEDGER_SOURCE_EXTRA_WEEKLY_PDF = "extra_weekly_pdf"
+LEDGER_SOURCE_TEST_ACCESS = "test_access"
 
 
 @dataclass
@@ -95,6 +121,9 @@ class AttemptConsumption:
     allowed: bool
     ration_kind: RationKind
     source: AttemptSource | None = None
+    meal_plan_id: int | None = None
+    denial_reason: AttemptDenialReason | None = None
+    ledger_event_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +131,14 @@ class PaymentApplication:
     processed: bool
     grant: PaymentGrant | None = None
     duplicate: bool = False
+    reason: str | None = None
+    status: str | None = None
+
+
+@dataclass(frozen=True)
+class PaymentReversalApplication:
+    processed: bool
+    reason: PaymentReversalReason | None = None
 
 
 def load_entitlements(path: Path) -> dict[int, Entitlement]:
@@ -109,10 +146,12 @@ def load_entitlements(path: Path) -> dict[int, Entitlement]:
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    except OSError as exc:
+        raise RuntimeError(f"Could not read entitlements state file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid entitlements state file {path}: {exc}") from exc
     if not isinstance(raw, dict):
-        return {}
+        raise RuntimeError(f"Invalid entitlements state file {path}: expected a JSON object.")
     entitlements: dict[int, Entitlement] = {}
     for chat_id, data in raw.items():
         if not isinstance(data, dict):
@@ -131,7 +170,7 @@ def save_entitlements(path: Path, entitlements: dict[int, Entitlement]) -> None:
         str(chat_id): entitlement.to_dict()
         for chat_id, entitlement in sorted(entitlements.items())
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(path, payload)
 
 
 def consume_one_day_attempt(
@@ -144,7 +183,7 @@ def consume_one_day_attempt(
     if entitlement.is_subscription_active(now) and entitlement.monthly_one_day_remaining > 0:
         entitlement.monthly_one_day_remaining -= 1
         return AttemptConsumption(True, "one_day", "monthly")
-    if entitlement.extra_one_day_remaining > 0:
+    if entitlement.is_subscription_active(now) and entitlement.extra_one_day_remaining > 0:
         entitlement.extra_one_day_remaining -= 1
         return AttemptConsumption(True, "one_day", "extra")
     if not entitlement.free_trial_used:
@@ -163,7 +202,7 @@ def consume_weekly_pdf_attempt(
     if entitlement.is_subscription_active(now) and entitlement.monthly_weekly_pdf_remaining > 0:
         entitlement.monthly_weekly_pdf_remaining -= 1
         return AttemptConsumption(True, "weekly_pdf", "monthly")
-    if entitlement.extra_weekly_pdf_remaining > 0:
+    if entitlement.is_subscription_active(now) and entitlement.extra_weekly_pdf_remaining > 0:
         entitlement.extra_weekly_pdf_remaining -= 1
         return AttemptConsumption(True, "weekly_pdf", "extra")
     return AttemptConsumption(False, "weekly_pdf")
@@ -230,11 +269,16 @@ def apply_subscription_payment(
         return PaymentApplication(False, "subscription", duplicate=True)
 
     start = _normalize_now(now)
-    end = (
+    entitlement.expire_if_needed(start)
+    current_end = entitlement.subscription_end_datetime()
+    extension_base = current_end if current_end and current_end > start else start
+    provider_end = (
         datetime.fromtimestamp(subscription_expiration_timestamp, UTC)
         if subscription_expiration_timestamp
-        else start + timedelta(seconds=SUBSCRIPTION_PERIOD_SECONDS)
+        else None
     )
+    extended_end = extension_base + timedelta(seconds=SUBSCRIPTION_PERIOD_SECONDS)
+    end = max(extended_end, provider_end) if provider_end else extended_end
     entitlement.subscription_period_start = _format_datetime(start)
     entitlement.subscription_period_end = _format_datetime(end)
     entitlement.monthly_one_day_remaining = MONTHLY_ONE_DAY_LIMIT
@@ -257,6 +301,36 @@ def apply_extra_weekly_pdf_payment(entitlement: Entitlement, charge_id: str) -> 
     entitlement.extra_weekly_pdf_remaining += 1
     _remember_charge_id(entitlement, charge_id)
     return PaymentApplication(True, "extra_weekly_pdf")
+
+
+def apply_payment_reversal(
+    entitlement: Entitlement,
+    product: str,
+    event_type: PaymentReversalType,
+    *,
+    now: datetime | None = None,
+) -> PaymentReversalApplication:
+    entitlement.expire_if_needed(now)
+    if product == "subscription_month":
+        if event_type == "cancel_subscription":
+            return PaymentReversalApplication(True)
+        entitlement.subscription_period_end = _format_datetime(_normalize_now(now))
+        entitlement.monthly_one_day_remaining = 0
+        entitlement.monthly_weekly_pdf_remaining = 0
+        return PaymentReversalApplication(True)
+    if event_type == "cancel_subscription":
+        return PaymentReversalApplication(False, "unsupported_product_for_event")
+    if product == "extra_one_day":
+        if entitlement.extra_one_day_remaining <= 0:
+            return PaymentReversalApplication(False, "extra_already_consumed")
+        entitlement.extra_one_day_remaining -= 1
+        return PaymentReversalApplication(True)
+    if product == "extra_weekly_pdf":
+        if entitlement.extra_weekly_pdf_remaining <= 0:
+            return PaymentReversalApplication(False, "extra_already_consumed")
+        entitlement.extra_weekly_pdf_remaining -= 1
+        return PaymentReversalApplication(True)
+    return PaymentReversalApplication(False, "unsupported_product_for_event")
 
 
 def _optional_str(value: Any) -> str | None:
@@ -304,3 +378,15 @@ def _remember_charge_id(entitlement: Entitlement, charge_id: str) -> None:
         return
     entitlement.processed_payment_charge_ids.append(charge_id)
     entitlement.processed_payment_charge_ids = entitlement.processed_payment_charge_ids[-PROCESSED_CHARGE_ID_LIMIT:]
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    with json_storage_transaction(path):
+        try:
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(path)
+        finally:
+            with suppress(OSError):
+                tmp_path.unlink()

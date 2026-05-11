@@ -321,9 +321,9 @@ def _coverage_dot(value: float, target: float) -> str:
     if target <= 0:
         return "🔴"
     percent = value / target * 100
-    if percent >= 100:
+    if percent >= 90:
         return "🟢"
-    if percent >= 50:
+    if percent >= 45:
         return "🟡"
     return "🔴"
 

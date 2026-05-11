@@ -1,13 +1,15 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "telegram-diet-bot"
 version = "0.1.0"
 description = "Telegram diet bot MVP with deterministic nutrition planning core."
 requires-python = ">=3.11"
 dependencies = [
-    "aiogram>=3.4.0",
-    "fastapi>=0.110.0",
-    "uvicorn>=0.27.0",
-    "openai>=1.0.0",
+    "aiogram>=3.27.0",
+    "psycopg[binary]>=3.1.0",
     "reportlab>=4.0.0",
 ]
 
@@ -15,11 +17,28 @@ dependencies = [
 diet-bot-telegram = "diet_bot.telegram_app:main"
 
 [project.optional-dependencies]
+ai = [
+    "openai>=1.0.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pypdf>=4.0.0",
 ]
 
+[tool.setuptools.package-data]
+diet_bot = [
+    "data/*.json",
+    "data/*.png",
+    "data/recipe_photos/*.jpg",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "slow_pdf_builder: long-running recipe and PDF builder checks split into a non-PR CI job",
+    "postgres_integration: live PostgreSQL storage and JSON migration checks",
+]

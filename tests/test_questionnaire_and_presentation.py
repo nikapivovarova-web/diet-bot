@@ -91,6 +91,24 @@ def test_questionnaire_rejects_invalid_meal_count() -> None:
     assert error is not None
 
 
+def test_questionnaire_rejects_fractional_integer_fields() -> None:
+    session = start_session()
+    next_session, error = session.receive("32.5")
+
+    assert next_session == session
+    assert error is not None
+
+    for answer in ["32", "женщина", "165", "60", "поддержание", "легкая"]:
+        session, error = session.receive(answer)
+        assert error is None
+
+    assert QUESTIONS[session.step_index].key == "meal_count"
+    next_session, error = session.receive("3.9")
+
+    assert next_session == session
+    assert error is not None
+
+
 def test_questionnaire_stops_under_18_after_age_answer() -> None:
     session = start_session()
     session, error = session.receive("17")

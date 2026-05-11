@@ -1,11 +1,17 @@
 from pathlib import Path
 
+import pytest
+
 from diet_bot.builder import _meal_energy_slots, _recipe_time_bucket, build_one_day_plan, filter_foods
 from diet_bot.catalog import built_in_foods
 from diet_bot.domain import (
     ActivityLevel,
     ConditionCode,
     CookingTimePreference,
+    Meal,
+    MealPlan,
+    NutrientVector,
+    NutritionTargets,
     Goal,
     Restriction,
     RestrictionType,
@@ -13,7 +19,7 @@ from diet_bot.domain import (
     UserProfile,
 )
 from diet_bot.recipe_catalog import built_in_recipes
-from diet_bot.safety import evaluate_safety
+from diet_bot.safety import evaluate_safety, is_food_excluded, is_name_excluded
 from diet_bot.validation import validate_plan
 
 
@@ -68,6 +74,57 @@ def test_excluded_mushrooms_filter_curated_recipes_by_alias() -> None:
     assert len(plan.meals) == 5
     assert "mushrooms" not in food_ids
     assert not any("excluded" in error for error in validation.errors)
+
+
+def test_name_exclusion_does_not_reverse_match_short_cyrillic_fragment() -> None:
+    assert not is_name_excluded("сыр", frozenset({"сы"}))
+    assert not is_name_excluded("мед", frozenset({"медовый месяц"}))
+    assert not is_name_excluded("чай", frozenset({"чайная ложка"}))
+    assert not is_name_excluded("сыр", frozenset({"сырые креветки"}))
+    assert is_name_excluded("сыр", frozenset({"сыр", "сырный"}))
+    assert is_name_excluded("сыр", frozenset({"сырный"}))
+    assert is_name_excluded("сыр", frozenset({"не ем сыр"}))
+
+
+def test_free_text_intolerance_excludes_named_food() -> None:
+    profile = profile_with(restrictions=(Restriction(RestrictionType.INTOLERANCE, "peanut"),))
+    safety = evaluate_safety(profile)
+    peanut = next(food for food in built_in_foods() if food.id == "peanuts")
+
+    assert is_food_excluded(peanut, safety.excluded_food_names)
+
+
+def test_food_allergy_restriction_does_not_block_plan_generation() -> None:
+    profile = profile_with(
+        conditions=(),
+        restrictions=(Restriction(RestrictionType.ALLERGY, "пищевая аллергия"),),
+    )
+    safety = evaluate_safety(profile)
+
+    assert safety.can_generate_plan
+    assert safety.red_flags == ()
+
+
+def test_validate_plan_blocks_forbidden_food_for_intolerance() -> None:
+    profile = profile_with(restrictions=(Restriction(RestrictionType.INTOLERANCE, "peanut"),))
+    safety = evaluate_safety(profile)
+    peanut = next(food for food in built_in_foods() if food.id == "peanuts")
+    meal = Meal("Перекус: peanuts", (peanut.portion(20),), "Serve.")
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector({"energy_kcal": 100}),
+        calorie_bounds=(0, 10_000),
+        macro_bounds={},
+    )
+
+    validation = validate_plan(MealPlan((meal,), targets, safety))
+
+    assert not validation.ok
+    assert any("excluded" in error for error in validation.errors)
 
 
 def test_celiac_excludes_gluten_foods_and_oats_by_default() -> None:
@@ -138,6 +195,7 @@ def test_gain_plan_stays_close_to_calorie_target() -> None:
     assert plan.totals.get("energy_kcal") >= plan.targets.targets.get("energy_kcal") * 0.96
 
 
+@pytest.mark.slow_pdf_builder
 def test_recipe_plan_keeps_meal_calories_reasonably_distributed() -> None:
     cases = (
         (3, (6,)),
@@ -169,6 +227,7 @@ def test_curated_high_bmi_loss_plan_tops_up_protein_when_possible() -> None:
     assert plan.totals.get("energy_kcal") <= plan.targets.targets.get("energy_kcal") * 1.04
 
 
+@pytest.mark.slow_pdf_builder
 def test_repeat_generation_changes_recipes() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     first = build_one_day_plan(profile, variety_seed=0)
@@ -197,6 +256,7 @@ def test_recipe_catalog_has_large_unique_recipe_pool() -> None:
     assert sum(1 for recipe in recipes if recipe.slot == "main") >= 4000
 
 
+@pytest.mark.slow_pdf_builder
 def test_five_repeat_generations_keep_key_meals_unique() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     plans = [build_one_day_plan(profile, variety_seed=seed) for seed in range(5)]
@@ -207,6 +267,7 @@ def test_five_repeat_generations_keep_key_meals_unique() -> None:
     assert len({tuple(meal.name for meal in plan.meals) for plan in plans}) == 5
 
 
+@pytest.mark.slow_pdf_builder
 def test_repeat_generations_can_avoid_recent_recipe_ids() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     avoided_recipe_ids: set[str] = set()
@@ -223,6 +284,7 @@ def test_repeat_generations_can_avoid_recent_recipe_ids() -> None:
         seen_recipe_ids.update(recipe_id for recipe_id in recipe_ids if recipe_id)
 
 
+@pytest.mark.slow_pdf_builder
 def test_repeat_generations_can_avoid_recent_recipe_families() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     avoided_recipe_keys: set[str] = set()

@@ -54,6 +54,8 @@ PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.90
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
+CARBOHYDRATE_CEILING_MULTIPLIER = 1.24
+SODIUM_CEILING_HEADROOM_MULTIPLIER = 0.98
 
 
 @dataclass(frozen=True)
@@ -514,6 +516,10 @@ def _add_missing_garnishes(
             if food is None:
                 continue
             grams = _garnish_portion_for(food, role, used_grams, room_energy)
+            grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
+            grams = _limit_grams_for_fat_ceiling(food, grams, total, target, portions)
+            grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target, portions)
+            grams = _limit_grams_for_sodium_ceiling(food, grams, total, target, portions)
             if grams <= 0:
                 continue
 
@@ -705,6 +711,7 @@ def _select_recipe(
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
         macro_penalty += _recipe_projected_fat_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
+        macro_penalty += _recipe_projected_sodium_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
         energy_penalty = _recipe_projected_energy_penalty(
             recipe,
             food_by_id,
@@ -939,6 +946,37 @@ def _recipe_projected_fat_penalty(
     return penalty
 
 
+def _recipe_projected_sodium_penalty(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    sodium_limit = target.get("sodium_mg") * SODIUM_CEILING_HEADROOM_MULTIPLIER
+    if sodium_limit <= 0:
+        return 0.0
+
+    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target)
+    if estimated is None:
+        return 0.0
+
+    target_energy = max(1.0, target.get("energy_kcal"))
+    slot_ratio = slot_energy_target / target_energy
+    slot_sodium_budget = sodium_limit * max(0.12, min(0.45, slot_ratio * 1.25))
+    estimated_sodium = estimated.get("sodium_mg")
+    projected_sodium = current_total.get("sodium_mg") + estimated_sodium
+
+    penalty = 0.0
+    if estimated_sodium > slot_sodium_budget:
+        penalty += (estimated_sodium - slot_sodium_budget) / sodium_limit * 16.0
+    if projected_sodium > sodium_limit * 0.85:
+        penalty += (projected_sodium - sodium_limit * 0.85) / sodium_limit * 24.0
+    if projected_sodium > sodium_limit:
+        penalty += (projected_sodium - sodium_limit) / sodium_limit * 60.0
+    return penalty
+
+
 def _recipe_projected_energy_penalty(
     recipe: RecipeTemplate,
     food_by_id: dict[str, Food],
@@ -1027,6 +1065,8 @@ def _scaled_recipe_portions(
         grams = round(base_grams * _scale_for_food(food, scale), 1)
         grams = min(grams, food.max_per_meal_g, max(0.0, food.max_per_day_g - used_grams[food.id]))
         grams = _limit_grams_for_protein_ceiling(food, grams, current_total, target, portions)
+        grams = _limit_grams_for_carbohydrate_ceiling(food, grams, current_total, target, portions)
+        grams = _limit_grams_for_sodium_ceiling(food, grams, current_total, target, portions)
         if grams <= 0:
             if food.category in {"protein", "dairy"}:
                 return tuple()
@@ -1165,8 +1205,10 @@ def _score_food(
         score -= 1.2
     if food.category == "nuts_seeds" and used_grams[food.id] > 0:
         score -= 4.0
-    if vector.get("sodium_mg") > deficit.get("sodium_mg") * 0.5:
-        score -= 1.0
+    if deficit.get("sodium_mg") <= 0 and vector.get("sodium_mg") > 0:
+        score -= 5.0
+    elif vector.get("sodium_mg") > deficit.get("sodium_mg") * 0.5:
+        score -= 1.5
     if vector.get("energy_kcal") > max(300, deficit.get("energy_kcal") * 0.45):
         score -= 0.8
     return score
@@ -1296,6 +1338,8 @@ def _top_up_if_needed(
                 grams = round(max(0.0, grams), 1)
                 grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_fat_ceiling(food, grams, total, target, portions)
+                grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target, portions)
+                grams = _limit_grams_for_sodium_ceiling(food, grams, total, target, portions)
                 if grams <= 0:
                     continue
                 portion = food.portion(grams)
@@ -1364,6 +1408,8 @@ def _increase_existing_portions(
                         continue
                     grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
                     grams = _limit_grams_for_fat_ceiling(food, grams, total, target)
+                    grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
+                    grams = _limit_grams_for_sodium_ceiling(food, grams, total, target)
                     if grams <= 0:
                         continue
                     portions[portion_index] = FoodPortion(food=food, grams=round(portion.grams + grams, 1))
@@ -1443,6 +1489,8 @@ def _increase_existing_protein_if_needed(
                 )
                 grams = max(0.0, round(grams, 1))
                 grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
+                grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
+                grams = _limit_grams_for_sodium_ceiling(food, grams, total, target)
                 if grams <= 0:
                     continue
 
@@ -1534,6 +1582,44 @@ def _limit_grams_for_fat_ceiling(
     if fat_room <= 0:
         return 0.0
     return round(min(grams, fat_room / fat_per_g), 1)
+
+
+def _limit_grams_for_carbohydrate_ceiling(
+    food: Food,
+    grams: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    pending_portions: list[FoodPortion] | None = None,
+) -> float:
+    carbohydrate_per_g = food.nutrients_per_100g.get("carbohydrate_g") / 100
+    if carbohydrate_per_g <= 0:
+        return grams
+
+    pending_total = NutrientVector.sum(portion.nutrients for portion in (pending_portions or ()))
+    carbohydrate_room = target.get("carbohydrate_g") * CARBOHYDRATE_CEILING_MULTIPLIER
+    carbohydrate_room -= current_total.plus(pending_total).get("carbohydrate_g")
+    if carbohydrate_room <= 0:
+        return 0.0
+    return round(min(grams, carbohydrate_room / carbohydrate_per_g), 1)
+
+
+def _limit_grams_for_sodium_ceiling(
+    food: Food,
+    grams: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    pending_portions: list[FoodPortion] | None = None,
+) -> float:
+    sodium_limit = target.get("sodium_mg") * SODIUM_CEILING_HEADROOM_MULTIPLIER
+    sodium_per_g = food.nutrients_per_100g.get("sodium_mg") / 100
+    if sodium_limit <= 0 or sodium_per_g <= 0:
+        return grams
+
+    pending_total = NutrientVector.sum(portion.nutrients for portion in (pending_portions or ()))
+    sodium_room = sodium_limit - current_total.plus(pending_total).get("sodium_mg")
+    if sodium_room <= 0:
+        return 0.0
+    return round(min(grams, sodium_room / sodium_per_g), 1)
 
 
 def _protein_ceiling_multiplier(target: NutrientVector) -> float:

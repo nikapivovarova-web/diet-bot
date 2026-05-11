@@ -38,11 +38,11 @@ Excluded from MVP:
 
 The user's DOCX files are used as internal knowledge material and product requirements context:
 
-- `C:\Users\adck8\Downloads\Диетология и питание для безопасного похудения.docx`
-- `C:\Users\adck8\Downloads\Диетология для набора массы тела.docx`
-- `C:\Users\adck8\Downloads\Здоровое питание при нормальном ИМТ.docx`
-- `C:\Users\adck8\Downloads\Диетология и правильное питание для здорового взрослого.docx`
-- `C:\Users\adck8\Downloads\Диетология.docx`
+- Local source document: `Диетология и питание для безопасного похудения.docx`
+- Local source document: `Диетология для набора массы тела.docx`
+- Local source document: `Здоровое питание при нормальном ИМТ.docx`
+- Local source document: `Диетология и правильное питание для здорового взрослого.docx`
+- Local source document: `Диетология.docx`
 
 Authoritative external references for rules and defaults:
 

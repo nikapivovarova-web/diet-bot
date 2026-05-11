@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+import string
 from dataclasses import dataclass, field
 
 from .domain import (
@@ -13,9 +15,20 @@ from .domain import (
     UserProfile,
     normalize_text,
 )
+from .profile_normalization import (
+    normalize_conditions,
+    normalize_free_text_list,
+    normalize_stored_condition_codes,
+    normalize_stored_free_text_items,
+)
 
 
-NONE_WORDS = {"нет", "no", "-", "ничего", "нету", "не"}
+SESSION_ID_ALPHABET = string.ascii_letters + string.digits
+SESSION_ID_LENGTH = 8
+
+
+def _new_session_id() -> str:
+    return "".join(secrets.choice(SESSION_ID_ALPHABET) for _ in range(SESSION_ID_LENGTH))
 
 
 @dataclass(frozen=True)
@@ -74,6 +87,7 @@ QUESTIONS: tuple[Question, ...] = (
 class QuestionnaireSession:
     answers: dict[str, str] = field(default_factory=dict)
     step_index: int = 0
+    session_id: str = field(default_factory=_new_session_id)
 
     @property
     def is_complete(self) -> bool:
@@ -91,13 +105,13 @@ class QuestionnaireSession:
             return self, None
 
         try:
-            _validate_answer(question.key, answer)
+            normalized_answer = _normalize_answer(question.key, answer)
         except ValueError as error:
             return self, str(error)
 
         next_answers = dict(self.answers)
-        next_answers[question.key] = answer.strip()
-        return QuestionnaireSession(next_answers, self.step_index + 1), None
+        next_answers[question.key] = normalized_answer
+        return QuestionnaireSession(next_answers, self.step_index + 1, self.session_id), None
 
     def should_stop_after_answer(self) -> str | None:
         age_answer = self.answers.get("age")
@@ -150,11 +164,33 @@ def start_session() -> QuestionnaireSession:
     return QuestionnaireSession()
 
 
+def _normalize_answer(key: str, answer: str) -> str:
+    if not answer.strip():
+        raise ValueError("Ответ не должен быть пустым.")
+
+    if key == "conditions":
+        normalized = normalize_conditions(answer)
+        if normalized.errors:
+            raise ValueError(normalized.errors[0])
+        return ", ".join(normalized.items)
+
+    if key in {"allergies", "intolerances", "excluded_foods"}:
+        normalized = normalize_free_text_list(answer)
+        if normalized.errors:
+            raise ValueError(normalized.errors[0])
+        return ", ".join(normalized.items)
+
+    _validate_answer(key, answer)
+    return answer.strip()
+
+
 def _validate_answer(key: str, answer: str) -> None:
     if not answer.strip():
         raise ValueError("Ответ не должен быть пустым.")
     if key in {"age", "height_cm", "weight_kg", "meal_count"}:
         value = _number(answer)
+        if key in {"age", "meal_count"} and not value.is_integer():
+            raise ValueError("Введите целое число.")
         if key == "age" and not 1 <= value <= 120:
             raise ValueError("Возраст должен быть числом от 1 до 120.")
         if key == "height_cm" and not 90 <= value <= 240:
@@ -228,46 +264,12 @@ def _parse_cooking_time(value: str) -> CookingTimePreference:
 
 
 def _split_list(value: str) -> list[str]:
-    normalized = normalize_text(value)
-    if normalized in NONE_WORDS:
-        return []
-    return [item.strip() for item in normalized.split(",") if item.strip() and item.strip() not in NONE_WORDS]
+    return normalize_stored_free_text_items(value)
 
 
 def _intolerance_restrictions(value: str) -> list[Restriction]:
-    restrictions = []
-    normalized = normalize_text(value)
-    if normalized in NONE_WORDS:
-        return restrictions
-    for item in _split_list(value):
-        restrictions.append(Restriction(RestrictionType.INTOLERANCE, item))
-    return restrictions
+    return [Restriction(RestrictionType.INTOLERANCE, item) for item in _split_list(value)]
 
 
 def _parse_conditions(value: str) -> list[ConditionCode]:
-    normalized = normalize_text(value)
-    if normalized in NONE_WORDS:
-        return []
-
-    found: list[ConditionCode] = []
-    condition_map: tuple[tuple[tuple[str, ...], ConditionCode], ...] = (
-        (("целиак",), ConditionCode.CELIAC),
-        (("глютен", "gluten"), ConditionCode.GLUTEN_INTOLERANCE),
-        (("лактоз", "lactose"), ConditionCode.LACTOSE_INTOLERANCE),
-        (("хпн", "почек", "почеч"), ConditionCode.CKD),
-        (("диабет",), ConditionCode.DIABETES),
-        (("гипертони", "давлен"), ConditionCode.HYPERTENSION),
-        (("гэрб", "рефлюкс"), ConditionCode.GERD),
-        (("гастрит",), ConditionCode.GASTRITIS),
-        (("подагр",), ConditionCode.GOUT),
-        (("беремен",), ConditionCode.PREGNANCY),
-        (("лактац", "кормлю"), ConditionCode.LACTATION),
-        (("рпп", "пищев"), ConditionCode.EATING_DISORDER),
-        (("диализ",), ConditionCode.DIALYSIS),
-        (("онко", "рак"), ConditionCode.ONCOLOGY),
-        (("печен", "цирроз"), ConditionCode.SEVERE_LIVER_DISEASE),
-    )
-    for needles, condition in condition_map:
-        if any(needle in normalized for needle in needles):
-            found.append(condition)
-    return found
+    return normalize_stored_condition_codes(value)

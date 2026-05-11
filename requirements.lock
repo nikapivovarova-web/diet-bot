@@ -1,0 +1,27 @@
+# Production runtime lock for Docker images.
+# Regenerate intentionally from the production dependency set only:
+# aiogram, psycopg[binary], reportlab.
+aiofiles==25.1.0
+aiogram==3.28.2
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.5
+aiosignal==1.4.0
+annotated-types==0.7.0
+attrs==26.1.0
+certifi==2026.4.22
+charset-normalizer==3.4.7
+frozenlist==1.8.0
+idna==3.14
+magic-filter==1.0.12
+multidict==6.7.1
+pillow==12.2.0
+propcache==0.4.1
+psycopg==3.3.4
+psycopg-binary==3.3.4
+pydantic==2.13.4
+pydantic_core==2.46.4
+reportlab==4.5.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+tzdata==2026.2
+yarl==1.23.0
