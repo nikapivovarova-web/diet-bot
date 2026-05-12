@@ -24,12 +24,16 @@ from diet_bot.payments import (
     PaymentProductInvoiceMetadata,
     PaymentProduct,
     PaymentProvider,
+    PaymentReconciliationAction,
+    PaymentReconciliationCode,
+    PaymentReconciliationInput,
     PaymentReversalCode,
     PaymentReversalInput,
     PaymentSuccessfulPaymentCode,
     PaymentSuccessfulPaymentInput,
     ProcessedProviderCharge,
     apply_payment_reversal,
+    apply_payment_reconciliation,
     apply_successful_payment,
     build_payment_invoice_metadata,
     build_payment_invoice_payload,
@@ -1716,6 +1720,287 @@ def test_reversal_event_raw_metadata_is_redacted() -> None:
     assert result.event.raw_payload_redacted["raw_payload"]["order_info"] == "[REDACTED]"
 
 
+def test_orphan_successful_payment_can_be_reconciled_to_matching_pending_order_once() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    repository = InMemoryPaymentLedgerRepository()
+    orphan = apply_successful_payment(
+        repository,
+        PaymentSuccessfulPaymentInput(
+            payload="diet:order:order_missing1:nonce_missing1",
+            provider=PaymentProvider.TELEGRAM_STARS,
+            telegram_charge_id="tg-charge-orphan1",
+            provider_charge_id="provider-charge-orphan1",
+            user_id=1001,
+            delivery_chat_id=2002,
+            currency=PaymentCurrency.XTR,
+            total_amount=400,
+        ),
+        now=now,
+    )
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository.orders.append(order)
+
+    result = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS,
+            target_event_id=orphan.event.event_id if orphan.event is not None else None,
+            target_order_id=order.order_id,
+            admin_actor={"admin_id": "admin-42"},
+            reason="matched Telegram support receipt",
+        ),
+        now=now + timedelta(minutes=1),
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    paid_order = repository.load_payment_order(order.order_id)
+    reconciled_event = repository.load_payment_event(orphan.event.event_id)
+    assert result.processed is True
+    assert result.code == PaymentReconciliationCode.PROCESSED
+    assert result.successful_payment_result is not None
+    assert result.successful_payment_result.processed is True
+    assert paid_order is not None
+    assert paid_order.status == PaymentOrderStatus.PAID
+    assert entitlement.is_subscription_active(now + timedelta(minutes=1))
+    assert repository.processed_charge_ids() == [
+        "tg-charge-orphan1",
+        "provider-charge-orphan1",
+    ]
+    assert reconciled_event is not None
+    assert reconciled_event.status == PaymentEventStatus.PROCESSED
+    assert reconciled_event.order_id == order.order_id
+    assert reconciled_event.product == order.product
+    assert result.audit_event is not None
+    assert result.audit_event.event_type == PaymentEventType.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("event_overrides", "order_overrides", "expected_code"),
+    [
+        ({"user_id": 9999}, {}, PaymentReconciliationCode.USER_MISMATCH),
+        (
+            {"delivery_chat_id": 9999},
+            {},
+            PaymentReconciliationCode.DELIVERY_CHAT_MISMATCH,
+        ),
+        ({"provider": PaymentProvider.YOOKASSA}, {}, PaymentReconciliationCode.PROVIDER_MISMATCH),
+        (
+            {"product": PaymentProduct.EXTRA_ONE_DAY},
+            {},
+            PaymentReconciliationCode.PRODUCT_MISMATCH,
+        ),
+        ({"amount": 399}, {}, PaymentReconciliationCode.AMOUNT_MISMATCH),
+        ({"currency": PaymentCurrency.RUB}, {}, PaymentReconciliationCode.CURRENCY_MISMATCH),
+    ],
+)
+def test_orphan_success_reconciliation_rejects_mismatched_order_fields(
+    event_overrides: dict[str, object],
+    order_overrides: dict[str, object],
+    expected_code: PaymentReconciliationCode,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    event = _orphan_success_event(**event_overrides)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+        **order_overrides,
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.insert_payment_event(event)
+
+    result = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS,
+            target_event_id=event.event_id,
+            target_order_id=order.order_id,
+            admin_actor={"admin_id": "admin-42"},
+            reason="manual mismatch check",
+        ),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == expected_code
+    assert repository.load_payment_order(order.order_id) == order
+    assert repository.get_entitlement(order.user_id) == Entitlement()
+    assert repository.processed_charge_ids() == []
+    assert repository.load_payment_event(event.event_id) == event
+
+
+def test_duplicate_orphan_reconciliation_does_not_grant_twice() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    event = _orphan_success_event(
+        event_id="evt_orphan_extra1",
+        product=PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+    )
+    order = _payment_order(
+        "order_day1",
+        "nonce_day1",
+        PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.entitlements[order.user_id] = _active_entitlement(now)
+    repository.insert_payment_event(event)
+
+    first = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS,
+            target_event_id=event.event_id,
+            target_order_id=order.order_id,
+            admin_actor={"admin_id": "admin-42"},
+            reason="matched Telegram support receipt",
+        ),
+        now=now,
+    )
+    repository.entitlements[order.user_id].extra_one_day_remaining = 0
+    duplicate = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS,
+            target_event_id=event.event_id,
+            target_order_id=order.order_id,
+            admin_actor={"admin_id": "admin-42"},
+            reason="retry after operator refresh",
+        ),
+        now=now + timedelta(seconds=10),
+    )
+
+    assert first.processed is True
+    assert duplicate.processed is False
+    assert duplicate.duplicate is True
+    assert duplicate.code == PaymentReconciliationCode.DUPLICATE
+    assert repository.entitlements[order.user_id].extra_one_day_remaining == 0
+    assert repository.processed_charge_ids() == ["tg-charge-orphan1"]
+
+
+@pytest.mark.parametrize("event_type", [PaymentEventType.REFUND, PaymentEventType.CHARGEBACK])
+def test_pending_terminal_reversal_reconciles_after_matching_success_and_revokes_access(
+    event_type: PaymentEventType,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    repository = InMemoryPaymentLedgerRepository()
+    pending = apply_payment_reversal(
+        repository,
+        PaymentReversalInput(
+            event_type=event_type,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            telegram_charge_id="tg-charge-pending1",
+            amount=400,
+            currency=PaymentCurrency.XTR,
+        ),
+        now=now,
+    )
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository.orders.append(order)
+    _pay_order(repository, order, now=now + timedelta(minutes=1), telegram_charge_id="tg-charge-pending1")
+
+    result = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.RECONCILE_PENDING_REVERSAL,
+            target_event_id=pending.event.event_id if pending.event is not None else None,
+            admin_actor={"admin_id": "admin-42"},
+            reason="provider sent terminal event before success update",
+        ),
+        now=now + timedelta(minutes=2),
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    reconciled_event = repository.load_payment_event(pending.event.event_id)
+    assert result.processed is True
+    assert result.code == PaymentReconciliationCode.PROCESSED
+    assert result.reversal_result is not None
+    assert result.reversal_result.processed is True
+    assert not entitlement.is_subscription_active(now + timedelta(minutes=2))
+    assert repository.processed_charge_ids(event_type) == ["tg-charge-pending1"]
+    assert reconciled_event is not None
+    assert reconciled_event.status == PaymentEventStatus.PROCESSED
+    assert reconciled_event.order_id == order.order_id
+
+
+def test_ignored_orphan_event_records_reason_without_mutating_entitlement() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    event = _orphan_success_event(event_id="evt_ignore1")
+    repository = InMemoryPaymentLedgerRepository()
+    repository.entitlements[1001] = _active_entitlement(now)
+    before = repository.entitlements[1001].to_dict()
+    repository.insert_payment_event(event)
+
+    result = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.IGNORE_EVENT,
+            target_event_id=event.event_id,
+            admin_actor={"admin_id": "admin-42"},
+            reason="provider support confirmed no matching payment",
+        ),
+        now=now,
+    )
+
+    ignored = repository.load_payment_event(event.event_id)
+    assert result.processed is True
+    assert result.code == PaymentReconciliationCode.IGNORED
+    assert ignored is not None
+    assert ignored.status == PaymentEventStatus.IGNORED_NON_TERMINAL
+    assert ignored.reason == "provider support confirmed no matching payment"
+    assert repository.entitlements[1001].to_dict() == before
+    assert repository.processed_charge_ids() == []
+
+
+def test_reconciliation_admin_metadata_is_hashed_or_redacted() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    event = _orphan_success_event(event_id="evt_admin_redaction1")
+    repository = InMemoryPaymentLedgerRepository()
+    repository.insert_payment_event(event)
+
+    result = apply_payment_reconciliation(
+        repository,
+        PaymentReconciliationInput(
+            action=PaymentReconciliationAction.IGNORE_EVENT,
+            target_event_id=event.event_id,
+            admin_actor={
+                "admin_id": "admin-777",
+                "email": "ops@example.com",
+                "provider_token": "381764678:TEST:very-secret-provider-token",
+                "note": "contact ops@example.com",
+            },
+            reason="manual close",
+        ),
+        now=now,
+    )
+
+    assert result.audit_event is not None
+    actor = result.audit_event.raw_payload_redacted["admin_actor"]
+    serialized = json.dumps(
+        [event.raw_payload_redacted for event in repository.payment_events],
+        sort_keys=True,
+    )
+    assert "admin-777" not in serialized
+    assert "ops@example.com" not in serialized
+    assert "very-secret-provider-token" not in serialized
+    assert actor["admin_id_hash"] != "admin-777"
+    assert actor["email_hash"] != "ops@example.com"
+    assert actor["provider_token_hash"] != "381764678:TEST:very-secret-provider-token"
+    assert len(actor["admin_id_hash"]) == 64
+
+
 class InMemoryPaymentOrderRepository:
     def __init__(self, orders: list[PaymentOrder] | None = None) -> None:
         self.orders = list(orders or [])
@@ -1815,6 +2100,44 @@ class InMemoryPaymentLedgerRepository(InMemoryPaymentOrderRepository):
     def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent:
         self.payment_events.append(event)
         return event
+
+    def load_payment_event(self, event_id: str) -> PaymentEvent | None:
+        for event in self.payment_events:
+            if event.event_id == event_id:
+                return event
+        return None
+
+    def update_payment_event(self, event: PaymentEvent) -> PaymentEvent:
+        for index, existing in enumerate(self.payment_events):
+            if existing.event_id != event.event_id:
+                continue
+            self.payment_events[index] = event
+            return event
+        self.payment_events.append(event)
+        return event
+
+    def find_payment_event(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType | None = None,
+        statuses: tuple[PaymentEventStatus, ...] = (),
+    ) -> PaymentEvent | None:
+        for event in reversed(self.payment_events):
+            if event.provider != provider:
+                continue
+            if event_type is not None and event.event_type != event_type:
+                continue
+            if statuses and event.status not in statuses:
+                continue
+            if charge_id in {
+                event.charge_id,
+                event.telegram_charge_id,
+                event.provider_charge_id,
+            }:
+                return event
+        return None
 
     def find_processed_provider_charge(
         self,
@@ -1950,6 +2273,37 @@ def _payment_reversal(
         amount=order.amount if amount is None else amount,
         currency=order.currency if currency is None else currency,
         raw_payload=raw_payload,
+    )
+
+
+def _orphan_success_event(
+    *,
+    event_id: str = "evt_orphan1",
+    provider: PaymentProvider = PaymentProvider.TELEGRAM_STARS,
+    product: PaymentProduct | None = PaymentProduct.SUBSCRIPTION_MONTH,
+    user_id: int = 1001,
+    delivery_chat_id: int | None = 2002,
+    amount: int = 400,
+    currency: PaymentCurrency = PaymentCurrency.XTR,
+    telegram_charge_id: str = "tg-charge-orphan1",
+    provider_charge_id: str | None = None,
+) -> PaymentEvent:
+    return PaymentEvent(
+        event_id=event_id,
+        event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        provider=provider,
+        order_id="order_missing1",
+        charge_id=telegram_charge_id,
+        telegram_charge_id=telegram_charge_id,
+        provider_charge_id=provider_charge_id,
+        user_id=user_id,
+        delivery_chat_id=delivery_chat_id,
+        product=product,
+        amount=amount,
+        currency=currency,
+        status=PaymentEventStatus.ORPHAN_RECOVERABLE,
+        reason=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND.value,
+        raw_payload_redacted={"invoice_payload": "diet:order:order_missing1:nonce_missing1"},
     )
 
 

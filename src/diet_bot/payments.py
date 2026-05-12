@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Callable, Protocol
@@ -115,6 +116,38 @@ class PaymentReversalCode(StrEnum):
     ORIGINAL_ORDER_NOT_FOUND = "original_order_not_found"
     AMOUNT_MISMATCH = "amount_mismatch"
     CURRENCY_MISMATCH = "currency_mismatch"
+    EXTRA_ALREADY_CONSUMED = "extra_already_consumed"
+    UNSUPPORTED_PRODUCT_FOR_EVENT = "unsupported_product_for_event"
+
+
+class PaymentReconciliationAction(StrEnum):
+    RECONCILE_ORPHAN_SUCCESS = "reconcile_orphan_success"
+    RECONCILE_PENDING_REVERSAL = "reconcile_pending_reversal"
+    IGNORE_EVENT = "ignore_event"
+
+
+class PaymentReconciliationCode(StrEnum):
+    PROCESSED = "processed"
+    DUPLICATE = "duplicate"
+    IGNORED = "ignored"
+    EVENT_NOT_FOUND = "event_not_found"
+    EVENT_NOT_RECONCILABLE = "event_not_reconcilable"
+    TARGET_REQUIRED = "target_required"
+    REASON_REQUIRED = "reason_required"
+    ORDER_NOT_FOUND = "order_not_found"
+    ORDER_NOT_PENDING = "order_not_pending"
+    ORDER_EXPIRED = "order_expired"
+    USER_MISMATCH = "user_mismatch"
+    DELIVERY_CHAT_MISMATCH = "delivery_chat_mismatch"
+    PROVIDER_MISMATCH = "provider_mismatch"
+    PRODUCT_MISMATCH = "product_mismatch"
+    CURRENCY_MISMATCH = "currency_mismatch"
+    AMOUNT_MISMATCH = "amount_mismatch"
+    ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+    CHARGE_ID_MISSING = "charge_id_missing"
+    CHARGE_ALIAS_CONFLICT = "charge_alias_conflict"
+    ORIGINAL_PAYMENT_NOT_FOUND = "original_payment_not_found"
+    ORIGINAL_ORDER_NOT_FOUND = "original_order_not_found"
     EXTRA_ALREADY_CONSUMED = "extra_already_consumed"
     UNSUPPORTED_PRODUCT_FOR_EVENT = "unsupported_product_for_event"
 
@@ -487,6 +520,48 @@ class PaymentReversalResult:
         object.__setattr__(self, "code", PaymentReversalCode(self.code))
 
 
+@dataclass(frozen=True)
+class PaymentReconciliationInput:
+    action: PaymentReconciliationAction | str
+    target_event_id: str | None = None
+    target_order_id: str | None = None
+    target_charge_id: str | None = None
+    provider: PaymentProvider | str | None = None
+    admin_actor: Mapping[str, Any] | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "action", PaymentReconciliationAction(self.action))
+        if self.provider is not None:
+            object.__setattr__(self, "provider", PaymentProvider(self.provider))
+        for field_name in ("target_event_id", "target_order_id", "target_charge_id", "reason"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            text = str(value).strip()
+            object.__setattr__(self, field_name, text or None)
+        if self.admin_actor is not None:
+            object.__setattr__(self, "admin_actor", dict(self.admin_actor))
+
+
+@dataclass(frozen=True)
+class PaymentReconciliationResult:
+    processed: bool
+    code: PaymentReconciliationCode | str
+    action: PaymentReconciliationAction | str
+    target_event: PaymentEvent | None = None
+    order: PaymentOrder | None = None
+    audit_event: PaymentEvent | None = None
+    successful_payment_result: PaymentSuccessfulPaymentResult | None = None
+    reversal_result: PaymentReversalResult | None = None
+    duplicate: bool = False
+    message: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", PaymentReconciliationCode(self.code))
+        object.__setattr__(self, "action", PaymentReconciliationAction(self.action))
+
+
 class PaymentSuccessfulPaymentRepository(Protocol):
     def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
     def get_entitlement(self, user_id: int) -> Entitlement: ...
@@ -531,6 +606,20 @@ class PaymentReversalRepository(Protocol):
         self,
         charge: ProcessedProviderCharge,
     ) -> ProcessedProviderCharge: ...
+
+
+class PaymentReconciliationRepository(PaymentSuccessfulPaymentRepository, PaymentReversalRepository, Protocol):
+    def load_payment_event(self, event_id: str) -> PaymentEvent | None: ...
+    def update_payment_event(self, event: PaymentEvent) -> PaymentEvent: ...
+
+    def find_payment_event(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType | None = None,
+        statuses: tuple[PaymentEventStatus, ...] = (),
+    ) -> PaymentEvent | None: ...
 
 
 def encode_payment_order_payload(order_id: str, nonce: str) -> str:
@@ -961,6 +1050,82 @@ def build_payment_reversal_event(
     )
 
 
+def apply_payment_reconciliation(
+    repository: PaymentReconciliationRepository,
+    reconciliation: PaymentReconciliationInput,
+    *,
+    now: datetime | None = None,
+) -> PaymentReconciliationResult:
+    current_time = _normalize_datetime(now)
+    if reconciliation.action == PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS:
+        return _reconcile_orphan_success(
+            repository,
+            reconciliation,
+            now=current_time,
+        )
+    if reconciliation.action == PaymentReconciliationAction.RECONCILE_PENDING_REVERSAL:
+        return _reconcile_pending_reversal(
+            repository,
+            reconciliation,
+            now=current_time,
+        )
+    if reconciliation.action == PaymentReconciliationAction.IGNORE_EVENT:
+        return _ignore_reconciliation_event(
+            repository,
+            reconciliation,
+            now=current_time,
+        )
+    raise ValueError("unsupported payment reconciliation action")
+
+
+def build_payment_reconciliation_audit_event(
+    reconciliation: PaymentReconciliationInput,
+    *,
+    code: PaymentReconciliationCode,
+    event_status: PaymentEventStatus,
+    now: datetime,
+    target_event: PaymentEvent | None = None,
+    order: PaymentOrder | None = None,
+    reason: str | None = None,
+) -> PaymentEvent:
+    provider = (
+        target_event.provider
+        if target_event is not None
+        else PaymentProvider(reconciliation.provider)
+    )
+    return PaymentEvent(
+        event_id=_payment_event_id(),
+        event_type=PaymentEventType.UNKNOWN,
+        provider=provider,
+        order_id=order.order_id if order is not None else (
+            target_event.order_id if target_event is not None else reconciliation.target_order_id
+        ),
+        charge_id=(
+            target_event.charge_id
+            if target_event is not None
+            else reconciliation.target_charge_id
+        ),
+        telegram_charge_id=target_event.telegram_charge_id if target_event is not None else None,
+        provider_charge_id=target_event.provider_charge_id if target_event is not None else None,
+        product=order.product if order is not None else (
+            target_event.product if target_event is not None else None
+        ),
+        amount=target_event.amount if target_event is not None else None,
+        currency=target_event.currency if target_event is not None else None,
+        status=event_status,
+        reason=reason,
+        raw_payload_redacted=_payment_reconciliation_redacted_payload(
+            reconciliation,
+            code=code,
+            target_event=target_event,
+            order=order,
+            reason=reason,
+        ),
+        created_at=now,
+        processed_at=now,
+    )
+
+
 def get_payment_product_invoice_metadata(
     provider: PaymentProvider | str,
     product: PaymentProduct | str,
@@ -1128,6 +1293,604 @@ def redact_payment_payload(value: Any) -> Any:
     if isinstance(value, str):
         return _redact_payment_text(value)
     return value
+
+
+def redact_admin_actor_metadata(actor: Mapping[str, Any] | None) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    for key, value in dict(actor or {}).items():
+        text_key = str(key)
+        normalized_key = re.sub(r"[^a-z0-9]", "", text_key.lower())
+        if _admin_actor_key_requires_hash(normalized_key):
+            redacted[f"{text_key}_hash"] = _hash_reconciliation_value(text_key, value)
+        else:
+            redacted[text_key] = redact_payment_payload(value)
+    return redacted
+
+
+def _reconcile_orphan_success(
+    repository: PaymentReconciliationRepository,
+    reconciliation: PaymentReconciliationInput,
+    *,
+    now: datetime,
+) -> PaymentReconciliationResult:
+    target_event = _load_reconciliation_target_event(
+        repository,
+        reconciliation,
+        event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        statuses=(
+            PaymentEventStatus.ORPHAN_RECOVERABLE,
+            PaymentEventStatus.PROCESSED,
+        ),
+    )
+    if target_event is None:
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.EVENT_NOT_FOUND,
+            action=reconciliation.action,
+            message="Payment event was not found.",
+        )
+    if reconciliation.target_order_id is None:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=PaymentReconciliationCode.TARGET_REQUIRED,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            target_event=target_event,
+            reason=PaymentReconciliationCode.TARGET_REQUIRED.value,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.TARGET_REQUIRED,
+            action=reconciliation.action,
+            target_event=target_event,
+            audit_event=audit,
+            message="A target payment order is required.",
+        )
+
+    order = repository.load_payment_order(reconciliation.target_order_id)
+    if order is None:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=PaymentReconciliationCode.ORDER_NOT_FOUND,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            target_event=target_event,
+            reason=PaymentReconciliationCode.ORDER_NOT_FOUND.value,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.ORDER_NOT_FOUND,
+            action=reconciliation.action,
+            target_event=target_event,
+            audit_event=audit,
+            message="Target payment order was not found.",
+        )
+
+    validation_code = _validate_orphan_success_reconciliation(
+        target_event,
+        order,
+        reconciliation,
+    )
+    if validation_code != PaymentReconciliationCode.PROCESSED:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=validation_code,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            target_event=target_event,
+            order=order,
+            reason=validation_code.value,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=validation_code,
+            action=reconciliation.action,
+            target_event=target_event,
+            order=order,
+            audit_event=audit,
+            message="Orphan successful payment does not match target order.",
+        )
+
+    successful_payment = _successful_payment_input_from_event(target_event, order)
+    successful_result = apply_successful_payment(repository, successful_payment, now=now)
+    code = _reconciliation_code_from_successful_payment(successful_result.code)
+    processed = successful_result.processed
+    duplicate = successful_result.duplicate
+    event_status = (
+        PaymentEventStatus.PROCESSED
+        if processed
+        else PaymentEventStatus.DUPLICATE if duplicate else PaymentEventStatus.IGNORED_NON_TERMINAL
+    )
+    reason = (
+        _safe_reconciliation_reason(reconciliation.reason)
+        if processed
+        else None if duplicate else code.value
+    )
+    updated_target = target_event
+    if processed or duplicate:
+        updated_target = _update_payment_event_if_supported(
+            repository,
+            _reconciled_payment_event(
+                target_event,
+                order=successful_result.order or order,
+                status=PaymentEventStatus.PROCESSED,
+                reason=reason or "reconciled_orphan_success",
+                processed_at=now,
+            ),
+        )
+    audit = _insert_reconciliation_audit_event(
+        repository,
+        reconciliation,
+        code=code,
+        event_status=event_status,
+        target_event=updated_target,
+        order=successful_result.order or order,
+        reason=reason,
+        now=now,
+    )
+    return PaymentReconciliationResult(
+        processed=processed,
+        code=code,
+        action=reconciliation.action,
+        target_event=updated_target,
+        order=successful_result.order or order,
+        audit_event=audit,
+        successful_payment_result=successful_result,
+        duplicate=duplicate,
+        message=successful_result.message,
+    )
+
+
+def _reconcile_pending_reversal(
+    repository: PaymentReconciliationRepository,
+    reconciliation: PaymentReconciliationInput,
+    *,
+    now: datetime,
+) -> PaymentReconciliationResult:
+    target_event = _load_reconciliation_target_event(
+        repository,
+        reconciliation,
+        statuses=(
+            PaymentEventStatus.PENDING_RECONCILIATION,
+            PaymentEventStatus.PROCESSED,
+        ),
+    )
+    if target_event is None:
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.EVENT_NOT_FOUND,
+            action=reconciliation.action,
+            message="Payment event was not found.",
+        )
+    if target_event.event_type not in PAYMENT_REVERSAL_EVENT_TYPES:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=PaymentReconciliationCode.EVENT_NOT_RECONCILABLE,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            target_event=target_event,
+            reason=PaymentReconciliationCode.EVENT_NOT_RECONCILABLE.value,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.EVENT_NOT_RECONCILABLE,
+            action=reconciliation.action,
+            target_event=target_event,
+            audit_event=audit,
+            message="Payment event is not a pending reversal.",
+        )
+
+    reversal = _payment_reversal_input_from_event(target_event)
+    if reversal is None:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=PaymentReconciliationCode.CHARGE_ID_MISSING,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            target_event=target_event,
+            reason=PaymentReconciliationCode.CHARGE_ID_MISSING.value,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.CHARGE_ID_MISSING,
+            action=reconciliation.action,
+            target_event=target_event,
+            audit_event=audit,
+            message="Pending reversal charge id is missing.",
+        )
+
+    reversal_result = apply_payment_reversal(repository, reversal, now=now)
+    code = _reconciliation_code_from_reversal(reversal_result.code)
+    processed = reversal_result.processed
+    duplicate = reversal_result.duplicate
+    event_status = (
+        PaymentEventStatus.PROCESSED
+        if processed
+        else PaymentEventStatus.DUPLICATE if duplicate else PaymentEventStatus.IGNORED_NON_TERMINAL
+    )
+    reason = (
+        _safe_reconciliation_reason(reconciliation.reason)
+        if processed
+        else None if duplicate else code.value
+    )
+    updated_target = target_event
+    if processed or duplicate:
+        source_event = reversal_result.event
+        updated_target = _update_payment_event_if_supported(
+            repository,
+            replace(
+                target_event,
+                order_id=(
+                    reversal_result.order.order_id
+                    if reversal_result.order is not None
+                    else source_event.order_id if source_event is not None else target_event.order_id
+                ),
+                user_id=(
+                    reversal_result.order.user_id
+                    if reversal_result.order is not None
+                    else source_event.user_id if source_event is not None else target_event.user_id
+                ),
+                delivery_chat_id=(
+                    reversal_result.order.delivery_chat_id
+                    if reversal_result.order is not None
+                    else (
+                        source_event.delivery_chat_id
+                        if source_event is not None
+                        else target_event.delivery_chat_id
+                    )
+                ),
+                product=(
+                    reversal_result.order.product
+                    if reversal_result.order is not None
+                    else source_event.product if source_event is not None else target_event.product
+                ),
+                status=PaymentEventStatus.PROCESSED,
+                reason=reason or "reconciled_pending_reversal",
+                processed_at=now,
+            ),
+        )
+    audit = _insert_reconciliation_audit_event(
+        repository,
+        reconciliation,
+        code=code,
+        event_status=event_status,
+        target_event=updated_target,
+        order=reversal_result.order,
+        reason=reason,
+        now=now,
+    )
+    return PaymentReconciliationResult(
+        processed=processed,
+        code=code,
+        action=reconciliation.action,
+        target_event=updated_target,
+        order=reversal_result.order,
+        audit_event=audit,
+        reversal_result=reversal_result,
+        duplicate=duplicate,
+        message=reversal_result.message,
+    )
+
+
+def _ignore_reconciliation_event(
+    repository: PaymentReconciliationRepository,
+    reconciliation: PaymentReconciliationInput,
+    *,
+    now: datetime,
+) -> PaymentReconciliationResult:
+    target_event = _load_reconciliation_target_event(repository, reconciliation)
+    if target_event is None:
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.EVENT_NOT_FOUND,
+            action=reconciliation.action,
+            message="Payment event was not found.",
+        )
+    reason = _safe_reconciliation_reason(reconciliation.reason)
+    if reason is None:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=PaymentReconciliationCode.REASON_REQUIRED,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            target_event=target_event,
+            reason=PaymentReconciliationCode.REASON_REQUIRED.value,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.REASON_REQUIRED,
+            action=reconciliation.action,
+            target_event=target_event,
+            audit_event=audit,
+            message="Ignoring a payment event requires a reason.",
+        )
+    if target_event.status == PaymentEventStatus.IGNORED_NON_TERMINAL:
+        audit = _insert_reconciliation_audit_event(
+            repository,
+            reconciliation,
+            code=PaymentReconciliationCode.DUPLICATE,
+            event_status=PaymentEventStatus.DUPLICATE,
+            target_event=target_event,
+            reason=reason,
+            now=now,
+        )
+        return PaymentReconciliationResult(
+            processed=False,
+            code=PaymentReconciliationCode.DUPLICATE,
+            action=reconciliation.action,
+            target_event=target_event,
+            audit_event=audit,
+            duplicate=True,
+        )
+
+    ignored = _update_payment_event_if_supported(
+        repository,
+        replace(
+            target_event,
+            status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            reason=reason,
+            processed_at=now,
+        ),
+    )
+    audit = _insert_reconciliation_audit_event(
+        repository,
+        reconciliation,
+        code=PaymentReconciliationCode.IGNORED,
+        event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+        target_event=ignored,
+        reason=reason,
+        now=now,
+    )
+    return PaymentReconciliationResult(
+        processed=True,
+        code=PaymentReconciliationCode.IGNORED,
+        action=reconciliation.action,
+        target_event=ignored,
+        audit_event=audit,
+    )
+
+
+def _load_reconciliation_target_event(
+    repository: PaymentReconciliationRepository,
+    reconciliation: PaymentReconciliationInput,
+    *,
+    event_type: PaymentEventType | None = None,
+    statuses: tuple[PaymentEventStatus, ...] = (),
+) -> PaymentEvent | None:
+    if reconciliation.target_event_id:
+        return repository.load_payment_event(reconciliation.target_event_id)
+    if reconciliation.target_charge_id and reconciliation.provider is not None:
+        finder = getattr(repository, "find_payment_event", None)
+        if callable(finder):
+            return finder(
+                provider=reconciliation.provider,
+                charge_id=reconciliation.target_charge_id,
+                event_type=event_type,
+                statuses=statuses,
+            )
+    return None
+
+
+def _validate_orphan_success_reconciliation(
+    event: PaymentEvent,
+    order: PaymentOrder,
+    reconciliation: PaymentReconciliationInput,
+) -> PaymentReconciliationCode:
+    if event.event_type != PaymentEventType.SUCCESSFUL_PAYMENT:
+        return PaymentReconciliationCode.EVENT_NOT_RECONCILABLE
+    if event.status not in {
+        PaymentEventStatus.ORPHAN_RECOVERABLE,
+        PaymentEventStatus.PROCESSED,
+    }:
+        return PaymentReconciliationCode.EVENT_NOT_RECONCILABLE
+    charge_aliases = _payment_event_charge_aliases(event)
+    if not charge_aliases:
+        return PaymentReconciliationCode.CHARGE_ID_MISSING
+    if (
+        reconciliation.target_charge_id is not None
+        and reconciliation.target_charge_id not in charge_aliases
+    ):
+        return PaymentReconciliationCode.CHARGE_ID_MISSING
+    if order.status not in {PaymentOrderStatus.PENDING, PaymentOrderStatus.PAID}:
+        return PaymentReconciliationCode.ORDER_NOT_PENDING
+    if event.provider != order.provider:
+        return PaymentReconciliationCode.PROVIDER_MISMATCH
+    if event.product is not None and event.product != order.product:
+        return PaymentReconciliationCode.PRODUCT_MISMATCH
+    if event.user_id != order.user_id:
+        return PaymentReconciliationCode.USER_MISMATCH
+    if event.delivery_chat_id != order.delivery_chat_id:
+        return PaymentReconciliationCode.DELIVERY_CHAT_MISMATCH
+    if event.currency != order.currency:
+        return PaymentReconciliationCode.CURRENCY_MISMATCH
+    if event.amount != order.amount:
+        return PaymentReconciliationCode.AMOUNT_MISMATCH
+    return PaymentReconciliationCode.PROCESSED
+
+
+def _successful_payment_input_from_event(
+    event: PaymentEvent,
+    order: PaymentOrder,
+) -> PaymentSuccessfulPaymentInput:
+    return PaymentSuccessfulPaymentInput(
+        payload=order.payload,
+        provider=event.provider,
+        telegram_charge_id=event.telegram_charge_id or event.charge_id or "",
+        provider_charge_id=event.provider_charge_id,
+        user_id=event.user_id if event.user_id is not None else order.user_id,
+        delivery_chat_id=event.delivery_chat_id,
+        currency=event.currency if event.currency is not None else order.currency,
+        total_amount=event.amount if event.amount is not None else order.amount,
+        expected_product=order.product,
+        raw_payload={
+            "reconciliation_target_event_id": event.event_id,
+            "reconciliation_action": PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS.value,
+        },
+    )
+
+
+def _payment_reversal_input_from_event(event: PaymentEvent) -> PaymentReversalInput | None:
+    if not _payment_event_charge_aliases(event):
+        return None
+    return PaymentReversalInput(
+        event_type=event.event_type,
+        provider=event.provider,
+        telegram_charge_id=event.telegram_charge_id,
+        provider_charge_id=event.provider_charge_id,
+        amount=event.amount,
+        currency=event.currency,
+        reason=event.reason,
+        raw_payload={
+            "reconciliation_target_event_id": event.event_id,
+            "reconciliation_action": PaymentReconciliationAction.RECONCILE_PENDING_REVERSAL.value,
+        },
+    )
+
+
+def _reconciled_payment_event(
+    event: PaymentEvent,
+    *,
+    order: PaymentOrder,
+    status: PaymentEventStatus,
+    reason: str,
+    processed_at: datetime,
+) -> PaymentEvent:
+    return replace(
+        event,
+        order_id=order.order_id,
+        user_id=order.user_id,
+        delivery_chat_id=order.delivery_chat_id,
+        product=order.product,
+        amount=event.amount if event.amount is not None else order.amount,
+        currency=event.currency if event.currency is not None else order.currency,
+        status=status,
+        reason=reason,
+        processed_at=processed_at,
+    )
+
+
+def _insert_reconciliation_audit_event(
+    repository: PaymentReconciliationRepository,
+    reconciliation: PaymentReconciliationInput,
+    *,
+    code: PaymentReconciliationCode,
+    event_status: PaymentEventStatus,
+    now: datetime,
+    target_event: PaymentEvent | None = None,
+    order: PaymentOrder | None = None,
+    reason: str | None = None,
+) -> PaymentEvent | None:
+    if target_event is None and reconciliation.provider is None:
+        return None
+    event = build_payment_reconciliation_audit_event(
+        reconciliation,
+        code=code,
+        event_status=event_status,
+        target_event=target_event,
+        order=order,
+        reason=reason,
+        now=now,
+    )
+    return repository.insert_payment_event(event)
+
+
+def _update_payment_event_if_supported(
+    repository: PaymentReconciliationRepository,
+    event: PaymentEvent,
+) -> PaymentEvent:
+    updater = getattr(repository, "update_payment_event", None)
+    if not callable(updater):
+        return event
+    updated = updater(event)
+    return updated if isinstance(updated, PaymentEvent) else event
+
+
+def _payment_event_charge_aliases(event: PaymentEvent) -> tuple[str, ...]:
+    aliases: list[str] = []
+    for charge_id in (event.charge_id, event.telegram_charge_id, event.provider_charge_id):
+        text = str(charge_id or "").strip()
+        if text and text not in aliases:
+            aliases.append(text)
+    return tuple(aliases)
+
+
+def _reconciliation_code_from_successful_payment(
+    code: PaymentSuccessfulPaymentCode | str,
+) -> PaymentReconciliationCode:
+    value = PaymentSuccessfulPaymentCode(code).value
+    return _reconciliation_code_from_value(value)
+
+
+def _reconciliation_code_from_reversal(
+    code: PaymentReversalCode | str,
+) -> PaymentReconciliationCode:
+    value = PaymentReversalCode(code).value
+    return _reconciliation_code_from_value(value)
+
+
+def _reconciliation_code_from_value(value: str) -> PaymentReconciliationCode:
+    try:
+        return PaymentReconciliationCode(value)
+    except ValueError:
+        return PaymentReconciliationCode.EVENT_NOT_RECONCILABLE
+
+
+def _payment_reconciliation_redacted_payload(
+    reconciliation: PaymentReconciliationInput,
+    *,
+    code: PaymentReconciliationCode,
+    target_event: PaymentEvent | None,
+    order: PaymentOrder | None,
+    reason: str | None,
+) -> dict[str, Any]:
+    charge_id = (
+        target_event.charge_id
+        if target_event is not None
+        else reconciliation.target_charge_id
+    )
+    return {
+        "event_type": "payment_reconciliation",
+        "action": reconciliation.action.value,
+        "status_code": code.value,
+        "target_event_id": target_event.event_id if target_event is not None else (
+            reconciliation.target_event_id
+        ),
+        "target_order_id": order.order_id if order is not None else reconciliation.target_order_id,
+        "target_charge_id_hash": (
+            _hash_reconciliation_value("charge_id", charge_id)
+            if charge_id
+            else None
+        ),
+        "admin_actor": redact_admin_actor_metadata(reconciliation.admin_actor),
+        "reason": reason,
+    }
+
+
+def _safe_reconciliation_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    text = str(redact_payment_payload(str(reason).strip())).strip()
+    return text or None
+
+
+def _admin_actor_key_requires_hash(normalized_key: str) -> bool:
+    return (
+        normalized_key in {"id", "adminid", "userid", "telegramid", "email"}
+        or normalized_key.endswith("id")
+        or normalized_key.endswith("email")
+        or _is_sensitive_key(normalized_key)
+    )
+
+
+def _hash_reconciliation_value(key: str, value: Any) -> str:
+    normalized = f"foodbalance:payments:admin:{key}:{value}".encode("utf-8")
+    return hashlib.sha256(normalized).hexdigest()
 
 
 def _apply_successful_payment_generic(
@@ -1882,6 +2645,11 @@ __all__ = [
     "PaymentProduct",
     "PaymentProductInvoiceMetadata",
     "PaymentProvider",
+    "PaymentReconciliationAction",
+    "PaymentReconciliationCode",
+    "PaymentReconciliationInput",
+    "PaymentReconciliationRepository",
+    "PaymentReconciliationResult",
     "PaymentReversalCode",
     "PaymentReversalInput",
     "PaymentReversalRepository",
@@ -1894,10 +2662,12 @@ __all__ = [
     "REDACTED_PAYMENT_VALUE",
     "apply_payment_reversal",
     "apply_payment_reversal_entitlement",
+    "apply_payment_reconciliation",
     "apply_successful_payment",
     "apply_successful_payment_entitlement",
     "build_payment_invoice_metadata",
     "build_payment_invoice_payload",
+    "build_payment_reconciliation_audit_event",
     "build_payment_reversal_event",
     "build_successful_payment_event",
     "create_or_reuse_pending_payment_order",
@@ -1906,6 +2676,7 @@ __all__ = [
     "get_payment_product_invoice_metadata",
     "is_active_pending_payment_order",
     "redact_payment_payload",
+    "redact_admin_actor_metadata",
     "payment_reversal_canonical_charge_id",
     "payment_reversal_charge_aliases",
     "successful_payment_canonical_charge_id",

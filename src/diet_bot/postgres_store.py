@@ -18,6 +18,8 @@ from .payments import (
     PaymentOrderStatus,
     PaymentProduct,
     PaymentProvider,
+    PaymentReconciliationInput,
+    PaymentReconciliationResult,
     PaymentReversalCode,
     PaymentReversalInput,
     PaymentReversalResult,
@@ -27,6 +29,7 @@ from .payments import (
     ProcessedProviderCharge,
     apply_payment_reversal as apply_payment_reversal_core,
     apply_payment_reversal_entitlement,
+    apply_payment_reconciliation as apply_payment_reconciliation_core,
     apply_successful_payment as apply_successful_payment_core,
     apply_successful_payment_entitlement,
     build_payment_reversal_event,
@@ -836,6 +839,14 @@ class PostgresDietBotStore:
     ) -> PaymentReversalResult:
         return apply_payment_reversal_core(self, reversal, now=now)
 
+    def apply_payment_reconciliation(
+        self,
+        reconciliation: PaymentReconciliationInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentReconciliationResult:
+        return apply_payment_reconciliation_core(self, reconciliation, now=now)
+
     def apply_successful_payment_transaction(
         self,
         successful_payment: PaymentSuccessfulPaymentInput,
@@ -874,6 +885,60 @@ class PostgresDietBotStore:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 return self._insert_payment_event_cur(cur, event)
+
+    def load_payment_event(self, event_id: str) -> PaymentEvent | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM payment_events WHERE event_id = %s",
+                    (event_id,),
+                )
+                row = cur.fetchone()
+        return _row_to_payment_event(row) if row is not None else None
+
+    def update_payment_event(self, event: PaymentEvent) -> PaymentEvent:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._update_payment_event_cur(cur, event)
+
+    def find_payment_event(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType | None = None,
+        statuses: tuple[PaymentEventStatus, ...] = (),
+    ) -> PaymentEvent | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                filters = [
+                    "provider = %s",
+                    "(charge_id = %s OR telegram_charge_id = %s OR provider_charge_id = %s)",
+                ]
+                params: list[Any] = [
+                    provider.value,
+                    charge_id,
+                    charge_id,
+                    charge_id,
+                ]
+                if event_type is not None:
+                    filters.append("event_type = %s")
+                    params.append(event_type.value)
+                if statuses:
+                    filters.append("status = ANY(%s)")
+                    params.append([status.value for status in statuses])
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM payment_events
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY created_at DESC, event_id DESC
+                    LIMIT 1
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+        return _row_to_payment_event(row) if row is not None else None
 
     def _apply_successful_payment_transaction_cur(
         self,
@@ -1384,6 +1449,52 @@ class PostgresDietBotStore:
         row = cur.fetchone()
         if row is None:
             raise RuntimeError("Could not create payment event.")
+        return _row_to_payment_event(row)
+
+    def _update_payment_event_cur(self, cur: Any, event: PaymentEvent) -> PaymentEvent:
+        cur.execute(
+            """
+            UPDATE payment_events
+            SET order_id = %s,
+                charge_id = %s,
+                telegram_charge_id = %s,
+                provider_charge_id = %s,
+                user_id = %s,
+                delivery_chat_id = %s,
+                product = %s,
+                amount = %s,
+                currency = %s,
+                status = %s,
+                reason = %s,
+                raw_payload_redacted = %s,
+                processed_at = %s
+            WHERE event_id = %s
+            RETURNING *
+            """,
+            (
+                event.order_id,
+                event.charge_id,
+                event.telegram_charge_id,
+                event.provider_charge_id,
+                event.user_id,
+                event.delivery_chat_id,
+                event.product.value if event.product is not None else None,
+                event.amount,
+                event.currency.value if event.currency is not None else None,
+                event.status.value,
+                event.reason,
+                _jsonb(event.raw_payload_redacted),
+                (
+                    _normalize_datetime(event.processed_at)
+                    if event.processed_at is not None
+                    else None
+                ),
+                event.event_id,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not update payment event.")
         return _row_to_payment_event(row)
 
     def _insert_processed_provider_charge_cur(
