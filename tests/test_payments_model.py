@@ -24,9 +24,12 @@ from diet_bot.payments import (
     PaymentProductInvoiceMetadata,
     PaymentProduct,
     PaymentProvider,
+    PaymentReversalCode,
+    PaymentReversalInput,
     PaymentSuccessfulPaymentCode,
     PaymentSuccessfulPaymentInput,
     ProcessedProviderCharge,
+    apply_payment_reversal,
     apply_successful_payment,
     build_payment_invoice_metadata,
     build_payment_invoice_payload,
@@ -38,7 +41,7 @@ from diet_bot.payments import (
     validate_payment_pre_checkout,
     validate_payment_invoice_payload,
 )
-from diet_bot.subscriptions import Entitlement
+from diet_bot.subscriptions import Entitlement, consume_one_day_attempt
 
 
 def test_payment_order_payload_round_trips_order_id_and_nonce() -> None:
@@ -1270,6 +1273,449 @@ def test_successful_payment_event_raw_payload_is_redacted() -> None:
     assert result.event.raw_payload_redacted["raw_payload"]["order_info"] == "[REDACTED]"
 
 
+def test_refund_subscription_revokes_matching_paid_period() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    _pay_order(repository, order, now=now, telegram_charge_id="tg-charge-sub1")
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            order,
+            telegram_charge_id="tg-charge-sub1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert result.processed is True
+    assert result.code == PaymentReversalCode.PROCESSED
+    assert result.event is not None
+    assert result.event.status == PaymentEventStatus.PROCESSED
+    assert not entitlement.is_subscription_active(now + timedelta(hours=1))
+    assert entitlement.monthly_one_day_remaining == 0
+    assert entitlement.monthly_weekly_pdf_remaining == 0
+
+
+def test_refund_old_subscription_does_not_revoke_newer_active_subscription() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    renewal_at = now + timedelta(days=1)
+    old_order = _payment_order(
+        "order_old1",
+        "nonce_old1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    new_order = _payment_order(
+        "order_new1",
+        "nonce_new1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=renewal_at + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([old_order, new_order])
+    _pay_order(repository, old_order, now=now, telegram_charge_id="tg-charge-old1")
+    _pay_order(repository, new_order, now=renewal_at, telegram_charge_id="tg-charge-new1")
+    before = repository.get_entitlement(old_order.user_id).to_dict()
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            old_order,
+            telegram_charge_id="tg-charge-old1",
+        ),
+        now=renewal_at + timedelta(hours=1),
+    )
+
+    after = repository.get_entitlement(old_order.user_id)
+    assert result.processed is True
+    assert result.code == PaymentReversalCode.PROCESSED
+    assert result.event is not None
+    assert result.event.status == PaymentEventStatus.PROCESSED
+    assert result.event.reason == "paid_period_not_current"
+    assert after.to_dict() == before
+    assert after.is_subscription_active(renewal_at + timedelta(hours=1))
+
+
+def test_chargeback_subscription_behaves_as_terminal_matching_reversal() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    _pay_order(repository, order, now=now, telegram_charge_id="tg-charge-sub1")
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.CHARGEBACK,
+            order,
+            telegram_charge_id="tg-charge-sub1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert result.processed is True
+    assert result.code == PaymentReversalCode.PROCESSED
+    assert result.event is not None
+    assert result.event.event_type == PaymentEventType.CHARGEBACK
+    assert result.event.status == PaymentEventStatus.PROCESSED
+    assert not entitlement.is_subscription_active(now + timedelta(hours=1))
+    assert repository.processed_charge_ids(PaymentEventType.CHARGEBACK) == ["tg-charge-sub1"]
+
+
+def test_cancel_subscription_records_event_and_keeps_paid_period_active() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    _pay_order(repository, order, now=now, telegram_charge_id="tg-charge-sub1")
+    before = repository.get_entitlement(order.user_id).to_dict()
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.CANCEL_SUBSCRIPTION,
+            order,
+            telegram_charge_id="tg-charge-sub1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert result.processed is True
+    assert result.code == PaymentReversalCode.PROCESSED
+    assert result.event is not None
+    assert result.event.event_type == PaymentEventType.CANCEL_SUBSCRIPTION
+    assert result.event.status == PaymentEventStatus.PROCESSED
+    assert entitlement.to_dict() == before
+    assert entitlement.is_subscription_active(now + timedelta(hours=1))
+
+
+def test_duplicate_refund_does_not_revoke_newer_subscription() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    renewal_at = now + timedelta(hours=2)
+    refunded_order = _payment_order(
+        "order_refund1",
+        "nonce_refund1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    new_order = _payment_order(
+        "order_new1",
+        "nonce_new1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=renewal_at + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([refunded_order, new_order])
+    _pay_order(repository, refunded_order, now=now, telegram_charge_id="tg-charge-refund1")
+    first = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            refunded_order,
+            telegram_charge_id="tg-charge-refund1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+    _pay_order(repository, new_order, now=renewal_at, telegram_charge_id="tg-charge-new1")
+    before_duplicate = repository.get_entitlement(refunded_order.user_id).to_dict()
+
+    duplicate = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            refunded_order,
+            telegram_charge_id="tg-charge-refund1",
+        ),
+        now=renewal_at + timedelta(hours=1),
+    )
+
+    entitlement = repository.get_entitlement(refunded_order.user_id)
+    assert first.processed is True
+    assert duplicate.processed is False
+    assert duplicate.duplicate is True
+    assert duplicate.code == PaymentReversalCode.DUPLICATE
+    assert duplicate.event is not None
+    assert duplicate.event.status == PaymentEventStatus.DUPLICATE
+    assert entitlement.to_dict() == before_duplicate
+    assert entitlement.is_subscription_active(renewal_at + timedelta(hours=1))
+
+
+def test_duplicate_chargeback_does_not_revoke_newer_subscription() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    renewal_at = now + timedelta(hours=2)
+    charged_back_order = _payment_order(
+        "order_chargeback1",
+        "nonce_chargeback1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    new_order = _payment_order(
+        "order_new1",
+        "nonce_new1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=renewal_at + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([charged_back_order, new_order])
+    _pay_order(
+        repository,
+        charged_back_order,
+        now=now,
+        telegram_charge_id="tg-charge-chargeback1",
+    )
+    first = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.CHARGEBACK,
+            charged_back_order,
+            telegram_charge_id="tg-charge-chargeback1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+    _pay_order(repository, new_order, now=renewal_at, telegram_charge_id="tg-charge-new1")
+    before_duplicate = repository.get_entitlement(charged_back_order.user_id).to_dict()
+
+    duplicate = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.CHARGEBACK,
+            charged_back_order,
+            telegram_charge_id="tg-charge-chargeback1",
+        ),
+        now=renewal_at + timedelta(hours=1),
+    )
+
+    entitlement = repository.get_entitlement(charged_back_order.user_id)
+    assert first.processed is True
+    assert duplicate.processed is False
+    assert duplicate.duplicate is True
+    assert duplicate.code == PaymentReversalCode.DUPLICATE
+    assert entitlement.to_dict() == before_duplicate
+    assert entitlement.is_subscription_active(renewal_at + timedelta(hours=1))
+
+
+@pytest.mark.parametrize(
+    ("product", "amount", "target_field", "other_field"),
+    [
+        (
+            PaymentProduct.EXTRA_ONE_DAY,
+            35,
+            "extra_one_day_remaining",
+            "extra_weekly_pdf_remaining",
+        ),
+        (
+            PaymentProduct.EXTRA_WEEKLY_PDF,
+            170,
+            "extra_weekly_pdf_remaining",
+            "extra_one_day_remaining",
+        ),
+    ],
+)
+def test_refund_extra_removes_only_matching_unused_extra(
+    product: PaymentProduct,
+    amount: int,
+    target_field: str,
+    other_field: str,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        f"order_{product.value}",
+        "nonce_extra1",
+        product,
+        amount=amount,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.entitlements[order.user_id] = _active_entitlement(now)
+    _pay_order(repository, order, now=now, telegram_charge_id=f"tg-charge-{product.value}")
+    setattr(repository.entitlements[order.user_id], other_field, 2)
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            order,
+            telegram_charge_id=f"tg-charge-{product.value}",
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert result.processed is True
+    assert result.code == PaymentReversalCode.PROCESSED
+    assert getattr(entitlement, target_field) == 0
+    assert getattr(entitlement, other_field) == 2
+    assert entitlement.is_subscription_active(now + timedelta(hours=1))
+
+
+def test_refund_consumed_extra_records_ignored_reason_without_wrong_quota_change() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_day1",
+        "nonce_day1",
+        PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.entitlements[order.user_id] = _active_entitlement(now)
+    repository.entitlements[order.user_id].monthly_one_day_remaining = 1
+    _pay_order(repository, order, now=now, telegram_charge_id="tg-charge-day1")
+
+    entitlement = repository.get_entitlement(order.user_id)
+    monthly = consume_one_day_attempt(entitlement, now)
+    extra = consume_one_day_attempt(entitlement, now)
+    repository.save_entitlement(order.user_id, entitlement)
+    before_refund = entitlement.to_dict()
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            order,
+            telegram_charge_id="tg-charge-day1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    updated = repository.get_entitlement(order.user_id)
+    assert monthly.source == "monthly"
+    assert extra.source == "extra"
+    assert result.processed is False
+    assert result.code == PaymentReversalCode.EXTRA_ALREADY_CONSUMED
+    assert result.event is not None
+    assert result.event.status == PaymentEventStatus.IGNORED_NON_TERMINAL
+    assert result.event.reason == "extra_already_consumed"
+    assert updated.to_dict() == before_refund
+    assert updated.monthly_one_day_remaining == 0
+    assert updated.extra_one_day_remaining == 0
+
+
+@pytest.mark.parametrize("event_type", [PaymentEventType.REFUND, PaymentEventType.CHARGEBACK])
+def test_unknown_negative_reversal_is_pending_reconciliation_without_entitlement_change(
+    event_type: PaymentEventType,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    repository = InMemoryPaymentLedgerRepository()
+    repository.entitlements[1001] = _active_entitlement(now)
+    before = repository.entitlements[1001].to_dict()
+
+    result = apply_payment_reversal(
+        repository,
+        PaymentReversalInput(
+            event_type=event_type,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            telegram_charge_id="tg-charge-missing",
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            raw_payload={"email": "buyer@example.com"},
+        ),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND
+    assert result.event is not None
+    assert result.event.status == PaymentEventStatus.PENDING_RECONCILIATION
+    assert result.event.reason == "original_payment_not_found"
+    assert repository.entitlements[1001].to_dict() == before
+    assert repository.processed_charge_ids(event_type) == []
+
+
+def test_refund_matches_original_payment_by_provider_charge_alias() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_ru1",
+        "nonce_ru1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.YOOKASSA,
+        amount=59_900,
+        currency=PaymentCurrency.RUB,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    _pay_order(
+        repository,
+        order,
+        now=now,
+        telegram_charge_id="tg-charge-ru1",
+        provider_charge_id="provider-charge-ru1",
+    )
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            order,
+            telegram_charge_id=None,
+            provider_charge_id="provider-charge-ru1",
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    assert result.processed is True
+    assert result.order is not None
+    assert result.order.order_id == order.order_id
+    assert not repository.get_entitlement(order.user_id).is_subscription_active(
+        now + timedelta(hours=1)
+    )
+
+
+def test_reversal_event_raw_metadata_is_redacted() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    _pay_order(repository, order, now=now, telegram_charge_id="tg-charge-sub1")
+
+    result = apply_payment_reversal(
+        repository,
+        _payment_reversal(
+            PaymentEventType.REFUND,
+            order,
+            telegram_charge_id="tg-charge-sub1",
+            raw_payload={
+                "email": "buyer@example.com",
+                "phone_number": "+37499123456",
+                "order_info": {"email": "nested@example.com"},
+                "provider_token": "381764678:TEST:very-secret-provider-token",
+                "database_url": "postgresql://diet_bot:secret@localhost:5432/foodbalance",
+            },
+        ),
+        now=now + timedelta(hours=1),
+    )
+
+    assert result.event is not None
+    serialized = json.dumps(result.event.raw_payload_redacted, sort_keys=True)
+    assert "buyer@example.com" not in serialized
+    assert "nested@example.com" not in serialized
+    assert "+37499123456" not in serialized
+    assert "very-secret-provider-token" not in serialized
+    assert "postgresql://diet_bot:secret@localhost:5432/foodbalance" not in serialized
+    assert result.event.raw_payload_redacted["raw_payload"]["email"] == "[REDACTED]"
+    assert result.event.raw_payload_redacted["raw_payload"]["order_info"] == "[REDACTED]"
+
+
 class InMemoryPaymentOrderRepository:
     def __init__(self, orders: list[PaymentOrder] | None = None) -> None:
         self.orders = list(orders or [])
@@ -1418,8 +1864,15 @@ class InMemoryPaymentLedgerRepository(InMemoryPaymentOrderRepository):
             return updated
         return None
 
-    def processed_charge_ids(self) -> list[str]:
-        return [charge.charge_id for charge in self.processed_provider_charges]
+    def processed_charge_ids(
+        self,
+        event_type: PaymentEventType = PaymentEventType.SUCCESSFUL_PAYMENT,
+    ) -> list[str]:
+        return [
+            charge.charge_id
+            for charge in self.processed_provider_charges
+            if charge.event_type == event_type
+        ]
 
 
 def _payment_order(
@@ -1477,6 +1930,47 @@ def _successful_payment(
         expected_product=expected_product,
         raw_payload=raw_payload,
     )
+
+
+def _payment_reversal(
+    event_type: PaymentEventType,
+    order: PaymentOrder,
+    *,
+    telegram_charge_id: str | None,
+    provider_charge_id: str | None = None,
+    amount: int | None = None,
+    currency: PaymentCurrency | str | None = None,
+    raw_payload: dict[str, object] | None = None,
+) -> PaymentReversalInput:
+    return PaymentReversalInput(
+        event_type=event_type,
+        provider=order.provider,
+        telegram_charge_id=telegram_charge_id,
+        provider_charge_id=provider_charge_id,
+        amount=order.amount if amount is None else amount,
+        currency=order.currency if currency is None else currency,
+        raw_payload=raw_payload,
+    )
+
+
+def _pay_order(
+    repository: InMemoryPaymentLedgerRepository,
+    order: PaymentOrder,
+    *,
+    now: datetime,
+    telegram_charge_id: str,
+    provider_charge_id: str | None = None,
+) -> None:
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id=telegram_charge_id,
+            provider_charge_id=provider_charge_id,
+        ),
+        now=now,
+    )
+    assert result.processed is True
 
 
 def _active_entitlement(now: datetime) -> Entitlement:

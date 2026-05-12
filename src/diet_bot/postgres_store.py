@@ -18,15 +18,22 @@ from .payments import (
     PaymentOrderStatus,
     PaymentProduct,
     PaymentProvider,
+    PaymentReversalCode,
+    PaymentReversalInput,
+    PaymentReversalResult,
     PaymentSuccessfulPaymentCode,
     PaymentSuccessfulPaymentInput,
     PaymentSuccessfulPaymentResult,
     ProcessedProviderCharge,
+    apply_payment_reversal as apply_payment_reversal_core,
+    apply_payment_reversal_entitlement,
     apply_successful_payment as apply_successful_payment_core,
     apply_successful_payment_entitlement,
+    build_payment_reversal_event,
     build_successful_payment_event,
     successful_payment_canonical_charge_id,
     successful_payment_charge_aliases,
+    validate_payment_reversal_order,
     validate_successful_payment_order,
 )
 from .postgres_migrations import run_postgres_migrations
@@ -821,6 +828,14 @@ class PostgresDietBotStore:
     ) -> PaymentSuccessfulPaymentResult:
         return apply_successful_payment_core(self, successful_payment, now=now)
 
+    def apply_payment_reversal(
+        self,
+        reversal: PaymentReversalInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentReversalResult:
+        return apply_payment_reversal_core(self, reversal, now=now)
+
     def apply_successful_payment_transaction(
         self,
         successful_payment: PaymentSuccessfulPaymentInput,
@@ -836,6 +851,22 @@ class PostgresDietBotStore:
                     successful_payment,
                     order_id=order_id,
                     nonce=nonce,
+                    now=now,
+                )
+
+    def apply_payment_reversal_transaction(
+        self,
+        reversal: PaymentReversalInput,
+        *,
+        charge_aliases: tuple[str, ...],
+        now: datetime,
+    ) -> PaymentReversalResult:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._apply_payment_reversal_transaction_cur(
+                    cur,
+                    reversal,
+                    charge_aliases=charge_aliases,
                     now=now,
                 )
 
@@ -1045,12 +1076,173 @@ class PostgresDietBotStore:
             charge_aliases=charge_aliases,
         )
 
+    def _apply_payment_reversal_transaction_cur(
+        self,
+        cur: Any,
+        reversal: PaymentReversalInput,
+        *,
+        charge_aliases: tuple[str, ...],
+        now: datetime,
+    ) -> PaymentReversalResult:
+        duplicate_charges = self._load_processed_provider_charges_cur(
+            cur,
+            provider=reversal.provider,
+            charge_aliases=charge_aliases,
+            event_type=reversal.event_type,
+        )
+        duplicate_charge = next(iter(duplicate_charges.values()), None)
+        if duplicate_charge is not None:
+            order = self._select_payment_order_for_update_cur(cur, duplicate_charge.order_id)
+            event = build_payment_reversal_event(
+                reversal,
+                code=PaymentReversalCode.DUPLICATE,
+                event_status=PaymentEventStatus.DUPLICATE,
+                order=order,
+                original_charge=duplicate_charge,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentReversalResult(
+                processed=False,
+                code=PaymentReversalCode.DUPLICATE,
+                order=order,
+                event=event,
+                duplicate=True,
+                charge_aliases=charge_aliases,
+            )
+
+        original_charges = self._load_processed_provider_charges_cur(
+            cur,
+            provider=reversal.provider,
+            charge_aliases=charge_aliases,
+            event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        )
+        original_charge = next(iter(original_charges.values()), None)
+        if original_charge is None:
+            event = build_payment_reversal_event(
+                reversal,
+                code=PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND,
+                event_status=PaymentEventStatus.PENDING_RECONCILIATION,
+                reason=PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND.value,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentReversalResult(
+                processed=False,
+                code=PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND,
+                event=event,
+                charge_aliases=charge_aliases,
+                message="Original successful payment was not found.",
+            )
+
+        order = self._select_payment_order_for_update_cur(cur, original_charge.order_id)
+        if order is None:
+            event = build_payment_reversal_event(
+                reversal,
+                code=PaymentReversalCode.ORIGINAL_ORDER_NOT_FOUND,
+                event_status=PaymentEventStatus.PENDING_RECONCILIATION,
+                original_charge=original_charge,
+                reason=PaymentReversalCode.ORIGINAL_ORDER_NOT_FOUND.value,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentReversalResult(
+                processed=False,
+                code=PaymentReversalCode.ORIGINAL_ORDER_NOT_FOUND,
+                event=event,
+                charge_aliases=charge_aliases,
+                message="Original payment order was not found.",
+            )
+
+        validation_code = validate_payment_reversal_order(reversal, order)
+        if validation_code is not None:
+            event = build_payment_reversal_event(
+                reversal,
+                code=validation_code,
+                event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+                order=order,
+                original_charge=original_charge,
+                reason=validation_code.value,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentReversalResult(
+                processed=False,
+                code=validation_code,
+                order=order,
+                event=event,
+                charge_aliases=charge_aliases,
+                message="Payment reversal did not match the original order.",
+            )
+
+        reserved, duplicate_charge = self._reserve_reversal_processed_charges_cur(
+            cur,
+            reversal,
+            order,
+            charge_aliases=charge_aliases,
+            now=now,
+        )
+        if duplicate_charge is not None:
+            self._delete_reserved_processed_charges_cur(cur, reserved, order.order_id)
+            event = build_payment_reversal_event(
+                reversal,
+                code=PaymentReversalCode.DUPLICATE,
+                event_status=PaymentEventStatus.DUPLICATE,
+                order=order,
+                original_charge=duplicate_charge,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentReversalResult(
+                processed=False,
+                code=PaymentReversalCode.DUPLICATE,
+                order=order,
+                event=event,
+                duplicate=True,
+                charge_aliases=charge_aliases,
+            )
+
+        entitlement = self._select_entitlement_for_update_cur(cur, order.user_id)
+        application = apply_payment_reversal_entitlement(
+            entitlement,
+            order,
+            reversal,
+            now=now,
+        )
+        event_status = (
+            PaymentEventStatus.PROCESSED
+            if application.processed
+            else PaymentEventStatus.IGNORED_NON_TERMINAL
+        )
+        event = build_payment_reversal_event(
+            reversal,
+            code=application.code,
+            event_status=event_status,
+            order=order,
+            original_charge=original_charge,
+            reason=application.reason,
+            now=now,
+        )
+        self._insert_payment_event_cur(cur, event)
+        if application.save_entitlement:
+            self._update_entitlement_cur(cur, order.user_id, entitlement)
+            self._insert_entitlement_snapshot_cur(cur, order.user_id, entitlement)
+        return PaymentReversalResult(
+            processed=application.processed,
+            code=application.code,
+            order=order,
+            event=event,
+            charge_aliases=charge_aliases,
+            message=None if application.processed else application.reason,
+        )
+
     def _load_processed_provider_charges_cur(
         self,
         cur: Any,
         *,
         provider: PaymentProvider,
         charge_aliases: tuple[str, ...],
+        event_type: PaymentEventType = PaymentEventType.SUCCESSFUL_PAYMENT,
     ) -> dict[str, ProcessedProviderCharge]:
         if not charge_aliases:
             return {}
@@ -1065,7 +1257,7 @@ class PostgresDietBotStore:
             """,
             (
                 provider.value,
-                PaymentEventType.SUCCESSFUL_PAYMENT.value,
+                event_type.value,
                 list(charge_aliases),
             ),
         )
@@ -1073,6 +1265,72 @@ class PostgresDietBotStore:
             str(row["charge_id"]): _row_to_processed_provider_charge(row)
             for row in cur.fetchall()
         }
+
+    def _select_payment_order_for_update_cur(
+        self,
+        cur: Any,
+        order_id: str | None,
+    ) -> PaymentOrder | None:
+        if order_id is None:
+            return None
+        cur.execute(
+            "SELECT * FROM payment_orders WHERE order_id = %s FOR UPDATE",
+            (order_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_payment_order(row) if row is not None else None
+
+    def _reserve_reversal_processed_charges_cur(
+        self,
+        cur: Any,
+        reversal: PaymentReversalInput,
+        order: PaymentOrder,
+        *,
+        charge_aliases: tuple[str, ...],
+        now: datetime,
+    ) -> tuple[list[ProcessedProviderCharge], ProcessedProviderCharge | None]:
+        reserved: list[ProcessedProviderCharge] = []
+        for charge_alias in charge_aliases:
+            charge = ProcessedProviderCharge(
+                provider=reversal.provider,
+                charge_id=charge_alias,
+                telegram_charge_id=reversal.telegram_charge_id,
+                provider_charge_id=reversal.provider_charge_id,
+                order_id=order.order_id,
+                event_type=reversal.event_type,
+                user_id=order.user_id,
+                product=order.product,
+                created_at=now,
+            )
+            stored_charge, inserted = self._insert_processed_provider_charge_cur(cur, charge)
+            if inserted:
+                reserved.append(stored_charge)
+                continue
+            return reserved, stored_charge
+        return reserved, None
+
+    def _delete_reserved_processed_charges_cur(
+        self,
+        cur: Any,
+        reserved: list[ProcessedProviderCharge],
+        order_id: str,
+    ) -> None:
+        for charge in reserved:
+            cur.execute(
+                """
+                DELETE FROM processed_provider_charges
+                WHERE provider = %s
+                  AND charge_id = %s
+                  AND event_type = %s
+                  AND order_id = %s
+                """,
+                (
+                    charge.provider.value,
+                    charge.charge_id,
+                    charge.event_type.value,
+                    order_id,
+                ),
+            )
 
     def _insert_payment_event_cur(self, cur: Any, event: PaymentEvent) -> PaymentEvent:
         cur.execute(

@@ -10,6 +10,8 @@ from .payments import (
     PaymentOrderCreationResult,
     PaymentProduct,
     PaymentProvider,
+    PaymentReversalInput,
+    PaymentReversalResult,
     PaymentSuccessfulPaymentInput,
     PaymentSuccessfulPaymentResult,
 )
@@ -90,5 +92,11 @@ class DietBotStore(Protocol):
         *,
         now: datetime | None = None,
     ) -> PaymentSuccessfulPaymentResult: ...
+    def apply_payment_reversal(
+        self,
+        reversal: PaymentReversalInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentReversalResult: ...
     def record_support_state(self, state: SupportState) -> None: ...
     def load_support_state(self, user_id: int) -> SupportState | None: ...

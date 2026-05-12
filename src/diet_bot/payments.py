@@ -107,6 +107,18 @@ class PaymentSuccessfulPaymentCode(StrEnum):
     CHARGE_ALIAS_CONFLICT = "charge_alias_conflict"
 
 
+class PaymentReversalCode(StrEnum):
+    PROCESSED = "processed"
+    DUPLICATE = "duplicate"
+    CHARGE_ID_MISSING = "charge_id_missing"
+    ORIGINAL_PAYMENT_NOT_FOUND = "original_payment_not_found"
+    ORIGINAL_ORDER_NOT_FOUND = "original_order_not_found"
+    AMOUNT_MISMATCH = "amount_mismatch"
+    CURRENCY_MISMATCH = "currency_mismatch"
+    EXTRA_ALREADY_CONSUMED = "extra_already_consumed"
+    UNSUPPORTED_PRODUCT_FOR_EVENT = "unsupported_product_for_event"
+
+
 PROVIDER_CURRENCIES: Mapping[PaymentProvider, PaymentCurrency] = {
     PaymentProvider.TELEGRAM_STARS: PaymentCurrency.XTR,
     PaymentProvider.YOOKASSA: PaymentCurrency.RUB,
@@ -118,6 +130,14 @@ EXTRA_PAYMENT_PRODUCTS = frozenset(
     {
         PaymentProduct.EXTRA_ONE_DAY,
         PaymentProduct.EXTRA_WEEKLY_PDF,
+    }
+)
+
+PAYMENT_REVERSAL_EVENT_TYPES = frozenset(
+    {
+        PaymentEventType.REFUND,
+        PaymentEventType.CHARGEBACK,
+        PaymentEventType.CANCEL_SUBSCRIPTION,
     }
 )
 
@@ -423,6 +443,50 @@ class PaymentSuccessfulPaymentResult:
         object.__setattr__(self, "code", PaymentSuccessfulPaymentCode(self.code))
 
 
+@dataclass(frozen=True)
+class PaymentReversalInput:
+    event_type: PaymentEventType | str
+    provider: PaymentProvider | str
+    telegram_charge_id: str | None = None
+    provider_charge_id: str | None = None
+    amount: int | None = None
+    currency: PaymentCurrency | str | None = None
+    reason: str | None = None
+    status: str | None = None
+    raw_payload: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        event_type = PaymentEventType(self.event_type)
+        if event_type not in PAYMENT_REVERSAL_EVENT_TYPES:
+            raise ValueError("payment reversal event type must be refund, chargeback, or cancel_subscription")
+        object.__setattr__(self, "event_type", event_type)
+        object.__setattr__(self, "provider", PaymentProvider(self.provider))
+        if self.currency is not None:
+            object.__setattr__(self, "currency", PaymentCurrency(self.currency))
+        if self.amount is not None and self.amount < 0:
+            raise ValueError("payment reversal amount must be non-negative")
+        for field_name in ("telegram_charge_id", "provider_charge_id"):
+            charge_id = getattr(self, field_name)
+            if charge_id is None:
+                continue
+            text_charge_id = str(charge_id).strip()
+            object.__setattr__(self, field_name, text_charge_id or None)
+
+
+@dataclass(frozen=True)
+class PaymentReversalResult:
+    processed: bool
+    code: PaymentReversalCode | str
+    order: PaymentOrder | None = None
+    event: PaymentEvent | None = None
+    duplicate: bool = False
+    charge_aliases: tuple[str, ...] = ()
+    message: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", PaymentReversalCode(self.code))
+
+
 class PaymentSuccessfulPaymentRepository(Protocol):
     def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
     def get_entitlement(self, user_id: int) -> Entitlement: ...
@@ -447,6 +511,26 @@ class PaymentSuccessfulPaymentRepository(Protocol):
         order_id: str,
         paid_at: datetime,
     ) -> PaymentOrder | None: ...
+
+
+class PaymentReversalRepository(Protocol):
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
+    def get_entitlement(self, user_id: int) -> Entitlement: ...
+    def save_entitlement(self, user_id: int, entitlement: Entitlement) -> None: ...
+    def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent: ...
+
+    def find_processed_provider_charge(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType,
+    ) -> ProcessedProviderCharge | None: ...
+
+    def insert_processed_provider_charge(
+        self,
+        charge: ProcessedProviderCharge,
+    ) -> ProcessedProviderCharge: ...
 
 
 def encode_payment_order_payload(order_id: str, nonce: str) -> str:
@@ -770,6 +854,113 @@ def apply_successful_payment_entitlement(
     raise ValueError("unsupported successful payment product")
 
 
+def apply_payment_reversal(
+    repository: PaymentReversalRepository,
+    reversal: PaymentReversalInput,
+    *,
+    now: datetime | None = None,
+) -> PaymentReversalResult:
+    current_time = _normalize_datetime(now)
+    charge_aliases = payment_reversal_charge_aliases(reversal)
+    if not charge_aliases:
+        event = build_payment_reversal_event(
+            reversal,
+            code=PaymentReversalCode.CHARGE_ID_MISSING,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            reason=PaymentReversalCode.CHARGE_ID_MISSING.value,
+            now=current_time,
+        )
+        _insert_payment_event_if_supported(repository, event)
+        return PaymentReversalResult(
+            processed=False,
+            code=PaymentReversalCode.CHARGE_ID_MISSING,
+            event=event,
+            message="Payment reversal charge id is missing.",
+        )
+
+    transactional_applier = getattr(repository, "apply_payment_reversal_transaction", None)
+    if callable(transactional_applier):
+        return transactional_applier(
+            reversal,
+            charge_aliases=charge_aliases,
+            now=current_time,
+        )
+
+    return _apply_payment_reversal_generic(
+        repository,
+        reversal,
+        charge_aliases=charge_aliases,
+        now=current_time,
+    )
+
+
+def payment_reversal_charge_aliases(reversal: PaymentReversalInput) -> tuple[str, ...]:
+    aliases: list[str] = []
+    for charge_id in (reversal.telegram_charge_id, reversal.provider_charge_id):
+        text = str(charge_id or "").strip()
+        if text and text not in aliases:
+            aliases.append(text)
+    return tuple(aliases)
+
+
+def payment_reversal_canonical_charge_id(reversal: PaymentReversalInput) -> str | None:
+    aliases = payment_reversal_charge_aliases(reversal)
+    return aliases[0] if aliases else None
+
+
+def build_payment_reversal_event(
+    reversal: PaymentReversalInput,
+    *,
+    code: PaymentReversalCode,
+    event_status: PaymentEventStatus,
+    now: datetime,
+    order: PaymentOrder | None = None,
+    order_id: str | None = None,
+    original_charge: ProcessedProviderCharge | None = None,
+    reason: str | None = None,
+) -> PaymentEvent:
+    event_order_id = order.order_id if order is not None else order_id
+    if event_order_id is None and original_charge is not None:
+        event_order_id = original_charge.order_id
+    event_product = order.product if order is not None else None
+    if event_product is None and original_charge is not None:
+        event_product = original_charge.product
+    event_user_id = order.user_id if order is not None else None
+    if event_user_id is None and original_charge is not None:
+        event_user_id = original_charge.user_id
+    return PaymentEvent(
+        event_id=_payment_event_id(),
+        event_type=reversal.event_type,
+        provider=reversal.provider,
+        order_id=event_order_id,
+        charge_id=payment_reversal_canonical_charge_id(reversal),
+        telegram_charge_id=reversal.telegram_charge_id,
+        provider_charge_id=reversal.provider_charge_id,
+        user_id=event_user_id,
+        delivery_chat_id=order.delivery_chat_id if order is not None else None,
+        product=event_product,
+        amount=reversal.amount if reversal.amount is not None else (
+            order.amount if order is not None else None
+        ),
+        currency=reversal.currency if reversal.currency is not None else (
+            order.currency if order is not None else None
+        ),
+        status=event_status,
+        reason=reason,
+        raw_payload_redacted=_payment_reversal_redacted_payload(
+            reversal,
+            code=code,
+            order_id=event_order_id,
+        ),
+        created_at=now,
+        processed_at=now if event_status in {
+            PaymentEventStatus.PROCESSED,
+            PaymentEventStatus.DUPLICATE,
+            PaymentEventStatus.IGNORED_NON_TERMINAL,
+        } else None,
+    )
+
+
 def get_payment_product_invoice_metadata(
     provider: PaymentProvider | str,
     product: PaymentProduct | str,
@@ -1084,21 +1275,330 @@ def _process_successful_payment_generic(
     )
 
 
+def _apply_payment_reversal_generic(
+    repository: PaymentReversalRepository,
+    reversal: PaymentReversalInput,
+    *,
+    charge_aliases: tuple[str, ...],
+    now: datetime,
+) -> PaymentReversalResult:
+    duplicate_charge = _first_processed_charge(
+        _load_processed_charges(
+            repository,
+            reversal.provider,
+            charge_aliases,
+            reversal.event_type,
+        ).values()
+    )
+    if duplicate_charge is not None:
+        order = (
+            repository.load_payment_order(duplicate_charge.order_id)
+            if duplicate_charge.order_id is not None
+            else None
+        )
+        event = build_payment_reversal_event(
+            reversal,
+            code=PaymentReversalCode.DUPLICATE,
+            event_status=PaymentEventStatus.DUPLICATE,
+            order=order,
+            original_charge=duplicate_charge,
+            now=now,
+        )
+        repository.insert_payment_event(event)
+        return PaymentReversalResult(
+            processed=False,
+            code=PaymentReversalCode.DUPLICATE,
+            order=order,
+            event=event,
+            duplicate=True,
+            charge_aliases=charge_aliases,
+        )
+
+    original_charge = _first_processed_charge(
+        _load_processed_charges(
+            repository,
+            reversal.provider,
+            charge_aliases,
+            PaymentEventType.SUCCESSFUL_PAYMENT,
+        ).values()
+    )
+    if original_charge is None:
+        event = build_payment_reversal_event(
+            reversal,
+            code=PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND,
+            event_status=PaymentEventStatus.PENDING_RECONCILIATION,
+            reason=PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND.value,
+            now=now,
+        )
+        repository.insert_payment_event(event)
+        return PaymentReversalResult(
+            processed=False,
+            code=PaymentReversalCode.ORIGINAL_PAYMENT_NOT_FOUND,
+            event=event,
+            charge_aliases=charge_aliases,
+            message="Original successful payment was not found.",
+        )
+
+    order = (
+        repository.load_payment_order(original_charge.order_id)
+        if original_charge.order_id is not None
+        else None
+    )
+    if order is None:
+        event = build_payment_reversal_event(
+            reversal,
+            code=PaymentReversalCode.ORIGINAL_ORDER_NOT_FOUND,
+            event_status=PaymentEventStatus.PENDING_RECONCILIATION,
+            original_charge=original_charge,
+            reason=PaymentReversalCode.ORIGINAL_ORDER_NOT_FOUND.value,
+            now=now,
+        )
+        repository.insert_payment_event(event)
+        return PaymentReversalResult(
+            processed=False,
+            code=PaymentReversalCode.ORIGINAL_ORDER_NOT_FOUND,
+            event=event,
+            charge_aliases=charge_aliases,
+            message="Original payment order was not found.",
+        )
+
+    validation_code = _validate_reversal_against_order(reversal, order)
+    if validation_code is not None:
+        event = build_payment_reversal_event(
+            reversal,
+            code=validation_code,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            order=order,
+            original_charge=original_charge,
+            reason=validation_code.value,
+            now=now,
+        )
+        repository.insert_payment_event(event)
+        return PaymentReversalResult(
+            processed=False,
+            code=validation_code,
+            order=order,
+            event=event,
+            charge_aliases=charge_aliases,
+            message="Payment reversal did not match the original order.",
+        )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    application = apply_payment_reversal_entitlement(
+        entitlement,
+        order,
+        reversal,
+        now=now,
+    )
+    event_status = (
+        PaymentEventStatus.PROCESSED
+        if application.processed
+        else PaymentEventStatus.IGNORED_NON_TERMINAL
+    )
+    event = build_payment_reversal_event(
+        reversal,
+        code=application.code,
+        event_status=event_status,
+        order=order,
+        original_charge=original_charge,
+        reason=application.reason,
+        now=now,
+    )
+    repository.insert_payment_event(event)
+    _insert_reversal_processed_charges(
+        repository,
+        reversal,
+        order,
+        charge_aliases=charge_aliases,
+        now=now,
+    )
+    if application.save_entitlement:
+        repository.save_entitlement(order.user_id, entitlement)
+    return PaymentReversalResult(
+        processed=application.processed,
+        code=application.code,
+        order=order,
+        event=event,
+        charge_aliases=charge_aliases,
+        message=None if application.processed else application.reason,
+    )
+
+
+@dataclass(frozen=True)
+class _PaymentReversalEntitlementApplication:
+    processed: bool
+    code: PaymentReversalCode
+    reason: str | None = None
+    save_entitlement: bool = False
+
+
+def apply_payment_reversal_entitlement(
+    entitlement: Entitlement,
+    order: PaymentOrder,
+    reversal: PaymentReversalInput,
+    *,
+    now: datetime,
+) -> _PaymentReversalEntitlementApplication:
+    entitlement.expire_if_needed(now)
+    if reversal.event_type == PaymentEventType.CANCEL_SUBSCRIPTION:
+        if order.product == PaymentProduct.SUBSCRIPTION_MONTH:
+            return _PaymentReversalEntitlementApplication(
+                True,
+                PaymentReversalCode.PROCESSED,
+            )
+        return _PaymentReversalEntitlementApplication(
+            False,
+            PaymentReversalCode.UNSUPPORTED_PRODUCT_FOR_EVENT,
+            PaymentReversalCode.UNSUPPORTED_PRODUCT_FOR_EVENT.value,
+        )
+
+    if order.product == PaymentProduct.SUBSCRIPTION_MONTH:
+        return _apply_subscription_payment_reversal_entitlement(
+            entitlement,
+            order,
+            now=now,
+        )
+    if order.product == PaymentProduct.EXTRA_ONE_DAY:
+        if entitlement.extra_one_day_remaining <= 0:
+            return _PaymentReversalEntitlementApplication(
+                False,
+                PaymentReversalCode.EXTRA_ALREADY_CONSUMED,
+                PaymentReversalCode.EXTRA_ALREADY_CONSUMED.value,
+            )
+        entitlement.extra_one_day_remaining -= 1
+        return _PaymentReversalEntitlementApplication(
+            True,
+            PaymentReversalCode.PROCESSED,
+            save_entitlement=True,
+        )
+    if order.product == PaymentProduct.EXTRA_WEEKLY_PDF:
+        if entitlement.extra_weekly_pdf_remaining <= 0:
+            return _PaymentReversalEntitlementApplication(
+                False,
+                PaymentReversalCode.EXTRA_ALREADY_CONSUMED,
+                PaymentReversalCode.EXTRA_ALREADY_CONSUMED.value,
+            )
+        entitlement.extra_weekly_pdf_remaining -= 1
+        return _PaymentReversalEntitlementApplication(
+            True,
+            PaymentReversalCode.PROCESSED,
+            save_entitlement=True,
+        )
+    return _PaymentReversalEntitlementApplication(
+        False,
+        PaymentReversalCode.UNSUPPORTED_PRODUCT_FOR_EVENT,
+        PaymentReversalCode.UNSUPPORTED_PRODUCT_FOR_EVENT.value,
+    )
+
+
+def _apply_subscription_payment_reversal_entitlement(
+    entitlement: Entitlement,
+    order: PaymentOrder,
+    *,
+    now: datetime,
+) -> _PaymentReversalEntitlementApplication:
+    original_period_start = _normalize_datetime(order.paid_at or order.created_at)
+    current_period_start = _parse_payment_datetime(entitlement.subscription_period_start)
+    if (
+        current_period_start is None
+        or abs((current_period_start - original_period_start).total_seconds()) > 1
+    ):
+        return _PaymentReversalEntitlementApplication(
+            True,
+            PaymentReversalCode.PROCESSED,
+            "paid_period_not_current",
+        )
+
+    entitlement.subscription_period_end = _format_payment_datetime(now)
+    entitlement.monthly_one_day_remaining = 0
+    entitlement.monthly_weekly_pdf_remaining = 0
+    return _PaymentReversalEntitlementApplication(
+        True,
+        PaymentReversalCode.PROCESSED,
+        save_entitlement=True,
+    )
+
+
 def _load_existing_processed_charges(
     repository: PaymentSuccessfulPaymentRepository,
     provider: PaymentProvider,
     charge_aliases: tuple[str, ...],
+) -> dict[str, ProcessedProviderCharge]:
+    return _load_processed_charges(
+        repository,
+        provider,
+        charge_aliases,
+        PaymentEventType.SUCCESSFUL_PAYMENT,
+    )
+
+
+def _load_processed_charges(
+    repository: PaymentSuccessfulPaymentRepository | PaymentReversalRepository,
+    provider: PaymentProvider,
+    charge_aliases: tuple[str, ...],
+    event_type: PaymentEventType,
 ) -> dict[str, ProcessedProviderCharge]:
     existing: dict[str, ProcessedProviderCharge] = {}
     for charge_alias in charge_aliases:
         processed = repository.find_processed_provider_charge(
             provider=provider,
             charge_id=charge_alias,
-            event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+            event_type=event_type,
         )
         if processed is not None:
             existing[charge_alias] = processed
     return existing
+
+
+def _first_processed_charge(
+    processed_charges: object,
+) -> ProcessedProviderCharge | None:
+    for processed in processed_charges:
+        if isinstance(processed, ProcessedProviderCharge):
+            return processed
+    return None
+
+
+def _validate_reversal_against_order(
+    reversal: PaymentReversalInput,
+    order: PaymentOrder,
+) -> PaymentReversalCode | None:
+    return validate_payment_reversal_order(reversal, order)
+
+
+def validate_payment_reversal_order(
+    reversal: PaymentReversalInput,
+    order: PaymentOrder,
+) -> PaymentReversalCode | None:
+    if reversal.amount is not None and reversal.amount != order.amount:
+        return PaymentReversalCode.AMOUNT_MISMATCH
+    if reversal.currency is not None and reversal.currency != order.currency:
+        return PaymentReversalCode.CURRENCY_MISMATCH
+    return None
+
+
+def _insert_reversal_processed_charges(
+    repository: PaymentReversalRepository,
+    reversal: PaymentReversalInput,
+    order: PaymentOrder,
+    *,
+    charge_aliases: tuple[str, ...],
+    now: datetime,
+) -> None:
+    for charge_alias in charge_aliases:
+        repository.insert_processed_provider_charge(
+            ProcessedProviderCharge(
+                provider=reversal.provider,
+                charge_id=charge_alias,
+                telegram_charge_id=reversal.telegram_charge_id,
+                provider_charge_id=reversal.provider_charge_id,
+                order_id=order.order_id,
+                event_type=reversal.event_type,
+                user_id=order.user_id,
+                product=order.product,
+                created_at=now,
+            )
+        )
 
 
 def _validate_order_against_invoice_catalog(
@@ -1194,6 +1694,30 @@ def _successful_payment_redacted_payload(
         "has_provider_charge_id": bool(successful_payment.provider_charge_id),
         "raw_payload": redact_payment_payload(dict(successful_payment.raw_payload or {})),
     }
+
+
+def _payment_reversal_redacted_payload(
+    reversal: PaymentReversalInput,
+    *,
+    code: PaymentReversalCode,
+    order_id: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "event_type": reversal.event_type.value,
+        "status_code": code.value,
+        "order_id": order_id,
+        "provider": reversal.provider.value,
+        "amount": reversal.amount,
+        "currency": reversal.currency.value if reversal.currency is not None else None,
+        "has_telegram_charge_id": bool(reversal.telegram_charge_id),
+        "has_provider_charge_id": bool(reversal.provider_charge_id),
+        "raw_payload": redact_payment_payload(dict(reversal.raw_payload or {})),
+    }
+    if reversal.reason is not None:
+        payload["reason"] = redact_payment_payload(reversal.reason)
+    if reversal.status is not None:
+        payload["provider_status"] = redact_payment_payload(reversal.status)
+    return payload
 
 
 def _insert_payment_event_if_supported(
@@ -1304,6 +1828,19 @@ def _format_kopecks_as_rub(amount: int) -> str:
     return f"{amount / 100:.2f}"
 
 
+def _format_payment_datetime(value: datetime) -> str:
+    return _normalize_datetime(value).isoformat()
+
+
+def _parse_payment_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return _normalize_datetime(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+
+
 def _normalize_datetime(value: datetime | None) -> datetime:
     if value is None:
         return datetime.now(UTC)
@@ -1325,6 +1862,7 @@ __all__ = [
     "PAYMENT_ORDER_PAYLOAD_PREFIX",
     "PAYMENT_ORDER_TTL_SECONDS",
     "PAYMENT_PRODUCTS",
+    "PAYMENT_REVERSAL_EVENT_TYPES",
     "PROVIDER_CURRENCIES",
     "TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS",
     "PaymentCurrency",
@@ -1344,16 +1882,23 @@ __all__ = [
     "PaymentProduct",
     "PaymentProductInvoiceMetadata",
     "PaymentProvider",
+    "PaymentReversalCode",
+    "PaymentReversalInput",
+    "PaymentReversalRepository",
+    "PaymentReversalResult",
     "PaymentSuccessfulPaymentCode",
     "PaymentSuccessfulPaymentInput",
     "PaymentSuccessfulPaymentRepository",
     "PaymentSuccessfulPaymentResult",
     "ProcessedProviderCharge",
     "REDACTED_PAYMENT_VALUE",
+    "apply_payment_reversal",
+    "apply_payment_reversal_entitlement",
     "apply_successful_payment",
     "apply_successful_payment_entitlement",
     "build_payment_invoice_metadata",
     "build_payment_invoice_payload",
+    "build_payment_reversal_event",
     "build_successful_payment_event",
     "create_or_reuse_pending_payment_order",
     "decode_payment_order_payload",
@@ -1361,9 +1906,12 @@ __all__ = [
     "get_payment_product_invoice_metadata",
     "is_active_pending_payment_order",
     "redact_payment_payload",
+    "payment_reversal_canonical_charge_id",
+    "payment_reversal_charge_aliases",
     "successful_payment_canonical_charge_id",
     "successful_payment_charge_aliases",
     "validate_successful_payment_order",
+    "validate_payment_reversal_order",
     "validate_payment_pre_checkout",
     "validate_payment_invoice_payload",
 ]
