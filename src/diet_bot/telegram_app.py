@@ -48,10 +48,8 @@ from .domain import (
 )
 from .presentation import (
     format_calculation_summary,
-    format_daily_totals,
     format_meal_card,
     format_plan_messages,
-    format_week_shopping_list,
 )
 from .pdf_renderer import build_week_plan_pdf
 from .promo_codes import PromoCodeActivation, activate_promo_code
@@ -192,7 +190,8 @@ WEEK_PDF_STATUS_FRAMES = (
 )
 WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
-WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
+WEEK_PDF_FAILURE_TEXT = "PDF не удалось подготовить или отправить. Попробуйте позже."
+TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_BATCH_TOTAL_UNITS = 6
 DEFAULT_BATCH_SERVING_UNITS = 2
 DEFAULT_BATCH_SERVINGS = DEFAULT_BATCH_TOTAL_UNITS // DEFAULT_BATCH_SERVING_UNITS
@@ -1067,6 +1066,7 @@ async def _send_week_plan(
 
         try:
             pdf_data, pdf_filename = await asyncio.to_thread(_build_week_pdf_payload, plans, plan_dates)
+            _validate_week_pdf_payload_size(pdf_data, pdf_filename)
             await _stop_week_pdf_status(status_task)
             await _edit_week_pdf_status(status_message, WEEK_PDF_UPLOAD_TEXT)
             await _send_week_pdf_document(
@@ -1077,10 +1077,8 @@ async def _send_week_plan(
             )
         except Exception:
             await _stop_week_pdf_status(status_task)
-            await _edit_week_pdf_status(status_message, WEEK_PDF_FALLBACK_TEXT)
-            await message.answer("Не удалось создать PDF-файл, отправляю рацион текстом.")
-            await _send_week_plan_as_text(message, plans, plan_dates, status_text=status_text)
-            return True
+            await _edit_week_pdf_status(status_message, WEEK_PDF_FAILURE_TEXT)
+            return False
 
         await _edit_week_pdf_status(status_message, WEEK_PDF_DONE_TEXT)
 
@@ -1120,6 +1118,15 @@ def _build_week_pdf_payload(
             pdf_path.unlink()
 
 
+def _validate_week_pdf_payload_size(pdf_data: bytes, pdf_filename: str) -> None:
+    if len(pdf_data) <= TELEGRAM_DOCUMENT_MAX_BYTES:
+        return
+    raise ValueError(
+        f"Weekly PDF {pdf_filename!r} is {len(pdf_data)} bytes; "
+        f"Telegram document limit is {TELEGRAM_DOCUMENT_MAX_BYTES} bytes."
+    )
+
+
 async def _animate_week_pdf_status(message: Message, status_message: Message) -> None:
     frame_index = 0
     while True:
@@ -1147,26 +1154,6 @@ async def _stop_week_pdf_status(status_task: asyncio.Task) -> None:
     status_task.cancel()
     with suppress(asyncio.CancelledError):
         await status_task
-
-
-async def _send_week_plan_as_text(
-    message: Message,
-    plans: Sequence[MealPlan],
-    plan_dates: Sequence[date],
-    *,
-    status_text: str | None = None,
-) -> None:
-    for day_index, (plan_result, plan_date) in enumerate(zip(plans, plan_dates), start=1):
-        await _send_text_chunks(message, _format_week_day_header(day_index, plan_date))
-        for meal in plan_result.meals:
-            await _send_meal_card(message, meal)
-        await _send_text_chunks(message, format_daily_totals(plan_result))
-        _remember_recipes(message.chat.id, plan_result)
-
-    shopping_list = format_week_shopping_list(plans)
-    if status_text:
-        shopping_list = f"{shopping_list}\n\n{status_text}"
-    await _send_text_chunks(message, shopping_list, _after_plan_keyboard(message.chat.id))
 
 
 def _build_week_plans(

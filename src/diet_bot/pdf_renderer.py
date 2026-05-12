@@ -53,6 +53,8 @@ TEXT_COLOR = colors.HexColor("#243126")
 MUTED_COLOR = colors.HexColor("#66736A")
 LINE_COLOR = colors.HexColor("#D9E5D5")
 EMOJI_RE = re.compile("[\U0001f300-\U0001faff\u2600-\u27bf\ufe0f]")
+LONG_TOKEN_MAX_CHARS = 48
+LONG_TOKEN_RE = re.compile(r"\S{" + str(LONG_TOKEN_MAX_CHARS + 1) + r",}")
 
 
 def build_week_plan_pdf(
@@ -89,6 +91,7 @@ def render_week_plan_pdf(
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    remove_output_on_error = not output.exists()
     base_font, bold_font, emoji_font = _register_fonts()
     styles = _build_styles(base_font, bold_font, emoji_font)
     doc = SimpleDocTemplate(
@@ -102,7 +105,13 @@ def render_week_plan_pdf(
         author="FoodBalance",
     )
     story = _build_story(plans, plan_dates, styles, doc.width)
-    doc.build(story, onFirstPage=_footer(base_font), onLaterPages=_footer(base_font))
+    try:
+        doc.build(story, onFirstPage=_footer(base_font), onLaterPages=_footer(base_font))
+    except Exception:
+        if remove_output_on_error:
+            with suppress(OSError):
+                output.unlink()
+        raise
     return output
 
 
@@ -982,6 +991,7 @@ def _emoji_p(text: str, style: ParagraphStyle) -> Paragraph:
 
 def _html(text: str, strip_emoji: bool = True) -> str:
     cleaned = _clean_text(text) if strip_emoji else _clean_basic_text(text)
+    cleaned = _soft_wrap_long_tokens(cleaned)
     return escape(cleaned, quote=False).replace("\n", "<br/>")
 
 
@@ -999,6 +1009,17 @@ def _clean_basic_text(text: str) -> str:
         .replace("\u2014", "-")
         .replace("\u00a0", " ")
     ).strip()
+
+
+def _soft_wrap_long_tokens(text: str) -> str:
+    def wrap(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return " ".join(
+            token[index : index + LONG_TOKEN_MAX_CHARS]
+            for index in range(0, len(token), LONG_TOKEN_MAX_CHARS)
+        )
+
+    return LONG_TOKEN_RE.sub(wrap, text)
 
 
 def _footer(base_font: str):

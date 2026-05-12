@@ -11,7 +11,7 @@ from pypdf import PdfReader
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult
-from diet_bot.pdf_renderer import _clean_text, render_week_plan_pdf, resolve_local_meal_image_path
+from diet_bot.pdf_renderer import _clean_text, _html, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
 
@@ -89,6 +89,34 @@ def test_week_pdf_ignores_missing_meal_photo(
 
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 1_000
+
+
+def test_week_pdf_html_soft_wraps_long_unbroken_tokens() -> None:
+    html = _html("TOKEN" + "A" * 160)
+
+    assert max(len(token) for token in html.split()) <= 48
+
+
+def test_week_pdf_removes_partial_output_when_render_fails(monkeypatch, tmp_path: Path, sample_week_dates) -> None:
+    class FailingDoc:
+        width = 120
+
+        def __init__(self, path, **_kwargs) -> None:
+            self.path = Path(path)
+
+        def build(self, *_args, **_kwargs) -> None:
+            self.path.write_bytes(b"%PDF-1.4\npartial")
+            raise RuntimeError("render failed")
+
+    recipe = built_in_recipes()[0]
+    plan = _plan_for_recipe(recipe)
+    pdf_path = tmp_path / "partial.pdf"
+    monkeypatch.setattr("diet_bot.pdf_renderer.SimpleDocTemplate", FailingDoc)
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        render_week_plan_pdf((plan,), (sample_week_dates[0],), pdf_path)
+
+    assert not pdf_path.exists()
 
 
 def test_week_pdf_contains_fixed_soup_recipe_to_the_end(tmp_path: Path, sample_week_dates) -> None:

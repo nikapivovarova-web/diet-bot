@@ -844,6 +844,16 @@ class FakeMessage:
         self.documents.append(kwargs)
 
 
+class FailingDocumentMessage(FakeMessage):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.document_attempts = []
+
+    async def answer_document(self, **kwargs) -> None:
+        self.document_attempts.append(kwargs)
+        raise RuntimeError("telegram send failed")
+
+
 class FakeCallback:
     def __init__(self, data: str, message: FakeMessage) -> None:
         self.data = data
@@ -900,6 +910,77 @@ def profile_with(**kwargs) -> UserProfile:
     }
     data.update(kwargs)
     return UserProfile(**data)
+
+
+def _telegram_week_plan_fixture() -> tuple[MealPlan, ...]:
+    food = Food(
+        id="weekly_sentinel_food",
+        name="Weekly Plan Ingredient Sentinel",
+        category="test",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100}),
+    )
+    meal = Meal(
+        "Weekly Plan Text Sentinel",
+        (FoodPortion(food, 100),),
+        "Cook the weekly text sentinel.",
+        recipe_id="weekly_sentinel_recipe",
+        recipe_key="weekly:sentinel",
+    )
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector({"energy_kcal": 2000}),
+        calorie_bounds=(1800, 2200),
+        macro_bounds={},
+    )
+    plan = MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+    return (plan,) * 7
+
+
+def _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes: bytes | None = b"%PDF-1.4\n%test\n%%EOF\n") -> Path:
+    pdf_path = tmp_path / "week.pdf"
+    plans = _telegram_week_plan_fixture()
+
+    def fake_build_week_plans(*_args, **_kwargs):
+        return plans
+
+    def fake_build_week_plan_pdf(_plans, _plan_dates):
+        if pdf_bytes is None:
+            raise RuntimeError("pdf failed")
+        pdf_path.write_bytes(pdf_bytes)
+        return pdf_path
+
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "_build_week_plans", fake_build_week_plans)
+    monkeypatch.setattr(telegram_app, "build_week_plan_pdf", fake_build_week_plan_pdf)
+    monkeypatch.setattr(
+        telegram_app,
+        "_week_plan_dates",
+        lambda today=None: tuple(date(2026, 5, day) for day in range(8, 15)),
+    )
+    return pdf_path
+
+
+def _sent_text(message: FakeMessage) -> str:
+    return "\n".join(text for text, _ in message.texts)
+
+
+def _assert_weekly_text_fallback_not_sent(message: FakeMessage) -> None:
+    sent_text = _sent_text(message)
+
+    assert "Weekly Plan Text Sentinel" not in sent_text
+    assert "Weekly Plan Ingredient Sentinel" not in sent_text
+
+
+def _clear_week_plan_state(chat_id: int) -> None:
+    PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+    PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+    RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+    RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
 
 
 def _save_active_subscription(
@@ -1073,21 +1154,12 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
 @pytest.mark.anyio
 async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
     chat_id = 92_001
-    pdf_path = tmp_path / "week.pdf"
-
-    def fake_build_week_plan_pdf(plans, plan_dates):
-        assert len(plans) == 7
-        assert len(plan_dates) == 7
-        pdf_path.write_bytes(b"%PDF-1.4\n%test\n%%EOF\n")
-        return pdf_path
-
-    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
-    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
-    monkeypatch.setattr(telegram_app, "build_week_plan_pdf", fake_build_week_plan_pdf)
+    pdf_path = _patch_fast_week_plan(monkeypatch, tmp_path)
     message = FakeMessage(chat_id)
     try:
-        await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(message, profile_with())
 
+        assert sent is True
         assert len(message.documents) == 1
         document = message.documents[0]["document"]
         assert isinstance(document, BufferedInputFile)
@@ -1099,40 +1171,82 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
         assert message.edits
         assert message.edits[-1][0] == "Готово. PDF отправлен ниже."
         assert message.bot.chat_actions
-        assert not any("День 1" in text for text, _ in message.texts[1:])
+        _assert_weekly_text_fallback_not_sent(message)
     finally:
-        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
-        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
-        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
-        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        _clear_week_plan_state(chat_id)
 
 
 @pytest.mark.anyio
-async def test_week_plan_falls_back_to_text_when_pdf_fails(monkeypatch, tmp_path) -> None:
+async def test_week_plan_render_failure_does_not_send_text_fallback(monkeypatch, tmp_path) -> None:
     chat_id = 92_002
-
-    def failing_build_week_plan_pdf(plans, plan_dates):
-        raise RuntimeError("pdf failed")
-
-    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
-    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
-    monkeypatch.setattr(telegram_app, "build_week_plan_pdf", failing_build_week_plan_pdf)
+    _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes=None)
     message = FakeMessage(chat_id)
     try:
-        await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(message, profile_with())
 
-        sent_text = "\n".join(text for text, _ in message.texts)
+        assert sent is False
         assert message.documents == []
         assert message.edits
-        assert message.edits[-1][0] == "PDF не удалось собрать. Отправляю рацион текстом."
-        assert "PDF" in sent_text
-        assert "День 1" in sent_text
-        assert "Общий список покупок" in sent_text
+        assert "PDF" in message.edits[-1][0]
+        _assert_weekly_text_fallback_not_sent(message)
     finally:
-        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
-        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
-        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
-        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        _clear_week_plan_state(chat_id)
+
+
+@pytest.mark.anyio
+async def test_week_plan_oversize_pdf_does_not_send_text_fallback(monkeypatch, tmp_path) -> None:
+    chat_id = 92_003
+    _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes=b"oversized pdf payload")
+    monkeypatch.setattr(telegram_app, "TELEGRAM_DOCUMENT_MAX_BYTES", 5)
+    message = FakeMessage(chat_id)
+    try:
+        sent = await _send_week_plan(message, profile_with())
+
+        assert sent is False
+        assert message.documents == []
+        assert message.edits
+        assert "PDF" in message.edits[-1][0]
+        _assert_weekly_text_fallback_not_sent(message)
+    finally:
+        _clear_week_plan_state(chat_id)
+
+
+@pytest.mark.anyio
+async def test_week_plan_document_send_failure_does_not_send_text_fallback(monkeypatch, tmp_path) -> None:
+    chat_id = 92_004
+    _patch_fast_week_plan(monkeypatch, tmp_path)
+    message = FailingDocumentMessage(chat_id)
+    try:
+        sent = await _send_week_plan(message, profile_with())
+
+        assert sent is False
+        assert len(message.document_attempts) == 1
+        assert message.documents == []
+        assert message.edits
+        assert "PDF" in message.edits[-1][0]
+        _assert_weekly_text_fallback_not_sent(message)
+    finally:
+        _clear_week_plan_state(chat_id)
+
+
+@pytest.mark.anyio
+async def test_week_plan_with_access_refunds_limit_when_pdf_not_delivered(monkeypatch, tmp_path) -> None:
+    chat_id = 92_005
+    subscriptions_path = tmp_path / "subscriptions.json"
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+
+    async def fake_send_week_plan(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+    message = FakeMessage(chat_id)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+    entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+
+    assert sent is False
+    assert entitlement.monthly_weekly_pdf_remaining == 1
 
 
 @pytest.mark.anyio
