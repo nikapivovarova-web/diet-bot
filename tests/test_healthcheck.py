@@ -80,3 +80,47 @@ def test_healthcheck_does_not_import_telegram_or_postgres(monkeypatch) -> None:
     assert healthcheck.run_healthcheck(environ={}) == []
     assert "aiogram" not in sys.modules
     assert "psycopg" not in sys.modules
+
+
+def test_healthcheck_strict_requires_postgres_in_production(monkeypatch) -> None:
+    checked: list[tuple[str, int, int]] = []
+
+    class FakePostgresStore:
+        def __init__(
+            self,
+            dsn: str,
+            *,
+            statement_timeout_ms: int,
+            lock_timeout_ms: int,
+            **_kwargs: object,
+        ) -> None:
+            checked.append((dsn, statement_timeout_ms, lock_timeout_ms))
+
+        def healthcheck(self) -> None:
+            checked.append(("healthcheck", 0, 0))
+
+    monkeypatch.setattr(healthcheck, "PostgresDietBotStore", FakePostgresStore)
+
+    missing_errors = healthcheck.run_healthcheck(
+        strict=True,
+        environ={
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_TOKEN": "prod-token",
+        },
+    )
+    assert any("DIET_BOT_DATABASE_URL" in error for error in missing_errors)
+
+    errors = healthcheck.run_healthcheck(
+        strict=True,
+        environ={
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@localhost:5432/diet_bot",
+        },
+    )
+
+    assert errors == []
+    assert checked == [
+        ("postgresql://diet_bot@localhost:5432/diet_bot", 5000, 1000),
+        ("healthcheck", 0, 0),
+    ]

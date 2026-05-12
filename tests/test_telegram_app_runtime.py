@@ -199,3 +199,82 @@ async def test_run_bot_rejects_blank_token_before_creating_bot(monkeypatch) -> N
         await telegram_app.run_bot()
 
     assert created_tokens == []
+
+
+@pytest.mark.anyio
+async def test_run_bot_initializes_store_before_polling_when_database_url_exists(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeStore:
+        def __init__(self, dsn: str, **_kwargs: object) -> None:
+            events.append(f"store:{dsn}")
+
+        def initialize(self) -> None:
+            events.append("store.initialize")
+
+    class FakeBot:
+        def __init__(self, token: str) -> None:
+            events.append(f"bot:{token}")
+
+    class FakeDispatcher:
+        async def start_polling(self, bot: FakeBot) -> None:
+            events.append("polling")
+
+    async def fake_set_bot_commands(bot: FakeBot) -> None:
+        events.append("commands")
+
+    monkeypatch.setenv("DIET_BOT_ENV", "development")
+    monkeypatch.setenv("DIET_BOT_TOKEN", "local-token")
+    monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://diet_bot@localhost:5432/diet_bot")
+    monkeypatch.delenv("DIET_BOT_ALLOW_JSON_STORAGE", raising=False)
+    monkeypatch.setattr(telegram_app, "PostgresDietBotStore", FakeStore)
+    monkeypatch.setattr(telegram_app, "Bot", FakeBot)
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+    monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_bot_commands)
+
+    await telegram_app.run_bot()
+
+    assert events == [
+        "store:postgresql://diet_bot@localhost:5432/diet_bot",
+        "store.initialize",
+        "bot:local-token",
+        "commands",
+        "polling",
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("database_url", "expected_error"),
+    [
+        ("", "DIET_BOT_ALLOW_JSON_STORAGE=1"),
+        ("not-a-postgres-url", "DIET_BOT_DATABASE_URL must be a PostgreSQL URL"),
+    ],
+)
+async def test_run_bot_rejects_blank_or_invalid_storage_config_before_creating_bot(
+    monkeypatch,
+    database_url: str,
+    expected_error: str,
+) -> None:
+    created_tokens: list[str] = []
+
+    class UnexpectedBot:
+        def __init__(self, token: str) -> None:
+            created_tokens.append(token)
+            raise AssertionError("Bot must not be constructed with invalid storage config")
+
+    monkeypatch.setenv("DIET_BOT_ENV", "development")
+    monkeypatch.setenv("DIET_BOT_TOKEN", "local-token")
+    if database_url:
+        monkeypatch.setenv("DIET_BOT_DATABASE_URL", database_url)
+    else:
+        monkeypatch.delenv("DIET_BOT_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DIET_BOT_ALLOW_JSON_STORAGE", raising=False)
+    monkeypatch.setattr(telegram_app, "Bot", UnexpectedBot)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        await telegram_app.run_bot()
+
+    assert created_tokens == []

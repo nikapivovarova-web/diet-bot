@@ -52,9 +52,13 @@ from .presentation import (
     format_plan_messages,
 )
 from .pdf_renderer import build_week_plan_pdf
+from .json_storage import atomic_write_json, json_storage_transaction
+from .postgres_store import PostgresDietBotStore
 from .promo_codes import PromoCodeActivation, activate_promo_code
 from .questionnaire import QuestionnaireSession, start_session
+from .runtime_config import RuntimeConfig, is_production_environment, load_runtime_config
 from .safety import evaluate_safety
+from .storage import DietBotStore, SupportState
 from .subscriptions import (
     MONTHLY_ONE_DAY_LIMIT,
     MONTHLY_WEEKLY_PDF_LIMIT,
@@ -89,6 +93,7 @@ SUPPORT_REQUEST_CHAT_IDS: set[int] = set()
 PROMO_CODE_REQUEST_CHAT_IDS: set[int] = set()
 router = Router()
 DEFAULT_SUPPORT_CHAT_ID = -5_271_779_108
+_RUNTIME_STORE: DietBotStore | None = None
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
@@ -750,11 +755,65 @@ def create_dispatcher() -> Dispatcher:
     return dispatcher
 
 
+def _storage_backend_mode(config: RuntimeConfig) -> str:
+    if config.database_url:
+        return "postgres"
+    if config.local_json_storage_allowed and not is_production_environment(config.environment):
+        return "json"
+    if is_production_environment(config.environment):
+        raise RuntimeError("Set DIET_BOT_DATABASE_URL for production durable storage.")
+    raise RuntimeError("Set DIET_BOT_DATABASE_URL or DIET_BOT_ALLOW_JSON_STORAGE=1 for local JSON storage.")
+
+
+def _build_store_from_runtime_config(config: RuntimeConfig) -> DietBotStore | None:
+    mode = _storage_backend_mode(config)
+    if mode == "json":
+        return None
+    return PostgresDietBotStore(
+        config.database_url,
+        statement_timeout_ms=config.postgres_statement_timeout_ms,
+        lock_timeout_ms=config.postgres_lock_timeout_ms,
+    )
+
+
+def _initialize_runtime_store(config: RuntimeConfig) -> DietBotStore | None:
+    global _RUNTIME_STORE
+
+    _RUNTIME_STORE = None
+    store = _build_store_from_runtime_config(config)
+    if store is not None:
+        store.initialize()
+    _RUNTIME_STORE = store
+    return store
+
+
+def _apply_runtime_config(config: RuntimeConfig) -> None:
+    global ADMIN_USER_IDS
+    global PROMO_CODES_STATE_FILE
+    global STATE_FILE
+    global SUBSCRIPTIONS_STATE_FILE
+    global SUPPORT_CHAT_ID
+    global TELEGRAM_PROVIDER_TOKEN
+    global TESTER_CHAT_IDS
+
+    STATE_FILE = config.state_file
+    SUBSCRIPTIONS_STATE_FILE = config.subscriptions_state_file
+    PROMO_CODES_STATE_FILE = config.promo_codes_state_file
+    ADMIN_USER_IDS = set(config.admin_user_ids)
+    TESTER_CHAT_IDS = set(config.tester_chat_ids)
+    TELEGRAM_PROVIDER_TOKEN = config.telegram_provider_token
+    SUPPORT_CHAT_ID = config.support_chat_id or DEFAULT_SUPPORT_CHAT_ID
+
+
 async def run_bot() -> None:
-    token = (os.getenv("DIET_BOT_TOKEN") or "").strip() or (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.")
-    bot = Bot(token)
+    global _RUNTIME_STORE
+
+    _RUNTIME_STORE = None
+    config = load_runtime_config()
+    _apply_runtime_config(config)
+    _initialize_runtime_store(config)
+
+    bot = Bot(config.bot_token)
     await _set_bot_commands(bot)
     dispatcher = create_dispatcher()
     await dispatcher.start_polling(bot)
@@ -785,6 +844,7 @@ async def _set_bot_commands(bot: Bot) -> None:
 async def _start_support_request(message: Message) -> None:
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     SUPPORT_REQUEST_CHAT_IDS.add(message.chat.id)
+    _record_support_state(message.chat.id, "open")
     await message.answer(SUPPORT_PROMPT_TEXT)
 
 
@@ -822,6 +882,7 @@ async def _handle_support_request(message: Message, text: str) -> None:
 
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     sent = await _send_support_request_to_admin(message, text)
+    _record_support_state(message.chat.id, "open" if sent else "closed")
     if sent:
         await message.answer(SUPPORT_SENT_TEXT, reply_markup=_main_menu_keyboard(message.chat.id))
         return
@@ -840,6 +901,19 @@ async def _send_support_request_to_admin(message: Message, text: str) -> bool:
     except (AttributeError, TelegramAPIError):
         return False
     return True
+
+
+def _record_support_state(chat_id: int, status: str) -> None:
+    store = _runtime_store()
+    if store is None:
+        return
+    store.record_support_state(
+        SupportState(
+            user_id=chat_id,
+            status=status,
+            last_request_at=datetime.now().astimezone(),
+        ),
+    )
 
 
 def _format_support_admin_message(message: Message, text: str) -> str:
@@ -1454,20 +1528,59 @@ def _remember_recipes(chat_id: int, plan_result) -> None:
     _save_chat_history(chat_id)
 
 
+def _runtime_store() -> DietBotStore | None:
+    return _RUNTIME_STORE
+
+
+def _load_chat_state_for_chat(chat_id: int) -> dict[str, object]:
+    store = _runtime_store()
+    if store is not None:
+        return store.load_chat_state(chat_id)
+    return dict(_load_state().get(str(chat_id), {}))
+
+
+def _save_chat_state_for_chat(chat_id: int, chat_state: dict[str, object]) -> None:
+    store = _runtime_store()
+    if store is not None:
+        store.save_chat_state(chat_id, chat_state)
+        return
+
+    with json_storage_transaction(STATE_FILE):
+        state = _load_state()
+        state[str(chat_id)] = dict(chat_state)
+        _save_state(state)
+
+
+def _load_profile_data_for_chat(chat_id: int) -> dict[str, object] | None:
+    store = _runtime_store()
+    if store is not None:
+        return store.load_profile_data(chat_id)
+    raw_profile = _load_chat_state_for_chat(chat_id).get("profile")
+    return raw_profile if isinstance(raw_profile, dict) else None
+
+
+def _save_profile_data_for_chat(chat_id: int, profile_data: dict[str, object]) -> None:
+    store = _runtime_store()
+    if store is not None:
+        store.save_profile_data(chat_id, profile_data)
+        return
+
+    chat_state = _load_chat_state_for_chat(chat_id)
+    chat_state["profile"] = profile_data
+    _save_chat_state_for_chat(chat_id, chat_state)
+
+
 def _load_chat_history(chat_id: int) -> None:
-    state = _load_state()
-    chat_state = state.get(str(chat_id), {})
+    chat_state = _load_chat_state_for_chat(chat_id)
     RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = list(chat_state.get("recipe_ids", []))[-RECENT_RECIPE_LIMIT:]
     RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = list(chat_state.get("recipe_keys", []))[-RECENT_RECIPE_LIMIT:]
 
 
 def _save_chat_history(chat_id: int) -> None:
-    state = _load_state()
-    chat_state = dict(state.get(str(chat_id), {}))
+    chat_state = _load_chat_state_for_chat(chat_id)
     chat_state["recipe_ids"] = RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:]
     chat_state["recipe_keys"] = RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:]
-    state[str(chat_id)] = chat_state
-    _save_state(state)
+    _save_chat_state_for_chat(chat_id, chat_state)
 
 
 def _profile_for_chat(chat_id: int) -> UserProfile | None:
@@ -1475,9 +1588,8 @@ def _profile_for_chat(chat_id: int) -> UserProfile | None:
     if profile is not None:
         return profile
 
-    state = _load_state()
-    raw_profile = state.get(str(chat_id), {}).get("profile")
-    if not isinstance(raw_profile, dict):
+    raw_profile = _load_profile_data_for_chat(chat_id)
+    if raw_profile is None:
         return None
 
     profile = _profile_from_dict(raw_profile)
@@ -1488,11 +1600,7 @@ def _profile_for_chat(chat_id: int) -> UserProfile | None:
 
 
 def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
-    state = _load_state()
-    chat_state = dict(state.get(str(chat_id), {}))
-    chat_state["profile"] = _profile_to_dict(profile)
-    state[str(chat_id)] = chat_state
-    _save_state(state)
+    _save_profile_data_for_chat(chat_id, _profile_to_dict(profile))
 
 
 def _load_state() -> dict[str, dict[str, object]]:
@@ -1517,8 +1625,7 @@ def _load_state() -> dict[str, dict[str, object]]:
 
 
 def _save_state(state: dict[str, dict[str, object]]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(STATE_FILE, state)
 
 
 def _profile_to_dict(profile: UserProfile) -> dict[str, object]:
@@ -1833,9 +1940,28 @@ def _is_valid_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> bool:
     )
 
 
-def _apply_successful_payment(chat_id: int, payment: SuccessfulPayment) -> PaymentApplication:
+def _load_entitlement_for_chat(chat_id: int) -> Entitlement:
+    store = _runtime_store()
+    if store is not None:
+        return store.get_entitlement(chat_id)
     entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    return entitlements.get(chat_id, Entitlement())
+
+
+def _save_entitlement_for_chat(chat_id: int, entitlement: Entitlement) -> None:
+    store = _runtime_store()
+    if store is not None:
+        store.save_entitlement(chat_id, entitlement)
+        return
+
+    with json_storage_transaction(SUBSCRIPTIONS_STATE_FILE):
+        entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
+        entitlements[chat_id] = entitlement
+        save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+
+
+def _apply_successful_payment(chat_id: int, payment: SuccessfulPayment) -> PaymentApplication:
+    entitlement = _load_entitlement_for_chat(chat_id)
     charge_id = payment.telegram_payment_charge_id
     payload = payment.invoice_payload
 
@@ -1852,8 +1978,7 @@ def _apply_successful_payment(chat_id: int, payment: SuccessfulPayment) -> Payme
     else:
         return PaymentApplication(False)
 
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
     return result
 
 
@@ -1868,16 +1993,19 @@ def _payment_success_text(result: PaymentApplication) -> str:
 
 
 def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeActivation:
-    activation = activate_promo_code(PROMO_CODES_STATE_FILE, promo_code, chat_id)
-    if not activation.activated:
-        return activation
+    store = _runtime_store()
+    if store is not None:
+        return store.activate_promo_code(chat_id, promo_code)
 
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    apply_subscription_payment(entitlement, f"promo:{activation.code}")
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return activation
+    with json_storage_transaction(PROMO_CODES_STATE_FILE, SUBSCRIPTIONS_STATE_FILE):
+        activation = activate_promo_code(PROMO_CODES_STATE_FILE, promo_code, chat_id)
+        if not activation.activated:
+            return activation
+
+        entitlement = _load_entitlement_for_chat(chat_id)
+        apply_subscription_payment(entitlement, f"promo:{activation.code}")
+        _save_entitlement_for_chat(chat_id, entitlement)
+        return activation
 
 
 def _promo_code_success_text(chat_id: int) -> str:
@@ -1938,29 +2066,23 @@ def _grant_test_access_to_chat(
     *,
     now: datetime | None = None,
 ) -> Entitlement:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    entitlement = _load_entitlement_for_chat(chat_id)
     grant_test_access(entitlement, now=now)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
     return entitlement
 
 
 def _revoke_test_access_for_chat(chat_id: int) -> Entitlement:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    entitlement = _load_entitlement_for_chat(chat_id)
     revoke_test_access(entitlement)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
     return entitlement
 
 
 def _set_test_access_mode(chat_id: int, enabled: bool) -> tuple[bool, Entitlement]:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    entitlement = _load_entitlement_for_chat(chat_id)
     changed = set_test_access_enabled(entitlement, enabled)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
     return changed, entitlement
 
 
@@ -2020,8 +2142,8 @@ def _consume_generation_attempt(chat_id: int, ration_kind: RationKind) -> Attemp
     if chat_id in TESTER_CHAT_IDS:
         return AttemptConsumption(True, ration_kind, "test_access")
 
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    store = _runtime_store()
+    entitlement = _load_entitlement_for_chat(chat_id)
     if _is_free_preview_mode(chat_id, entitlement):
         preview_entitlement = replace(
             entitlement,
@@ -2038,29 +2160,33 @@ def _consume_generation_attempt(chat_id: int, ration_kind: RationKind) -> Attemp
         else:
             consumption = consume_one_day_attempt(preview_entitlement)
         entitlement.free_trial_used = preview_entitlement.free_trial_used
+        _save_entitlement_for_chat(chat_id, entitlement)
+        return consumption
+    if store is not None:
+        return store.consume_generation_attempt(chat_id, ration_kind)
     elif ration_kind == "weekly_pdf":
         consumption = consume_weekly_pdf_attempt(entitlement)
     else:
         consumption = consume_one_day_attempt(entitlement)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
     return consumption
 
 
 def _refund_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    store = _runtime_store()
+    if store is not None and getattr(consumption, "_postgres_generation_id", None) is not None:
+        store.refund_generation_attempt(chat_id, consumption)
+        return
+
+    entitlement = _load_entitlement_for_chat(chat_id)
     refund_attempt(entitlement, consumption)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
 
 
 def _entitlement_for_chat(chat_id: int) -> Entitlement:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    entitlement = _load_entitlement_for_chat(chat_id)
     entitlement.expire_if_needed()
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _save_entitlement_for_chat(chat_id, entitlement)
     return entitlement
 
 

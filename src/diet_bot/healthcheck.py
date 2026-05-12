@@ -8,7 +8,8 @@ from importlib import import_module
 from importlib.resources import files
 from pathlib import PurePosixPath
 
-from .runtime_config import RuntimeConfigError, load_runtime_config
+from .postgres_store import PostgresDietBotStore
+from .runtime_config import RuntimeConfig, RuntimeConfigError, is_production_environment, load_runtime_config
 
 
 REQUIRED_DATA_FILES = (
@@ -54,25 +55,42 @@ def check_package_data(required_files: Sequence[str] = REQUIRED_DATA_FILES) -> l
 
 
 def check_runtime_config(environ: Mapping[str, str] | None = None) -> list[str]:
+    _config, errors = _load_checked_runtime_config(environ)
+    return errors
+
+
+def check_postgres(config: RuntimeConfig) -> list[str]:
+    if not config.database_url:
+        if is_production_environment(config.environment):
+            return ["Set DIET_BOT_DATABASE_URL for production durable storage."]
+        return []
+
     try:
-        load_runtime_config(_runtime_config_environ(environ))
-    except RuntimeConfigError as exc:
-        return [str(exc)]
-    except Exception as exc:  # noqa: BLE001 - healthcheck must translate config failures.
-        return [f"Runtime config check failed ({exc.__class__.__name__})."]
+        store = PostgresDietBotStore(
+            config.database_url,
+            statement_timeout_ms=config.postgres_statement_timeout_ms,
+            lock_timeout_ms=config.postgres_lock_timeout_ms,
+        )
+        store.healthcheck()
+    except Exception as exc:  # noqa: BLE001 - healthcheck must translate DB failures.
+        return [f"PostgreSQL healthcheck failed ({exc.__class__.__name__})."]
     return []
 
 
 def run_healthcheck(
     *,
     package_data_only: bool = False,
+    strict: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     errors.extend(check_package_import())
     errors.extend(check_package_data())
     if not package_data_only:
-        errors.extend(check_runtime_config(environ))
+        config, config_errors = _load_checked_runtime_config(environ)
+        errors.extend(config_errors)
+        if strict and config is not None:
+            errors.extend(check_postgres(config))
     return errors
 
 
@@ -83,9 +101,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Only verify package import and bundled data files.",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Verify strict runtime dependencies such as PostgreSQL when configured.",
+    )
     args = parser.parse_args(argv)
 
-    errors = run_healthcheck(package_data_only=args.package_data_only)
+    errors = run_healthcheck(package_data_only=args.package_data_only, strict=args.strict)
     if errors:
         for error in errors:
             print(f"healthcheck: {error}", file=sys.stderr)
@@ -93,6 +116,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("healthcheck: ok")
     return 0
+
+
+def _load_checked_runtime_config(
+    environ: Mapping[str, str] | None,
+) -> tuple[RuntimeConfig | None, list[str]]:
+    try:
+        return load_runtime_config(_runtime_config_environ(environ)), []
+    except RuntimeConfigError as exc:
+        return None, [str(exc)]
+    except Exception as exc:  # noqa: BLE001 - healthcheck must translate config failures.
+        return None, [f"Runtime config check failed ({exc.__class__.__name__})."]
 
 
 def _runtime_config_environ(environ: Mapping[str, str] | None) -> dict[str, str]:
