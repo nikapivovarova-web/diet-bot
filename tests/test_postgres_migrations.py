@@ -13,6 +13,8 @@ REQUIRED_TABLES = {
     "entitlements",
     "entitlement_events",
     "payment_orders",
+    "payment_events",
+    "processed_provider_charges",
     "generation_records",
     "promo_codes",
     "promo_redemptions",
@@ -27,6 +29,9 @@ REQUIRED_INDEXES = {
     "uniq_active_generation_per_user",
     "idx_generation_records_active_heartbeat",
     "idx_payment_orders_user_status",
+    "idx_payment_events_order_created_at",
+    "idx_payment_events_charge",
+    "idx_processed_provider_charges_order",
     "idx_promo_redemptions_user",
     "idx_support_state_status_updated",
 }

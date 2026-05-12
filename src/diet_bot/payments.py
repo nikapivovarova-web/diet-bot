@@ -8,6 +8,14 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Callable, Protocol
 
+from .subscriptions import (
+    Entitlement,
+    PaymentApplication,
+    apply_extra_one_day_payment,
+    apply_extra_weekly_pdf_payment,
+    apply_subscription_payment,
+)
+
 
 PAYMENT_ORDER_PAYLOAD_PREFIX = "diet:order"
 PAYMENT_ORDER_TTL_SECONDS = 15 * 60
@@ -72,6 +80,25 @@ class PaymentPreCheckoutCode(StrEnum):
     CURRENCY_MISMATCH = "currency_mismatch"
     AMOUNT_MISMATCH = "amount_mismatch"
     ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+
+
+class PaymentSuccessfulPaymentCode(StrEnum):
+    PROCESSED = "processed"
+    DUPLICATE = "duplicate"
+    INVALID_PAYLOAD = "invalid_payload"
+    ORDER_NOT_FOUND = "order_not_found"
+    NONCE_MISMATCH = "nonce_mismatch"
+    ORDER_NOT_PENDING = "order_not_pending"
+    ORDER_EXPIRED = "order_expired"
+    USER_MISMATCH = "user_mismatch"
+    DELIVERY_CHAT_MISMATCH = "delivery_chat_mismatch"
+    PROVIDER_MISMATCH = "provider_mismatch"
+    PRODUCT_MISMATCH = "product_mismatch"
+    CURRENCY_MISMATCH = "currency_mismatch"
+    AMOUNT_MISMATCH = "amount_mismatch"
+    ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+    CHARGE_ID_MISSING = "charge_id_missing"
+    CHARGE_ALIAS_CONFLICT = "charge_alias_conflict"
 
 
 PROVIDER_CURRENCIES: Mapping[PaymentProvider, PaymentCurrency] = {
@@ -333,6 +360,77 @@ class PaymentPreCheckoutValidation:
         object.__setattr__(self, "code", PaymentPreCheckoutCode(self.code))
 
 
+@dataclass(frozen=True)
+class PaymentSuccessfulPaymentInput:
+    payload: str
+    provider: PaymentProvider | str
+    telegram_charge_id: str
+    user_id: int
+    delivery_chat_id: int | None
+    currency: PaymentCurrency | str
+    total_amount: int
+    provider_charge_id: str | None = None
+    expected_product: PaymentProduct | str | None = None
+    raw_payload: Mapping[str, Any] | None = None
+    subscription_expiration_timestamp: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", PaymentProvider(self.provider))
+        object.__setattr__(self, "currency", PaymentCurrency(self.currency))
+        if self.expected_product is not None:
+            object.__setattr__(self, "expected_product", PaymentProduct(self.expected_product))
+        if self.total_amount < 0:
+            raise ValueError("successful payment amount must be non-negative")
+        if self.provider_charge_id is not None:
+            text_provider_charge_id = str(self.provider_charge_id).strip()
+            object.__setattr__(
+                self,
+                "provider_charge_id",
+                text_provider_charge_id or None,
+            )
+        object.__setattr__(self, "telegram_charge_id", str(self.telegram_charge_id).strip())
+
+
+@dataclass(frozen=True)
+class PaymentSuccessfulPaymentResult:
+    processed: bool
+    code: PaymentSuccessfulPaymentCode | str
+    order: PaymentOrder | None = None
+    event: PaymentEvent | None = None
+    duplicate: bool = False
+    charge_aliases: tuple[str, ...] = ()
+    message: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", PaymentSuccessfulPaymentCode(self.code))
+
+
+class PaymentSuccessfulPaymentRepository(Protocol):
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
+    def get_entitlement(self, user_id: int) -> Entitlement: ...
+    def save_entitlement(self, user_id: int, entitlement: Entitlement) -> None: ...
+    def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent: ...
+
+    def find_processed_provider_charge(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType,
+    ) -> ProcessedProviderCharge | None: ...
+
+    def insert_processed_provider_charge(
+        self,
+        charge: ProcessedProviderCharge,
+    ) -> ProcessedProviderCharge: ...
+
+    def mark_payment_order_paid(
+        self,
+        order_id: str,
+        paid_at: datetime,
+    ) -> PaymentOrder | None: ...
+
+
 def encode_payment_order_payload(order_id: str, nonce: str) -> str:
     order_id = _validate_payload_token("order_id", order_id)
     nonce = _validate_payload_token("nonce", nonce)
@@ -461,6 +559,191 @@ def validate_payment_pre_checkout(
         order=approved_order,
         requires_active_subscription=requires_active_subscription,
     )
+
+
+def apply_successful_payment(
+    repository: PaymentSuccessfulPaymentRepository,
+    successful_payment: PaymentSuccessfulPaymentInput,
+    *,
+    now: datetime | None = None,
+) -> PaymentSuccessfulPaymentResult:
+    current_time = _normalize_datetime(now)
+    try:
+        order_id, nonce = decode_payment_order_payload(successful_payment.payload)
+    except PaymentPayloadError:
+        event = build_successful_payment_event(
+            successful_payment,
+            code=PaymentSuccessfulPaymentCode.INVALID_PAYLOAD,
+            event_status=PaymentEventStatus.IGNORED_NON_TERMINAL,
+            reason=PaymentSuccessfulPaymentCode.INVALID_PAYLOAD.value,
+            now=current_time,
+        )
+        _insert_payment_event_if_supported(repository, event)
+        return PaymentSuccessfulPaymentResult(
+            processed=False,
+            code=PaymentSuccessfulPaymentCode.INVALID_PAYLOAD,
+            event=event,
+            message="Payment payload could not be verified.",
+        )
+
+    transactional_applier = getattr(repository, "apply_successful_payment_transaction", None)
+    if callable(transactional_applier):
+        return transactional_applier(
+            successful_payment,
+            order_id=order_id,
+            nonce=nonce,
+            now=current_time,
+        )
+
+    return _apply_successful_payment_generic(
+        repository,
+        successful_payment,
+        order_id=order_id,
+        nonce=nonce,
+        now=current_time,
+    )
+
+
+def validate_successful_payment_order(
+    successful_payment: PaymentSuccessfulPaymentInput,
+    order: PaymentOrder,
+    *,
+    nonce: str,
+    now: datetime,
+    existing_processed_charges: Mapping[str, ProcessedProviderCharge] | None = None,
+    has_active_subscription: bool | None = None,
+) -> PaymentSuccessfulPaymentCode:
+    charge_aliases = successful_payment_charge_aliases(successful_payment)
+    if not charge_aliases:
+        return PaymentSuccessfulPaymentCode.CHARGE_ID_MISSING
+    if order.nonce != nonce:
+        return PaymentSuccessfulPaymentCode.NONCE_MISMATCH
+    if order.status not in {PaymentOrderStatus.PENDING, PaymentOrderStatus.PAID}:
+        return PaymentSuccessfulPaymentCode.ORDER_NOT_PENDING
+    if order.user_id != successful_payment.user_id:
+        return PaymentSuccessfulPaymentCode.USER_MISMATCH
+    if order.delivery_chat_id != successful_payment.delivery_chat_id:
+        return PaymentSuccessfulPaymentCode.DELIVERY_CHAT_MISMATCH
+    if order.provider != successful_payment.provider:
+        return PaymentSuccessfulPaymentCode.PROVIDER_MISMATCH
+    if (
+        successful_payment.expected_product is not None
+        and order.product != successful_payment.expected_product
+    ):
+        return PaymentSuccessfulPaymentCode.PRODUCT_MISMATCH
+    if order.currency != successful_payment.currency:
+        return PaymentSuccessfulPaymentCode.CURRENCY_MISMATCH
+    if order.amount != successful_payment.total_amount:
+        return PaymentSuccessfulPaymentCode.AMOUNT_MISMATCH
+
+    catalog_code = _validate_order_against_invoice_catalog(order)
+    if catalog_code is not None:
+        return catalog_code
+
+    existing = existing_processed_charges or {}
+    matching_alias = _matching_processed_charge(order, existing.values())
+    if _conflicting_processed_charge(order, existing.values()) is not None:
+        return PaymentSuccessfulPaymentCode.CHARGE_ALIAS_CONFLICT
+    if order.status == PaymentOrderStatus.PAID:
+        return (
+            PaymentSuccessfulPaymentCode.DUPLICATE
+            if matching_alias is not None
+            else PaymentSuccessfulPaymentCode.ORDER_NOT_PENDING
+        )
+    if matching_alias is not None:
+        return PaymentSuccessfulPaymentCode.DUPLICATE
+
+    if _successful_payment_order_is_expired_without_approval(order, now):
+        return PaymentSuccessfulPaymentCode.ORDER_EXPIRED
+    if (
+        order.product in EXTRA_PAYMENT_PRODUCTS
+        and has_active_subscription is not True
+    ):
+        return PaymentSuccessfulPaymentCode.ACTIVE_SUBSCRIPTION_REQUIRED
+    return PaymentSuccessfulPaymentCode.PROCESSED
+
+
+def successful_payment_charge_aliases(
+    successful_payment: PaymentSuccessfulPaymentInput,
+) -> tuple[str, ...]:
+    aliases: list[str] = []
+    for charge_id in (
+        successful_payment.telegram_charge_id,
+        successful_payment.provider_charge_id,
+    ):
+        text = str(charge_id or "").strip()
+        if text and text not in aliases:
+            aliases.append(text)
+    return tuple(aliases)
+
+
+def successful_payment_canonical_charge_id(
+    successful_payment: PaymentSuccessfulPaymentInput,
+) -> str | None:
+    aliases = successful_payment_charge_aliases(successful_payment)
+    return aliases[0] if aliases else None
+
+
+def build_successful_payment_event(
+    successful_payment: PaymentSuccessfulPaymentInput,
+    *,
+    code: PaymentSuccessfulPaymentCode,
+    event_status: PaymentEventStatus,
+    now: datetime,
+    order: PaymentOrder | None = None,
+    order_id: str | None = None,
+    reason: str | None = None,
+) -> PaymentEvent:
+    return PaymentEvent(
+        event_id=_payment_event_id(),
+        event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        provider=successful_payment.provider,
+        order_id=order.order_id if order is not None else order_id,
+        charge_id=successful_payment_canonical_charge_id(successful_payment),
+        telegram_charge_id=successful_payment.telegram_charge_id or None,
+        provider_charge_id=successful_payment.provider_charge_id,
+        user_id=successful_payment.user_id,
+        delivery_chat_id=successful_payment.delivery_chat_id,
+        product=order.product if order is not None else None,
+        amount=successful_payment.total_amount,
+        currency=successful_payment.currency,
+        status=event_status,
+        reason=reason,
+        raw_payload_redacted=_successful_payment_redacted_payload(
+            successful_payment,
+            code=code,
+            order_id=order.order_id if order is not None else order_id,
+        ),
+        created_at=now,
+        processed_at=now if event_status in {
+            PaymentEventStatus.PROCESSED,
+            PaymentEventStatus.DUPLICATE,
+        } else None,
+    )
+
+
+def apply_successful_payment_entitlement(
+    entitlement: Entitlement,
+    order: PaymentOrder,
+    successful_payment: PaymentSuccessfulPaymentInput,
+    *,
+    charge_id: str,
+    now: datetime,
+) -> PaymentApplication:
+    if order.product == PaymentProduct.SUBSCRIPTION_MONTH:
+        return apply_subscription_payment(
+            entitlement,
+            charge_id,
+            now=now,
+            subscription_expiration_timestamp=(
+                successful_payment.subscription_expiration_timestamp
+            ),
+        )
+    if order.product == PaymentProduct.EXTRA_ONE_DAY:
+        return apply_extra_one_day_payment(entitlement, charge_id)
+    if order.product == PaymentProduct.EXTRA_WEEKLY_PDF:
+        return apply_extra_weekly_pdf_payment(entitlement, charge_id)
+    raise ValueError("unsupported successful payment product")
 
 
 def get_payment_product_invoice_metadata(
@@ -607,6 +890,272 @@ def redact_payment_payload(value: Any) -> Any:
     return value
 
 
+def _apply_successful_payment_generic(
+    repository: PaymentSuccessfulPaymentRepository,
+    successful_payment: PaymentSuccessfulPaymentInput,
+    *,
+    order_id: str,
+    nonce: str,
+    now: datetime,
+) -> PaymentSuccessfulPaymentResult:
+    order = repository.load_payment_order(order_id)
+    charge_aliases = successful_payment_charge_aliases(successful_payment)
+    if order is None:
+        event = build_successful_payment_event(
+            successful_payment,
+            code=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND,
+            event_status=PaymentEventStatus.ORPHAN_RECOVERABLE,
+            order_id=order_id,
+            reason=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND.value,
+            now=now,
+        )
+        repository.insert_payment_event(event)
+        return PaymentSuccessfulPaymentResult(
+            processed=False,
+            code=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND,
+            event=event,
+            charge_aliases=charge_aliases,
+            message="Payment order was not found.",
+        )
+
+    existing_processed_charges = _load_existing_processed_charges(
+        repository,
+        successful_payment.provider,
+        charge_aliases,
+    )
+    entitlement = repository.get_entitlement(order.user_id)
+    code = validate_successful_payment_order(
+        successful_payment,
+        order,
+        nonce=nonce,
+        now=now,
+        existing_processed_charges=existing_processed_charges,
+        has_active_subscription=entitlement.is_subscription_active(now),
+    )
+    if code == PaymentSuccessfulPaymentCode.PROCESSED:
+        canonical_charge_id = successful_payment_canonical_charge_id(successful_payment)
+        if canonical_charge_id is None:
+            code = PaymentSuccessfulPaymentCode.CHARGE_ID_MISSING
+        else:
+            return _process_successful_payment_generic(
+                repository,
+                successful_payment,
+                order,
+                entitlement,
+                charge_aliases=charge_aliases,
+                canonical_charge_id=canonical_charge_id,
+                now=now,
+            )
+
+    event_status = _event_status_for_successful_payment_code(code)
+    event = build_successful_payment_event(
+        successful_payment,
+        code=code,
+        event_status=event_status,
+        order=order,
+        reason=None if code == PaymentSuccessfulPaymentCode.DUPLICATE else code.value,
+        now=now,
+    )
+    repository.insert_payment_event(event)
+    return PaymentSuccessfulPaymentResult(
+        processed=False,
+        code=code,
+        order=order,
+        event=event,
+        duplicate=code == PaymentSuccessfulPaymentCode.DUPLICATE,
+        charge_aliases=charge_aliases,
+        message=None if code == PaymentSuccessfulPaymentCode.DUPLICATE else "Payment was rejected.",
+    )
+
+
+def _process_successful_payment_generic(
+    repository: PaymentSuccessfulPaymentRepository,
+    successful_payment: PaymentSuccessfulPaymentInput,
+    order: PaymentOrder,
+    entitlement: Entitlement,
+    *,
+    charge_aliases: tuple[str, ...],
+    canonical_charge_id: str,
+    now: datetime,
+) -> PaymentSuccessfulPaymentResult:
+    event = build_successful_payment_event(
+        successful_payment,
+        code=PaymentSuccessfulPaymentCode.PROCESSED,
+        event_status=PaymentEventStatus.PROCESSED,
+        order=order,
+        now=now,
+    )
+    repository.insert_payment_event(event)
+    for charge_alias in charge_aliases:
+        repository.insert_processed_provider_charge(
+            ProcessedProviderCharge(
+                provider=successful_payment.provider,
+                charge_id=charge_alias,
+                telegram_charge_id=successful_payment.telegram_charge_id or None,
+                provider_charge_id=successful_payment.provider_charge_id,
+                order_id=order.order_id,
+                event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+                user_id=order.user_id,
+                product=order.product,
+                created_at=now,
+            )
+        )
+    application = apply_successful_payment_entitlement(
+        entitlement,
+        order,
+        successful_payment,
+        charge_id=canonical_charge_id,
+        now=now,
+    )
+    if not application.processed:
+        duplicate_event = build_successful_payment_event(
+            successful_payment,
+            code=PaymentSuccessfulPaymentCode.DUPLICATE,
+            event_status=PaymentEventStatus.DUPLICATE,
+            order=order,
+            now=now,
+        )
+        repository.insert_payment_event(duplicate_event)
+        return PaymentSuccessfulPaymentResult(
+            processed=False,
+            code=PaymentSuccessfulPaymentCode.DUPLICATE,
+            order=order,
+            event=duplicate_event,
+            duplicate=True,
+            charge_aliases=charge_aliases,
+        )
+    repository.save_entitlement(order.user_id, entitlement)
+    paid_order = repository.mark_payment_order_paid(order.order_id, now) or order
+    return PaymentSuccessfulPaymentResult(
+        processed=True,
+        code=PaymentSuccessfulPaymentCode.PROCESSED,
+        order=paid_order,
+        event=event,
+        charge_aliases=charge_aliases,
+    )
+
+
+def _load_existing_processed_charges(
+    repository: PaymentSuccessfulPaymentRepository,
+    provider: PaymentProvider,
+    charge_aliases: tuple[str, ...],
+) -> dict[str, ProcessedProviderCharge]:
+    existing: dict[str, ProcessedProviderCharge] = {}
+    for charge_alias in charge_aliases:
+        processed = repository.find_processed_provider_charge(
+            provider=provider,
+            charge_id=charge_alias,
+            event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        )
+        if processed is not None:
+            existing[charge_alias] = processed
+    return existing
+
+
+def _validate_order_against_invoice_catalog(
+    order: PaymentOrder,
+) -> PaymentSuccessfulPaymentCode | None:
+    try:
+        metadata = get_payment_product_invoice_metadata(order.provider, order.product)
+    except ValueError:
+        return PaymentSuccessfulPaymentCode.PRODUCT_MISMATCH
+    if order.currency != metadata.currency:
+        return PaymentSuccessfulPaymentCode.CURRENCY_MISMATCH
+    if order.amount != metadata.amount:
+        return PaymentSuccessfulPaymentCode.AMOUNT_MISMATCH
+    return None
+
+
+def _matching_processed_charge(
+    order: PaymentOrder,
+    processed_charges: object,
+) -> ProcessedProviderCharge | None:
+    for processed in processed_charges:
+        if not isinstance(processed, ProcessedProviderCharge):
+            continue
+        if (
+            processed.order_id == order.order_id
+            and processed.event_type == PaymentEventType.SUCCESSFUL_PAYMENT
+            and processed.provider == order.provider
+        ):
+            return processed
+    return None
+
+
+def _conflicting_processed_charge(
+    order: PaymentOrder,
+    processed_charges: object,
+) -> ProcessedProviderCharge | None:
+    for processed in processed_charges:
+        if not isinstance(processed, ProcessedProviderCharge):
+            continue
+        if (
+            processed.event_type == PaymentEventType.SUCCESSFUL_PAYMENT
+            and (
+                processed.provider != order.provider
+                or processed.order_id != order.order_id
+            )
+        ):
+            return processed
+    return None
+
+
+def _successful_payment_order_is_expired_without_approval(
+    order: PaymentOrder,
+    now: datetime,
+) -> bool:
+    if order.expires_at is None:
+        return True
+    expires_at = _normalize_datetime(order.expires_at)
+    if expires_at > _normalize_datetime(now):
+        return False
+    approved_at = order.pre_checkout_approved_at
+    if approved_at is None:
+        return True
+    return _normalize_datetime(approved_at) > expires_at
+
+
+def _event_status_for_successful_payment_code(
+    code: PaymentSuccessfulPaymentCode,
+) -> PaymentEventStatus:
+    if code == PaymentSuccessfulPaymentCode.DUPLICATE:
+        return PaymentEventStatus.DUPLICATE
+    if code == PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND:
+        return PaymentEventStatus.ORPHAN_RECOVERABLE
+    if code == PaymentSuccessfulPaymentCode.PROCESSED:
+        return PaymentEventStatus.PROCESSED
+    return PaymentEventStatus.IGNORED_NON_TERMINAL
+
+
+def _successful_payment_redacted_payload(
+    successful_payment: PaymentSuccessfulPaymentInput,
+    *,
+    code: PaymentSuccessfulPaymentCode,
+    order_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "event_type": PaymentEventType.SUCCESSFUL_PAYMENT.value,
+        "status_code": code.value,
+        "order_id": order_id,
+        "invoice_payload": successful_payment.payload,
+        "provider": successful_payment.provider.value,
+        "currency": successful_payment.currency.value,
+        "total_amount": successful_payment.total_amount,
+        "has_telegram_charge_id": bool(successful_payment.telegram_charge_id),
+        "has_provider_charge_id": bool(successful_payment.provider_charge_id),
+        "raw_payload": redact_payment_payload(dict(successful_payment.raw_payload or {})),
+    }
+
+
+def _insert_payment_event_if_supported(
+    repository: object,
+    event: PaymentEvent,
+) -> None:
+    inserter = getattr(repository, "insert_payment_event", None)
+    if callable(inserter):
+        inserter(event)
+
+
 def _validate_payload_token(name: str, value: str) -> str:
     text = str(value).strip()
     if not _PAYLOAD_TOKEN_RE.fullmatch(text):
@@ -702,6 +1251,10 @@ def _default_payment_token() -> str:
     return secrets.token_urlsafe(18)
 
 
+def _payment_event_id() -> str:
+    return f"evt_{secrets.token_urlsafe(18)}"
+
+
 __all__ = [
     "LEGACY_STATIC_PAYMENT_PAYLOADS",
     "PAYMENT_ORDER_PAYLOAD_PREFIX",
@@ -724,16 +1277,26 @@ __all__ = [
     "PaymentProduct",
     "PaymentProductInvoiceMetadata",
     "PaymentProvider",
+    "PaymentSuccessfulPaymentCode",
+    "PaymentSuccessfulPaymentInput",
+    "PaymentSuccessfulPaymentRepository",
+    "PaymentSuccessfulPaymentResult",
     "ProcessedProviderCharge",
     "REDACTED_PAYMENT_VALUE",
+    "apply_successful_payment",
+    "apply_successful_payment_entitlement",
     "build_payment_invoice_metadata",
     "build_payment_invoice_payload",
+    "build_successful_payment_event",
     "create_or_reuse_pending_payment_order",
     "decode_payment_order_payload",
     "encode_payment_order_payload",
     "get_payment_product_invoice_metadata",
     "is_active_pending_payment_order",
     "redact_payment_payload",
+    "successful_payment_canonical_charge_id",
+    "successful_payment_charge_aliases",
+    "validate_successful_payment_order",
     "validate_payment_pre_checkout",
     "validate_payment_invoice_payload",
 ]

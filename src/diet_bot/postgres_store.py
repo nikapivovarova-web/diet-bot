@@ -7,11 +7,24 @@ from typing import Any
 from .payments import (
     PAYMENT_ORDER_TTL_SECONDS,
     PROVIDER_CURRENCIES,
+    PaymentEvent,
+    PaymentEventStatus,
+    PaymentEventType,
     PaymentCurrency,
     PaymentOrder,
     PaymentOrderStatus,
     PaymentProduct,
     PaymentProvider,
+    PaymentSuccessfulPaymentCode,
+    PaymentSuccessfulPaymentInput,
+    PaymentSuccessfulPaymentResult,
+    ProcessedProviderCharge,
+    apply_successful_payment as apply_successful_payment_core,
+    apply_successful_payment_entitlement,
+    build_successful_payment_event,
+    successful_payment_canonical_charge_id,
+    successful_payment_charge_aliases,
+    validate_successful_payment_order,
 )
 from .postgres_migrations import run_postgres_migrations
 from .promo_codes import PromoCodeActivation, PromoCodeRecord, normalize_promo_code
@@ -777,6 +790,396 @@ class PostgresDietBotStore:
                     (order_id,),
                 )
 
+    def apply_successful_payment(
+        self,
+        successful_payment: PaymentSuccessfulPaymentInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentSuccessfulPaymentResult:
+        return apply_successful_payment_core(self, successful_payment, now=now)
+
+    def apply_successful_payment_transaction(
+        self,
+        successful_payment: PaymentSuccessfulPaymentInput,
+        *,
+        order_id: str,
+        nonce: str,
+        now: datetime,
+    ) -> PaymentSuccessfulPaymentResult:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._apply_successful_payment_transaction_cur(
+                    cur,
+                    successful_payment,
+                    order_id=order_id,
+                    nonce=nonce,
+                    now=now,
+                )
+
+    def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._insert_payment_event_cur(cur, event)
+
+    def _apply_successful_payment_transaction_cur(
+        self,
+        cur: Any,
+        successful_payment: PaymentSuccessfulPaymentInput,
+        *,
+        order_id: str,
+        nonce: str,
+        now: datetime,
+    ) -> PaymentSuccessfulPaymentResult:
+        charge_aliases = successful_payment_charge_aliases(successful_payment)
+        cur.execute(
+            "SELECT * FROM payment_orders WHERE order_id = %s FOR UPDATE",
+            (order_id,),
+        )
+        order_row = cur.fetchone()
+        if order_row is None:
+            event = build_successful_payment_event(
+                successful_payment,
+                code=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND,
+                event_status=PaymentEventStatus.ORPHAN_RECOVERABLE,
+                order_id=order_id,
+                reason=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND.value,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentSuccessfulPaymentResult(
+                processed=False,
+                code=PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND,
+                event=event,
+                charge_aliases=charge_aliases,
+                message="Payment order was not found.",
+            )
+
+        order = _row_to_payment_order(order_row)
+        existing_processed_charges = self._load_processed_provider_charges_cur(
+            cur,
+            provider=successful_payment.provider,
+            charge_aliases=charge_aliases,
+        )
+        entitlement = self._select_entitlement_for_update_cur(cur, order.user_id)
+        code = validate_successful_payment_order(
+            successful_payment,
+            order,
+            nonce=nonce,
+            now=now,
+            existing_processed_charges=existing_processed_charges,
+            has_active_subscription=entitlement.is_subscription_active(now),
+        )
+        if code == PaymentSuccessfulPaymentCode.PROCESSED:
+            canonical_charge_id = successful_payment_canonical_charge_id(successful_payment)
+            if canonical_charge_id is None:
+                code = PaymentSuccessfulPaymentCode.CHARGE_ID_MISSING
+            else:
+                return self._process_successful_payment_cur(
+                    cur,
+                    successful_payment,
+                    order,
+                    entitlement,
+                    charge_aliases=charge_aliases,
+                    canonical_charge_id=canonical_charge_id,
+                    now=now,
+                )
+
+        event = build_successful_payment_event(
+            successful_payment,
+            code=code,
+            event_status=_payment_event_status_for_successful_payment_code(code),
+            order=order,
+            reason=None if code == PaymentSuccessfulPaymentCode.DUPLICATE else code.value,
+            now=now,
+        )
+        self._insert_payment_event_cur(cur, event)
+        return PaymentSuccessfulPaymentResult(
+            processed=False,
+            code=code,
+            order=order,
+            event=event,
+            duplicate=code == PaymentSuccessfulPaymentCode.DUPLICATE,
+            charge_aliases=charge_aliases,
+            message=None if code == PaymentSuccessfulPaymentCode.DUPLICATE else "Payment was rejected.",
+        )
+
+    def _process_successful_payment_cur(
+        self,
+        cur: Any,
+        successful_payment: PaymentSuccessfulPaymentInput,
+        order: PaymentOrder,
+        entitlement: Entitlement,
+        *,
+        charge_aliases: tuple[str, ...],
+        canonical_charge_id: str,
+        now: datetime,
+    ) -> PaymentSuccessfulPaymentResult:
+        reserved_charges: list[ProcessedProviderCharge] = []
+        for charge_alias in charge_aliases:
+            charge = ProcessedProviderCharge(
+                provider=successful_payment.provider,
+                charge_id=charge_alias,
+                telegram_charge_id=successful_payment.telegram_charge_id or None,
+                provider_charge_id=successful_payment.provider_charge_id,
+                order_id=order.order_id,
+                event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+                user_id=order.user_id,
+                product=order.product,
+                created_at=now,
+            )
+            stored_charge, inserted = self._insert_processed_provider_charge_cur(cur, charge)
+            if inserted:
+                reserved_charges.append(stored_charge)
+                continue
+
+            for reserved in reserved_charges:
+                cur.execute(
+                    """
+                    DELETE FROM processed_provider_charges
+                    WHERE provider = %s
+                      AND charge_id = %s
+                      AND event_type = %s
+                      AND order_id = %s
+                    """,
+                    (
+                        reserved.provider.value,
+                        reserved.charge_id,
+                        reserved.event_type.value,
+                        order.order_id,
+                    ),
+                )
+
+            duplicate = (
+                stored_charge.order_id == order.order_id
+                and stored_charge.provider == order.provider
+                and stored_charge.event_type == PaymentEventType.SUCCESSFUL_PAYMENT
+            )
+            code = (
+                PaymentSuccessfulPaymentCode.DUPLICATE
+                if duplicate
+                else PaymentSuccessfulPaymentCode.CHARGE_ALIAS_CONFLICT
+            )
+            event = build_successful_payment_event(
+                successful_payment,
+                code=code,
+                event_status=_payment_event_status_for_successful_payment_code(code),
+                order=order,
+                reason=None if duplicate else code.value,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentSuccessfulPaymentResult(
+                processed=False,
+                code=code,
+                order=order,
+                event=event,
+                duplicate=duplicate,
+                charge_aliases=charge_aliases,
+                message=None if duplicate else "Payment was rejected.",
+            )
+
+        application = apply_successful_payment_entitlement(
+            entitlement,
+            order,
+            successful_payment,
+            charge_id=canonical_charge_id,
+            now=now,
+        )
+        if not application.processed:
+            event = build_successful_payment_event(
+                successful_payment,
+                code=PaymentSuccessfulPaymentCode.DUPLICATE,
+                event_status=PaymentEventStatus.DUPLICATE,
+                order=order,
+                now=now,
+            )
+            self._insert_payment_event_cur(cur, event)
+            return PaymentSuccessfulPaymentResult(
+                processed=False,
+                code=PaymentSuccessfulPaymentCode.DUPLICATE,
+                order=order,
+                event=event,
+                duplicate=True,
+                charge_aliases=charge_aliases,
+            )
+
+        event = build_successful_payment_event(
+            successful_payment,
+            code=PaymentSuccessfulPaymentCode.PROCESSED,
+            event_status=PaymentEventStatus.PROCESSED,
+            order=order,
+            now=now,
+        )
+        self._insert_payment_event_cur(cur, event)
+        self._update_entitlement_cur(cur, order.user_id, entitlement)
+        self._insert_entitlement_snapshot_cur(cur, order.user_id, entitlement)
+        paid_order = self._mark_payment_order_paid_cur(cur, order.order_id, now) or order
+        return PaymentSuccessfulPaymentResult(
+            processed=True,
+            code=PaymentSuccessfulPaymentCode.PROCESSED,
+            order=paid_order,
+            event=event,
+            charge_aliases=charge_aliases,
+        )
+
+    def _load_processed_provider_charges_cur(
+        self,
+        cur: Any,
+        *,
+        provider: PaymentProvider,
+        charge_aliases: tuple[str, ...],
+    ) -> dict[str, ProcessedProviderCharge]:
+        if not charge_aliases:
+            return {}
+        cur.execute(
+            """
+            SELECT *
+            FROM processed_provider_charges
+            WHERE provider = %s
+              AND event_type = %s
+              AND charge_id = ANY(%s)
+            FOR UPDATE
+            """,
+            (
+                provider.value,
+                PaymentEventType.SUCCESSFUL_PAYMENT.value,
+                list(charge_aliases),
+            ),
+        )
+        return {
+            str(row["charge_id"]): _row_to_processed_provider_charge(row)
+            for row in cur.fetchall()
+        }
+
+    def _insert_payment_event_cur(self, cur: Any, event: PaymentEvent) -> PaymentEvent:
+        cur.execute(
+            """
+            INSERT INTO payment_events (
+                event_id,
+                event_type,
+                provider,
+                order_id,
+                charge_id,
+                telegram_charge_id,
+                provider_charge_id,
+                user_id,
+                delivery_chat_id,
+                product,
+                amount,
+                currency,
+                status,
+                reason,
+                raw_payload_redacted,
+                created_at,
+                processed_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (
+                event.event_id,
+                event.event_type.value,
+                event.provider.value,
+                event.order_id,
+                event.charge_id,
+                event.telegram_charge_id,
+                event.provider_charge_id,
+                event.user_id,
+                event.delivery_chat_id,
+                event.product.value if event.product is not None else None,
+                event.amount,
+                event.currency.value if event.currency is not None else None,
+                event.status.value,
+                event.reason,
+                _jsonb(event.raw_payload_redacted),
+                _normalize_datetime(event.created_at),
+                (
+                    _normalize_datetime(event.processed_at)
+                    if event.processed_at is not None
+                    else None
+                ),
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not create payment event.")
+        return _row_to_payment_event(row)
+
+    def _insert_processed_provider_charge_cur(
+        self,
+        cur: Any,
+        charge: ProcessedProviderCharge,
+    ) -> tuple[ProcessedProviderCharge, bool]:
+        cur.execute(
+            """
+            INSERT INTO processed_provider_charges (
+                provider,
+                charge_id,
+                telegram_charge_id,
+                provider_charge_id,
+                order_id,
+                event_type,
+                user_id,
+                product,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (provider, charge_id, event_type) DO NOTHING
+            RETURNING *
+            """,
+            (
+                charge.provider.value,
+                charge.charge_id,
+                charge.telegram_charge_id,
+                charge.provider_charge_id,
+                charge.order_id,
+                charge.event_type.value,
+                charge.user_id,
+                charge.product.value if charge.product is not None else None,
+                _normalize_datetime(charge.created_at),
+            ),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            return _row_to_processed_provider_charge(row), True
+
+        cur.execute(
+            """
+            SELECT *
+            FROM processed_provider_charges
+            WHERE provider = %s
+              AND charge_id = %s
+              AND event_type = %s
+            FOR UPDATE
+            """,
+            (charge.provider.value, charge.charge_id, charge.event_type.value),
+        )
+        existing = cur.fetchone()
+        if existing is None:
+            raise RuntimeError("Could not read processed provider charge conflict.")
+        return _row_to_processed_provider_charge(existing), False
+
+    def _mark_payment_order_paid_cur(
+        self,
+        cur: Any,
+        order_id: str,
+        paid_at: datetime,
+    ) -> PaymentOrder | None:
+        cur.execute(
+            """
+            UPDATE payment_orders
+            SET status = 'paid',
+                paid_at = COALESCE(paid_at, %s),
+                updated_at = now()
+            WHERE order_id = %s
+              AND status = 'pending'
+            RETURNING *
+            """,
+            (_normalize_datetime(paid_at), order_id),
+        )
+        row = cur.fetchone()
+        return _row_to_payment_order(row) if row is not None else None
+
     def _find_active_pending_payment_order_cur(
         self,
         cur: Any,
@@ -1378,6 +1781,82 @@ def _row_to_payment_order(row: dict[str, Any]) -> PaymentOrder:
         ),
         updated_at=_normalize_datetime(row["updated_at"]),
     )
+
+
+def _row_to_payment_event(row: dict[str, Any]) -> PaymentEvent:
+    return PaymentEvent(
+        event_id=str(row["event_id"]),
+        event_type=str(row["event_type"]),
+        provider=str(row["provider"]),
+        order_id=str(row["order_id"]) if row.get("order_id") is not None else None,
+        charge_id=str(row["charge_id"]) if row.get("charge_id") is not None else None,
+        telegram_charge_id=(
+            str(row["telegram_charge_id"])
+            if row.get("telegram_charge_id") is not None
+            else None
+        ),
+        provider_charge_id=(
+            str(row["provider_charge_id"])
+            if row.get("provider_charge_id") is not None
+            else None
+        ),
+        user_id=int(row["user_id"]) if row.get("user_id") is not None else None,
+        delivery_chat_id=(
+            int(row["delivery_chat_id"])
+            if row.get("delivery_chat_id") is not None
+            else None
+        ),
+        product=str(row["product"]) if row.get("product") is not None else None,
+        amount=int(row["amount"]) if row.get("amount") is not None else None,
+        currency=str(row["currency"]) if row.get("currency") is not None else None,
+        status=str(row["status"]),
+        reason=str(row["reason"]) if row.get("reason") is not None else None,
+        raw_payload_redacted=(
+            dict(row["raw_payload_redacted"])
+            if isinstance(row.get("raw_payload_redacted"), dict)
+            else {}
+        ),
+        created_at=_normalize_datetime(row["created_at"]),
+        processed_at=(
+            _normalize_datetime(row["processed_at"])
+            if row.get("processed_at") is not None
+            else None
+        ),
+    )
+
+
+def _row_to_processed_provider_charge(row: dict[str, Any]) -> ProcessedProviderCharge:
+    return ProcessedProviderCharge(
+        provider=str(row["provider"]),
+        charge_id=str(row["charge_id"]),
+        telegram_charge_id=(
+            str(row["telegram_charge_id"])
+            if row.get("telegram_charge_id") is not None
+            else None
+        ),
+        provider_charge_id=(
+            str(row["provider_charge_id"])
+            if row.get("provider_charge_id") is not None
+            else None
+        ),
+        order_id=str(row["order_id"]) if row.get("order_id") is not None else None,
+        event_type=str(row["event_type"]),
+        user_id=int(row["user_id"]) if row.get("user_id") is not None else None,
+        product=str(row["product"]) if row.get("product") is not None else None,
+        created_at=_normalize_datetime(row["created_at"]),
+    )
+
+
+def _payment_event_status_for_successful_payment_code(
+    code: PaymentSuccessfulPaymentCode,
+) -> PaymentEventStatus:
+    if code == PaymentSuccessfulPaymentCode.PROCESSED:
+        return PaymentEventStatus.PROCESSED
+    if code == PaymentSuccessfulPaymentCode.DUPLICATE:
+        return PaymentEventStatus.DUPLICATE
+    if code == PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND:
+        return PaymentEventStatus.ORPHAN_RECOVERABLE
+    return PaymentEventStatus.IGNORED_NON_TERMINAL
 
 
 def _plan_and_status(entitlement: Entitlement) -> tuple[str, str]:

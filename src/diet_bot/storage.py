@@ -4,7 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from .payments import PaymentCurrency, PaymentOrder, PaymentProduct, PaymentProvider
+from .payments import (
+    PaymentCurrency,
+    PaymentOrder,
+    PaymentProduct,
+    PaymentProvider,
+    PaymentSuccessfulPaymentInput,
+    PaymentSuccessfulPaymentResult,
+)
 from .promo_codes import PromoCodeActivation, PromoCodeRecord
 from .subscriptions import AttemptConsumption, Entitlement, RationKind
 
@@ -76,5 +83,11 @@ class DietBotStore(Protocol):
         order_id: str,
         approved_at: datetime | None = None,
     ) -> PaymentOrder | None: ...
+    def apply_successful_payment(
+        self,
+        successful_payment: PaymentSuccessfulPaymentInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentSuccessfulPaymentResult: ...
     def record_support_state(self, state: SupportState) -> None: ...
     def load_support_state(self, user_id: int) -> SupportState | None: ...

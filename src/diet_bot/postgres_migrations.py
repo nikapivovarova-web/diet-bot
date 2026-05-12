@@ -233,9 +233,98 @@ PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION = PostgresMigration(
 )
 
 
+PAYMENT_SUCCESS_LEDGER_MIGRATION = PostgresMigration(
+    version="202605130002",
+    description="Add successful payment event and charge idempotency ledger",
+    statements=(
+        """
+        CREATE TABLE IF NOT EXISTS payment_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            order_id TEXT REFERENCES payment_orders(order_id) ON DELETE SET NULL,
+            charge_id TEXT,
+            telegram_charge_id TEXT,
+            provider_charge_id TEXT,
+            user_id BIGINT,
+            delivery_chat_id BIGINT,
+            product TEXT,
+            amount INTEGER,
+            currency TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            raw_payload_redacted JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            processed_at TIMESTAMPTZ,
+            CHECK (event_type IN (
+                'successful_payment',
+                'refund',
+                'chargeback',
+                'cancel_subscription',
+                'unknown'
+            )),
+            CHECK (provider IN ('telegram_stars', 'yookassa')),
+            CHECK (
+                product IS NULL
+                OR product IN ('subscription_month', 'extra_one_day', 'extra_weekly_pdf')
+            ),
+            CHECK (currency IS NULL OR currency IN ('XTR', 'RUB')),
+            CHECK (status IN (
+                'processed',
+                'duplicate',
+                'pending_reconciliation',
+                'orphan_recoverable',
+                'ignored_non_terminal'
+            )),
+            CHECK (amount IS NULL OR amount >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS processed_provider_charges (
+            provider TEXT NOT NULL,
+            charge_id TEXT NOT NULL,
+            telegram_charge_id TEXT,
+            provider_charge_id TEXT,
+            order_id TEXT REFERENCES payment_orders(order_id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            user_id BIGINT,
+            product TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (provider, charge_id, event_type),
+            CHECK (provider IN ('telegram_stars', 'yookassa')),
+            CHECK (event_type IN (
+                'successful_payment',
+                'refund',
+                'chargeback',
+                'cancel_subscription',
+                'unknown'
+            )),
+            CHECK (
+                product IS NULL
+                OR product IN ('subscription_month', 'extra_one_day', 'extra_weekly_pdf')
+            )
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_payment_events_order_created_at
+            ON payment_events(order_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_payment_events_charge
+            ON payment_events(provider, charge_id, event_type)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_processed_provider_charges_order
+            ON processed_provider_charges(order_id, created_at DESC)
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
+    PAYMENT_SUCCESS_LEDGER_MIGRATION,
 )
 
 

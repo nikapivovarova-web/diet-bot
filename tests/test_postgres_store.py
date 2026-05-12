@@ -618,6 +618,84 @@ def test_postgres_payment_order_pre_checkout_approval_round_trips_without_entitl
         _cleanup_users(store, user_id)
 
 
+def test_postgres_successful_payment_applies_order_and_records_charge_aliases() -> None:
+    from diet_bot.payments import PaymentSuccessfulPaymentCode, PaymentSuccessfulPaymentInput
+    from diet_bot.subscriptions import MONTHLY_ONE_DAY_LIMIT, MONTHLY_WEEKLY_PDF_LIMIT
+
+    store = _store()
+    user_id = _unique_user_id()
+    order_id = f"order-{uuid.uuid4().hex}"
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    try:
+        store.create_payment_order(
+            order_id=order_id,
+            nonce="nonce-ok1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            product="subscription_month",
+            provider="yookassa",
+            amount=59_900,
+            currency="RUB",
+            expires_at=now + timedelta(minutes=5),
+        )
+        order = store.load_payment_order(order_id)
+        assert order is not None
+        payment = PaymentSuccessfulPaymentInput(
+            payload=order.payload,
+            provider="yookassa",
+            telegram_charge_id="tg-charge-ru1",
+            provider_charge_id="provider-charge-ru1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            currency="RUB",
+            total_amount=59_900,
+            raw_payload={"email": "buyer@example.com", "invoice_payload": order.payload},
+        )
+
+        result = store.apply_successful_payment(payment, now=now)
+        duplicate = store.apply_successful_payment(payment, now=now + timedelta(seconds=10))
+
+        entitlement = store.get_entitlement(user_id)
+        paid_order = store.load_payment_order(order_id)
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT charge_id
+                    FROM processed_provider_charges
+                    WHERE order_id = %s
+                    ORDER BY charge_id
+                    """,
+                    (order_id,),
+                )
+                charge_ids = [str(row["charge_id"]) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT status, reason, raw_payload_redacted
+                    FROM payment_events
+                    WHERE order_id = %s
+                    ORDER BY created_at, event_id
+                    """,
+                    (order_id,),
+                )
+                events = cur.fetchall()
+
+        assert result.processed is True
+        assert result.code == PaymentSuccessfulPaymentCode.PROCESSED
+        assert duplicate.duplicate is True
+        assert duplicate.code == PaymentSuccessfulPaymentCode.DUPLICATE
+        assert paid_order is not None
+        assert paid_order.status == "paid"
+        assert entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
+        assert entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+        assert charge_ids == ["provider-charge-ru1", "tg-charge-ru1"]
+        assert [event["status"] for event in events] == ["processed", "duplicate"]
+        assert events[0]["reason"] is None
+        assert "buyer@example.com" not in str(events[0]["raw_payload_redacted"])
+    finally:
+        _cleanup_users(store, user_id)
+
+
 def _store(**kwargs: Any):
     from diet_bot.postgres_store import PostgresDietBotStore
 

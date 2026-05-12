@@ -23,7 +23,10 @@ from diet_bot.payments import (
     PaymentProductInvoiceMetadata,
     PaymentProduct,
     PaymentProvider,
+    PaymentSuccessfulPaymentCode,
+    PaymentSuccessfulPaymentInput,
     ProcessedProviderCharge,
+    apply_successful_payment,
     build_payment_invoice_metadata,
     build_payment_invoice_payload,
     create_or_reuse_pending_payment_order,
@@ -768,6 +771,361 @@ def test_payment_order_creation_does_not_mutate_entitlement() -> None:
     assert entitlement.to_dict() == before
 
 
+def test_successful_subscription_payment_marks_order_paid_and_grants_subscription_once() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-charge-sub1"),
+        now=now,
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    paid_order = repository.load_payment_order(order.order_id)
+    assert result.processed is True
+    assert result.code == PaymentSuccessfulPaymentCode.PROCESSED
+    assert result.duplicate is False
+    assert paid_order is not None
+    assert paid_order.status == PaymentOrderStatus.PAID
+    assert paid_order.paid_at == now
+    assert entitlement.is_subscription_active(now)
+    assert entitlement.monthly_one_day_remaining == 5
+    assert entitlement.monthly_weekly_pdf_remaining == 4
+    assert repository.processed_charge_ids() == ["tg-charge-sub1"]
+    assert [event.status for event in repository.payment_events] == [
+        PaymentEventStatus.PROCESSED
+    ]
+
+
+def test_duplicate_same_successful_payment_does_not_grant_twice() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_day1",
+        "nonce_day1",
+        PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.entitlements[order.user_id] = _active_entitlement(now)
+    payment = _successful_payment(
+        order,
+        telegram_charge_id="tg-charge-day1",
+        provider_charge_id="provider-charge-day1",
+    )
+
+    first = apply_successful_payment(repository, payment, now=now)
+    repository.entitlements[order.user_id].extra_one_day_remaining = 0
+    duplicate = apply_successful_payment(repository, payment, now=now + timedelta(seconds=10))
+
+    assert first.processed is True
+    assert duplicate.processed is False
+    assert duplicate.duplicate is True
+    assert duplicate.code == PaymentSuccessfulPaymentCode.DUPLICATE
+    assert repository.entitlements[order.user_id].extra_one_day_remaining == 0
+    assert repository.processed_charge_ids() == [
+        "tg-charge-day1",
+        "provider-charge-day1",
+    ]
+    assert [event.status for event in repository.payment_events] == [
+        PaymentEventStatus.PROCESSED,
+        PaymentEventStatus.DUPLICATE,
+    ]
+
+
+def test_successful_payment_wrong_nonce_is_rejected_without_grant() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            payload="diet:order:order_sub1:nonce_bad1",
+            telegram_charge_id="tg-charge-sub1",
+        ),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == PaymentSuccessfulPaymentCode.NONCE_MISMATCH
+    assert repository.load_payment_order(order.order_id) == order
+    assert repository.get_entitlement(order.user_id) == Entitlement()
+    assert repository.processed_charge_ids() == []
+
+
+def test_successful_payment_missing_order_is_recorded_as_orphan_without_grant() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    repository = InMemoryPaymentLedgerRepository()
+
+    result = apply_successful_payment(
+        repository,
+        PaymentSuccessfulPaymentInput(
+            payload="diet:order:order_missing1:nonce_456",
+            provider=PaymentProvider.TELEGRAM_STARS,
+            telegram_charge_id="tg-charge-orphan",
+            user_id=1001,
+            delivery_chat_id=2002,
+            currency=PaymentCurrency.XTR,
+            total_amount=400,
+        ),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND
+    assert result.order is None
+    assert result.event is not None
+    assert result.event.status == PaymentEventStatus.ORPHAN_RECOVERABLE
+    assert result.event.reason == PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND.value
+    assert repository.entitlements == {}
+    assert repository.processed_charge_ids() == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_code"),
+    [
+        ({"user_id": 9999}, PaymentSuccessfulPaymentCode.USER_MISMATCH),
+        ({"delivery_chat_id": 9999}, PaymentSuccessfulPaymentCode.DELIVERY_CHAT_MISMATCH),
+    ],
+)
+def test_successful_payment_rejects_wrong_user_or_delivery_chat(
+    overrides: dict[str, object],
+    expected_code: PaymentSuccessfulPaymentCode,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-charge-sub1", **overrides),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == expected_code
+    assert repository.get_entitlement(order.user_id) == Entitlement()
+    assert repository.processed_charge_ids() == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_code"),
+    [
+        ({"provider": PaymentProvider.YOOKASSA}, PaymentSuccessfulPaymentCode.PROVIDER_MISMATCH),
+        (
+            {"expected_product": PaymentProduct.EXTRA_ONE_DAY},
+            PaymentSuccessfulPaymentCode.PRODUCT_MISMATCH,
+        ),
+        ({"currency": PaymentCurrency.RUB}, PaymentSuccessfulPaymentCode.CURRENCY_MISMATCH),
+        ({"total_amount": 399}, PaymentSuccessfulPaymentCode.AMOUNT_MISMATCH),
+    ],
+)
+def test_successful_payment_rejects_wrong_provider_product_currency_or_amount(
+    overrides: dict[str, object],
+    expected_code: PaymentSuccessfulPaymentCode,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-charge-sub1", **overrides),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == expected_code
+    assert repository.get_entitlement(order.user_id) == Entitlement()
+    assert repository.processed_charge_ids() == []
+
+
+@pytest.mark.parametrize(
+    ("product", "amount", "field_name"),
+    [
+        (PaymentProduct.EXTRA_ONE_DAY, 35, "extra_one_day_remaining"),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 170, "extra_weekly_pdf_remaining"),
+    ],
+)
+def test_successful_payment_extras_require_active_subscription_at_success_time(
+    product: PaymentProduct,
+    amount: int,
+    field_name: str,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    inactive_order = _payment_order(
+        f"order_{product.value}_inactive",
+        "nonce_inactive",
+        product,
+        amount=amount,
+        expires_at=now + timedelta(minutes=5),
+    )
+    active_order = _payment_order(
+        f"order_{product.value}_active",
+        "nonce_active",
+        product,
+        amount=amount,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([inactive_order, active_order])
+
+    rejected = apply_successful_payment(
+        repository,
+        _successful_payment(inactive_order, telegram_charge_id=f"tg-{product.value}-inactive"),
+        now=now,
+    )
+    repository.entitlements[active_order.user_id] = _active_entitlement(now)
+    accepted = apply_successful_payment(
+        repository,
+        _successful_payment(active_order, telegram_charge_id=f"tg-{product.value}-active"),
+        now=now,
+    )
+
+    assert rejected.processed is False
+    assert rejected.code == PaymentSuccessfulPaymentCode.ACTIVE_SUBSCRIPTION_REQUIRED
+    assert accepted.processed is True
+    assert getattr(repository.entitlements[active_order.user_id], field_name) == 1
+
+
+def test_expired_successful_payment_without_prior_pre_checkout_approval_is_rejected() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_expired1",
+        "nonce_expired1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now - timedelta(seconds=1),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-charge-expired1"),
+        now=now,
+    )
+
+    assert result.processed is False
+    assert result.code == PaymentSuccessfulPaymentCode.ORDER_EXPIRED
+    assert repository.get_entitlement(order.user_id) == Entitlement()
+
+
+def test_expired_successful_payment_with_prior_pre_checkout_approval_is_accepted() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    expires_at = now - timedelta(seconds=1)
+    approved_at = expires_at - timedelta(seconds=10)
+    order = _payment_order(
+        "order_expired1",
+        "nonce_expired1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=expires_at,
+        pre_checkout_approved_at=approved_at,
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-charge-expired1"),
+        now=now,
+    )
+
+    assert result.processed is True
+    assert result.code == PaymentSuccessfulPaymentCode.PROCESSED
+    assert repository.load_payment_order(order.order_id).status == PaymentOrderStatus.PAID
+    assert repository.get_entitlement(order.user_id).is_subscription_active(now)
+
+
+def test_successful_payment_records_telegram_and_provider_charge_aliases() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_ru1",
+        "nonce_ru1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.YOOKASSA,
+        amount=59_900,
+        currency=PaymentCurrency.RUB,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-charge-ru1",
+            provider_charge_id="provider-charge-ru1",
+        ),
+        now=now,
+    )
+
+    assert result.processed is True
+    assert result.charge_aliases == ("tg-charge-ru1", "provider-charge-ru1")
+    assert repository.processed_charge_ids() == [
+        "tg-charge-ru1",
+        "provider-charge-ru1",
+    ]
+
+
+def test_successful_payment_event_raw_payload_is_redacted() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_sub1",
+        "nonce_sub1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-charge-sub1",
+            raw_payload={
+                "email": "buyer@example.com",
+                "phone_number": "+37499123456",
+                "order_info": {"email": "nested@example.com"},
+                "provider_token": "381764678:TEST:very-secret-provider-token",
+                "database_url": "postgresql://diet_bot:secret@localhost:5432/foodbalance",
+                "invoice_payload": order.payload,
+            },
+        ),
+        now=now,
+    )
+
+    assert result.event is not None
+    serialized = json.dumps(result.event.raw_payload_redacted, sort_keys=True)
+    assert "buyer@example.com" not in serialized
+    assert "nested@example.com" not in serialized
+    assert "+37499123456" not in serialized
+    assert "very-secret-provider-token" not in serialized
+    assert "postgresql://diet_bot:secret@localhost:5432/foodbalance" not in serialized
+    assert result.event.raw_payload_redacted["raw_payload"]["email"] == "[REDACTED]"
+    assert result.event.raw_payload_redacted["raw_payload"]["order_info"] == "[REDACTED]"
+
+
 class InMemoryPaymentOrderRepository:
     def __init__(self, orders: list[PaymentOrder] | None = None) -> None:
         self.orders = list(orders or [])
@@ -837,6 +1195,75 @@ class InMemoryPaymentOrderRepository:
             return
 
 
+class InMemoryPaymentLedgerRepository(InMemoryPaymentOrderRepository):
+    def __init__(self, orders: list[PaymentOrder] | None = None) -> None:
+        super().__init__(orders)
+        self.entitlements: dict[int, Entitlement] = {}
+        self.payment_events: list[PaymentEvent] = []
+        self.processed_provider_charges: list[ProcessedProviderCharge] = []
+
+    def get_entitlement(self, user_id: int) -> Entitlement:
+        return self.entitlements.setdefault(user_id, Entitlement())
+
+    def save_entitlement(self, user_id: int, entitlement: Entitlement) -> None:
+        self.entitlements[user_id] = entitlement
+
+    def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent:
+        self.payment_events.append(event)
+        return event
+
+    def find_processed_provider_charge(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType,
+    ) -> ProcessedProviderCharge | None:
+        for processed in self.processed_provider_charges:
+            if (
+                processed.provider == provider
+                and processed.charge_id == charge_id
+                and processed.event_type == event_type
+            ):
+                return processed
+        return None
+
+    def insert_processed_provider_charge(
+        self,
+        charge: ProcessedProviderCharge,
+    ) -> ProcessedProviderCharge:
+        existing = self.find_processed_provider_charge(
+            provider=charge.provider,
+            charge_id=charge.charge_id,
+            event_type=charge.event_type,
+        )
+        if existing is not None:
+            return existing
+        self.processed_provider_charges.append(charge)
+        return charge
+
+    def mark_payment_order_paid(
+        self,
+        order_id: str,
+        paid_at: datetime,
+    ) -> PaymentOrder | None:
+        for index, order in enumerate(self.orders):
+            if order.order_id != order_id:
+                continue
+            updated = replace(
+                order,
+                status=PaymentOrderStatus.PAID,
+                paid_at=paid_at,
+                updated_at=paid_at,
+            )
+            self.orders[index] = updated
+            return updated
+        return None
+
+    def processed_charge_ids(self) -> list[str]:
+        return [charge.charge_id for charge in self.processed_provider_charges]
+
+
 def _payment_order(
     order_id: str,
     nonce: str,
@@ -849,6 +1276,7 @@ def _payment_order(
     user_id: int = 1001,
     delivery_chat_id: int | None = 2002,
     expires_at: datetime | None = None,
+    pre_checkout_approved_at: datetime | None = None,
 ) -> PaymentOrder:
     return PaymentOrder(
         order_id=order_id,
@@ -861,6 +1289,44 @@ def _payment_order(
         currency=currency,
         status=status,
         expires_at=expires_at,
+        pre_checkout_approved_at=pre_checkout_approved_at,
+    )
+
+
+def _successful_payment(
+    order: PaymentOrder,
+    *,
+    payload: str | None = None,
+    provider: PaymentProvider | str | None = None,
+    telegram_charge_id: str = "tg-charge-1",
+    provider_charge_id: str | None = None,
+    user_id: int | None = None,
+    delivery_chat_id: int | None = None,
+    currency: PaymentCurrency | str | None = None,
+    total_amount: int | None = None,
+    expected_product: PaymentProduct | str | None = None,
+    raw_payload: dict[str, object] | None = None,
+) -> PaymentSuccessfulPaymentInput:
+    return PaymentSuccessfulPaymentInput(
+        payload=payload or order.payload,
+        provider=provider or order.provider,
+        telegram_charge_id=telegram_charge_id,
+        provider_charge_id=provider_charge_id,
+        user_id=order.user_id if user_id is None else user_id,
+        delivery_chat_id=order.delivery_chat_id if delivery_chat_id is None else delivery_chat_id,
+        currency=currency or order.currency,
+        total_amount=order.amount if total_amount is None else total_amount,
+        expected_product=expected_product,
+        raw_payload=raw_payload,
+    )
+
+
+def _active_entitlement(now: datetime) -> Entitlement:
+    return Entitlement(
+        subscription_period_start=now.isoformat(),
+        subscription_period_end=(now + timedelta(days=3)).isoformat(),
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=1,
     )
 
 
