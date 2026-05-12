@@ -59,12 +59,34 @@ class PaymentEventStatus(StrEnum):
     IGNORED_NON_TERMINAL = "ignored_non_terminal"
 
 
+class PaymentPreCheckoutCode(StrEnum):
+    APPROVED = "approved"
+    INVALID_PAYLOAD = "invalid_payload"
+    ORDER_NOT_FOUND = "order_not_found"
+    NONCE_MISMATCH = "nonce_mismatch"
+    ORDER_NOT_PENDING = "order_not_pending"
+    ORDER_EXPIRED = "order_expired"
+    USER_MISMATCH = "user_mismatch"
+    PROVIDER_MISMATCH = "provider_mismatch"
+    PRODUCT_MISMATCH = "product_mismatch"
+    CURRENCY_MISMATCH = "currency_mismatch"
+    AMOUNT_MISMATCH = "amount_mismatch"
+    ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+
+
 PROVIDER_CURRENCIES: Mapping[PaymentProvider, PaymentCurrency] = {
     PaymentProvider.TELEGRAM_STARS: PaymentCurrency.XTR,
     PaymentProvider.YOOKASSA: PaymentCurrency.RUB,
 }
 
 PAYMENT_PRODUCTS = frozenset(product.value for product in PaymentProduct)
+
+EXTRA_PAYMENT_PRODUCTS = frozenset(
+    {
+        PaymentProduct.EXTRA_ONE_DAY,
+        PaymentProduct.EXTRA_WEEKLY_PDF,
+    }
+)
 
 LEGACY_STATIC_PAYMENT_PAYLOADS = frozenset(
     {
@@ -242,6 +264,10 @@ class PaymentOrderRepository(Protocol):
     def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder: ...
 
 
+class PaymentPreCheckoutOrderRepository(Protocol):
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
+
+
 @dataclass(frozen=True)
 class PaymentEvent:
     event_id: str
@@ -295,6 +321,18 @@ class ProcessedProviderCharge:
             raise ValueError("processed provider charge requires a charge_id")
 
 
+@dataclass(frozen=True)
+class PaymentPreCheckoutValidation:
+    approved: bool
+    code: PaymentPreCheckoutCode | str
+    order: PaymentOrder | None = None
+    message: str | None = None
+    requires_active_subscription: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", PaymentPreCheckoutCode(self.code))
+
+
 def encode_payment_order_payload(order_id: str, nonce: str) -> str:
     order_id = _validate_payload_token("order_id", order_id)
     nonce = _validate_payload_token("nonce", nonce)
@@ -310,6 +348,119 @@ def validate_payment_invoice_payload(order: PaymentOrder, payload: str) -> tuple
     if order_id != order.order_id or nonce != order.nonce:
         raise PaymentPayloadError("payment payload does not match order nonce")
     return order_id, nonce
+
+
+def validate_payment_pre_checkout(
+    repository: PaymentPreCheckoutOrderRepository,
+    *,
+    payload: str,
+    user_id: int,
+    currency: PaymentCurrency | str,
+    total_amount: int,
+    expected_provider: PaymentProvider | str | None = None,
+    expected_product: PaymentProduct | str | None = None,
+    has_active_subscription: bool | None = None,
+    now: datetime | None = None,
+) -> PaymentPreCheckoutValidation:
+    current_time = _normalize_datetime(now)
+    try:
+        order_id, nonce = decode_payment_order_payload(payload)
+    except PaymentPayloadError:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.INVALID_PAYLOAD,
+            message="Payment could not be verified. Please create a new invoice.",
+        )
+
+    order = repository.load_payment_order(order_id)
+    if order is None:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.ORDER_NOT_FOUND,
+            message="Payment could not be verified. Please create a new invoice.",
+        )
+    if order.nonce != nonce:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.NONCE_MISMATCH,
+            order=order,
+            message="Payment could not be verified. Please create a new invoice.",
+        )
+    if order.status != PaymentOrderStatus.PENDING:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.ORDER_NOT_PENDING,
+            order=order,
+            message="Payment is no longer pending. Please create a new invoice.",
+        )
+    if order.expires_at is None or _normalize_datetime(order.expires_at) <= current_time:
+        _mark_pre_checkout_order_expired(repository, order.order_id)
+        refreshed_order = repository.load_payment_order(order.order_id) or order
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.ORDER_EXPIRED,
+            order=refreshed_order,
+            message="Payment invoice expired. Please create a new invoice.",
+        )
+    if order.user_id != user_id:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.USER_MISMATCH,
+            order=order,
+            message="Payment could not be verified. Please create a new invoice.",
+        )
+
+    if expected_provider is not None:
+        try:
+            expected_provider_value = PaymentProvider(expected_provider)
+        except ValueError:
+            expected_provider_value = None
+        if expected_provider_value != order.provider:
+            return _pre_checkout_rejection(
+                PaymentPreCheckoutCode.PROVIDER_MISMATCH,
+                order=order,
+                message="Payment could not be verified. Please create a new invoice.",
+            )
+
+    if expected_product is not None:
+        try:
+            expected_product_value = PaymentProduct(expected_product)
+        except ValueError:
+            expected_product_value = None
+        if expected_product_value != order.product:
+            return _pre_checkout_rejection(
+                PaymentPreCheckoutCode.PRODUCT_MISMATCH,
+                order=order,
+                message="Payment could not be verified. Please create a new invoice.",
+            )
+
+    try:
+        currency_value = PaymentCurrency(currency)
+    except ValueError:
+        currency_value = None
+    if currency_value != order.currency:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.CURRENCY_MISMATCH,
+            order=order,
+            message="Payment currency changed. Please create a new invoice.",
+        )
+    if total_amount != order.amount:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.AMOUNT_MISMATCH,
+            order=order,
+            message="Payment amount changed. Please create a new invoice.",
+        )
+
+    requires_active_subscription = order.product in EXTRA_PAYMENT_PRODUCTS
+    if requires_active_subscription and has_active_subscription is not True:
+        return _pre_checkout_rejection(
+            PaymentPreCheckoutCode.ACTIVE_SUBSCRIPTION_REQUIRED,
+            order=order,
+            message="Active subscription is required for this extra.",
+            requires_active_subscription=True,
+        )
+
+    approved_order = _record_pre_checkout_approval(repository, order, current_time)
+    return PaymentPreCheckoutValidation(
+        approved=True,
+        code=PaymentPreCheckoutCode.APPROVED,
+        order=approved_order,
+        requires_active_subscription=requires_active_subscription,
+    )
 
 
 def get_payment_product_invoice_metadata(
@@ -478,6 +629,43 @@ def _redact_payment_text(value: str) -> str:
     return _PHONE_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
 
 
+def _pre_checkout_rejection(
+    code: PaymentPreCheckoutCode,
+    *,
+    order: PaymentOrder | None = None,
+    message: str | None = None,
+    requires_active_subscription: bool = False,
+) -> PaymentPreCheckoutValidation:
+    return PaymentPreCheckoutValidation(
+        approved=False,
+        code=code,
+        order=order,
+        message=message,
+        requires_active_subscription=requires_active_subscription,
+    )
+
+
+def _record_pre_checkout_approval(
+    repository: PaymentPreCheckoutOrderRepository,
+    order: PaymentOrder,
+    approved_at: datetime,
+) -> PaymentOrder:
+    recorder = getattr(repository, "record_payment_order_pre_checkout_approved", None)
+    if not callable(recorder):
+        return order
+    recorded = recorder(order.order_id, approved_at)
+    return recorded if isinstance(recorded, PaymentOrder) else order
+
+
+def _mark_pre_checkout_order_expired(
+    repository: PaymentPreCheckoutOrderRepository,
+    order_id: str,
+) -> None:
+    marker = getattr(repository, "mark_payment_order_expired", None)
+    if callable(marker):
+        marker(order_id)
+
+
 def _build_yookassa_provider_data(product: PaymentProduct, amount: int) -> dict[str, Any]:
     return {
         "receipt": {
@@ -530,6 +718,9 @@ __all__ = [
     "PaymentOrderRepository",
     "PaymentOrderStatus",
     "PaymentPayloadError",
+    "PaymentPreCheckoutCode",
+    "PaymentPreCheckoutOrderRepository",
+    "PaymentPreCheckoutValidation",
     "PaymentProduct",
     "PaymentProductInvoiceMetadata",
     "PaymentProvider",
@@ -543,5 +734,6 @@ __all__ = [
     "get_payment_product_invoice_metadata",
     "is_active_pending_payment_order",
     "redact_payment_payload",
+    "validate_payment_pre_checkout",
     "validate_payment_invoice_payload",
 ]

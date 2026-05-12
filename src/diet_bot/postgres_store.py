@@ -729,6 +729,28 @@ class PostgresDietBotStore:
                     (invoice_link, order_id),
                 )
 
+    def record_payment_order_pre_checkout_approved(
+        self,
+        order_id: str,
+        approved_at: datetime | None = None,
+    ) -> PaymentOrder | None:
+        approved_at_value = _normalize_datetime(approved_at)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE payment_orders
+                    SET pre_checkout_approved_at = COALESCE(pre_checkout_approved_at, %s),
+                        updated_at = now()
+                    WHERE order_id = %s
+                      AND status = 'pending'
+                    RETURNING *
+                    """,
+                    (approved_at_value, order_id),
+                )
+                row = cur.fetchone()
+        return _row_to_payment_order(row) if row is not None else None
+
     def mark_payment_order_expired(self, order_id: str) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -810,12 +832,13 @@ class PostgresDietBotStore:
                 currency,
                 status,
                 invoice_link,
+                pre_checkout_approved_at,
                 created_at,
                 expires_at,
                 paid_at,
                 updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -829,6 +852,11 @@ class PostgresDietBotStore:
                 order.currency.value,
                 order.status.value,
                 order.invoice_link,
+                (
+                    _normalize_datetime(order.pre_checkout_approved_at)
+                    if order.pre_checkout_approved_at is not None
+                    else None
+                ),
                 _normalize_datetime(order.created_at),
                 _normalize_datetime(order.expires_at),
                 _normalize_datetime(order.paid_at) if order.paid_at is not None else None,
@@ -1337,6 +1365,11 @@ def _row_to_payment_order(row: dict[str, Any]) -> PaymentOrder:
         status=str(row["status"]),
         invoice_link=(
             str(row["invoice_link"]) if row["invoice_link"] is not None else None
+        ),
+        pre_checkout_approved_at=(
+            _normalize_datetime(row["pre_checkout_approved_at"])
+            if row.get("pre_checkout_approved_at") is not None
+            else None
         ),
         created_at=_normalize_datetime(row["created_at"]),
         expires_at=_normalize_datetime(row["expires_at"]),

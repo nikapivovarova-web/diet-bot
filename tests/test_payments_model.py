@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -17,6 +18,8 @@ from diet_bot.payments import (
     PaymentOrder,
     PaymentOrderStatus,
     PaymentPayloadError,
+    PaymentPreCheckoutCode,
+    PaymentPreCheckoutValidation,
     PaymentProductInvoiceMetadata,
     PaymentProduct,
     PaymentProvider,
@@ -28,6 +31,7 @@ from diet_bot.payments import (
     encode_payment_order_payload,
     get_payment_product_invoice_metadata,
     redact_payment_payload,
+    validate_payment_pre_checkout,
     validate_payment_invoice_payload,
 )
 from diet_bot.subscriptions import Entitlement
@@ -117,6 +121,324 @@ def test_tampered_invoice_payload_nonce_is_rejected_against_order() -> None:
     assert validate_payment_invoice_payload(order, order.payload) == (order.order_id, order.nonce)
     with pytest.raises(PaymentPayloadError):
         validate_payment_invoice_payload(order, tampered_payload)
+
+
+def test_pre_checkout_validation_approves_valid_pending_order_and_records_approval() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        expected_provider=order.provider,
+        expected_product=order.product,
+        now=now,
+    )
+
+    assert isinstance(result, PaymentPreCheckoutValidation)
+    assert result.approved is True
+    assert result.code == PaymentPreCheckoutCode.APPROVED
+    assert result.order is not None
+    assert result.order.pre_checkout_approved_at == now
+    assert repository.pre_checkout_approvals == [("order_123", now)]
+
+
+def test_pre_checkout_validation_rejects_static_legacy_payload_without_recording_approval() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    repository = InMemoryPaymentOrderRepository()
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload="subscription_month",
+        user_id=1001,
+        currency=PaymentCurrency.XTR,
+        total_amount=400,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.INVALID_PAYLOAD
+    assert result.order is None
+    assert repository.pre_checkout_approvals == []
+
+
+def test_pre_checkout_validation_rejects_tampered_nonce_without_recording_approval() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload="diet:order:order_123:nonce_999",
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.NONCE_MISMATCH
+    assert result.order == order
+    assert repository.pre_checkout_approvals == []
+
+
+def test_pre_checkout_validation_rejects_missing_order_without_recording_approval() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    repository = InMemoryPaymentOrderRepository()
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload="diet:order:order_missing:nonce_456",
+        user_id=1001,
+        currency=PaymentCurrency.XTR,
+        total_amount=400,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.ORDER_NOT_FOUND
+    assert result.order is None
+    assert repository.pre_checkout_approvals == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        PaymentOrderStatus.PAID,
+        PaymentOrderStatus.EXPIRED,
+        PaymentOrderStatus.FAILED_INVOICE_CREATION,
+    ],
+)
+def test_pre_checkout_validation_rejects_non_pending_order_statuses(
+    status: PaymentOrderStatus,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        status=status,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.ORDER_NOT_PENDING
+    assert result.order == order
+    assert repository.pre_checkout_approvals == []
+
+
+def test_pre_checkout_validation_rejects_and_marks_expired_pending_order() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now - timedelta(seconds=1),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.ORDER_EXPIRED
+    assert repository.expired_order_ids == ["order_123"]
+    assert repository.load_payment_order("order_123").status == PaymentOrderStatus.EXPIRED
+    assert repository.pre_checkout_approvals == []
+
+
+def test_pre_checkout_validation_rejects_wrong_user_without_recording_approval() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=9999,
+        currency=order.currency,
+        total_amount=order.amount,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.USER_MISMATCH
+    assert repository.pre_checkout_approvals == []
+
+
+@pytest.mark.parametrize(
+    ("currency", "total_amount", "expected_code"),
+    [
+        (PaymentCurrency.RUB, 400, PaymentPreCheckoutCode.CURRENCY_MISMATCH),
+        (PaymentCurrency.XTR, 399, PaymentPreCheckoutCode.AMOUNT_MISMATCH),
+    ],
+)
+def test_pre_checkout_validation_rejects_wrong_currency_or_amount(
+    currency: PaymentCurrency,
+    total_amount: int,
+    expected_code: PaymentPreCheckoutCode,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=currency,
+        total_amount=total_amount,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == expected_code
+    assert repository.pre_checkout_approvals == []
+
+
+@pytest.mark.parametrize(
+    ("expected_provider", "expected_product", "expected_code"),
+    [
+        (
+            PaymentProvider.YOOKASSA,
+            PaymentProduct.SUBSCRIPTION_MONTH,
+            PaymentPreCheckoutCode.PROVIDER_MISMATCH,
+        ),
+        (
+            PaymentProvider.TELEGRAM_STARS,
+            PaymentProduct.EXTRA_ONE_DAY,
+            PaymentPreCheckoutCode.PRODUCT_MISMATCH,
+        ),
+    ],
+)
+def test_pre_checkout_validation_rejects_wrong_provider_or_product_when_expected(
+    expected_provider: PaymentProvider,
+    expected_product: PaymentProduct,
+    expected_code: PaymentPreCheckoutCode,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        expected_provider=expected_provider,
+        expected_product=expected_product,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == expected_code
+    assert repository.pre_checkout_approvals == []
+
+
+@pytest.mark.parametrize(
+    ("product", "amount"),
+    [
+        (PaymentProduct.EXTRA_ONE_DAY, 35),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 170),
+    ],
+)
+def test_pre_checkout_validation_requires_active_subscription_for_extras_without_mutating_entitlement(
+    product: PaymentProduct,
+    amount: int,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    entitlement = Entitlement(
+        subscription_period_end=(now + timedelta(days=3)).isoformat(),
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=1,
+    )
+    before = entitlement.to_dict()
+    order = _payment_order(
+        "order_123",
+        "nonce_456",
+        product,
+        amount=amount,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentOrderRepository([order])
+
+    rejected = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        expected_provider=order.provider,
+        expected_product=order.product,
+        has_active_subscription=False,
+        now=now,
+    )
+    approved = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        expected_provider=order.provider,
+        expected_product=order.product,
+        has_active_subscription=entitlement.is_subscription_active(now),
+        now=now,
+    )
+
+    assert rejected.approved is False
+    assert rejected.code == PaymentPreCheckoutCode.ACTIVE_SUBSCRIPTION_REQUIRED
+    assert rejected.requires_active_subscription is True
+    assert approved.approved is True
+    assert approved.code == PaymentPreCheckoutCode.APPROVED
+    assert approved.requires_active_subscription is True
+    assert repository.pre_checkout_approvals == [("order_123", now)]
+    assert entitlement.to_dict() == before
 
 
 def test_payment_enums_match_production_payment_plan() -> None:
@@ -449,6 +771,8 @@ def test_payment_order_creation_does_not_mutate_entitlement() -> None:
 class InMemoryPaymentOrderRepository:
     def __init__(self, orders: list[PaymentOrder] | None = None) -> None:
         self.orders = list(orders or [])
+        self.pre_checkout_approvals: list[tuple[str, datetime]] = []
+        self.expired_order_ids: list[str] = []
 
     def find_active_pending_payment_order(
         self,
@@ -480,6 +804,38 @@ class InMemoryPaymentOrderRepository:
         self.orders.append(order)
         return order
 
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None:
+        for order in self.orders:
+            if order.order_id == order_id:
+                return order
+        return None
+
+    def record_payment_order_pre_checkout_approved(
+        self,
+        order_id: str,
+        approved_at: datetime,
+    ) -> PaymentOrder | None:
+        for index, order in enumerate(self.orders):
+            if order.order_id != order_id:
+                continue
+            updated = replace(
+                order,
+                pre_checkout_approved_at=approved_at,
+                updated_at=approved_at,
+            )
+            self.orders[index] = updated
+            self.pre_checkout_approvals.append((order_id, approved_at))
+            return updated
+        return None
+
+    def mark_payment_order_expired(self, order_id: str) -> None:
+        for index, order in enumerate(self.orders):
+            if order.order_id != order_id:
+                continue
+            self.orders[index] = replace(order, status=PaymentOrderStatus.EXPIRED)
+            self.expired_order_ids.append(order_id)
+            return
+
 
 def _payment_order(
     order_id: str,
@@ -489,17 +845,22 @@ def _payment_order(
     provider: PaymentProvider = PaymentProvider.TELEGRAM_STARS,
     amount: int = 400,
     currency: PaymentCurrency = PaymentCurrency.XTR,
+    status: PaymentOrderStatus = PaymentOrderStatus.PENDING,
+    user_id: int = 1001,
+    delivery_chat_id: int | None = 2002,
+    expires_at: datetime | None = None,
 ) -> PaymentOrder:
     return PaymentOrder(
         order_id=order_id,
         nonce=nonce,
-        user_id=1001,
-        delivery_chat_id=2002,
+        user_id=user_id,
+        delivery_chat_id=delivery_chat_id,
         provider=provider,
         product=product,
         amount=amount,
         currency=currency,
-        status=PaymentOrderStatus.PENDING,
+        status=status,
+        expires_at=expires_at,
     )
 
 

@@ -551,6 +551,73 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
         _cleanup_users(store, user_id)
 
 
+def test_postgres_payment_order_pre_checkout_approval_round_trips_without_entitlement_change() -> None:
+    from diet_bot.subscriptions import Entitlement
+
+    store = _store()
+    user_id = _unique_user_id()
+    approved_order_id = f"order-{uuid.uuid4().hex}"
+    rejected_order_id = f"order-{uuid.uuid4().hex}"
+    expires_at = datetime(2026, 5, 13, 10, 15, tzinfo=UTC)
+    approved_at = datetime(2026, 5, 13, 10, 5, tzinfo=UTC)
+    baseline = Entitlement(
+        free_trial_used=True,
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=1,
+        extra_one_day_remaining=3,
+        extra_weekly_pdf_remaining=4,
+        processed_payment_charge_ids=["existing-charge"],
+    )
+    try:
+        store.save_entitlement(user_id, baseline)
+        before_entitlement = store.get_entitlement(user_id).to_dict()
+        before_event_count = _entitlement_event_count(store, user_id)
+
+        store.create_payment_order(
+            order_id=approved_order_id,
+            nonce="nonce-ok1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            product="subscription_month",
+            provider="telegram_stars",
+            amount=400,
+            currency="XTR",
+            expires_at=expires_at,
+        )
+        store.create_payment_order(
+            order_id=rejected_order_id,
+            nonce="nonce-no1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            product="subscription_month",
+            provider="telegram_stars",
+            amount=400,
+            currency="XTR",
+            expires_at=expires_at,
+        )
+
+        approved = store.record_payment_order_pre_checkout_approved(
+            approved_order_id,
+            approved_at=approved_at,
+        )
+        reloaded_approved = store.load_payment_order(approved_order_id)
+        reloaded_rejected = store.load_payment_order(rejected_order_id)
+
+        after_entitlement = store.get_entitlement(user_id).to_dict()
+        after_event_count = _entitlement_event_count(store, user_id)
+
+        assert approved is not None
+        assert approved.pre_checkout_approved_at == approved_at
+        assert reloaded_approved is not None
+        assert reloaded_approved.pre_checkout_approved_at == approved_at
+        assert reloaded_rejected is not None
+        assert reloaded_rejected.pre_checkout_approved_at is None
+        assert before_entitlement == after_entitlement
+        assert before_event_count == after_event_count
+    finally:
+        _cleanup_users(store, user_id)
+
+
 def _store(**kwargs: Any):
     from diet_bot.postgres_store import PostgresDietBotStore
 

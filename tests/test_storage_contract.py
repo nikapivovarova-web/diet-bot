@@ -31,6 +31,7 @@ def test_storage_contract_exposes_paid_production_methods() -> None:
         "activate_promo_code",
         "create_or_reuse_pending_payment_order",
         "load_payment_order",
+        "record_payment_order_pre_checkout_approved",
         "record_support_state",
         "load_support_state",
     }
@@ -48,3 +49,8 @@ def test_storage_contract_exposes_paid_production_methods() -> None:
 
     refund_signature = inspect.signature(storage.DietBotStore.refund_generation_attempt)
     assert "error_message" in refund_signature.parameters
+
+    pre_checkout_signature = inspect.signature(
+        storage.DietBotStore.record_payment_order_pre_checkout_approved
+    )
+    assert "approved_at" in pre_checkout_signature.parameters

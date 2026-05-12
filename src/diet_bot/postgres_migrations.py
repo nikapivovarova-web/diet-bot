@@ -97,6 +97,7 @@ BASE_SCHEMA_STATEMENTS = (
         currency TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
         invoice_link TEXT,
+        pre_checkout_approved_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         expires_at TIMESTAMPTZ NOT NULL,
         paid_at TIMESTAMPTZ,
@@ -220,7 +221,22 @@ BASE_SCHEMA_MIGRATION = PostgresMigration(
 )
 
 
-POSTGRES_MIGRATIONS = (BASE_SCHEMA_MIGRATION,)
+PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION = PostgresMigration(
+    version="202605130001",
+    description="Add payment order pre-checkout approval timestamp",
+    statements=(
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS pre_checkout_approved_at TIMESTAMPTZ
+        """,
+    ),
+)
+
+
+POSTGRES_MIGRATIONS = (
+    BASE_SCHEMA_MIGRATION,
+    PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
+)
 
 
 def run_postgres_migrations(cur: Any) -> None:

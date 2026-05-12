@@ -85,6 +85,12 @@ def test_migrations_include_required_paid_storage_tables() -> None:
             flags=re.IGNORECASE,
         ), index
 
+    assert re.search(
+        r"\bpre_checkout_approved_at\s+TIMESTAMPTZ\b",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
 
 def test_migrations_use_idempotent_sql_shapes() -> None:
     from diet_bot import postgres_migrations
@@ -101,6 +107,7 @@ def test_migrations_use_idempotent_sql_shapes() -> None:
                 "CREATE TABLE IF NOT EXISTS",
                 "CREATE INDEX IF NOT EXISTS",
                 "CREATE UNIQUE INDEX IF NOT EXISTS",
+                "ALTER TABLE",
                 "DO $$",
             )
         ), normalized
