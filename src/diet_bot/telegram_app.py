@@ -115,6 +115,47 @@ def _parse_optional_int(raw: str | None) -> int | None:
 def _is_support_chat(chat_id: int) -> bool:
     return SUPPORT_CHAT_ID is not None and chat_id == SUPPORT_CHAT_ID
 
+
+PRIVATE_CHAT_REQUIRED_TEXT = "Пожалуйста, откройте бота в личном чате, чтобы продолжить."
+PRIVATE_CHAT_CALLBACK_TEXT = "Откройте бота в личном чате, чтобы использовать эту кнопку."
+
+
+def is_private_chat(message: Message) -> bool:
+    chat = getattr(message, "chat", None)
+    chat_type = getattr(chat, "type", None)
+    chat_type_value = getattr(chat_type, "value", chat_type)
+    if chat_type_value is not None:
+        return chat_type_value == "private"
+    chat_id = getattr(chat, "id", None)
+    return isinstance(chat_id, int) and chat_id > 0
+
+
+async def ensure_private_chat(message: Message) -> bool:
+    if is_private_chat(message):
+        return True
+    await message.answer(PRIVATE_CHAT_REQUIRED_TEXT)
+    return False
+
+
+def _callback_user_id(callback: CallbackQuery) -> int | None:
+    user = getattr(callback, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if isinstance(user_id, int):
+        return user_id
+    message = getattr(callback, "message", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if isinstance(chat_id, int) and message is not None and is_private_chat(message):
+        return chat_id
+    return None
+
+
+async def _answer_private_chat_callback(callback: CallbackQuery) -> None:
+    with suppress(TypeError):
+        await callback.answer(PRIVATE_CHAT_CALLBACK_TEXT, show_alert=True)
+        return
+    await callback.answer(PRIVATE_CHAT_CALLBACK_TEXT)
+
 START_PLAN_TEXT = "🥗 Составить план"
 TRY_FREE_TEXT = "🥗 Попробовать бесплатно"
 SUBSCRIBE_MONTH_TEXT = "💳 Подписка на месяц - 599 ₽"
@@ -291,6 +332,8 @@ async def start(message: Message) -> None:
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
         return
+    if not await ensure_private_chat(message):
+        return
     await _send_welcome_photo(message)
     if _has_active_paid_access(message.chat.id):
         await message.answer(
@@ -313,6 +356,8 @@ async def plan(message: Message) -> None:
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
         return
+    if not await ensure_private_chat(message):
+        return
     profile = _profile_for_chat(message.chat.id)
     if profile is not None:
         await _send_calculation_options(message, profile)
@@ -327,6 +372,8 @@ async def cancel(message: Message) -> None:
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
+        return
+    if not await ensure_private_chat(message):
         return
     await message.answer("Анкета сброшена ✅", reply_markup=_main_menu_keyboard(message.chat.id))
 
@@ -402,11 +449,18 @@ async def handle_callback(callback: CallbackQuery) -> None:
     data = callback.data or ""
     message = callback.message
     if not isinstance(message, Message):
-        await callback.answer()
+        await _answer_private_chat_callback(callback)
         return
 
     if _is_support_chat(message.chat.id):
         await callback.answer()
+        return
+    if not is_private_chat(message):
+        await _answer_private_chat_callback(callback)
+        return
+    callback_user_id = _callback_user_id(callback)
+    if callback_user_id is None or callback_user_id != message.chat.id:
+        await _answer_private_chat_callback(callback)
         return
 
     if data != CALLBACK_SUPPORT:
@@ -592,6 +646,8 @@ async def handle_answer(message: Message) -> None:
     if normalized_command == "330366":
         await secret_access_command(message)
         return
+    if not await ensure_private_chat(message):
+        return
     if text == SUPPORT_TEXT:
         await _start_support_request(message)
         return
@@ -695,7 +751,7 @@ def create_dispatcher() -> Dispatcher:
 
 
 async def run_bot() -> None:
-    token = os.getenv("DIET_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    token = (os.getenv("DIET_BOT_TOKEN") or "").strip() or (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
         raise RuntimeError("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.")
     bot = Bot(token)

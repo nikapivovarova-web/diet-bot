@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+import diet_bot.telegram_app as telegram_app
+from diet_bot.questionnaire import start_session
+
+
+PRIVATE_CHAT_REQUIRED_TEXT = "Пожалуйста, откройте бота в личном чате, чтобы продолжить."
+PRIVATE_CHAT_CALLBACK_TEXT = "Откройте бота в личном чате, чтобы использовать эту кнопку."
+
+
+class FakeMessage:
+    def __init__(
+        self,
+        chat_id: int = 12345,
+        *,
+        text: str = "",
+        user_id: int | None = None,
+        chat_type: str = "private",
+    ) -> None:
+        self.chat = SimpleNamespace(id=chat_id, type=chat_type)
+        self.from_user = SimpleNamespace(
+            id=chat_id if user_id is None else user_id,
+            username=None,
+            first_name=None,
+            last_name=None,
+            full_name="",
+        )
+        self.text = text
+        self.texts: list[tuple[str, object | None]] = []
+
+    async def answer(self, text: str, reply_markup=None):
+        self.texts.append((text, reply_markup))
+        return SimpleNamespace()
+
+
+class FakeCallback:
+    def __init__(
+        self,
+        data: str,
+        message: FakeMessage,
+        *,
+        from_user_id: int | None = None,
+    ) -> None:
+        self.data = data
+        self.message = message
+        self.from_user = SimpleNamespace(
+            id=message.chat.id if from_user_id is None else from_user_id,
+            username=None,
+            first_name=None,
+            last_name=None,
+            full_name="",
+        )
+        self.answers: list[object] = []
+
+    async def answer(self, text=None, show_alert=None) -> None:
+        self.answers.append(text if show_alert is None else (text, show_alert))
+
+
+@pytest.fixture(autouse=True)
+def isolated_telegram_runtime_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    touched_ids = {
+        -100_510_001,
+        -100_510_002,
+        -100_510_003,
+        -100_510_004,
+        51_001,
+        51_002,
+        51_003,
+        51_004,
+        51_005,
+    }
+    for chat_id in touched_ids:
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+        telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+    yield
+    for chat_id in touched_ids:
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+        telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_group_text_button_is_rejected_without_questionnaire_state() -> None:
+    group_id = -100_510_001
+    message = FakeMessage(
+        group_id,
+        text=telegram_app.TRY_FREE_TEXT,
+        user_id=51_001,
+        chat_type="supergroup",
+    )
+
+    await telegram_app.handle_answer(message)
+
+    assert message.texts == [(PRIVATE_CHAT_REQUIRED_TEXT, None)]
+    assert group_id not in telegram_app.SESSION_BY_CHAT_ID
+    assert group_id not in telegram_app.TRIAL_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_support_chat_flow_bypasses_private_chat_guard(monkeypatch) -> None:
+    support_chat_id = -100_510_002
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
+    telegram_app.SUPPORT_REQUEST_CHAT_IDS.add(support_chat_id)
+    telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.add(support_chat_id)
+    message = FakeMessage(
+        support_chat_id,
+        text="support-side message",
+        user_id=51_002,
+        chat_type="supergroup",
+    )
+
+    await telegram_app.handle_answer(message)
+
+    assert message.texts == []
+    assert support_chat_id not in telegram_app.SUPPORT_REQUEST_CHAT_IDS
+    assert support_chat_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_admin_command_flow_bypasses_private_chat_guard(monkeypatch, tmp_path) -> None:
+    admin_user_id = 51_003
+    target_chat_id = 51_004
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(
+        -100_510_003,
+        text=f"/330366 {target_chat_id}",
+        user_id=admin_user_id,
+        chat_type="supergroup",
+    )
+
+    await telegram_app.handle_answer(message)
+
+    assert message.texts
+    assert str(target_chat_id) in message.texts[-1][0]
+    assert target_chat_id in telegram_app.load_entitlements(tmp_path / "subscriptions.json")
+
+
+@pytest.mark.anyio
+async def test_group_callback_does_not_change_private_questionnaire_state() -> None:
+    owner_id = 51_004
+    group_id = -100_510_004
+    private_session = start_session()
+    telegram_app.SESSION_BY_CHAT_ID[owner_id] = private_session
+    message = FakeMessage(group_id, user_id=owner_id, chat_type="supergroup")
+    callback = FakeCallback(telegram_app.CALLBACK_START, message, from_user_id=owner_id)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [(PRIVATE_CHAT_CALLBACK_TEXT, True)]
+    assert telegram_app.SESSION_BY_CHAT_ID[owner_id] is private_session
+    assert group_id not in telegram_app.SESSION_BY_CHAT_ID
+    assert group_id not in telegram_app.TRIAL_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_foreign_private_callback_is_rejected_without_state_change() -> None:
+    owner_id = 51_005
+    foreign_user_id = 51_001
+    message = FakeMessage(owner_id, user_id=owner_id)
+    callback = FakeCallback(
+        telegram_app.CALLBACK_PROMO_CODE,
+        message,
+        from_user_id=foreign_user_id,
+    )
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [(PRIVATE_CHAT_CALLBACK_TEXT, True)]
+    assert owner_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+    assert foreign_user_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_run_bot_rejects_blank_token_before_creating_bot(monkeypatch) -> None:
+    created_tokens: list[str] = []
+
+    class UnexpectedBot:
+        def __init__(self, token: str) -> None:
+            created_tokens.append(token)
+            raise AssertionError("Bot must not be created without a real token")
+
+    monkeypatch.setenv("DIET_BOT_TOKEN", "   ")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setattr(telegram_app, "Bot", UnexpectedBot)
+
+    with pytest.raises(RuntimeError, match="Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN."):
+        await telegram_app.run_bot()
+
+    assert created_tokens == []
