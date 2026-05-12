@@ -106,6 +106,44 @@ def test_runtime_config_requires_explicit_json_fallback_in_development() -> None
     assert config.database_url == ""
 
 
+def test_json_fallback_requires_explicit_development_opt_in() -> None:
+    with pytest.raises(RuntimeConfigError) as exc_info:
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "local-token",
+                "DIET_BOT_ENV": "development",
+            },
+        )
+
+    assert "DIET_BOT_ALLOW_JSON_STORAGE=1" in str(exc_info.value)
+
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "local-token",
+            "DIET_BOT_ENV": "development",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+        },
+    )
+
+    assert config.local_json_storage_allowed is True
+    assert config.database_url == ""
+
+
+def test_production_rejects_json_fallback_even_when_flag_is_set() -> None:
+    with pytest.raises(RuntimeConfigError) as exc_info:
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+            },
+        )
+
+    message = str(exc_info.value)
+    assert "DIET_BOT_DATABASE_URL" in message
+    assert "prod-token" not in message
+
+
 def test_runtime_config_rejects_placeholder_database_url_without_leaking_secrets() -> None:
     placeholder_url = "postgresql://diet_bot:super-secret-db-password@example.com:5432/diet_bot"
 
