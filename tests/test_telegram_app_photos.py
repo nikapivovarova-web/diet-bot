@@ -24,11 +24,18 @@ from diet_bot.domain import (
 )
 from diet_bot.payments import (
     PaymentCurrency,
+    PaymentEvent,
+    PaymentEventStatus,
+    PaymentEventType,
     PaymentOrder,
     PaymentOrderCreationResult,
     PaymentOrderStatus,
     PaymentProduct,
     PaymentProvider,
+    PaymentSuccessfulPaymentInput,
+    PaymentSuccessfulPaymentResult,
+    ProcessedProviderCharge,
+    apply_successful_payment as apply_successful_payment_core,
     create_or_reuse_pending_payment_order,
     decode_payment_order_payload,
     is_active_pending_payment_order,
@@ -693,6 +700,226 @@ async def test_pre_checkout_failure_message_is_safe(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+async def test_successful_payment_handler_grants_subscription_once_through_store(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(order.delivery_chat_id, user_id=order.user_id)
+    message.successful_payment = _successful_payment_for_order(
+        order,
+        telegram_charge_id="tg-charge-sub1",
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    entitlement = store.get_entitlement(order.user_id)
+    received = store.successful_payment_inputs[0]
+    assert entitlement.is_subscription_active()
+    assert entitlement.monthly_one_day_remaining == telegram_app.MONTHLY_ONE_DAY_LIMIT
+    assert entitlement.monthly_weekly_pdf_remaining == telegram_app.MONTHLY_WEEKLY_PDF_LIMIT
+    assert store.load_payment_order(order.order_id).status == PaymentOrderStatus.PAID
+    assert store.processed_charge_ids() == ["tg-charge-sub1"]
+    assert received.payload == order.payload
+    assert received.provider == PaymentProvider.TELEGRAM_STARS
+    assert received.telegram_charge_id == "tg-charge-sub1"
+    assert received.provider_charge_id is None
+    assert received.user_id == order.user_id
+    assert received.delivery_chat_id == order.delivery_chat_id
+    assert received.currency == PaymentCurrency.XTR
+    assert received.total_amount == order.amount
+    assert message.texts[-1][0].startswith(
+        telegram_app._payment_success_text(
+            telegram_app.PaymentApplication(True, "subscription"),
+        ),
+    )
+
+
+@pytest.mark.anyio
+async def test_duplicate_successful_payment_handler_does_not_grant_twice(monkeypatch) -> None:
+    chat_id = 12345
+    store = FakePaymentStore(entitlements={chat_id: _active_payment_entitlement()})
+    order = store.insert_payment_order(
+        _pending_payment_order(
+            order_id="order_extra_day",
+            nonce="nonce_extra_day",
+            product=PaymentProduct.EXTRA_ONE_DAY,
+            amount=35,
+        ),
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    first = FakeMessage(chat_id)
+    first.successful_payment = _successful_payment_for_order(
+        order,
+        telegram_charge_id="tg-charge-extra1",
+    )
+    duplicate = FakeMessage(chat_id)
+    duplicate.successful_payment = first.successful_payment
+
+    await telegram_app.handle_successful_payment(first)
+    await telegram_app.handle_successful_payment(duplicate)
+
+    entitlement = store.get_entitlement(chat_id)
+    assert entitlement.extra_one_day_remaining == 1
+    assert store.processed_charge_ids() == ["tg-charge-extra1"]
+    assert [event.status for event in store.payment_events] == [
+        PaymentEventStatus.PROCESSED,
+        PaymentEventStatus.DUPLICATE,
+    ]
+    assert duplicate.texts[-1][1] is not None
+
+
+@pytest.mark.anyio
+async def test_successful_payment_handler_rejects_tampered_payload_without_grant(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(order.delivery_chat_id, user_id=order.user_id)
+    message.successful_payment = _successful_payment_for_order(
+        order,
+        payload=f"diet:order:{order.order_id}:nonce_tampered",
+        telegram_charge_id="tg-charge-tampered1",
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    assert not store.get_entitlement(order.user_id).is_subscription_active()
+    assert store.load_payment_order(order.order_id).status == PaymentOrderStatus.PENDING
+    assert store.processed_charge_ids() == []
+    assert store.payment_events[-1].status == PaymentEventStatus.IGNORED_NON_TERMINAL
+    assert message.texts[-1][0] == telegram_app.PAYMENT_SUCCESSFUL_PAYMENT_REJECTED_TEXT
+
+
+@pytest.mark.anyio
+async def test_orphan_successful_payment_handler_does_not_grant_and_returns_safe_message(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage()
+    message.successful_payment = _successful_payment_for_order(
+        _pending_payment_order(order_id="order_missing", nonce="nonce_missing"),
+        telegram_charge_id="tg-charge-orphan1",
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    assert not store.get_entitlement(message.chat.id).is_subscription_active()
+    assert store.processed_charge_ids() == []
+    assert store.payment_events[-1].status == PaymentEventStatus.ORPHAN_RECOVERABLE
+    assert message.texts[-1][0] == telegram_app.PAYMENT_SUCCESSFUL_PAYMENT_REJECTED_TEXT
+    for secret in ("tg-charge-orphan1", "order_missing", "nonce_missing"):
+        assert secret not in message.texts[-1][0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("message_kwargs", "payment_kwargs"),
+    [
+        ({"user_id": 99999}, {}),
+        ({"chat_id": 99999, "user_id": 12345}, {}),
+        ({}, {"total_amount": 399}),
+        ({}, {"currency": "RUB"}),
+    ],
+)
+async def test_successful_payment_handler_rejects_wrong_user_chat_amount_or_currency(
+    monkeypatch,
+    message_kwargs: dict[str, int],
+    payment_kwargs: dict[str, object],
+) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(**message_kwargs)
+    message.successful_payment = _successful_payment_for_order(
+        order,
+        telegram_charge_id="tg-charge-mismatch1",
+        **payment_kwargs,
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    assert not store.get_entitlement(order.user_id).is_subscription_active()
+    assert store.load_payment_order(order.order_id).status == PaymentOrderStatus.PENDING
+    assert store.processed_charge_ids() == []
+    assert store.payment_events[-1].status == PaymentEventStatus.IGNORED_NON_TERMINAL
+
+
+@pytest.mark.anyio
+async def test_extra_successful_payment_handler_grants_only_with_active_subscription(monkeypatch) -> None:
+    chat_id = 12345
+    store = FakePaymentStore(entitlements={chat_id: _active_payment_entitlement()})
+    order = store.insert_payment_order(
+        _pending_payment_order(
+            order_id="order_extra_active",
+            nonce="nonce_extra_active",
+            product=PaymentProduct.EXTRA_WEEKLY_PDF,
+            amount=170,
+        ),
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(chat_id)
+    message.successful_payment = _successful_payment_for_order(
+        order,
+        telegram_charge_id="tg-charge-weekly-extra1",
+        total_amount=170,
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    entitlement = store.get_entitlement(chat_id)
+    assert entitlement.extra_weekly_pdf_remaining == 1
+    assert store.load_payment_order(order.order_id).status == PaymentOrderStatus.PAID
+    assert store.processed_charge_ids() == ["tg-charge-weekly-extra1"]
+
+
+@pytest.mark.anyio
+async def test_extra_successful_payment_handler_without_active_subscription_does_not_grant(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(
+        _pending_payment_order(
+            order_id="order_extra_inactive",
+            nonce="nonce_extra_inactive",
+            product=PaymentProduct.EXTRA_ONE_DAY,
+            amount=35,
+        ),
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(order.delivery_chat_id, user_id=order.user_id)
+    message.successful_payment = _successful_payment_for_order(
+        order,
+        telegram_charge_id="tg-charge-extra-inactive1",
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    entitlement = store.get_entitlement(order.user_id)
+    assert entitlement.extra_one_day_remaining == 0
+    assert store.load_payment_order(order.order_id).status == PaymentOrderStatus.PENDING
+    assert store.processed_charge_ids() == []
+    assert store.payment_events[-1].status == PaymentEventStatus.IGNORED_NON_TERMINAL
+
+
+@pytest.mark.anyio
+async def test_successful_payment_handler_does_not_call_legacy_direct_apply_path(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(
+        telegram_app,
+        "apply_subscription_payment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy path called")),
+    )
+    message = FakeMessage(order.delivery_chat_id, user_id=order.user_id)
+    message.successful_payment = _successful_payment_for_order(
+        order,
+        telegram_charge_id="tg-charge-core1",
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    assert store.get_entitlement(order.user_id).is_subscription_active()
+    assert store.successful_payment_inputs
+
+
+@pytest.mark.anyio
 async def test_send_subscription_invoice_link_creates_recurring_stars_invoice(monkeypatch) -> None:
     store = FakePaymentStore()
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1043,6 +1270,7 @@ class FakeMessage:
             full_name=" ".join(part for part in (first_name, last_name) if part),
         )
         self.text = text
+        self.successful_payment = None
         self.bot = FakeInvoiceBot()
         self.photos = []
         self.texts = []
@@ -1149,6 +1377,9 @@ class FakePaymentStore:
         self.failed_invoice_creation_order_ids: list[str] = []
         self.pre_checkout_approvals: list[str] = []
         self.expired_order_ids: list[str] = []
+        self.payment_events: list[PaymentEvent] = []
+        self.processed_provider_charges: list[ProcessedProviderCharge] = []
+        self.successful_payment_inputs: list[PaymentSuccessfulPaymentInput] = []
         self._sequence = 0
 
     def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
@@ -1156,6 +1387,9 @@ class FakePaymentStore:
 
     def save_entitlement(self, user_id: int, entitlement: telegram_app.Entitlement) -> None:
         self.entitlements[user_id] = entitlement
+
+    def load_profile_data(self, user_id: int) -> dict[str, object] | None:
+        return None
 
     def create_or_reuse_pending_payment_order(
         self,
@@ -1266,6 +1500,77 @@ class FakePaymentStore:
             self.expired_order_ids.append(order_id)
             return
 
+    def apply_successful_payment(
+        self,
+        successful_payment: PaymentSuccessfulPaymentInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentSuccessfulPaymentResult:
+        self.successful_payment_inputs.append(successful_payment)
+        return apply_successful_payment_core(self, successful_payment, now=now)
+
+    def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent:
+        self.payment_events.append(event)
+        return event
+
+    def find_processed_provider_charge(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType,
+    ) -> ProcessedProviderCharge | None:
+        for processed in self.processed_provider_charges:
+            if (
+                processed.provider == provider
+                and processed.charge_id == charge_id
+                and processed.event_type == event_type
+            ):
+                return processed
+        return None
+
+    def insert_processed_provider_charge(
+        self,
+        charge: ProcessedProviderCharge,
+    ) -> ProcessedProviderCharge:
+        existing = self.find_processed_provider_charge(
+            provider=charge.provider,
+            charge_id=charge.charge_id,
+            event_type=charge.event_type,
+        )
+        if existing is not None:
+            return existing
+        self.processed_provider_charges.append(charge)
+        return charge
+
+    def mark_payment_order_paid(
+        self,
+        order_id: str,
+        paid_at: datetime,
+    ) -> PaymentOrder | None:
+        for index, order in enumerate(self.orders):
+            if order.order_id != order_id:
+                continue
+            updated = replace(
+                order,
+                status=PaymentOrderStatus.PAID,
+                paid_at=paid_at,
+                updated_at=paid_at,
+            )
+            self.orders[index] = updated
+            return updated
+        return None
+
+    def processed_charge_ids(
+        self,
+        event_type: PaymentEventType = PaymentEventType.SUCCESSFUL_PAYMENT,
+    ) -> list[str]:
+        return [
+            charge.charge_id
+            for charge in self.processed_provider_charges
+            if charge.event_type == event_type
+        ]
+
 
 class SensitiveFailurePaymentStore(FakePaymentStore):
     def load_payment_order(self, order_id: str) -> PaymentOrder | None:
@@ -1300,6 +1605,29 @@ def _pending_payment_order(
         currency=currency,
         status=PaymentOrderStatus.PENDING,
         expires_at=expires_at or (datetime.now(UTC) + timedelta(minutes=5)),
+    )
+
+
+def _successful_payment_for_order(
+    order: PaymentOrder,
+    *,
+    payload: str | None = None,
+    telegram_charge_id: str = "tg-charge-1",
+    provider_charge_id: str | None = None,
+    currency: PaymentCurrency | str | None = None,
+    total_amount: int | None = None,
+    subscription_expiration_date: int | None = None,
+) -> SimpleNamespace:
+    payment_currency = currency or order.currency
+    if isinstance(payment_currency, PaymentCurrency):
+        payment_currency = payment_currency.value
+    return SimpleNamespace(
+        invoice_payload=payload or order.payload,
+        currency=payment_currency,
+        total_amount=order.amount if total_amount is None else total_amount,
+        telegram_payment_charge_id=telegram_charge_id,
+        provider_payment_charge_id=provider_charge_id,
+        subscription_expiration_date=subscription_expiration_date,
     )
 
 

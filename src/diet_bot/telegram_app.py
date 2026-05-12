@@ -60,6 +60,7 @@ from .payments import (
     PaymentPreCheckoutValidation,
     PaymentProduct,
     PaymentProvider,
+    PaymentSuccessfulPaymentInput,
     build_payment_invoice_metadata,
     get_payment_product_invoice_metadata,
     validate_payment_pre_checkout,
@@ -78,8 +79,6 @@ from .subscriptions import (
     Entitlement,
     PaymentApplication,
     RationKind,
-    apply_extra_one_day_payment,
-    apply_extra_weekly_pdf_payment,
     apply_subscription_payment,
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
@@ -322,6 +321,7 @@ RUB_PAYMENT_PAYLOAD_DESCRIPTIONS = {
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
 PAYMENT_PRE_CHECKOUT_FAILED_TEXT = "Payment could not be verified. Please create a new invoice."
+PAYMENT_SUCCESSFUL_PAYMENT_REJECTED_TEXT = "\u041f\u043b\u0430\u0442\u0435\u0436 \u043f\u043e\u043b\u0443\u0447\u0435\u043d, \u043d\u043e \u044f \u043d\u0435 \u0441\u043c\u043e\u0433 \u0440\u0430\u0441\u043f\u043e\u0437\u043d\u0430\u0442\u044c \u0435\u0433\u043e \u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435. \u041d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0443, \u0447\u0442\u043e\u0431\u044b \u043c\u044b \u043f\u0440\u043e\u0432\u0435\u0440\u0438\u043b\u0438 \u043e\u043f\u043b\u0430\u0442\u0443."
 PAYMENT_PAYLOAD_PRODUCTS = {
     PAYLOAD_SUBSCRIPTION_MONTH: PaymentProduct.SUBSCRIPTION_MONTH,
     PAYLOAD_RU_SUBSCRIPTION_MONTH: PaymentProduct.SUBSCRIPTION_MONTH,
@@ -640,7 +640,7 @@ async def handle_successful_payment(message: Message) -> None:
     if payment is None:
         return
 
-    result = _apply_successful_payment(message.chat.id, payment)
+    result = _apply_successful_payment(message, payment)
     if result.duplicate:
         await message.answer(
             "Этот платеж уже был обработан. Текущие остатки:\n\n"
@@ -650,7 +650,7 @@ async def handle_successful_payment(message: Message) -> None:
         return
     if not result.processed:
         await message.answer(
-            "Платеж получен, но я не смог распознать его назначение. Напишите в поддержку, чтобы мы проверили оплату.",
+            PAYMENT_SUCCESSFUL_PAYMENT_REJECTED_TEXT,
             reply_markup=_subscription_payment_keyboard(),
         )
         return
@@ -2123,26 +2123,80 @@ def _save_entitlement_for_chat(chat_id: int, entitlement: Entitlement) -> None:
         save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
 
 
-def _apply_successful_payment(chat_id: int, payment: SuccessfulPayment) -> PaymentApplication:
-    entitlement = _load_entitlement_for_chat(chat_id)
-    charge_id = payment.telegram_payment_charge_id
-    payload = payment.invoice_payload
-
-    if payload in {PAYLOAD_SUBSCRIPTION_MONTH, PAYLOAD_RU_SUBSCRIPTION_MONTH}:
-        result = apply_subscription_payment(
-            entitlement,
-            charge_id,
-            subscription_expiration_timestamp=getattr(payment, "subscription_expiration_date", None),
-        )
-    elif payload in {PAYLOAD_EXTRA_ONE_DAY, PAYLOAD_RU_EXTRA_ONE_DAY}:
-        result = apply_extra_one_day_payment(entitlement, charge_id)
-    elif payload in {PAYLOAD_EXTRA_WEEKLY_PDF, PAYLOAD_RU_EXTRA_WEEKLY_PDF}:
-        result = apply_extra_weekly_pdf_payment(entitlement, charge_id)
-    else:
+def _apply_successful_payment(message: Message, payment: SuccessfulPayment) -> PaymentApplication:
+    store = _runtime_store()
+    payment_input = _successful_payment_input_for_message(message, payment)
+    if store is None or payment_input is None:
         return PaymentApplication(False)
 
-    _save_entitlement_for_chat(chat_id, entitlement)
-    return result
+    try:
+        result = store.apply_successful_payment(payment_input)
+    except Exception:
+        return PaymentApplication(False)
+    return _payment_application_from_successful_payment_result(result)
+
+
+def _successful_payment_input_for_message(
+    message: Message,
+    payment: SuccessfulPayment,
+) -> PaymentSuccessfulPaymentInput | None:
+    user_id = _payment_user_id_for_message(message)
+    delivery_chat_id = getattr(getattr(message, "chat", None), "id", None)
+    provider = _successful_payment_provider_for_currency(getattr(payment, "currency", None))
+    if user_id is None or not isinstance(delivery_chat_id, int) or provider is None:
+        return None
+
+    try:
+        return PaymentSuccessfulPaymentInput(
+            payload=str(getattr(payment, "invoice_payload", "")),
+            provider=provider,
+            telegram_charge_id=str(getattr(payment, "telegram_payment_charge_id", "")),
+            provider_charge_id=getattr(payment, "provider_payment_charge_id", None),
+            user_id=user_id,
+            delivery_chat_id=delivery_chat_id,
+            currency=str(getattr(payment, "currency", "")),
+            total_amount=int(getattr(payment, "total_amount", -1)),
+            subscription_expiration_timestamp=_successful_payment_subscription_expiration(payment),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _successful_payment_provider_for_currency(currency: object) -> PaymentProvider | None:
+    if str(currency) == "XTR":
+        return PaymentProvider.TELEGRAM_STARS
+    if str(currency) == "RUB":
+        return PaymentProvider.YOOKASSA
+    return None
+
+
+def _successful_payment_subscription_expiration(payment: SuccessfulPayment) -> int | None:
+    expiration = getattr(payment, "subscription_expiration_date", None)
+    if expiration is None:
+        expiration = getattr(payment, "subscription_expiration_timestamp", None)
+    return expiration if isinstance(expiration, int) else None
+
+
+def _payment_application_from_successful_payment_result(result: object) -> PaymentApplication:
+    processed = bool(getattr(result, "processed", False))
+    duplicate = bool(getattr(result, "duplicate", False))
+    order = getattr(result, "order", None)
+    grant = (
+        _payment_grant_for_order_product(getattr(order, "product", None))
+        if processed or duplicate
+        else None
+    )
+    return PaymentApplication(processed, grant, duplicate=duplicate)
+
+
+def _payment_grant_for_order_product(product: object) -> str | None:
+    if product == PaymentProduct.SUBSCRIPTION_MONTH:
+        return "subscription"
+    if product == PaymentProduct.EXTRA_ONE_DAY:
+        return "extra_one_day"
+    if product == PaymentProduct.EXTRA_WEEKLY_PDF:
+        return "extra_weekly_pdf"
+    return None
 
 
 def _payment_success_text(result: PaymentApplication) -> str:
