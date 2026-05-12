@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .payments import (
+    EXTRA_PAYMENT_PRODUCTS,
     PAYMENT_ORDER_TTL_SECONDS,
     PROVIDER_CURRENCIES,
     PaymentEvent,
@@ -12,6 +13,8 @@ from .payments import (
     PaymentEventType,
     PaymentCurrency,
     PaymentOrder,
+    PaymentOrderCreationCode,
+    PaymentOrderCreationResult,
     PaymentOrderStatus,
     PaymentProduct,
     PaymentProvider,
@@ -648,7 +651,7 @@ class PostgresDietBotStore:
         currency: PaymentCurrency | str,
         now: datetime | None = None,
         ttl_seconds: int = PAYMENT_ORDER_TTL_SECONDS,
-    ) -> PaymentOrder:
+    ) -> PaymentOrderCreationResult:
         provider_value = PaymentProvider(provider)
         product_value = PaymentProduct(product)
         currency_value = PaymentCurrency(currency)
@@ -660,10 +663,20 @@ class PostgresDietBotStore:
             raise ValueError("payment order ttl must be positive")
 
         current_time = _normalize_datetime(now)
+        requires_active_subscription = product_value in EXTRA_PAYMENT_PRODUCTS
         with self._connect() as conn:
             with conn.cursor() as cur:
                 self._remember_user_cur(cur, UserIdentity(user_id))
                 cur.execute("SELECT 1 FROM users WHERE telegram_id = %s FOR UPDATE", (user_id,))
+                if requires_active_subscription:
+                    entitlement = self._select_entitlement_for_update_cur(cur, user_id)
+                    if not entitlement.is_subscription_active(current_time):
+                        return PaymentOrderCreationResult(
+                            accepted=False,
+                            code=PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED,
+                            message="Active subscription is required for this extra.",
+                            requires_active_subscription=True,
+                        )
                 existing = self._find_active_pending_payment_order_cur(
                     cur,
                     user_id=user_id,
@@ -675,7 +688,12 @@ class PostgresDietBotStore:
                     now=current_time,
                 )
                 if existing is not None:
-                    return existing
+                    return PaymentOrderCreationResult(
+                        accepted=True,
+                        code=PaymentOrderCreationCode.REUSED,
+                        order=existing,
+                        requires_active_subscription=requires_active_subscription,
+                    )
                 order = PaymentOrder(
                     order_id=_payment_token(),
                     nonce=_payment_token(),
@@ -690,7 +708,12 @@ class PostgresDietBotStore:
                     expires_at=current_time + timedelta(seconds=ttl_seconds),
                     updated_at=current_time,
                 )
-                return self._insert_payment_order_cur(cur, order)
+                return PaymentOrderCreationResult(
+                    accepted=True,
+                    code=PaymentOrderCreationCode.CREATED,
+                    order=self._insert_payment_order_cur(cur, order),
+                    requires_active_subscription=requires_active_subscription,
+                )
 
     def find_active_pending_payment_order(
         self,

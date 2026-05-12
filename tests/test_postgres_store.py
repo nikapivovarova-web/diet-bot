@@ -478,7 +478,13 @@ def test_postgres_payment_order_placeholder_round_trips_without_entitlement_chan
 
 
 def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchanged() -> None:
-    from diet_bot.payments import PaymentCurrency, PaymentOrderStatus, PaymentProduct, PaymentProvider
+    from diet_bot.payments import (
+        PaymentCurrency,
+        PaymentOrderCreationCode,
+        PaymentOrderStatus,
+        PaymentProduct,
+        PaymentProvider,
+    )
     from diet_bot.subscriptions import Entitlement
 
     store = _store()
@@ -486,6 +492,8 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
     baseline = Entitlement(
         free_trial_used=True,
+        subscription_period_start=(now - timedelta(days=3)).isoformat(),
+        subscription_period_end=(now + timedelta(days=3)).isoformat(),
         monthly_one_day_remaining=2,
         monthly_weekly_pdf_remaining=1,
         extra_one_day_remaining=3,
@@ -497,7 +505,7 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
         before_entitlement = store.get_entitlement(user_id).to_dict()
         before_event_count = _entitlement_event_count(store, user_id)
 
-        first = store.create_or_reuse_pending_payment_order(
+        first_result = store.create_or_reuse_pending_payment_order(
             user_id=user_id,
             delivery_chat_id=user_id + 10,
             provider=PaymentProvider.TELEGRAM_STARS,
@@ -506,7 +514,7 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
             currency=PaymentCurrency.XTR,
             now=now,
         )
-        repeated = store.create_or_reuse_pending_payment_order(
+        repeated_result = store.create_or_reuse_pending_payment_order(
             user_id=user_id,
             delivery_chat_id=user_id + 10,
             provider=PaymentProvider.TELEGRAM_STARS,
@@ -526,7 +534,7 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
             currency="XTR",
             expires_at=now - timedelta(minutes=1),
         )
-        replacement = store.create_or_reuse_pending_payment_order(
+        replacement_result = store.create_or_reuse_pending_payment_order(
             user_id=user_id,
             delivery_chat_id=user_id + 20,
             provider=PaymentProvider.TELEGRAM_STARS,
@@ -539,6 +547,18 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
         after_entitlement = store.get_entitlement(user_id).to_dict()
         after_event_count = _entitlement_event_count(store, user_id)
 
+        assert first_result.accepted is True
+        assert first_result.code == PaymentOrderCreationCode.CREATED
+        assert repeated_result.accepted is True
+        assert repeated_result.code == PaymentOrderCreationCode.REUSED
+        assert replacement_result.accepted is True
+        assert replacement_result.code == PaymentOrderCreationCode.CREATED
+        first = first_result.order
+        repeated = repeated_result.order
+        replacement = replacement_result.order
+        assert first is not None
+        assert repeated is not None
+        assert replacement is not None
         assert first.status == PaymentOrderStatus.PENDING
         assert first.payload == f"diet:order:{first.order_id}:{first.nonce}"
         assert repeated == first
@@ -547,6 +567,60 @@ def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchan
         assert replacement.expires_at == now + timedelta(seconds=900)
         assert before_entitlement == after_entitlement
         assert before_event_count == after_event_count
+    finally:
+        _cleanup_users(store, user_id)
+
+
+def test_postgres_extra_payment_order_creation_requires_active_subscription() -> None:
+    from diet_bot.payments import (
+        PaymentCurrency,
+        PaymentOrderCreationCode,
+        PaymentProduct,
+        PaymentProvider,
+    )
+
+    store = _store()
+    user_id = _unique_user_id()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    try:
+        rejected = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.EXTRA_ONE_DAY,
+            amount=35,
+            currency=PaymentCurrency.XTR,
+            now=now,
+        )
+        subscription = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            now=now,
+        )
+
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT product, status
+                    FROM payment_orders
+                    WHERE user_id = %s
+                    ORDER BY product
+                    """,
+                    (user_id,),
+                )
+                orders = [dict(row) for row in cur.fetchall()]
+
+        assert rejected.accepted is False
+        assert rejected.code == PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED
+        assert rejected.order is None
+        assert subscription.accepted is True
+        assert subscription.order is not None
+        assert orders == [{"product": "subscription_month", "status": "pending"}]
     finally:
         _cleanup_users(store, user_id)
 

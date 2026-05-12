@@ -7,6 +7,7 @@ from typing import Protocol
 from .payments import (
     PaymentCurrency,
     PaymentOrder,
+    PaymentOrderCreationResult,
     PaymentProduct,
     PaymentProvider,
     PaymentSuccessfulPaymentInput,
@@ -76,7 +77,7 @@ class DietBotStore(Protocol):
         currency: PaymentCurrency | str,
         now: datetime | None = None,
         ttl_seconds: int = 900,
-    ) -> PaymentOrder: ...
+    ) -> PaymentOrderCreationResult: ...
     def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
     def record_payment_order_pre_checkout_approved(
         self,

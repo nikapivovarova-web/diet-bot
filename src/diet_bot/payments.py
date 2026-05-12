@@ -51,6 +51,12 @@ class PaymentOrderStatus(StrEnum):
     FAILED_INVOICE_CREATION = "failed_invoice_creation"
 
 
+class PaymentOrderCreationCode(StrEnum):
+    CREATED = "created"
+    REUSED = "reused"
+    ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+
+
 class PaymentEventType(StrEnum):
     SUCCESSFUL_PAYMENT = "successful_payment"
     REFUND = "refund"
@@ -273,6 +279,18 @@ class PaymentOrder:
     @property
     def payload(self) -> str:
         return encode_payment_order_payload(self.order_id, self.nonce)
+
+
+@dataclass(frozen=True)
+class PaymentOrderCreationResult:
+    accepted: bool
+    code: PaymentOrderCreationCode | str
+    order: PaymentOrder | None = None
+    message: str | None = None
+    requires_active_subscription: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", PaymentOrderCreationCode(self.code))
 
 
 class PaymentOrderRepository(Protocol):
@@ -544,7 +562,13 @@ def validate_payment_pre_checkout(
         )
 
     requires_active_subscription = order.product in EXTRA_PAYMENT_PRODUCTS
-    if requires_active_subscription and has_active_subscription is not True:
+    active_subscription = _repository_has_active_subscription(
+        repository,
+        user_id=order.user_id,
+        now=current_time,
+        provided=has_active_subscription,
+    )
+    if requires_active_subscription and not active_subscription:
         return _pre_checkout_rejection(
             PaymentPreCheckoutCode.ACTIVE_SUBSCRIPTION_REQUIRED,
             order=order,
@@ -806,7 +830,8 @@ def create_or_reuse_pending_payment_order(
     ttl_seconds: int = PAYMENT_ORDER_TTL_SECONDS,
     order_id_factory: TokenFactory | None = None,
     nonce_factory: TokenFactory | None = None,
-) -> PaymentOrder:
+    has_active_subscription: bool | None = None,
+) -> PaymentOrderCreationResult:
     provider_value = PaymentProvider(provider)
     product_value = PaymentProduct(product)
     currency_value = PaymentCurrency(currency)
@@ -818,6 +843,20 @@ def create_or_reuse_pending_payment_order(
         raise ValueError("payment order ttl must be positive")
 
     current_time = _normalize_datetime(now)
+    requires_active_subscription = product_value in EXTRA_PAYMENT_PRODUCTS
+    if requires_active_subscription and not _repository_has_active_subscription(
+        repository,
+        user_id=user_id,
+        now=current_time,
+        provided=has_active_subscription,
+    ):
+        return PaymentOrderCreationResult(
+            accepted=False,
+            code=PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED,
+            message="Active subscription is required for this extra.",
+            requires_active_subscription=True,
+        )
+
     existing = repository.find_active_pending_payment_order(
         user_id=user_id,
         delivery_chat_id=delivery_chat_id,
@@ -828,7 +867,12 @@ def create_or_reuse_pending_payment_order(
         now=current_time,
     )
     if existing is not None:
-        return existing
+        return PaymentOrderCreationResult(
+            accepted=True,
+            code=PaymentOrderCreationCode.REUSED,
+            order=existing,
+            requires_active_subscription=requires_active_subscription,
+        )
 
     order = PaymentOrder(
         order_id=(order_id_factory or _default_payment_token)(),
@@ -844,7 +888,12 @@ def create_or_reuse_pending_payment_order(
         expires_at=current_time + timedelta(seconds=ttl_seconds),
         updated_at=current_time,
     )
-    return repository.insert_payment_order(order)
+    return PaymentOrderCreationResult(
+        accepted=True,
+        code=PaymentOrderCreationCode.CREATED,
+        order=repository.insert_payment_order(order),
+        requires_active_subscription=requires_active_subscription,
+    )
 
 
 def is_active_pending_payment_order(order: PaymentOrder, *, now: datetime | None = None) -> bool:
@@ -1156,6 +1205,22 @@ def _insert_payment_event_if_supported(
         inserter(event)
 
 
+def _repository_has_active_subscription(
+    repository: object,
+    *,
+    user_id: int,
+    now: datetime,
+    provided: bool | None,
+) -> bool:
+    loader = getattr(repository, "get_entitlement", None)
+    if callable(loader):
+        entitlement = loader(user_id)
+        checker = getattr(entitlement, "is_subscription_active", None)
+        if callable(checker):
+            return bool(checker(now))
+    return provided is True
+
+
 def _validate_payload_token(name: str, value: str) -> str:
     text = str(value).strip()
     if not _PAYLOAD_TOKEN_RE.fullmatch(text):
@@ -1268,6 +1333,8 @@ __all__ = [
     "PaymentEventType",
     "PaymentInvoiceMetadata",
     "PaymentOrder",
+    "PaymentOrderCreationCode",
+    "PaymentOrderCreationResult",
     "PaymentOrderRepository",
     "PaymentOrderStatus",
     "PaymentPayloadError",

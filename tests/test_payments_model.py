@@ -16,6 +16,7 @@ from diet_bot.payments import (
     PaymentEventType,
     PaymentInvoiceMetadata,
     PaymentOrder,
+    PaymentOrderCreationCode,
     PaymentOrderStatus,
     PaymentPayloadError,
     PaymentPreCheckoutCode,
@@ -444,6 +445,42 @@ def test_pre_checkout_validation_requires_active_subscription_for_extras_without
     assert entitlement.to_dict() == before
 
 
+def test_extra_pre_checkout_rejects_when_subscription_expired_after_order_creation() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_day1",
+        "nonce_day1",
+        PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentCheckoutRepository(
+        [order],
+        entitlements={
+            order.user_id: Entitlement(
+                subscription_period_start=(now - timedelta(days=30)).isoformat(),
+                subscription_period_end=(now - timedelta(seconds=1)).isoformat(),
+            ),
+        },
+    )
+
+    result = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=order.amount,
+        expected_provider=order.provider,
+        expected_product=order.product,
+        now=now,
+    )
+
+    assert result.approved is False
+    assert result.code == PaymentPreCheckoutCode.ACTIVE_SUBSCRIPTION_REQUIRED
+    assert result.requires_active_subscription is True
+    assert repository.pre_checkout_approvals == []
+
+
 def test_payment_enums_match_production_payment_plan() -> None:
     assert PaymentProvider.TELEGRAM_STARS.value == "telegram_stars"
     assert PaymentProvider.YOOKASSA.value == "yookassa"
@@ -646,7 +683,7 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
     repository = InMemoryPaymentOrderRepository()
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
 
-    order = create_or_reuse_pending_payment_order(
+    result = create_or_reuse_pending_payment_order(
         repository,
         user_id=1001,
         delivery_chat_id=2002,
@@ -659,6 +696,10 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
         nonce_factory=_sequence_factory("nonce_new1"),
     )
 
+    assert result.accepted is True
+    assert result.code == PaymentOrderCreationCode.CREATED
+    order = result.order
+    assert order is not None
     assert order.order_id == "order_new1"
     assert order.nonce == "nonce_new1"
     assert order.user_id == 1001
@@ -675,11 +716,66 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
     assert repository.orders == [order]
 
 
+@pytest.mark.parametrize(
+    ("product", "amount"),
+    [
+        (PaymentProduct.EXTRA_ONE_DAY, 35),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 170),
+    ],
+)
+def test_create_pending_extra_payment_order_requires_active_subscription(
+    product: PaymentProduct,
+    amount: int,
+) -> None:
+    repository = InMemoryPaymentOrderRepository()
+
+    result = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=product,
+        amount=amount,
+        currency=PaymentCurrency.XTR,
+        now=datetime(2026, 5, 13, 10, 0, tzinfo=UTC),
+        order_id_factory=_sequence_factory("order_new1"),
+        nonce_factory=_sequence_factory("nonce_new1"),
+    )
+
+    assert result.accepted is False
+    assert result.code == PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED
+    assert result.order is None
+    assert result.requires_active_subscription is True
+    assert repository.orders == []
+
+
+def test_create_subscription_month_payment_order_allows_inactive_user() -> None:
+    repository = InMemoryPaymentOrderRepository()
+
+    result = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=400,
+        currency=PaymentCurrency.XTR,
+        now=datetime(2026, 5, 13, 10, 0, tzinfo=UTC),
+        order_id_factory=_sequence_factory("order_sub1"),
+        nonce_factory=_sequence_factory("nonce_sub1"),
+    )
+
+    assert result.accepted is True
+    assert result.code == PaymentOrderCreationCode.CREATED
+    assert result.order is not None
+    assert result.order.product == PaymentProduct.SUBSCRIPTION_MONTH
+
+
 def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
     repository = InMemoryPaymentOrderRepository()
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
 
-    first = create_or_reuse_pending_payment_order(
+    first_result = create_or_reuse_pending_payment_order(
         repository,
         user_id=1001,
         delivery_chat_id=2002,
@@ -688,10 +784,11 @@ def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
         amount=25000,
         currency=PaymentCurrency.RUB,
         now=now,
+        has_active_subscription=True,
         order_id_factory=_sequence_factory("order_new1"),
         nonce_factory=_sequence_factory("nonce_new1"),
     )
-    second = create_or_reuse_pending_payment_order(
+    second_result = create_or_reuse_pending_payment_order(
         repository,
         user_id=1001,
         delivery_chat_id=2002,
@@ -700,10 +797,15 @@ def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
         amount=25000,
         currency=PaymentCurrency.RUB,
         now=now + timedelta(minutes=1),
+        has_active_subscription=True,
         order_id_factory=_sequence_factory("order_new2"),
         nonce_factory=_sequence_factory("nonce_new2"),
     )
 
+    first = first_result.order
+    second = second_result.order
+    assert first_result.code == PaymentOrderCreationCode.CREATED
+    assert second_result.code == PaymentOrderCreationCode.REUSED
     assert second == first
     assert len(repository.orders) == 1
 
@@ -725,7 +827,7 @@ def test_expired_pending_payment_order_is_not_reused() -> None:
     )
     repository = InMemoryPaymentOrderRepository([expired])
 
-    order = create_or_reuse_pending_payment_order(
+    result = create_or_reuse_pending_payment_order(
         repository,
         user_id=1001,
         delivery_chat_id=2002,
@@ -734,10 +836,14 @@ def test_expired_pending_payment_order_is_not_reused() -> None:
         amount=35,
         currency=PaymentCurrency.XTR,
         now=now,
+        has_active_subscription=True,
         order_id_factory=_sequence_factory("order_new1"),
         nonce_factory=_sequence_factory("nonce_new1"),
     )
 
+    assert result.accepted is True
+    order = result.order
+    assert order is not None
     assert order.order_id == "order_new1"
     assert order.payload == "diet:order:order_new1:nonce_new1"
     assert repository.orders == [expired, order]
@@ -755,7 +861,7 @@ def test_payment_order_creation_does_not_mutate_entitlement() -> None:
     )
     before = entitlement.to_dict()
 
-    create_or_reuse_pending_payment_order(
+    result = create_or_reuse_pending_payment_order(
         repository,
         user_id=1001,
         delivery_chat_id=2002,
@@ -768,6 +874,7 @@ def test_payment_order_creation_does_not_mutate_entitlement() -> None:
         nonce_factory=_sequence_factory("nonce_new1"),
     )
 
+    assert result.accepted is True
     assert entitlement.to_dict() == before
 
 
@@ -1011,6 +1118,43 @@ def test_successful_payment_extras_require_active_subscription_at_success_time(
     assert getattr(repository.entitlements[active_order.user_id], field_name) == 1
 
 
+def test_extra_successful_payment_rejects_when_subscription_expired_after_pre_checkout() -> None:
+    pre_checkout_at = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    success_at = pre_checkout_at + timedelta(minutes=2)
+    order = _payment_order(
+        "order_day1",
+        "nonce_day1",
+        PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        expires_at=success_at + timedelta(minutes=5),
+        pre_checkout_approved_at=pre_checkout_at,
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.entitlements[order.user_id] = Entitlement(
+        subscription_period_start=(pre_checkout_at - timedelta(days=3)).isoformat(),
+        subscription_period_end=(pre_checkout_at + timedelta(minutes=1)).isoformat(),
+    )
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-charge-day1"),
+        now=success_at,
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert result.processed is False
+    assert result.code == PaymentSuccessfulPaymentCode.ACTIVE_SUBSCRIPTION_REQUIRED
+    assert entitlement.extra_one_day_remaining == 0
+    assert repository.processed_charge_ids() == []
+    pending_order = repository.load_payment_order(order.order_id)
+    assert pending_order is not None
+    assert pending_order.status == PaymentOrderStatus.PENDING
+    assert [event.status for event in repository.payment_events] == [
+        PaymentEventStatus.IGNORED_NON_TERMINAL
+    ]
+    assert repository.payment_events[0].reason == "active_subscription_required"
+
+
 def test_expired_successful_payment_without_prior_pre_checkout_approval_is_rejected() -> None:
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
     order = _payment_order(
@@ -1193,6 +1337,20 @@ class InMemoryPaymentOrderRepository:
             self.orders[index] = replace(order, status=PaymentOrderStatus.EXPIRED)
             self.expired_order_ids.append(order_id)
             return
+
+
+class InMemoryPaymentCheckoutRepository(InMemoryPaymentOrderRepository):
+    def __init__(
+        self,
+        orders: list[PaymentOrder] | None = None,
+        *,
+        entitlements: dict[int, Entitlement] | None = None,
+    ) -> None:
+        super().__init__(orders)
+        self.entitlements = dict(entitlements or {})
+
+    def get_entitlement(self, user_id: int) -> Entitlement:
+        return self.entitlements.setdefault(user_id, Entitlement())
 
 
 class InMemoryPaymentLedgerRepository(InMemoryPaymentOrderRepository):
