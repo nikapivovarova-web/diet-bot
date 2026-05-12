@@ -8,20 +8,27 @@ import pytest
 from diet_bot.payments import (
     PAYMENT_ORDER_TTL_SECONDS,
     PROVIDER_CURRENCIES,
+    TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS,
     PaymentCurrency,
     PaymentEvent,
     PaymentEventStatus,
     PaymentEventType,
+    PaymentInvoiceMetadata,
     PaymentOrder,
     PaymentOrderStatus,
     PaymentPayloadError,
+    PaymentProductInvoiceMetadata,
     PaymentProduct,
     PaymentProvider,
     ProcessedProviderCharge,
+    build_payment_invoice_metadata,
+    build_payment_invoice_payload,
     create_or_reuse_pending_payment_order,
     decode_payment_order_payload,
     encode_payment_order_payload,
+    get_payment_product_invoice_metadata,
     redact_payment_payload,
+    validate_payment_invoice_payload,
 )
 from diet_bot.subscriptions import Entitlement
 
@@ -31,6 +38,41 @@ def test_payment_order_payload_round_trips_order_id_and_nonce() -> None:
 
     assert payload == "diet:order:order_123:nonce_456"
     assert decode_payment_order_payload(payload) == ("order_123", "nonce_456")
+
+
+def test_invoice_payload_helper_uses_order_id_and_nonce_for_each_order() -> None:
+    orders = [
+        _payment_order("order_sub1", "nonce_sub1", PaymentProduct.SUBSCRIPTION_MONTH),
+        _payment_order("order_day1", "nonce_day1", PaymentProduct.EXTRA_ONE_DAY),
+        _payment_order("order_pdf1", "nonce_pdf1", PaymentProduct.EXTRA_WEEKLY_PDF),
+    ]
+
+    payloads = [build_payment_invoice_payload(order) for order in orders]
+
+    assert payloads == [
+        "diet:order:order_sub1:nonce_sub1",
+        "diet:order:order_day1:nonce_day1",
+        "diet:order:order_pdf1:nonce_pdf1",
+    ]
+    assert [decode_payment_order_payload(payload) for payload in payloads] == [
+        ("order_sub1", "nonce_sub1"),
+        ("order_day1", "nonce_day1"),
+        ("order_pdf1", "nonce_pdf1"),
+    ]
+
+
+def test_different_payment_orders_get_different_invoice_payloads() -> None:
+    first = _payment_order("order_aaa1", "nonce_same", PaymentProduct.SUBSCRIPTION_MONTH)
+    second = _payment_order("order_bbb1", "nonce_same", PaymentProduct.SUBSCRIPTION_MONTH)
+    third = _payment_order("order_aaa1", "nonce_diff", PaymentProduct.SUBSCRIPTION_MONTH)
+
+    assert len(
+        {
+            build_payment_invoice_payload(first),
+            build_payment_invoice_payload(second),
+            build_payment_invoice_payload(third),
+        }
+    ) == 3
 
 
 @pytest.mark.parametrize(
@@ -66,6 +108,15 @@ def test_tampered_payment_order_payload_is_rejected(payload: str) -> None:
 def test_static_legacy_payment_payload_is_rejected_by_default(payload: str) -> None:
     with pytest.raises(PaymentPayloadError):
         decode_payment_order_payload(payload)
+
+
+def test_tampered_invoice_payload_nonce_is_rejected_against_order() -> None:
+    order = _payment_order("order_123", "nonce_456", PaymentProduct.SUBSCRIPTION_MONTH)
+    tampered_payload = "diet:order:order_123:nonce_999"
+
+    assert validate_payment_invoice_payload(order, order.payload) == (order.order_id, order.nonce)
+    with pytest.raises(PaymentPayloadError):
+        validate_payment_invoice_payload(order, tampered_payload)
 
 
 def test_payment_enums_match_production_payment_plan() -> None:
@@ -118,6 +169,96 @@ def test_payment_payload_redaction_masks_private_customer_and_secret_values() ->
     assert redacted["phone_number"] == "[REDACTED]"
     assert redacted["order_info"] == "[REDACTED]"
     assert redacted["invoice_payload"] == "diet:order:order_123:nonce_456"
+
+
+def test_stars_subscription_invoice_metadata_contains_amount_and_subscription_period() -> None:
+    order = _payment_order("order_sub1", "nonce_sub1", PaymentProduct.SUBSCRIPTION_MONTH)
+
+    metadata = build_payment_invoice_metadata(order)
+
+    assert isinstance(metadata, PaymentInvoiceMetadata)
+    assert metadata.provider == PaymentProvider.TELEGRAM_STARS
+    assert metadata.product == PaymentProduct.SUBSCRIPTION_MONTH
+    assert metadata.payload == "diet:order:order_sub1:nonce_sub1"
+    assert metadata.currency == PaymentCurrency.XTR
+    assert metadata.amount == 400
+    assert metadata.subscription_period == TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS == 2_592_000
+    assert metadata.need_email is False
+    assert metadata.send_email_to_provider is False
+    assert metadata.provider_data is None
+
+
+def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags() -> None:
+    order = _payment_order(
+        "order_ru1",
+        "nonce_ru1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.YOOKASSA,
+        amount=59_900,
+        currency=PaymentCurrency.RUB,
+    )
+
+    metadata = build_payment_invoice_metadata(order)
+
+    assert metadata.provider == PaymentProvider.YOOKASSA
+    assert metadata.product == PaymentProduct.SUBSCRIPTION_MONTH
+    assert metadata.payload == "diet:order:order_ru1:nonce_ru1"
+    assert metadata.currency == PaymentCurrency.RUB
+    assert metadata.amount == 59_900
+    assert metadata.subscription_period is None
+    assert metadata.need_email is True
+    assert metadata.send_email_to_provider is True
+    assert metadata.provider_data is not None
+    item = metadata.provider_data["receipt"]["items"][0]
+    assert item["amount"] == {"value": "599.00", "currency": "RUB"}
+    assert item["quantity"] == "1.00"
+    assert item["vat_code"] == 1
+    assert item["payment_mode"] == "full_payment"
+    assert item["payment_subject"] == "service"
+
+
+@pytest.mark.parametrize(
+    ("provider", "product", "currency", "amount"),
+    [
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.XTR, 400),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.XTR, 35),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.XTR, 170),
+        (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.RUB, 59_900),
+        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.RUB, 5_000),
+        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.RUB, 25_000),
+    ],
+)
+def test_product_invoice_metadata_contains_provider_product_currency_and_amount(
+    provider: PaymentProvider,
+    product: PaymentProduct,
+    currency: PaymentCurrency,
+    amount: int,
+) -> None:
+    metadata = get_payment_product_invoice_metadata(provider, product)
+
+    assert isinstance(metadata, PaymentProductInvoiceMetadata)
+    assert metadata.provider == provider
+    assert metadata.product == product
+    assert metadata.currency == currency
+    assert metadata.amount == amount
+    if provider == PaymentProvider.YOOKASSA:
+        assert metadata.need_email is True
+        assert metadata.send_email_to_provider is True
+        assert metadata.provider_data is not None
+    else:
+        assert metadata.need_email is False
+        assert metadata.send_email_to_provider is False
+        assert metadata.provider_data is None
+
+
+def test_invoice_metadata_helper_does_not_require_telegram_bot_api() -> None:
+    order = _payment_order("order_sub1", "nonce_sub1", PaymentProduct.SUBSCRIPTION_MONTH)
+
+    metadata = build_payment_invoice_metadata(order)
+
+    assert metadata.payload == "diet:order:order_sub1:nonce_sub1"
+    assert not hasattr(metadata, "bot")
+    assert not hasattr(metadata, "create_invoice_link")
 
 
 def test_payment_dataclasses_represent_order_event_and_processed_charge_without_entitlements() -> None:
@@ -338,6 +479,28 @@ class InMemoryPaymentOrderRepository:
     def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder:
         self.orders.append(order)
         return order
+
+
+def _payment_order(
+    order_id: str,
+    nonce: str,
+    product: PaymentProduct,
+    *,
+    provider: PaymentProvider = PaymentProvider.TELEGRAM_STARS,
+    amount: int = 400,
+    currency: PaymentCurrency = PaymentCurrency.XTR,
+) -> PaymentOrder:
+    return PaymentOrder(
+        order_id=order_id,
+        nonce=nonce,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=provider,
+        product=product,
+        amount=amount,
+        currency=currency,
+        status=PaymentOrderStatus.PENDING,
+    )
 
 
 def _sequence_factory(*values: str):

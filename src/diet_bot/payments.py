@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 
 PAYMENT_ORDER_PAYLOAD_PREFIX = "diet:order"
 PAYMENT_ORDER_TTL_SECONDS = 15 * 60
+TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60
 REDACTED_PAYMENT_VALUE = "[REDACTED]"
 TokenFactory = Callable[[], str]
 
@@ -79,6 +80,51 @@ LEGACY_STATIC_PAYMENT_PAYLOADS = frozenset(
     }
 )
 
+_PAYMENT_PRODUCT_INVOICE_CATALOG: Mapping[
+    tuple[PaymentProvider, PaymentProduct],
+    tuple[PaymentCurrency, int, int | None],
+] = {
+    (
+        PaymentProvider.TELEGRAM_STARS,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+    ): (
+        PaymentCurrency.XTR,
+        400,
+        TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS,
+    ),
+    (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY): (
+        PaymentCurrency.XTR,
+        35,
+        None,
+    ),
+    (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF): (
+        PaymentCurrency.XTR,
+        170,
+        None,
+    ),
+    (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH): (
+        PaymentCurrency.RUB,
+        59_900,
+        None,
+    ),
+    (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY): (
+        PaymentCurrency.RUB,
+        5_000,
+        None,
+    ),
+    (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF): (
+        PaymentCurrency.RUB,
+        25_000,
+        None,
+    ),
+}
+
+_PAYMENT_PRODUCT_RECEIPT_DESCRIPTIONS: Mapping[PaymentProduct, str] = {
+    PaymentProduct.SUBSCRIPTION_MONTH: "FoodBalance monthly access",
+    PaymentProduct.EXTRA_ONE_DAY: "FoodBalance one-day ration",
+    PaymentProduct.EXTRA_WEEKLY_PDF: "FoodBalance weekly PDF",
+}
+
 _PAYLOAD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _PHONE_RE = re.compile(r"(?<![\w+])\+?\d[\d\s().-]{7,}\d(?!\w)")
@@ -106,6 +152,46 @@ _SENSITIVE_KEY_NAMES = frozenset(
         "providerdata",
     }
 )
+
+
+@dataclass(frozen=True)
+class PaymentProductInvoiceMetadata:
+    provider: PaymentProvider | str
+    product: PaymentProduct | str
+    currency: PaymentCurrency | str
+    amount: int
+    subscription_period: int | None = None
+    need_email: bool = False
+    send_email_to_provider: bool = False
+    provider_data: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", PaymentProvider(self.provider))
+        object.__setattr__(self, "product", PaymentProduct(self.product))
+        object.__setattr__(self, "currency", PaymentCurrency(self.currency))
+        if self.amount <= 0:
+            raise ValueError("invoice amount must be positive")
+
+
+@dataclass(frozen=True)
+class PaymentInvoiceMetadata:
+    provider: PaymentProvider | str
+    product: PaymentProduct | str
+    currency: PaymentCurrency | str
+    amount: int
+    payload: str
+    subscription_period: int | None = None
+    need_email: bool = False
+    send_email_to_provider: bool = False
+    provider_data: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", PaymentProvider(self.provider))
+        object.__setattr__(self, "product", PaymentProduct(self.product))
+        object.__setattr__(self, "currency", PaymentCurrency(self.currency))
+        if self.amount <= 0:
+            raise ValueError("invoice amount must be positive")
+        decode_payment_order_payload(self.payload)
 
 
 @dataclass(frozen=True)
@@ -213,6 +299,64 @@ def encode_payment_order_payload(order_id: str, nonce: str) -> str:
     order_id = _validate_payload_token("order_id", order_id)
     nonce = _validate_payload_token("nonce", nonce)
     return f"{PAYMENT_ORDER_PAYLOAD_PREFIX}:{order_id}:{nonce}"
+
+
+def build_payment_invoice_payload(order: PaymentOrder) -> str:
+    return encode_payment_order_payload(order.order_id, order.nonce)
+
+
+def validate_payment_invoice_payload(order: PaymentOrder, payload: str) -> tuple[str, str]:
+    order_id, nonce = decode_payment_order_payload(payload)
+    if order_id != order.order_id or nonce != order.nonce:
+        raise PaymentPayloadError("payment payload does not match order nonce")
+    return order_id, nonce
+
+
+def get_payment_product_invoice_metadata(
+    provider: PaymentProvider | str,
+    product: PaymentProduct | str,
+) -> PaymentProductInvoiceMetadata:
+    provider_value = PaymentProvider(provider)
+    product_value = PaymentProduct(product)
+    try:
+        currency, amount, subscription_period = _PAYMENT_PRODUCT_INVOICE_CATALOG[
+            (provider_value, product_value)
+        ]
+    except KeyError as exc:
+        raise ValueError("unsupported payment provider/product combination") from exc
+
+    return PaymentProductInvoiceMetadata(
+        provider=provider_value,
+        product=product_value,
+        currency=currency,
+        amount=amount,
+        subscription_period=subscription_period,
+        need_email=provider_value == PaymentProvider.YOOKASSA,
+        send_email_to_provider=provider_value == PaymentProvider.YOOKASSA,
+        provider_data=(
+            _build_yookassa_provider_data(product_value, amount)
+            if provider_value == PaymentProvider.YOOKASSA
+            else None
+        ),
+    )
+
+
+def build_payment_invoice_metadata(order: PaymentOrder) -> PaymentInvoiceMetadata:
+    product_metadata = get_payment_product_invoice_metadata(order.provider, order.product)
+    if order.amount != product_metadata.amount or order.currency != product_metadata.currency:
+        raise ValueError("payment order does not match production invoice metadata")
+
+    return PaymentInvoiceMetadata(
+        provider=product_metadata.provider,
+        product=product_metadata.product,
+        currency=product_metadata.currency,
+        amount=product_metadata.amount,
+        payload=build_payment_invoice_payload(order),
+        subscription_period=product_metadata.subscription_period,
+        need_email=product_metadata.need_email,
+        send_email_to_provider=product_metadata.send_email_to_provider,
+        provider_data=product_metadata.provider_data,
+    )
 
 
 def create_or_reuse_pending_payment_order(
@@ -334,6 +478,30 @@ def _redact_payment_text(value: str) -> str:
     return _PHONE_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
 
 
+def _build_yookassa_provider_data(product: PaymentProduct, amount: int) -> dict[str, Any]:
+    return {
+        "receipt": {
+            "items": [
+                {
+                    "description": _PAYMENT_PRODUCT_RECEIPT_DESCRIPTIONS[product],
+                    "quantity": "1.00",
+                    "amount": {
+                        "value": _format_kopecks_as_rub(amount),
+                        "currency": PaymentCurrency.RUB.value,
+                    },
+                    "vat_code": 1,
+                    "payment_mode": "full_payment",
+                    "payment_subject": "service",
+                },
+            ],
+        },
+    }
+
+
+def _format_kopecks_as_rub(amount: int) -> str:
+    return f"{amount / 100:.2f}"
+
+
 def _normalize_datetime(value: datetime | None) -> datetime:
     if value is None:
         return datetime.now(UTC)
@@ -352,21 +520,28 @@ __all__ = [
     "PAYMENT_ORDER_TTL_SECONDS",
     "PAYMENT_PRODUCTS",
     "PROVIDER_CURRENCIES",
+    "TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS",
     "PaymentCurrency",
     "PaymentEvent",
     "PaymentEventStatus",
     "PaymentEventType",
+    "PaymentInvoiceMetadata",
     "PaymentOrder",
     "PaymentOrderRepository",
     "PaymentOrderStatus",
     "PaymentPayloadError",
     "PaymentProduct",
+    "PaymentProductInvoiceMetadata",
     "PaymentProvider",
     "ProcessedProviderCharge",
     "REDACTED_PAYMENT_VALUE",
+    "build_payment_invoice_metadata",
+    "build_payment_invoice_payload",
     "create_or_reuse_pending_payment_order",
     "decode_payment_order_payload",
     "encode_payment_order_payload",
+    "get_payment_product_invoice_metadata",
     "is_active_pending_payment_order",
     "redact_payment_payload",
+    "validate_payment_invoice_payload",
 ]
