@@ -25,4 +25,5 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
     "slow_pdf_builder: long-running weekly PDF and recipe builder checks split out of the fast gate",
+    "postgres_integration: PostgreSQL-backed integration tests skipped by default unless --require-postgres is used",
 ]
