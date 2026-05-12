@@ -32,9 +32,16 @@ from diet_bot.payments import (
     PaymentOrderStatus,
     PaymentProduct,
     PaymentProvider,
+    PaymentReconciliationAction,
+    PaymentReconciliationInput,
+    PaymentReconciliationResult,
+    PaymentReversalInput,
+    PaymentReversalResult,
     PaymentSuccessfulPaymentInput,
     PaymentSuccessfulPaymentResult,
     ProcessedProviderCharge,
+    apply_payment_reconciliation as apply_payment_reconciliation_core,
+    apply_payment_reversal as apply_payment_reversal_core,
     apply_successful_payment as apply_successful_payment_core,
     create_or_reuse_pending_payment_order,
     decode_payment_order_payload,
@@ -920,6 +927,212 @@ async def test_successful_payment_handler_does_not_call_legacy_direct_apply_path
 
 
 @pytest.mark.anyio
+async def test_payment_event_command_requires_admin(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {71_900})
+    message = FakeMessage(
+        text="/payment_event refund telegram_stars tg-secret-refund",
+        user_id=71_901,
+    )
+
+    await telegram_app.payment_event_reconciliation_command(message)
+
+    response = message.texts[-1][0]
+    assert "only to admins" in response
+    assert "tg-secret-refund" not in response
+    assert store.payment_reversal_inputs == []
+    assert store.payment_reconciliation_inputs == []
+
+
+@pytest.mark.anyio
+async def test_admin_refund_command_calls_reversal_core_and_returns_redacted_status(monkeypatch) -> None:
+    admin_id = 71_902
+    store = FakePaymentStore()
+    order = _paid_store_order(
+        store,
+        order_id="order_refund_secret",
+        charge_id="tg-refund-secret",
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    message = FakeMessage(
+        text=(
+            "/payment_event refund telegram_stars tg-refund-secret "
+            "buyer@example.com +79991234567 order_info 123456789:ABCdefGhijKLMnopQRStuVWXyz"
+        ),
+        user_id=admin_id,
+    )
+    duplicate = FakeMessage(
+        text="/payment_event refund telegram_stars tg-refund-secret retry",
+        user_id=admin_id,
+    )
+
+    await telegram_app.payment_event_reconciliation_command(message)
+    await telegram_app.payment_event_reconciliation_command(duplicate)
+
+    response = message.texts[-1][0]
+    duplicate_response = duplicate.texts[-1][0]
+    entitlement = store.get_entitlement(order.user_id)
+    assert store.payment_reversal_inputs[0].event_type == PaymentEventType.REFUND
+    assert store.payment_reversal_inputs[0].provider == PaymentProvider.TELEGRAM_STARS
+    assert store.payment_reversal_inputs[0].telegram_charge_id == "tg-refund-secret"
+    assert response.startswith("processed: reversal applied")
+    assert duplicate_response.startswith("duplicate: reversal no-op")
+    assert not entitlement.is_subscription_active()
+    _assert_admin_payment_response_is_redacted(response)
+
+
+@pytest.mark.anyio
+async def test_admin_chargeback_command_calls_reversal_core_and_returns_redacted_status(monkeypatch) -> None:
+    admin_id = 71_903
+    store = FakePaymentStore()
+    _paid_store_order(
+        store,
+        order_id="order_chargeback_secret",
+        charge_id="tg-chargeback-secret",
+        product=PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        entitlement=telegram_app.Entitlement(
+            subscription_period_start=datetime.now(UTC).isoformat(),
+            subscription_period_end=(datetime.now(UTC) + timedelta(days=3)).isoformat(),
+        ),
+    )
+    assert store.get_entitlement(12345).extra_one_day_remaining == 1
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    message = FakeMessage(
+        text="/payment_event chargeback telegram_stars tg-chargeback-secret",
+        user_id=admin_id,
+    )
+
+    await telegram_app.payment_event_reconciliation_command(message)
+
+    response = message.texts[-1][0]
+    assert store.payment_reversal_inputs[0].event_type == PaymentEventType.CHARGEBACK
+    assert store.get_entitlement(12345).extra_one_day_remaining == 0
+    assert response.startswith("processed: reversal applied")
+    assert "tg-chargeback-secret" not in response
+
+
+@pytest.mark.anyio
+async def test_admin_cancel_command_records_cancel_and_keeps_paid_period(monkeypatch) -> None:
+    admin_id = 71_904
+    store = FakePaymentStore()
+    order = _paid_store_order(
+        store,
+        order_id="order_cancel_secret",
+        charge_id="tg-cancel-secret",
+    )
+    before = store.get_entitlement(order.user_id).to_dict()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    message = FakeMessage(
+        text="/payment_event cancel_subscription telegram_stars tg-cancel-secret",
+        user_id=admin_id,
+    )
+
+    await telegram_app.payment_event_reconciliation_command(message)
+
+    entitlement = store.get_entitlement(order.user_id)
+    assert store.payment_reversal_inputs[0].event_type == PaymentEventType.CANCEL_SUBSCRIPTION
+    assert entitlement.to_dict() == before
+    assert entitlement.is_subscription_active()
+    assert message.texts[-1][0].startswith("processed: reversal applied")
+
+
+@pytest.mark.anyio
+async def test_admin_reconcile_orphan_command_calls_reconciliation_core_once(monkeypatch) -> None:
+    admin_id = 71_905
+    store = FakePaymentStore()
+    now = datetime.now(UTC)
+    order = store.insert_payment_order(
+        _pending_payment_order(
+            order_id="order_reconcile_secret",
+            nonce="nonce_reconcile_secret",
+            expires_at=now + timedelta(minutes=5),
+        ),
+    )
+    orphan = PaymentEvent(
+        event_id="evt_orphan_secret",
+        event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        order_id="order_missing_secret",
+        charge_id="tg-orphan-secret",
+        telegram_charge_id="tg-orphan-secret",
+        user_id=order.user_id,
+        delivery_chat_id=order.delivery_chat_id,
+        product=order.product,
+        amount=order.amount,
+        currency=order.currency,
+        status=PaymentEventStatus.ORPHAN_RECOVERABLE,
+        reason="order_not_found",
+        raw_payload_redacted={"email": "[REDACTED]"},
+    )
+    store.insert_payment_event(orphan)
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    message = FakeMessage(
+        text=(
+            "/payment_event reconcile_orphan evt_orphan_secret order_reconcile_secret "
+            "matched buyer@example.com +79991234567"
+        ),
+        user_id=admin_id,
+    )
+    duplicate = FakeMessage(
+        text="/payment_event reconcile_orphan evt_orphan_secret order_reconcile_secret retry",
+        user_id=admin_id,
+    )
+
+    await telegram_app.payment_event_reconciliation_command(message)
+    await telegram_app.payment_event_reconciliation_command(duplicate)
+
+    response = message.texts[-1][0]
+    duplicate_response = duplicate.texts[-1][0]
+    assert len(store.payment_reconciliation_inputs) == 2
+    assert store.payment_reconciliation_inputs[0].action == PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS
+    assert store.payment_reconciliation_inputs[0].target_event_id == "evt_orphan_secret"
+    assert store.payment_reconciliation_inputs[0].target_order_id == "order_reconcile_secret"
+    assert store.get_entitlement(order.user_id).is_subscription_active()
+    assert response.startswith("processed: reconciliation applied")
+    assert duplicate_response.startswith("duplicate: reconciliation no-op")
+    _assert_admin_payment_response_is_redacted(response)
+
+
+@pytest.mark.anyio
+async def test_admin_ignore_orphan_command_closes_event_with_redacted_reason(monkeypatch) -> None:
+    admin_id = 71_906
+    store = FakePaymentStore()
+    event = PaymentEvent(
+        event_id="evt_ignore_secret",
+        event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        order_id=None,
+        charge_id="tg-ignore-secret",
+        telegram_charge_id="tg-ignore-secret",
+        status=PaymentEventStatus.ORPHAN_RECOVERABLE,
+        reason="order_not_found",
+    )
+    store.insert_payment_event(event)
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    message = FakeMessage(
+        text="/payment_event ignore evt_ignore_secret buyer@example.com +79991234567 order_info",
+        user_id=admin_id,
+    )
+
+    await telegram_app.payment_event_reconciliation_command(message)
+
+    ignored = store.load_payment_event("evt_ignore_secret")
+    response = message.texts[-1][0]
+    assert store.payment_reconciliation_inputs[0].action == PaymentReconciliationAction.IGNORE_EVENT
+    assert ignored is not None
+    assert ignored.status == PaymentEventStatus.IGNORED_NON_TERMINAL
+    assert response.startswith("processed: reconciliation applied")
+    _assert_admin_payment_response_is_redacted(response)
+
+
+@pytest.mark.anyio
 async def test_send_subscription_invoice_link_creates_recurring_stars_invoice(monkeypatch) -> None:
     store = FakePaymentStore()
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1380,6 +1593,8 @@ class FakePaymentStore:
         self.payment_events: list[PaymentEvent] = []
         self.processed_provider_charges: list[ProcessedProviderCharge] = []
         self.successful_payment_inputs: list[PaymentSuccessfulPaymentInput] = []
+        self.payment_reversal_inputs: list[PaymentReversalInput] = []
+        self.payment_reconciliation_inputs: list[PaymentReconciliationInput] = []
         self._sequence = 0
 
     def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
@@ -1509,9 +1724,64 @@ class FakePaymentStore:
         self.successful_payment_inputs.append(successful_payment)
         return apply_successful_payment_core(self, successful_payment, now=now)
 
+    def apply_payment_reversal(
+        self,
+        reversal: PaymentReversalInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentReversalResult:
+        self.payment_reversal_inputs.append(reversal)
+        return apply_payment_reversal_core(self, reversal, now=now)
+
+    def apply_payment_reconciliation(
+        self,
+        reconciliation: PaymentReconciliationInput,
+        *,
+        now: datetime | None = None,
+    ) -> PaymentReconciliationResult:
+        self.payment_reconciliation_inputs.append(reconciliation)
+        return apply_payment_reconciliation_core(self, reconciliation, now=now)
+
     def insert_payment_event(self, event: PaymentEvent) -> PaymentEvent:
         self.payment_events.append(event)
         return event
+
+    def load_payment_event(self, event_id: str) -> PaymentEvent | None:
+        for event in self.payment_events:
+            if event.event_id == event_id:
+                return event
+        return None
+
+    def update_payment_event(self, event: PaymentEvent) -> PaymentEvent:
+        for index, existing in enumerate(self.payment_events):
+            if existing.event_id == event.event_id:
+                self.payment_events[index] = event
+                return event
+        self.payment_events.append(event)
+        return event
+
+    def find_payment_event(
+        self,
+        *,
+        provider: PaymentProvider,
+        charge_id: str,
+        event_type: PaymentEventType | None = None,
+        statuses: tuple[PaymentEventStatus, ...] = (),
+    ) -> PaymentEvent | None:
+        for event in reversed(self.payment_events):
+            if event.provider != provider:
+                continue
+            if event_type is not None and event.event_type != event_type:
+                continue
+            if statuses and event.status not in statuses:
+                continue
+            if charge_id in {
+                event.charge_id,
+                event.telegram_charge_id,
+                event.provider_charge_id,
+            }:
+                return event
+        return None
 
     def find_processed_provider_charge(
         self,
@@ -1608,6 +1878,43 @@ def _pending_payment_order(
     )
 
 
+def _paid_store_order(
+    store: FakePaymentStore,
+    *,
+    order_id: str,
+    charge_id: str,
+    product: PaymentProduct = PaymentProduct.SUBSCRIPTION_MONTH,
+    amount: int = 400,
+    entitlement: telegram_app.Entitlement | None = None,
+) -> PaymentOrder:
+    now = datetime.now(UTC)
+    order = store.insert_payment_order(
+        _pending_payment_order(
+            order_id=order_id,
+            nonce=f"nonce_{order_id}",
+            product=product,
+            amount=amount,
+            expires_at=now + timedelta(minutes=5),
+        ),
+    )
+    if entitlement is not None:
+        store.entitlements[order.user_id] = entitlement
+    result = store.apply_successful_payment(
+        PaymentSuccessfulPaymentInput(
+            payload=order.payload,
+            provider=order.provider,
+            telegram_charge_id=charge_id,
+            user_id=order.user_id,
+            delivery_chat_id=order.delivery_chat_id,
+            currency=order.currency,
+            total_amount=order.amount,
+        ),
+        now=now,
+    )
+    assert result.processed is True
+    return order
+
+
 def _successful_payment_for_order(
     order: PaymentOrder,
     *,
@@ -1629,6 +1936,22 @@ def _successful_payment_for_order(
         provider_payment_charge_id=provider_charge_id,
         subscription_expiration_date=subscription_expiration_date,
     )
+
+
+def _assert_admin_payment_response_is_redacted(response: str) -> None:
+    for secret in (
+        "tg-refund-secret",
+        "tg-orphan-secret",
+        "tg-ignore-secret",
+        "buyer@example.com",
+        "+79991234567",
+        "order_info",
+        "123456789:ABCdefGhijKLMnopQRStuVWXyz",
+        "order_refund_secret",
+        "order_reconcile_secret",
+        "evt_orphan_secret",
+    ):
+        assert secret not in response
 
 
 def profile_with(**kwargs) -> UserProfile:

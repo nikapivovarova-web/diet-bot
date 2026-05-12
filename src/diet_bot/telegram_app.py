@@ -56,13 +56,22 @@ from .json_storage import atomic_write_json, json_storage_transaction
 from .payments import (
     PaymentOrder,
     PaymentOrderCreationCode,
+    PaymentEventType,
     PaymentPreCheckoutCode,
     PaymentPreCheckoutValidation,
     PaymentProduct,
     PaymentProvider,
+    PaymentReconciliationAction,
+    PaymentReconciliationInput,
+    PaymentReconciliationResult,
+    PaymentReversalInput,
+    PaymentReversalResult,
     PaymentSuccessfulPaymentInput,
+    REDACTED_PAYMENT_VALUE,
     build_payment_invoice_metadata,
     get_payment_product_invoice_metadata,
+    redact_admin_actor_metadata,
+    redact_payment_payload,
     validate_payment_pre_checkout,
 )
 from .postgres_store import PostgresDietBotStore
@@ -478,6 +487,31 @@ async def secret_access_command(message: Message) -> None:
     await message.answer(_format_test_access_command_status(message.chat.id))
 
 
+@router.message(Command("payment_event"))
+async def payment_event_reconciliation_command(message: Message) -> None:
+    if not _is_admin_message(message):
+        await message.answer("payment_event command is available only to admins.")
+        return
+
+    command = _parse_payment_event_admin_command(message.text or "")
+    if command is None:
+        await message.answer(_payment_event_admin_usage_text())
+        return
+
+    store = _runtime_store()
+    if store is None:
+        await message.answer("no_op: payment ledger store is not configured")
+        return
+
+    if command.mode == "reversal":
+        result = _apply_admin_payment_reversal(store, command, message)
+        await message.answer(_format_admin_payment_reversal_result(command, result))
+        return
+
+    result = _apply_admin_payment_reconciliation(store, command, message)
+    await message.answer(_format_admin_payment_reconciliation_result(command, result))
+
+
 @router.callback_query()
 async def handle_callback(callback: CallbackQuery) -> None:
     data = callback.data or ""
@@ -680,6 +714,9 @@ async def handle_answer(message: Message) -> None:
         return
     if normalized_command == "330366":
         await secret_access_command(message)
+        return
+    if normalized_command == "payment_event":
+        await payment_event_reconciliation_command(message)
         return
     if not await ensure_private_chat(message):
         return
@@ -2252,6 +2289,291 @@ def _normalize_command_text(text: str) -> str | None:
 def _is_admin_message(message: Message) -> bool:
     user_id = _message_user_id(message)
     return bool(user_id is not None and user_id in ADMIN_USER_IDS)
+
+
+@dataclass(frozen=True)
+class _PaymentEventAdminCommand:
+    mode: str
+    action: str
+    event_type: PaymentEventType | None = None
+    provider: PaymentProvider | None = None
+    charge_alias: str | None = None
+    reconciliation_action: PaymentReconciliationAction | None = None
+    target_event_id: str | None = None
+    target_order_id: str | None = None
+    reason: str | None = None
+
+
+def _parse_payment_event_admin_command(text: str) -> _PaymentEventAdminCommand | None:
+    args = text.split()
+    if not args:
+        return None
+    args = args[1:]
+    if not args:
+        return None
+
+    action = args[0].strip().lower().replace("-", "_")
+    if action in {"refund", "chargeback", "cancel", "cancel_subscription"}:
+        if len(args) < 3:
+            return None
+        provider = _parse_payment_admin_provider(args[1])
+        charge_alias = args[2].strip()
+        if provider is None or not charge_alias:
+            return None
+        event_type = (
+            PaymentEventType.CANCEL_SUBSCRIPTION
+            if action in {"cancel", "cancel_subscription"}
+            else PaymentEventType(action)
+        )
+        return _PaymentEventAdminCommand(
+            mode="reversal",
+            action=action,
+            event_type=event_type,
+            provider=provider,
+            charge_alias=charge_alias,
+            reason=_payment_admin_safe_reason(" ".join(args[3:]) or None),
+        )
+
+    if action in {"reconcile", "reconcile_orphan", "reconcile_orphan_success"}:
+        if len(args) < 2:
+            return None
+        if action == "reconcile" and len(args) == 2:
+            return _PaymentEventAdminCommand(
+                mode="reconciliation",
+                action=action,
+                reconciliation_action=PaymentReconciliationAction.RECONCILE_PENDING_REVERSAL,
+                target_event_id=args[1].strip() or None,
+            )
+        if len(args) < 3:
+            return None
+        return _PaymentEventAdminCommand(
+            mode="reconciliation",
+            action=action,
+            reconciliation_action=PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS,
+            target_event_id=args[1].strip() or None,
+            target_order_id=args[2].strip() or None,
+            reason=_payment_admin_safe_reason(" ".join(args[3:]) or None),
+        )
+
+    if action in {"reconcile_pending", "reconcile_pending_reversal"}:
+        if len(args) < 2:
+            return None
+        return _PaymentEventAdminCommand(
+            mode="reconciliation",
+            action=action,
+            reconciliation_action=PaymentReconciliationAction.RECONCILE_PENDING_REVERSAL,
+            target_event_id=args[1].strip() or None,
+            reason=_payment_admin_safe_reason(" ".join(args[2:]) or None),
+        )
+
+    if action in {"ignore", "close"}:
+        if len(args) < 2:
+            return None
+        return _PaymentEventAdminCommand(
+            mode="reconciliation",
+            action=action,
+            reconciliation_action=PaymentReconciliationAction.IGNORE_EVENT,
+            target_event_id=args[1].strip() or None,
+            reason=_payment_admin_safe_reason(" ".join(args[2:]) or None),
+        )
+
+    return None
+
+
+def _payment_event_admin_usage_text() -> str:
+    return (
+        "Usage:\n"
+        "/payment_event refund <provider> <charge_alias> [reason]\n"
+        "/payment_event chargeback <provider> <charge_alias> [reason]\n"
+        "/payment_event cancel_subscription <provider> <charge_alias> [reason]\n"
+        "/payment_event reconcile_orphan <event_id> <order_id> [reason]\n"
+        "/payment_event reconcile_pending <event_id> [reason]\n"
+        "/payment_event ignore <event_id> <reason>"
+    )
+
+
+def _parse_payment_admin_provider(value: str) -> PaymentProvider | None:
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "stars": PaymentProvider.TELEGRAM_STARS,
+        "telegram": PaymentProvider.TELEGRAM_STARS,
+        "telegram_stars": PaymentProvider.TELEGRAM_STARS,
+        "xtr": PaymentProvider.TELEGRAM_STARS,
+        "card": PaymentProvider.YOOKASSA,
+        "rub": PaymentProvider.YOOKASSA,
+        "yookassa": PaymentProvider.YOOKASSA,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    try:
+        return PaymentProvider(normalized)
+    except ValueError:
+        return None
+
+
+def _apply_admin_payment_reversal(
+    store: DietBotStore,
+    command: _PaymentEventAdminCommand,
+    message: Message,
+) -> PaymentReversalResult:
+    telegram_charge_id, provider_charge_id = _payment_charge_ids_from_alias(command.charge_alias)
+    reversal = PaymentReversalInput(
+        event_type=command.event_type,
+        provider=command.provider,
+        telegram_charge_id=telegram_charge_id,
+        provider_charge_id=provider_charge_id,
+        reason=command.reason,
+        raw_payload=_admin_payment_event_raw_payload(message, command),
+    )
+    return store.apply_payment_reversal(reversal)
+
+
+def _apply_admin_payment_reconciliation(
+    store: DietBotStore,
+    command: _PaymentEventAdminCommand,
+    message: Message,
+) -> PaymentReconciliationResult:
+    reconciliation = PaymentReconciliationInput(
+        action=command.reconciliation_action,
+        target_event_id=command.target_event_id,
+        target_order_id=command.target_order_id,
+        admin_actor=_payment_admin_actor(message),
+        reason=command.reason,
+    )
+    return store.apply_payment_reconciliation(reconciliation)
+
+
+def _payment_charge_ids_from_alias(charge_alias: str | None) -> tuple[str | None, str | None]:
+    text = str(charge_alias or "").strip()
+    lowered = text.lower()
+    for prefix in ("provider:", "provider_charge:", "pc:"):
+        if lowered.startswith(prefix):
+            value = text[len(prefix):].strip()
+            return None, value or None
+    for prefix in ("telegram:", "telegram_charge:", "tg:"):
+        if lowered.startswith(prefix):
+            value = text[len(prefix):].strip()
+            return value or None, None
+    return (text or None), (text or None)
+
+
+def _admin_payment_event_raw_payload(
+    message: Message,
+    command: _PaymentEventAdminCommand,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "source": "admin_payment_event_command",
+        "action": command.action,
+        "admin_actor": redact_admin_actor_metadata(_payment_admin_actor(message)),
+    }
+    if command.reason:
+        payload["reason"] = command.reason
+    return payload
+
+
+def _payment_admin_actor(message: Message) -> dict[str, object]:
+    actor: dict[str, object] = {"chat_id": message.chat.id}
+    user_id = _message_user_id(message)
+    if user_id is not None:
+        actor["admin_id"] = user_id
+    return actor
+
+
+def _format_admin_payment_reversal_result(
+    command: _PaymentEventAdminCommand,
+    result: PaymentReversalResult,
+) -> str:
+    status = _admin_payment_result_status(result)
+    headline = (
+        "processed: reversal applied"
+        if status == "processed"
+        else "duplicate: reversal no-op"
+        if status == "duplicate"
+        else "no_op: reversal did not change access"
+    )
+    lines = [
+        headline,
+        f"result: {status}",
+        f"event_type: {_enum_value(command.event_type)}",
+        f"provider: {_enum_value(command.provider)}",
+        f"code: {_enum_value(result.code)}",
+    ]
+    _append_admin_payment_result_details(lines, order=getattr(result, "order", None), event=getattr(result, "event", None))
+    return "\n".join(lines)
+
+
+def _format_admin_payment_reconciliation_result(
+    command: _PaymentEventAdminCommand,
+    result: PaymentReconciliationResult,
+) -> str:
+    status = _admin_payment_result_status(result)
+    headline = (
+        "processed: reconciliation applied"
+        if status == "processed"
+        else "duplicate: reconciliation no-op"
+        if status == "duplicate"
+        else "no_op: reconciliation did not change access"
+    )
+    target_event = getattr(result, "target_event", None)
+    order = getattr(result, "order", None)
+    lines = [
+        headline,
+        f"result: {status}",
+        f"action: {_enum_value(command.reconciliation_action)}",
+        f"code: {_enum_value(result.code)}",
+    ]
+    if target_event is None and command.target_event_id:
+        lines.append(f"event: {_short_payment_identifier(command.target_event_id)}")
+    _append_admin_payment_result_details(lines, order=order, event=target_event)
+    return "\n".join(lines)
+
+
+def _admin_payment_result_status(result: object) -> str:
+    if bool(getattr(result, "duplicate", False)):
+        return "duplicate"
+    if bool(getattr(result, "processed", False)):
+        return "processed"
+    return "no_op"
+
+
+def _append_admin_payment_result_details(
+    lines: list[str],
+    *,
+    order: PaymentOrder | None,
+    event: object,
+) -> None:
+    if order is not None:
+        lines.append(f"order: {_short_payment_identifier(order.order_id)}")
+    if event is not None:
+        event_id = getattr(event, "event_id", None)
+        if event_id:
+            lines.append(f"event: {_short_payment_identifier(str(event_id))}")
+        reason = _payment_admin_safe_reason(getattr(event, "reason", None))
+        if reason:
+            lines.append(f"reason: {reason}")
+
+
+def _payment_admin_safe_reason(reason: object) -> str | None:
+    if reason is None:
+        return None
+    text = str(redact_payment_payload(str(reason).strip())).strip()
+    if not text:
+        return None
+    for sensitive_word in ("order_info", "provider_data", "receipt", "customer"):
+        text = re.sub(re.escape(sensitive_word), REDACTED_PAYMENT_VALUE, text, flags=re.IGNORECASE)
+    return text
+
+
+def _short_payment_identifier(value: str | None) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 10:
+        return text
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def _enum_value(value: object) -> str:
+    enum_value = getattr(value, "value", None)
+    return str(enum_value if enum_value is not None else value)
 
 
 def _parse_test_access_command(text: str) -> tuple[str, int | None]:
