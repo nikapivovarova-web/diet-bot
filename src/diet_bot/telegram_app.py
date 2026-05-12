@@ -56,10 +56,13 @@ from .json_storage import atomic_write_json, json_storage_transaction
 from .payments import (
     PaymentOrder,
     PaymentOrderCreationCode,
+    PaymentPreCheckoutCode,
+    PaymentPreCheckoutValidation,
     PaymentProduct,
     PaymentProvider,
     build_payment_invoice_metadata,
     get_payment_product_invoice_metadata,
+    validate_payment_pre_checkout,
 )
 from .postgres_store import PostgresDietBotStore
 from .promo_codes import PromoCodeActivation, activate_promo_code
@@ -318,6 +321,7 @@ RUB_PAYMENT_PAYLOAD_DESCRIPTIONS = {
     PAYLOAD_RU_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
+PAYMENT_PRE_CHECKOUT_FAILED_TEXT = "Payment could not be verified. Please create a new invoice."
 PAYMENT_PAYLOAD_PRODUCTS = {
     PAYLOAD_SUBSCRIPTION_MONTH: PaymentProduct.SUBSCRIPTION_MONTH,
     PAYLOAD_RU_SUBSCRIPTION_MONTH: PaymentProduct.SUBSCRIPTION_MONTH,
@@ -620,12 +624,13 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
 @router.pre_checkout_query()
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
-    if _is_valid_pre_checkout(pre_checkout_query):
+    validation = _payment_pre_checkout_validation(pre_checkout_query)
+    if validation.approved:
         await pre_checkout_query.answer(ok=True)
         return
     await pre_checkout_query.answer(
         ok=False,
-        error_message="Не удалось проверить платеж. Попробуйте создать счет заново.",
+        error_message=PAYMENT_PRE_CHECKOUT_FAILED_TEXT,
     )
 
 
@@ -2061,15 +2066,40 @@ def _format_kopecks_for_display(amount: int) -> str:
 
 
 def _is_valid_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> bool:
-    expected_amount = PAYMENT_PAYLOAD_AMOUNTS.get(pre_checkout_query.invoice_payload)
-    if expected_amount is not None:
-        return pre_checkout_query.currency == "XTR" and pre_checkout_query.total_amount == expected_amount
+    return _payment_pre_checkout_validation(pre_checkout_query).approved
 
-    expected_rub_amount = RUB_PAYMENT_PAYLOAD_AMOUNTS.get(pre_checkout_query.invoice_payload)
-    return (
-        expected_rub_amount is not None
-        and pre_checkout_query.currency == "RUB"
-        and pre_checkout_query.total_amount == expected_rub_amount
+
+def _payment_pre_checkout_validation(
+    pre_checkout_query: PreCheckoutQuery,
+) -> PaymentPreCheckoutValidation:
+    store = _runtime_store()
+    user_id = _pre_checkout_user_id(pre_checkout_query)
+    if store is None or user_id is None:
+        return _payment_pre_checkout_rejection()
+
+    try:
+        return validate_payment_pre_checkout(
+            store,
+            payload=str(getattr(pre_checkout_query, "invoice_payload", "")),
+            user_id=user_id,
+            currency=str(getattr(pre_checkout_query, "currency", "")),
+            total_amount=int(getattr(pre_checkout_query, "total_amount", -1)),
+        )
+    except Exception:
+        return _payment_pre_checkout_rejection()
+
+
+def _pre_checkout_user_id(pre_checkout_query: PreCheckoutQuery) -> int | None:
+    user = getattr(pre_checkout_query, "from_user", None)
+    user_id = getattr(user, "id", None)
+    return user_id if isinstance(user_id, int) else None
+
+
+def _payment_pre_checkout_rejection() -> PaymentPreCheckoutValidation:
+    return PaymentPreCheckoutValidation(
+        approved=False,
+        code=PaymentPreCheckoutCode.ORDER_NOT_FOUND,
+        message=PAYMENT_PRE_CHECKOUT_FAILED_TEXT,
     )
 
 

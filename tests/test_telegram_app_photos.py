@@ -526,44 +526,170 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     ]
 
 
-def test_pre_checkout_validates_payload_currency_and_amount() -> None:
-    valid_query = SimpleNamespace(
-        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
-        currency="XTR",
-        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
-    )
-    wrong_amount_query = SimpleNamespace(
-        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
-        currency="XTR",
-        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH] + 1,
-    )
-    wrong_currency_query = SimpleNamespace(
-        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
-        currency="RUB",
-        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
-    )
-    valid_rub_query = SimpleNamespace(
-        invoice_payload=telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH,
-        currency="RUB",
-        total_amount=telegram_app.RUB_PAYMENT_PAYLOAD_AMOUNTS[telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH],
-    )
-    wrong_rub_amount_query = SimpleNamespace(
-        invoice_payload=telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH,
-        currency="RUB",
-        total_amount=telegram_app.RUB_PAYMENT_PAYLOAD_AMOUNTS[telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH] + 1,
-    )
-    unknown_payload_query = SimpleNamespace(
-        invoice_payload="diet:rub:unknown",
-        currency="RUB",
-        total_amount=0,
+@pytest.mark.anyio
+async def test_pre_checkout_approves_valid_durable_order(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency.value,
+        total_amount=order.amount,
     )
 
-    assert _is_valid_pre_checkout(valid_query)
-    assert not _is_valid_pre_checkout(wrong_amount_query)
-    assert not _is_valid_pre_checkout(wrong_currency_query)
-    assert _is_valid_pre_checkout(valid_rub_query)
-    assert not _is_valid_pre_checkout(wrong_rub_amount_query)
-    assert not _is_valid_pre_checkout(unknown_payload_query)
+    await telegram_app.handle_pre_checkout(query)
+
+    approved_order = store.load_payment_order(order.order_id)
+    assert query.answers == [{"ok": True, "error_message": None}]
+    assert approved_order is not None
+    assert approved_order.pre_checkout_approved_at is not None
+    assert store.pre_checkout_approvals == [order.order_id]
+    assert _is_valid_pre_checkout(query)
+
+
+@pytest.mark.anyio
+async def test_pre_checkout_rejects_static_legacy_payload(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        user_id=12345,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
+    )
+
+    await telegram_app.handle_pre_checkout(query)
+
+    assert query.answers == [{"ok": False, "error_message": telegram_app.PAYMENT_PRE_CHECKOUT_FAILED_TEXT}]
+    assert store.pre_checkout_approvals == []
+    assert not _is_valid_pre_checkout(query)
+
+
+@pytest.mark.anyio
+async def test_pre_checkout_rejects_tampered_nonce(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload=f"diet:order:{order.order_id}:nonce_tampered",
+        user_id=order.user_id,
+        currency=order.currency.value,
+        total_amount=order.amount,
+    )
+
+    await telegram_app.handle_pre_checkout(query)
+
+    assert query.answers == [{"ok": False, "error_message": telegram_app.PAYMENT_PRE_CHECKOUT_FAILED_TEXT}]
+    assert store.pre_checkout_approvals == []
+    assert not _is_valid_pre_checkout(query)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("currency", "total_amount"),
+    [
+        ("RUB", 400),
+        ("XTR", 399),
+    ],
+)
+async def test_pre_checkout_rejects_wrong_amount_or_currency(
+    monkeypatch,
+    currency: str,
+    total_amount: int,
+) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(_pending_payment_order())
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload=order.payload,
+        user_id=order.user_id,
+        currency=currency,
+        total_amount=total_amount,
+    )
+
+    await telegram_app.handle_pre_checkout(query)
+
+    assert query.answers == [{"ok": False, "error_message": telegram_app.PAYMENT_PRE_CHECKOUT_FAILED_TEXT}]
+    assert store.pre_checkout_approvals == []
+    assert not _is_valid_pre_checkout(query)
+
+
+@pytest.mark.anyio
+async def test_pre_checkout_rejects_expired_order(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(
+        _pending_payment_order(expires_at=datetime.now(UTC) - timedelta(seconds=1)),
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency.value,
+        total_amount=order.amount,
+    )
+
+    await telegram_app.handle_pre_checkout(query)
+
+    expired_order = store.load_payment_order(order.order_id)
+    assert query.answers == [{"ok": False, "error_message": telegram_app.PAYMENT_PRE_CHECKOUT_FAILED_TEXT}]
+    assert expired_order is not None
+    assert expired_order.status == PaymentOrderStatus.EXPIRED
+    assert store.expired_order_ids == [order.order_id]
+    assert store.pre_checkout_approvals == []
+
+
+@pytest.mark.anyio
+async def test_extra_pre_checkout_without_active_subscription_is_rejected(monkeypatch) -> None:
+    store = FakePaymentStore()
+    order = store.insert_payment_order(
+        _pending_payment_order(
+            order_id="order_extra",
+            nonce="nonce_extra",
+            product=PaymentProduct.EXTRA_ONE_DAY,
+            amount=35,
+        ),
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency.value,
+        total_amount=order.amount,
+    )
+
+    await telegram_app.handle_pre_checkout(query)
+
+    assert query.answers == [{"ok": False, "error_message": telegram_app.PAYMENT_PRE_CHECKOUT_FAILED_TEXT}]
+    assert store.pre_checkout_approvals == []
+    assert not _is_valid_pre_checkout(query)
+
+
+@pytest.mark.anyio
+async def test_pre_checkout_failure_message_is_safe(monkeypatch) -> None:
+    store = SensitiveFailurePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    query = FakePreCheckoutQuery(
+        invoice_payload="diet:order:order_secret:nonce_secret",
+        user_id=12345,
+        currency="XTR",
+        total_amount=400,
+    )
+
+    await telegram_app.handle_pre_checkout(query)
+
+    answer = query.answers[-1]
+    message = answer["error_message"] or ""
+    assert answer["ok"] is False
+    for secret in (
+        "postgresql://diet_bot:secret@example.com/db",
+        "123456789:ABCdefGhijKLMnopQRStuVWXyz",
+        "381764678:TEST:provider-secret",
+        "diet:order:order_secret:nonce_secret",
+        "order_secret",
+        "nonce_secret",
+    ):
+        assert secret not in message
 
 
 @pytest.mark.anyio
@@ -954,6 +1080,25 @@ class FakeCallback:
         self.answers.append(text)
 
 
+class FakePreCheckoutQuery:
+    def __init__(
+        self,
+        *,
+        invoice_payload: str,
+        user_id: int,
+        currency: str,
+        total_amount: int,
+    ) -> None:
+        self.invoice_payload = invoice_payload
+        self.from_user = SimpleNamespace(id=user_id)
+        self.currency = currency
+        self.total_amount = total_amount
+        self.answers = []
+
+    async def answer(self, *, ok: bool, error_message: str | None = None) -> None:
+        self.answers.append({"ok": ok, "error_message": error_message})
+
+
 class FakeSentMessage:
     def __init__(self, source: FakeMessage) -> None:
         self.source = source
@@ -1002,6 +1147,8 @@ class FakePaymentStore:
         self.entitlements = dict(entitlements or {})
         self.invoice_link_updates: list[tuple[str, str]] = []
         self.failed_invoice_creation_order_ids: list[str] = []
+        self.pre_checkout_approvals: list[str] = []
+        self.expired_order_ids: list[str] = []
         self._sequence = 0
 
     def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
@@ -1066,6 +1213,12 @@ class FakePaymentStore:
         self.orders.append(order)
         return order
 
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None:
+        for order in self.orders:
+            if order.order_id == order_id:
+                return order
+        return None
+
     def mark_payment_order_invoice_link(self, order_id: str, invoice_link: str) -> None:
         self.invoice_link_updates.append((order_id, invoice_link))
         for index, order in enumerate(self.orders):
@@ -1082,6 +1235,72 @@ class FakePaymentStore:
                     status=PaymentOrderStatus.FAILED_INVOICE_CREATION,
                 )
                 return
+
+    def record_payment_order_pre_checkout_approved(
+        self,
+        order_id: str,
+        approved_at: datetime | None = None,
+    ) -> PaymentOrder | None:
+        approved_at = approved_at or datetime.now(UTC)
+        for index, order in enumerate(self.orders):
+            if order.order_id != order_id:
+                continue
+            updated = replace(
+                order,
+                pre_checkout_approved_at=approved_at,
+                updated_at=approved_at,
+            )
+            self.orders[index] = updated
+            self.pre_checkout_approvals.append(order_id)
+            return updated
+        return None
+
+    def mark_payment_order_expired(self, order_id: str) -> None:
+        for index, order in enumerate(self.orders):
+            if order.order_id != order_id:
+                continue
+            self.orders[index] = replace(
+                order,
+                status=PaymentOrderStatus.EXPIRED,
+            )
+            self.expired_order_ids.append(order_id)
+            return
+
+
+class SensitiveFailurePaymentStore(FakePaymentStore):
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None:
+        raise RuntimeError(
+            "db postgresql://diet_bot:secret@example.com/db "
+            "bot 123456789:ABCdefGhijKLMnopQRStuVWXyz "
+            "provider 381764678:TEST:provider-secret "
+            f"payload diet:order:{order_id}:nonce_secret"
+        )
+
+
+def _pending_payment_order(
+    *,
+    order_id: str = "order_pre",
+    nonce: str = "nonce_pre",
+    user_id: int = 12345,
+    delivery_chat_id: int | None = 12345,
+    provider: PaymentProvider = PaymentProvider.TELEGRAM_STARS,
+    product: PaymentProduct = PaymentProduct.SUBSCRIPTION_MONTH,
+    amount: int = 400,
+    currency: PaymentCurrency = PaymentCurrency.XTR,
+    expires_at: datetime | None = None,
+) -> PaymentOrder:
+    return PaymentOrder(
+        order_id=order_id,
+        nonce=nonce,
+        user_id=user_id,
+        delivery_chat_id=delivery_chat_id,
+        provider=provider,
+        product=product,
+        amount=amount,
+        currency=currency,
+        status=PaymentOrderStatus.PENDING,
+        expires_at=expires_at or (datetime.now(UTC) + timedelta(minutes=5)),
+    )
 
 
 def profile_with(**kwargs) -> UserProfile:
