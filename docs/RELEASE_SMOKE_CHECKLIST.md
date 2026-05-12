@@ -76,9 +76,70 @@ Expected: the process starts polling without a startup config error.
 - If `TELEGRAM_PROVIDER_TOKEN` is empty, confirm card payment attempts do not create a broken invoice and the user receives a configuration message.
 - If `TELEGRAM_PROVIDER_TOKEN` is set to a test provider token, smoke one card invoice link with test credentials only.
 
-## 6. Release Notes
+## 6. Payment Happy Path Smoke
+
+Run this only against a staging/prod-like deployment after durable payment order/event storage and payment handler wiring are present. This is a happy-path and safety smoke before refund/admin reconciliation wiring; it is not production launch approval.
+
+### Preflight Production-Like Config
+
+- Confirm the bot build, branch, commit, deployment target, and `DIET_BOT_ENV` value.
+- Confirm the deployment uses durable DB-backed storage for payment orders, payment events, processed provider charges, entitlements, promo/test grants, and generation state.
+- Confirm production-like startup rejects JSON paid-state fallback and the active environment is not writing payment state to local JSON files.
+- Run strict healthcheck and save the exact redacted output.
+- Confirm Telegram bot token, YooKassa provider token, database URL, support/admin ids, and any receipt/customer data are absent from logs.
+- Confirm privacy/support path is visible before YooKassa/card payment collects email/receipt data.
+- Confirm disposable test users/orders are used and a DB restore/reset plan exists before live-provider smoke.
+
+### Subscription Invoices
+
+- Telegram Stars monthly subscription:
+  - Create a `subscription_month` invoice with provider `telegram_stars`, currency `XTR`, amount `400`, and 30-day subscription period.
+  - Confirm invoice payload is an order nonce payload like `diet:order:<order_id>:<nonce>`, not a static product payload.
+  - Pay through Telegram Stars and confirm the order becomes `paid`, a `successful_payment` event is recorded, processed charge aliases are stored, and the monthly entitlement period plus limits are active.
+- YooKassa/card monthly access:
+  - Create a `subscription_month` invoice with provider `yookassa`, currency `RUB`, amount `59900`, `need_email=True`, `send_email_to_provider=True`, and receipt provider data.
+  - Complete a test card payment through Telegram Payments and confirm the same durable order/event/processed-charge/entitlement transition as Stars.
+  - Confirm email, phone, full `order_info`, receipt/customer payload, provider token, bot token, and database URL are not present in general logs or support messages.
+
+### Extras And Access Rules
+
+- With an active paid subscription, buy `extra_one_day`; confirm exactly one extra one-day attempt is granted and recorded against the paid order/event.
+- With an active paid subscription, buy `extra_weekly_pdf`; confirm exactly one extra weekly PDF attempt is granted and recorded against the paid order/event.
+- Without an active paid subscription, attempt `extra_one_day` and `extra_weekly_pdf`; confirm the purchase is rejected before checkout where possible and remains rejected at final application if state changes between invoice and success.
+- Generate a one-day ration after subscription or extra purchase and confirm the expected quota source is consumed once.
+- Generate a weekly PDF after subscription or extra purchase and confirm Telegram receives a document PDF, with no text weekly-menu fallback.
+
+### Rejection, Replay, And Durability
+
+- `pre_checkout` reject checks where feasible:
+  - tampered payload or nonce;
+  - expired pending order;
+  - wrong amount;
+  - wrong currency/provider family;
+  - wrong user or delivery chat, if a test helper or safe manual setup exists.
+- Replay the same `successful_payment` update or fixture twice; confirm the second run is duplicate/no-op and does not grant subscription limits or extras again.
+- Restart the bot process after a successful payment; confirm orders, events, processed charges, entitlements, extras, and generation quota state survive restart.
+- Repeat one idempotency/replay check after restart.
+
+### Evidence Checklist
+
+- Bot/environment: bot username/id, deployment target, branch, commit SHA, `DIET_BOT_ENV`, and timestamp.
+- Healthcheck: exact command and redacted output.
+- Order evidence: internal `order_id`, provider, product, amount, currency, status, timestamps, and invoice link presence without leaking tokens.
+- Charge evidence: Telegram/provider charge ids redacted or partially masked; do not paste full charge ids into general release notes.
+- DB evidence: redacted query/output showing order status, payment event status, processed charge record, entitlement period/limits, and relevant generation quota state.
+- User-facing evidence: screenshots of invoice, payment success, entitlement/cabinet status, extra purchase result, and PDF document delivery.
+- Log evidence: only short snippets with secrets, tokens, database URLs, email, phone, receipt/customer data, and full raw provider payloads redacted.
+
+### Non-Goals And Launch Gate
+
+- Refund, chargeback, cancel-subscription, and admin reconciliation smoke belong in a separate section after that wiring exists.
+- Do not approve production launch until P0 paid-launch items are complete and this manual payment smoke passes with recorded evidence.
+
+## 7. Release Notes
 
 - Record the exact healthcheck output.
 - Record the fast-test command and result.
 - Record the full-test command and result if it was run for the release.
 - Record manual Telegram smoke results, including the weekly PDF-only check.
+- Record payment happy-path smoke evidence only after the production-like payment stack exists and the smoke is actually run.
