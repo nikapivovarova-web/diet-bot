@@ -4,15 +4,21 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .postgres_migrations import run_postgres_migrations
+from .promo_codes import PromoCodeActivation, PromoCodeRecord, normalize_promo_code
 from .subscriptions import (
     AttemptConsumption,
     Entitlement,
     RationKind,
+    SUBSCRIPTION_PERIOD_SECONDS,
+    apply_extra_one_day_payment,
+    apply_extra_weekly_pdf_payment,
+    apply_subscription_payment,
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
+    grant_test_access,
     refund_attempt,
 )
-from .storage import UserIdentity
+from .storage import SupportState, UserIdentity
 
 
 GENERATION_STALE_TIMEOUT = timedelta(minutes=30)
@@ -419,6 +425,259 @@ class PostgresDietBotStore:
                     )
                     self._update_entitlement_cur(cur, stale_user_id, entitlement)
         return cleaned
+
+    def upsert_promo_code(self, code: str, record: PromoCodeRecord) -> None:
+        normalized_code = normalize_promo_code(code)
+        if not normalized_code:
+            raise ValueError("Promo code must not be empty")
+
+        used_by_chat_id = record.used_by_chat_id if record.is_used() else None
+        used_at = _parse_datetime(record.used_at)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if used_by_chat_id is not None:
+                    self._remember_user_cur(cur, UserIdentity(used_by_chat_id))
+                cur.execute(
+                    """
+                    INSERT INTO promo_codes (code, kind, value, max_uses, used_count, is_active)
+                    VALUES (%s, 'subscription_month', 1, 1, %s, true)
+                    ON CONFLICT (code) DO UPDATE
+                    SET used_count = GREATEST(promo_codes.used_count, EXCLUDED.used_count),
+                        is_active = true
+                    RETURNING id
+                    """,
+                    (normalized_code, 1 if used_by_chat_id is not None else 0),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError("Could not upsert promo code.")
+                if used_by_chat_id is None:
+                    return
+                cur.execute(
+                    """
+                    INSERT INTO promo_redemptions (promo_code_id, user_id, redeemed_at)
+                    VALUES (%s, %s, COALESCE(%s, now()))
+                    ON CONFLICT (promo_code_id, user_id) DO NOTHING
+                    """,
+                    (int(row["id"]), used_by_chat_id, used_at),
+                )
+
+    def activate_promo_code(self, user_id: int, raw_code: str) -> PromoCodeActivation:
+        code = normalize_promo_code(raw_code)
+        if not code:
+            return PromoCodeActivation("not_found", "")
+
+        current_time = datetime.now(UTC)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                entitlement = self._select_entitlement_for_update_cur(cur, user_id)
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM promo_codes
+                    WHERE code = %s
+                      AND is_active = true
+                      AND (valid_from IS NULL OR valid_from <= %s)
+                      AND (valid_until IS NULL OR valid_until > %s)
+                    FOR UPDATE
+                    """,
+                    (code, current_time, current_time),
+                )
+                promo = cur.fetchone()
+                if promo is None:
+                    return PromoCodeActivation("not_found", code)
+
+                promo_id = int(promo["id"])
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM promo_redemptions
+                    WHERE promo_code_id = %s
+                      AND user_id = %s
+                    LIMIT 1
+                    """,
+                    (promo_id, user_id),
+                )
+                if cur.fetchone() is not None:
+                    return PromoCodeActivation("already_used", code, user_id)
+
+                used_count = _non_negative_int(promo.get("used_count"))
+                max_uses = promo.get("max_uses")
+                if max_uses is not None and used_count >= _non_negative_int(max_uses):
+                    return PromoCodeActivation(
+                        "already_used",
+                        code,
+                        self._first_promo_redeemer_cur(cur, promo_id),
+                    )
+
+                cur.execute(
+                    """
+                    INSERT INTO promo_redemptions (promo_code_id, user_id)
+                    VALUES (%s, %s)
+                    """,
+                    (promo_id, user_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE promo_codes
+                    SET used_count = used_count + 1
+                    WHERE id = %s
+                    """,
+                    (promo_id,),
+                )
+                self._apply_promo_grant_cur(cur, user_id, entitlement, promo, code, current_time)
+                self._update_entitlement_cur(cur, user_id, entitlement)
+                self._insert_entitlement_snapshot_cur(cur, user_id, entitlement)
+                return PromoCodeActivation("activated", code, user_id)
+
+    def record_support_state(self, state: SupportState) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                self._remember_user_cur(cur, UserIdentity(state.user_id))
+                cur.execute(
+                    """
+                    INSERT INTO support_state (
+                        user_id,
+                        status,
+                        last_request_at,
+                        last_admin_message_id,
+                        metadata_json
+                    )
+                    VALUES (%s, %s, %s, %s, '{}'::jsonb)
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET status = EXCLUDED.status,
+                        last_request_at = EXCLUDED.last_request_at,
+                        last_admin_message_id = EXCLUDED.last_admin_message_id,
+                        metadata_json = '{}'::jsonb,
+                        updated_at = now()
+                    """,
+                    (
+                        state.user_id,
+                        state.status,
+                        _parse_datetime(state.last_request_at),
+                        state.last_admin_message_id,
+                    ),
+                )
+
+    def load_support_state(self, user_id: int) -> SupportState | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, status, last_request_at, last_admin_message_id
+                    FROM support_state
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return SupportState(
+            user_id=int(row["user_id"]),
+            status=str(row["status"]),
+            last_request_at=_normalize_datetime(row["last_request_at"]) if row["last_request_at"] else None,
+            last_admin_message_id=(
+                int(row["last_admin_message_id"])
+                if row["last_admin_message_id"] is not None
+                else None
+            ),
+        )
+
+    def create_payment_order(
+        self,
+        *,
+        order_id: str,
+        nonce: str,
+        user_id: int,
+        delivery_chat_id: int | None,
+        product: str,
+        provider: str,
+        amount: int,
+        currency: str,
+        expires_at: datetime,
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                self._remember_user_cur(cur, UserIdentity(user_id))
+                cur.execute(
+                    """
+                    INSERT INTO payment_orders (
+                        order_id,
+                        nonce,
+                        user_id,
+                        delivery_chat_id,
+                        product,
+                        provider,
+                        amount,
+                        currency,
+                        expires_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        order_id,
+                        nonce,
+                        user_id,
+                        delivery_chat_id,
+                        product,
+                        provider,
+                        amount,
+                        currency,
+                        _normalize_datetime(expires_at),
+                    ),
+                )
+                row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not create payment order.")
+        return _row_to_payment_order(row)
+
+    def load_payment_order(self, order_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM payment_orders WHERE order_id = %s", (order_id,))
+                row = cur.fetchone()
+        return _row_to_payment_order(row) if row is not None else None
+
+    def mark_payment_order_invoice_link(self, order_id: str, invoice_link: str) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE payment_orders
+                    SET invoice_link = %s,
+                        updated_at = now()
+                    WHERE order_id = %s
+                    """,
+                    (invoice_link, order_id),
+                )
+
+    def mark_payment_order_expired(self, order_id: str) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE payment_orders
+                    SET status = 'expired',
+                        updated_at = now()
+                    WHERE order_id = %s
+                    """,
+                    (order_id,),
+                )
+
+    def mark_payment_order_invoice_creation_failed(self, order_id: str) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE payment_orders
+                    SET status = 'failed_invoice_creation',
+                        updated_at = now()
+                    WHERE order_id = %s
+                    """,
+                    (order_id,),
+                )
 
     def _connect(self):
         import psycopg
@@ -832,6 +1091,51 @@ class PostgresDietBotStore:
         )
         return True
 
+    def _first_promo_redeemer_cur(self, cur: Any, promo_id: int) -> int | None:
+        cur.execute(
+            """
+            SELECT user_id
+            FROM promo_redemptions
+            WHERE promo_code_id = %s
+            ORDER BY id
+            LIMIT 1
+            """,
+            (promo_id,),
+        )
+        row = cur.fetchone()
+        return int(row["user_id"]) if row is not None else None
+
+    def _apply_promo_grant_cur(
+        self,
+        cur: Any,
+        user_id: int,
+        entitlement: Entitlement,
+        promo: dict[str, Any],
+        code: str,
+        now: datetime,
+    ) -> None:
+        kind = str(promo["kind"])
+        value = max(1, _non_negative_int(promo.get("value")))
+        charge_id = f"promo:{code}"
+
+        if kind == "subscription_month":
+            apply_subscription_payment(
+                entitlement,
+                charge_id,
+                now=now,
+                subscription_expiration_timestamp=int(
+                    (now + timedelta(seconds=SUBSCRIPTION_PERIOD_SECONDS * value)).timestamp()
+                ),
+            )
+        elif kind == "extra_one_day":
+            for index in range(value):
+                apply_extra_one_day_payment(entitlement, f"{charge_id}:extra_one_day:{index}")
+        elif kind == "extra_weekly_pdf":
+            for index in range(value):
+                apply_extra_weekly_pdf_payment(entitlement, f"{charge_id}:extra_weekly_pdf:{index}")
+        elif kind == "test_access_days":
+            grant_test_access(entitlement, now=now, days=value)
+
 
 def _consume_entitlement_for_ration(
     entitlement: Entitlement,
@@ -855,6 +1159,31 @@ def _row_to_entitlement(row: dict[str, Any]) -> Entitlement:
         extra_one_day_remaining=_non_negative_int(row.get("extra_one_day_remaining")),
         extra_weekly_pdf_remaining=_non_negative_int(row.get("extra_weekly_pdf_remaining")),
     )
+
+
+def _row_to_payment_order(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "order_id": str(row["order_id"]),
+        "nonce": str(row["nonce"]),
+        "user_id": int(row["user_id"]),
+        "delivery_chat_id": (
+            int(row["delivery_chat_id"]) if row["delivery_chat_id"] is not None else None
+        ),
+        "product": str(row["product"]),
+        "provider": str(row["provider"]),
+        "amount": int(row["amount"]),
+        "currency": str(row["currency"]),
+        "status": str(row["status"]),
+        "invoice_link": (
+            str(row["invoice_link"]) if row["invoice_link"] is not None else None
+        ),
+        "created_at": _normalize_datetime(row["created_at"]),
+        "expires_at": _normalize_datetime(row["expires_at"]),
+        "paid_at": (
+            _normalize_datetime(row["paid_at"]) if row["paid_at"] is not None else None
+        ),
+        "updated_at": _normalize_datetime(row["updated_at"]),
+    }
 
 
 def _plan_and_status(entitlement: Entitlement) -> tuple[str, str]:

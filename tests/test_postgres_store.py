@@ -310,6 +310,172 @@ def test_postgres_completed_generation_is_not_refunded_by_late_failure() -> None
         _cleanup_users(store, user_id)
 
 
+def test_postgres_promo_redemption_is_one_per_user_and_respects_max_uses() -> None:
+    from diet_bot.promo_codes import PromoCodeRecord
+    from diet_bot.subscriptions import MONTHLY_ONE_DAY_LIMIT, MONTHLY_WEEKLY_PDF_LIMIT
+
+    store = _store()
+    first_user_id = _unique_user_id()
+    second_user_id = _unique_user_id()
+    third_user_id = _unique_user_id()
+    code = _unique_promo_code()
+    try:
+        store.upsert_promo_code(code, PromoCodeRecord())
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE promo_codes SET max_uses = 2 WHERE code = %s", (code,))
+
+        first = store.activate_promo_code(first_user_id, code.lower().replace("-", " "))
+        duplicate = store.activate_promo_code(first_user_id, code)
+        second = store.activate_promo_code(second_user_id, code)
+        exhausted = store.activate_promo_code(third_user_id, code)
+
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, used_count FROM promo_codes WHERE code = %s", (code,))
+                promo = cur.fetchone()
+                cur.execute(
+                    "SELECT user_id FROM promo_redemptions WHERE promo_code_id = %s ORDER BY user_id",
+                    (promo["id"],),
+                )
+                redeemed_user_ids = [int(row["user_id"]) for row in cur.fetchall()]
+
+        first_entitlement = store.get_entitlement(first_user_id)
+        second_entitlement = store.get_entitlement(second_user_id)
+        third_entitlement = store.get_entitlement(third_user_id)
+
+        assert first.activated
+        assert first.code == code
+        assert first.used_by_chat_id == first_user_id
+        assert duplicate.status == "already_used"
+        assert duplicate.used_by_chat_id == first_user_id
+        assert second.activated
+        assert second.used_by_chat_id == second_user_id
+        assert exhausted.status == "already_used"
+        assert not exhausted.activated
+        assert promo["used_count"] == 2
+        assert redeemed_user_ids == sorted([first_user_id, second_user_id])
+        assert first_entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
+        assert first_entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+        assert second_entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
+        assert second_entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+        assert third_entitlement == store.get_entitlement(third_user_id) == third_entitlement.__class__()
+    finally:
+        _cleanup_users(store, first_user_id, second_user_id, third_user_id)
+        _cleanup_promo_code(store, code)
+
+
+def test_postgres_support_state_round_trips_without_raw_message_text() -> None:
+    from diet_bot.storage import SupportState
+
+    store = _store()
+    user_id = _unique_user_id()
+    state = SupportState(
+        user_id=user_id,
+        status="open",
+        last_request_at=datetime(2026, 5, 12, 9, 30, tzinfo=UTC),
+        last_admin_message_id=987654,
+    )
+    try:
+        store.record_support_state(state)
+
+        loaded = store.load_support_state(user_id)
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT metadata_json
+                    FROM support_state
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+
+        assert loaded == state
+        assert row["metadata_json"] == {}
+        assert "raw_message_text" not in row["metadata_json"]
+        assert "message_text" not in row["metadata_json"]
+    finally:
+        _cleanup_users(store, user_id)
+
+
+def test_postgres_payment_order_placeholder_round_trips_without_entitlement_change() -> None:
+    from diet_bot.subscriptions import Entitlement
+
+    store = _store()
+    user_id = _unique_user_id()
+    order_id = f"order-{uuid.uuid4().hex}"
+    failed_order_id = f"order-{uuid.uuid4().hex}"
+    expires_at = datetime(2026, 5, 12, 11, 0, tzinfo=UTC)
+    baseline = Entitlement(
+        free_trial_used=True,
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=1,
+        extra_one_day_remaining=3,
+        extra_weekly_pdf_remaining=4,
+        processed_payment_charge_ids=["existing-charge"],
+    )
+    try:
+        store.save_entitlement(user_id, baseline)
+        before_entitlement = store.get_entitlement(user_id).to_dict()
+        before_event_count = _entitlement_event_count(store, user_id)
+
+        store.create_payment_order(
+            order_id=order_id,
+            nonce="nonce-1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            product="subscription_month",
+            provider="telegram_stars",
+            amount=499,
+            currency="XTR",
+            expires_at=expires_at,
+        )
+        created = store.load_payment_order(order_id)
+        store.mark_payment_order_invoice_link(order_id, "https://pay.example.test/invoice")
+        with_invoice = store.load_payment_order(order_id)
+        store.mark_payment_order_expired(order_id)
+        expired = store.load_payment_order(order_id)
+
+        store.create_payment_order(
+            order_id=failed_order_id,
+            nonce="nonce-2",
+            user_id=user_id,
+            delivery_chat_id=user_id,
+            product="extra_one_day",
+            provider="yookassa",
+            amount=19900,
+            currency="RUB",
+            expires_at=expires_at,
+        )
+        store.mark_payment_order_invoice_creation_failed(failed_order_id)
+        failed = store.load_payment_order(failed_order_id)
+
+        after_entitlement = store.get_entitlement(user_id).to_dict()
+        after_event_count = _entitlement_event_count(store, user_id)
+
+        assert created["order_id"] == order_id
+        assert created["status"] == "pending"
+        assert created["invoice_link"] is None
+        assert created["user_id"] == user_id
+        assert created["delivery_chat_id"] == user_id + 10
+        assert created["product"] == "subscription_month"
+        assert created["provider"] == "telegram_stars"
+        assert created["amount"] == 499
+        assert created["currency"] == "XTR"
+        assert created["expires_at"] == expires_at
+        assert with_invoice["status"] == "pending"
+        assert with_invoice["invoice_link"] == "https://pay.example.test/invoice"
+        assert expired["status"] == "expired"
+        assert expired["invoice_link"] == "https://pay.example.test/invoice"
+        assert failed["status"] == "failed_invoice_creation"
+        assert before_entitlement == after_entitlement
+        assert before_event_count == after_event_count
+    finally:
+        _cleanup_users(store, user_id)
+
+
 def _store(**kwargs: Any):
     from diet_bot.postgres_store import PostgresDietBotStore
 
@@ -328,10 +494,36 @@ def _unique_user_id() -> int:
     return 9_000_000_000 + uuid.uuid4().int % 900_000_000
 
 
+def _unique_promo_code() -> str:
+    compact = uuid.uuid4().hex.upper()[:12]
+    return f"FB-{compact[:4]}-{compact[4:8]}-{compact[8:12]}"
+
+
 def _cleanup_users(store: Any, *user_ids: int) -> None:
     with store._connect() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE telegram_id = ANY(%s)", (list(user_ids),))
+
+
+def _cleanup_promo_code(store: Any, code: str) -> None:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM promo_codes WHERE code = %s", (code,))
+
+
+def _entitlement_event_count(store: Any, user_id: int) -> int:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS event_count
+                FROM entitlement_events
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+    return int(row["event_count"])
 
 
 def _latest_generation_for_user(store: Any, user_id: int) -> dict[str, Any]:
