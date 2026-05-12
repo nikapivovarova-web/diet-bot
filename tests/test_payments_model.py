@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from diet_bot.payments import (
+    PAYMENT_ORDER_TTL_SECONDS,
     PROVIDER_CURRENCIES,
     PaymentCurrency,
     PaymentEvent,
@@ -17,6 +18,7 @@ from diet_bot.payments import (
     PaymentProduct,
     PaymentProvider,
     ProcessedProviderCharge,
+    create_or_reuse_pending_payment_order,
     decode_payment_order_payload,
     encode_payment_order_payload,
     redact_payment_payload,
@@ -172,3 +174,176 @@ def test_payment_dataclasses_represent_order_event_and_processed_charge_without_
     assert event.raw_payload_redacted == {"email": "[REDACTED]"}
     assert processed.event_type == PaymentEventType.SUCCESSFUL_PAYMENT
     assert entitlement.to_dict() == entitlement_before
+
+
+def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> None:
+    repository = InMemoryPaymentOrderRepository()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+
+    order = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=400,
+        currency=PaymentCurrency.XTR,
+        now=now,
+        order_id_factory=_sequence_factory("order_new1"),
+        nonce_factory=_sequence_factory("nonce_new1"),
+    )
+
+    assert order.order_id == "order_new1"
+    assert order.nonce == "nonce_new1"
+    assert order.user_id == 1001
+    assert order.delivery_chat_id == 2002
+    assert order.provider == PaymentProvider.TELEGRAM_STARS
+    assert order.product == PaymentProduct.SUBSCRIPTION_MONTH
+    assert order.amount == 400
+    assert order.currency == PaymentCurrency.XTR
+    assert order.status == PaymentOrderStatus.PENDING
+    assert order.created_at == now
+    assert order.expires_at == now + timedelta(seconds=PAYMENT_ORDER_TTL_SECONDS)
+    assert order.invoice_link is None
+    assert order.payload == "diet:order:order_new1:nonce_new1"
+    assert repository.orders == [order]
+
+
+def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
+    repository = InMemoryPaymentOrderRepository()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+
+    first = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.YOOKASSA,
+        product=PaymentProduct.EXTRA_WEEKLY_PDF,
+        amount=25000,
+        currency=PaymentCurrency.RUB,
+        now=now,
+        order_id_factory=_sequence_factory("order_new1"),
+        nonce_factory=_sequence_factory("nonce_new1"),
+    )
+    second = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.YOOKASSA,
+        product=PaymentProduct.EXTRA_WEEKLY_PDF,
+        amount=25000,
+        currency=PaymentCurrency.RUB,
+        now=now + timedelta(minutes=1),
+        order_id_factory=_sequence_factory("order_new2"),
+        nonce_factory=_sequence_factory("nonce_new2"),
+    )
+
+    assert second == first
+    assert len(repository.orders) == 1
+
+
+def test_expired_pending_payment_order_is_not_reused() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    expired = PaymentOrder(
+        order_id="order_old1",
+        nonce="nonce_old1",
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        currency=PaymentCurrency.XTR,
+        status=PaymentOrderStatus.PENDING,
+        created_at=now - timedelta(hours=1),
+        expires_at=now - timedelta(minutes=1),
+    )
+    repository = InMemoryPaymentOrderRepository([expired])
+
+    order = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=PaymentProduct.EXTRA_ONE_DAY,
+        amount=35,
+        currency=PaymentCurrency.XTR,
+        now=now,
+        order_id_factory=_sequence_factory("order_new1"),
+        nonce_factory=_sequence_factory("nonce_new1"),
+    )
+
+    assert order.order_id == "order_new1"
+    assert order.payload == "diet:order:order_new1:nonce_new1"
+    assert repository.orders == [expired, order]
+
+
+def test_payment_order_creation_does_not_mutate_entitlement() -> None:
+    repository = InMemoryPaymentOrderRepository()
+    entitlement = Entitlement(
+        free_trial_used=True,
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=1,
+        extra_one_day_remaining=3,
+        extra_weekly_pdf_remaining=4,
+        processed_payment_charge_ids=["charge-existing"],
+    )
+    before = entitlement.to_dict()
+
+    create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.YOOKASSA,
+        product=PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=59900,
+        currency=PaymentCurrency.RUB,
+        now=datetime(2026, 5, 13, 10, 0, tzinfo=UTC),
+        order_id_factory=_sequence_factory("order_new1"),
+        nonce_factory=_sequence_factory("nonce_new1"),
+    )
+
+    assert entitlement.to_dict() == before
+
+
+class InMemoryPaymentOrderRepository:
+    def __init__(self, orders: list[PaymentOrder] | None = None) -> None:
+        self.orders = list(orders or [])
+
+    def find_active_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider,
+        product: PaymentProduct,
+        amount: int,
+        currency: PaymentCurrency,
+        now: datetime,
+    ) -> PaymentOrder | None:
+        for order in reversed(self.orders):
+            if (
+                order.user_id == user_id
+                and order.delivery_chat_id == delivery_chat_id
+                and order.provider == provider
+                and order.product == product
+                and order.amount == amount
+                and order.currency == currency
+                and order.status == PaymentOrderStatus.PENDING
+                and order.expires_at is not None
+                and order.expires_at > now
+            ):
+                return order
+        return None
+
+    def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder:
+        self.orders.append(order)
+        return order
+
+
+def _sequence_factory(*values: str):
+    remaining = iter(values)
+
+    def factory() -> str:
+        return next(remaining)
+
+    return factory

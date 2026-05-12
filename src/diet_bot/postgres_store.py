@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .payments import (
+    PAYMENT_ORDER_TTL_SECONDS,
+    PROVIDER_CURRENCIES,
+    PaymentCurrency,
+    PaymentOrder,
+    PaymentOrderStatus,
+    PaymentProduct,
+    PaymentProvider,
+)
 from .postgres_migrations import run_postgres_migrations
 from .promo_codes import PromoCodeActivation, PromoCodeRecord, normalize_promo_code
 from .subscriptions import (
@@ -596,44 +606,110 @@ class PostgresDietBotStore:
         amount: int,
         currency: str,
         expires_at: datetime,
-    ) -> dict[str, Any]:
+    ) -> PaymentOrder:
+        created_at = datetime.now(UTC)
+        order = PaymentOrder(
+            order_id=order_id,
+            nonce=nonce,
+            user_id=user_id,
+            delivery_chat_id=delivery_chat_id,
+            product=product,
+            provider=provider,
+            amount=amount,
+            currency=currency,
+            status=PaymentOrderStatus.PENDING,
+            created_at=created_at,
+            expires_at=_normalize_datetime(expires_at),
+            updated_at=created_at,
+        )
+        return self.insert_payment_order(order)
+
+    def create_or_reuse_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider | str,
+        product: PaymentProduct | str,
+        amount: int,
+        currency: PaymentCurrency | str,
+        now: datetime | None = None,
+        ttl_seconds: int = PAYMENT_ORDER_TTL_SECONDS,
+    ) -> PaymentOrder:
+        provider_value = PaymentProvider(provider)
+        product_value = PaymentProduct(product)
+        currency_value = PaymentCurrency(currency)
+        if PROVIDER_CURRENCIES[provider_value] != currency_value:
+            raise ValueError("payment provider and currency do not match")
+        if amount <= 0:
+            raise ValueError("payment order amount must be positive")
+        if ttl_seconds <= 0:
+            raise ValueError("payment order ttl must be positive")
+
+        current_time = _normalize_datetime(now)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 self._remember_user_cur(cur, UserIdentity(user_id))
-                cur.execute(
-                    """
-                    INSERT INTO payment_orders (
-                        order_id,
-                        nonce,
-                        user_id,
-                        delivery_chat_id,
-                        product,
-                        provider,
-                        amount,
-                        currency,
-                        expires_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING *
-                    """,
-                    (
-                        order_id,
-                        nonce,
-                        user_id,
-                        delivery_chat_id,
-                        product,
-                        provider,
-                        amount,
-                        currency,
-                        _normalize_datetime(expires_at),
-                    ),
+                cur.execute("SELECT 1 FROM users WHERE telegram_id = %s FOR UPDATE", (user_id,))
+                existing = self._find_active_pending_payment_order_cur(
+                    cur,
+                    user_id=user_id,
+                    delivery_chat_id=delivery_chat_id,
+                    provider=provider_value,
+                    product=product_value,
+                    amount=amount,
+                    currency=currency_value,
+                    now=current_time,
                 )
-                row = cur.fetchone()
-        if row is None:
-            raise RuntimeError("Could not create payment order.")
-        return _row_to_payment_order(row)
+                if existing is not None:
+                    return existing
+                order = PaymentOrder(
+                    order_id=_payment_token(),
+                    nonce=_payment_token(),
+                    user_id=user_id,
+                    delivery_chat_id=delivery_chat_id,
+                    product=product_value,
+                    provider=provider_value,
+                    amount=amount,
+                    currency=currency_value,
+                    status=PaymentOrderStatus.PENDING,
+                    created_at=current_time,
+                    expires_at=current_time + timedelta(seconds=ttl_seconds),
+                    updated_at=current_time,
+                )
+                return self._insert_payment_order_cur(cur, order)
 
-    def load_payment_order(self, order_id: str) -> dict[str, Any] | None:
+    def find_active_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider,
+        product: PaymentProduct,
+        amount: int,
+        currency: PaymentCurrency,
+        now: datetime,
+    ) -> PaymentOrder | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._find_active_pending_payment_order_cur(
+                    cur,
+                    user_id=user_id,
+                    delivery_chat_id=delivery_chat_id,
+                    provider=provider,
+                    product=product,
+                    amount=amount,
+                    currency=currency,
+                    now=now,
+                )
+
+    def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                self._remember_user_cur(cur, UserIdentity(order.user_id))
+                return self._insert_payment_order_cur(cur, order)
+
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM payment_orders WHERE order_id = %s", (order_id,))
@@ -678,6 +754,91 @@ class PostgresDietBotStore:
                     """,
                     (order_id,),
                 )
+
+    def _find_active_pending_payment_order_cur(
+        self,
+        cur: Any,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider,
+        product: PaymentProduct,
+        amount: int,
+        currency: PaymentCurrency,
+        now: datetime,
+    ) -> PaymentOrder | None:
+        cur.execute(
+            """
+            SELECT *
+            FROM payment_orders
+            WHERE user_id = %s
+              AND delivery_chat_id IS NOT DISTINCT FROM %s
+              AND provider = %s
+              AND product = %s
+              AND amount = %s
+              AND currency = %s
+              AND status = 'pending'
+              AND expires_at > %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (
+                user_id,
+                delivery_chat_id,
+                provider.value,
+                product.value,
+                amount,
+                currency.value,
+                _normalize_datetime(now),
+            ),
+        )
+        row = cur.fetchone()
+        return _row_to_payment_order(row) if row is not None else None
+
+    def _insert_payment_order_cur(self, cur: Any, order: PaymentOrder) -> PaymentOrder:
+        cur.execute(
+            """
+            INSERT INTO payment_orders (
+                order_id,
+                nonce,
+                user_id,
+                delivery_chat_id,
+                product,
+                provider,
+                amount,
+                currency,
+                status,
+                invoice_link,
+                created_at,
+                expires_at,
+                paid_at,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (
+                order.order_id,
+                order.nonce,
+                order.user_id,
+                order.delivery_chat_id,
+                order.product.value,
+                order.provider.value,
+                order.amount,
+                order.currency.value,
+                order.status.value,
+                order.invoice_link,
+                _normalize_datetime(order.created_at),
+                _normalize_datetime(order.expires_at),
+                _normalize_datetime(order.paid_at) if order.paid_at is not None else None,
+                _normalize_datetime(order.updated_at),
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not create payment order.")
+        return _row_to_payment_order(row)
 
     def _connect(self):
         import psycopg
@@ -1161,29 +1322,29 @@ def _row_to_entitlement(row: dict[str, Any]) -> Entitlement:
     )
 
 
-def _row_to_payment_order(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "order_id": str(row["order_id"]),
-        "nonce": str(row["nonce"]),
-        "user_id": int(row["user_id"]),
-        "delivery_chat_id": (
+def _row_to_payment_order(row: dict[str, Any]) -> PaymentOrder:
+    return PaymentOrder(
+        order_id=str(row["order_id"]),
+        nonce=str(row["nonce"]),
+        user_id=int(row["user_id"]),
+        delivery_chat_id=(
             int(row["delivery_chat_id"]) if row["delivery_chat_id"] is not None else None
         ),
-        "product": str(row["product"]),
-        "provider": str(row["provider"]),
-        "amount": int(row["amount"]),
-        "currency": str(row["currency"]),
-        "status": str(row["status"]),
-        "invoice_link": (
+        product=str(row["product"]),
+        provider=str(row["provider"]),
+        amount=int(row["amount"]),
+        currency=str(row["currency"]),
+        status=str(row["status"]),
+        invoice_link=(
             str(row["invoice_link"]) if row["invoice_link"] is not None else None
         ),
-        "created_at": _normalize_datetime(row["created_at"]),
-        "expires_at": _normalize_datetime(row["expires_at"]),
-        "paid_at": (
+        created_at=_normalize_datetime(row["created_at"]),
+        expires_at=_normalize_datetime(row["expires_at"]),
+        paid_at=(
             _normalize_datetime(row["paid_at"]) if row["paid_at"] is not None else None
         ),
-        "updated_at": _normalize_datetime(row["updated_at"]),
-    }
+        updated_at=_normalize_datetime(row["updated_at"]),
+    )
 
 
 def _plan_and_status(entitlement: Entitlement) -> tuple[str, str]:
@@ -1307,3 +1468,7 @@ def _positive_int(value: int, *, name: str) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def _payment_token() -> str:
+    return secrets.token_urlsafe(18)

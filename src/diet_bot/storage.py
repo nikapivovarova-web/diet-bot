@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from .payments import PaymentCurrency, PaymentOrder, PaymentProduct, PaymentProvider
 from .promo_codes import PromoCodeActivation, PromoCodeRecord
 from .subscriptions import AttemptConsumption, Entitlement, RationKind
 
@@ -57,5 +58,18 @@ class DietBotStore(Protocol):
     def cleanup_stale_generations(self, now: datetime | None = None) -> int: ...
     def upsert_promo_code(self, code: str, record: PromoCodeRecord) -> None: ...
     def activate_promo_code(self, user_id: int, raw_code: str) -> PromoCodeActivation: ...
+    def create_or_reuse_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider | str,
+        product: PaymentProduct | str,
+        amount: int,
+        currency: PaymentCurrency | str,
+        now: datetime | None = None,
+        ttl_seconds: int = 900,
+    ) -> PaymentOrder: ...
+    def load_payment_order(self, order_id: str) -> PaymentOrder | None: ...
     def record_support_state(self, state: SupportState) -> None: ...
     def load_support_state(self, user_id: int) -> SupportState | None: ...

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable, Protocol
 
 
 PAYMENT_ORDER_PAYLOAD_PREFIX = "diet:order"
+PAYMENT_ORDER_TTL_SECONDS = 15 * 60
 REDACTED_PAYMENT_VALUE = "[REDACTED]"
+TokenFactory = Callable[[], str]
 
 
 class PaymentPayloadError(ValueError):
@@ -137,6 +140,22 @@ class PaymentOrder:
         return encode_payment_order_payload(self.order_id, self.nonce)
 
 
+class PaymentOrderRepository(Protocol):
+    def find_active_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider,
+        product: PaymentProduct,
+        amount: int,
+        currency: PaymentCurrency,
+        now: datetime,
+    ) -> PaymentOrder | None: ...
+
+    def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder: ...
+
+
 @dataclass(frozen=True)
 class PaymentEvent:
     event_id: str
@@ -196,6 +215,68 @@ def encode_payment_order_payload(order_id: str, nonce: str) -> str:
     return f"{PAYMENT_ORDER_PAYLOAD_PREFIX}:{order_id}:{nonce}"
 
 
+def create_or_reuse_pending_payment_order(
+    repository: PaymentOrderRepository,
+    *,
+    user_id: int,
+    delivery_chat_id: int | None,
+    provider: PaymentProvider | str,
+    product: PaymentProduct | str,
+    amount: int,
+    currency: PaymentCurrency | str,
+    now: datetime | None = None,
+    ttl_seconds: int = PAYMENT_ORDER_TTL_SECONDS,
+    order_id_factory: TokenFactory | None = None,
+    nonce_factory: TokenFactory | None = None,
+) -> PaymentOrder:
+    provider_value = PaymentProvider(provider)
+    product_value = PaymentProduct(product)
+    currency_value = PaymentCurrency(currency)
+    if PROVIDER_CURRENCIES[provider_value] != currency_value:
+        raise ValueError("payment provider and currency do not match")
+    if amount <= 0:
+        raise ValueError("payment order amount must be positive")
+    if ttl_seconds <= 0:
+        raise ValueError("payment order ttl must be positive")
+
+    current_time = _normalize_datetime(now)
+    existing = repository.find_active_pending_payment_order(
+        user_id=user_id,
+        delivery_chat_id=delivery_chat_id,
+        provider=provider_value,
+        product=product_value,
+        amount=amount,
+        currency=currency_value,
+        now=current_time,
+    )
+    if existing is not None:
+        return existing
+
+    order = PaymentOrder(
+        order_id=(order_id_factory or _default_payment_token)(),
+        nonce=(nonce_factory or _default_payment_token)(),
+        user_id=user_id,
+        delivery_chat_id=delivery_chat_id,
+        provider=provider_value,
+        product=product_value,
+        amount=amount,
+        currency=currency_value,
+        status=PaymentOrderStatus.PENDING,
+        created_at=current_time,
+        expires_at=current_time + timedelta(seconds=ttl_seconds),
+        updated_at=current_time,
+    )
+    return repository.insert_payment_order(order)
+
+
+def is_active_pending_payment_order(order: PaymentOrder, *, now: datetime | None = None) -> bool:
+    return (
+        order.status == PaymentOrderStatus.PENDING
+        and order.expires_at is not None
+        and order.expires_at > _normalize_datetime(now)
+    )
+
+
 def decode_payment_order_payload(payload: str) -> tuple[str, str]:
     if not isinstance(payload, str):
         raise PaymentPayloadError("payment payload must be a string")
@@ -253,9 +334,22 @@ def _redact_payment_text(value: str) -> str:
     return _PHONE_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
 
 
+def _normalize_datetime(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.now(UTC)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _default_payment_token() -> str:
+    return secrets.token_urlsafe(18)
+
+
 __all__ = [
     "LEGACY_STATIC_PAYMENT_PAYLOADS",
     "PAYMENT_ORDER_PAYLOAD_PREFIX",
+    "PAYMENT_ORDER_TTL_SECONDS",
     "PAYMENT_PRODUCTS",
     "PROVIDER_CURRENCIES",
     "PaymentCurrency",
@@ -263,13 +357,16 @@ __all__ = [
     "PaymentEventStatus",
     "PaymentEventType",
     "PaymentOrder",
+    "PaymentOrderRepository",
     "PaymentOrderStatus",
     "PaymentPayloadError",
     "PaymentProduct",
     "PaymentProvider",
     "ProcessedProviderCharge",
     "REDACTED_PAYMENT_VALUE",
+    "create_or_reuse_pending_payment_order",
     "decode_payment_order_payload",
     "encode_payment_order_payload",
+    "is_active_pending_payment_order",
     "redact_payment_payload",
 ]

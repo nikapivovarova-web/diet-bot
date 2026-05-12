@@ -29,6 +29,8 @@ def test_storage_contract_exposes_paid_production_methods() -> None:
         "cleanup_stale_generations",
         "upsert_promo_code",
         "activate_promo_code",
+        "create_or_reuse_pending_payment_order",
+        "load_payment_order",
         "record_support_state",
         "load_support_state",
     }

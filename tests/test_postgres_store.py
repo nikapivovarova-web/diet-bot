@@ -401,6 +401,7 @@ def test_postgres_support_state_round_trips_without_raw_message_text() -> None:
 
 
 def test_postgres_payment_order_placeholder_round_trips_without_entitlement_change() -> None:
+    from diet_bot.payments import PaymentOrderStatus, PaymentProduct, PaymentProvider
     from diet_bot.subscriptions import Entitlement
 
     store = _store()
@@ -455,21 +456,95 @@ def test_postgres_payment_order_placeholder_round_trips_without_entitlement_chan
         after_entitlement = store.get_entitlement(user_id).to_dict()
         after_event_count = _entitlement_event_count(store, user_id)
 
-        assert created["order_id"] == order_id
-        assert created["status"] == "pending"
-        assert created["invoice_link"] is None
-        assert created["user_id"] == user_id
-        assert created["delivery_chat_id"] == user_id + 10
-        assert created["product"] == "subscription_month"
-        assert created["provider"] == "telegram_stars"
-        assert created["amount"] == 499
-        assert created["currency"] == "XTR"
-        assert created["expires_at"] == expires_at
-        assert with_invoice["status"] == "pending"
-        assert with_invoice["invoice_link"] == "https://pay.example.test/invoice"
-        assert expired["status"] == "expired"
-        assert expired["invoice_link"] == "https://pay.example.test/invoice"
-        assert failed["status"] == "failed_invoice_creation"
+        assert created.order_id == order_id
+        assert created.status == PaymentOrderStatus.PENDING
+        assert created.invoice_link is None
+        assert created.user_id == user_id
+        assert created.delivery_chat_id == user_id + 10
+        assert created.product == PaymentProduct.SUBSCRIPTION_MONTH
+        assert created.provider == PaymentProvider.TELEGRAM_STARS
+        assert created.amount == 499
+        assert created.currency == "XTR"
+        assert created.expires_at == expires_at
+        assert with_invoice.status == PaymentOrderStatus.PENDING
+        assert with_invoice.invoice_link == "https://pay.example.test/invoice"
+        assert expired.status == PaymentOrderStatus.EXPIRED
+        assert expired.invoice_link == "https://pay.example.test/invoice"
+        assert failed.status == PaymentOrderStatus.FAILED_INVOICE_CREATION
+        assert before_entitlement == after_entitlement
+        assert before_event_count == after_event_count
+    finally:
+        _cleanup_users(store, user_id)
+
+
+def test_postgres_create_or_reuse_pending_payment_order_keeps_entitlement_unchanged() -> None:
+    from diet_bot.payments import PaymentCurrency, PaymentOrderStatus, PaymentProduct, PaymentProvider
+    from diet_bot.subscriptions import Entitlement
+
+    store = _store()
+    user_id = _unique_user_id()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    baseline = Entitlement(
+        free_trial_used=True,
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=1,
+        extra_one_day_remaining=3,
+        extra_weekly_pdf_remaining=4,
+        processed_payment_charge_ids=["existing-charge"],
+    )
+    try:
+        store.save_entitlement(user_id, baseline)
+        before_entitlement = store.get_entitlement(user_id).to_dict()
+        before_event_count = _entitlement_event_count(store, user_id)
+
+        first = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            now=now,
+        )
+        repeated = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            now=now + timedelta(minutes=1),
+        )
+        store.create_payment_order(
+            order_id=f"order-{uuid.uuid4().hex}",
+            nonce="nonce-old1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 20,
+            product="extra_one_day",
+            provider="telegram_stars",
+            amount=35,
+            currency="XTR",
+            expires_at=now - timedelta(minutes=1),
+        )
+        replacement = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 20,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.EXTRA_ONE_DAY,
+            amount=35,
+            currency=PaymentCurrency.XTR,
+            now=now,
+        )
+
+        after_entitlement = store.get_entitlement(user_id).to_dict()
+        after_event_count = _entitlement_event_count(store, user_id)
+
+        assert first.status == PaymentOrderStatus.PENDING
+        assert first.payload == f"diet:order:{first.order_id}:{first.nonce}"
+        assert repeated == first
+        assert replacement.status == PaymentOrderStatus.PENDING
+        assert replacement.payload == f"diet:order:{replacement.order_id}:{replacement.nonce}"
+        assert replacement.expires_at == now + timedelta(seconds=900)
         assert before_entitlement == after_entitlement
         assert before_event_count == after_event_count
     finally:
