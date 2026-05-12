@@ -23,3 +23,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "slow_pdf_builder: long-running weekly PDF and recipe builder checks split out of the fast gate",
+]

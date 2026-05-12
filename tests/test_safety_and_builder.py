@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from diet_bot.builder import _meal_energy_slots, _recipe_time_bucket, build_one_day_plan, filter_foods
 from diet_bot.catalog import built_in_foods
 from diet_bot.domain import (
@@ -138,6 +140,7 @@ def test_gain_plan_stays_close_to_calorie_target() -> None:
     assert plan.totals.get("energy_kcal") >= plan.targets.targets.get("energy_kcal") * 0.96
 
 
+@pytest.mark.slow_pdf_builder
 def test_recipe_plan_keeps_meal_calories_reasonably_distributed() -> None:
     cases = (
         (3, (6,)),
@@ -169,6 +172,7 @@ def test_curated_high_bmi_loss_plan_tops_up_protein_when_possible() -> None:
     assert plan.totals.get("energy_kcal") <= plan.targets.targets.get("energy_kcal") * 1.04
 
 
+@pytest.mark.slow_pdf_builder
 def test_repeat_generation_changes_recipes() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     first = build_one_day_plan(profile, variety_seed=0)
@@ -197,6 +201,7 @@ def test_recipe_catalog_has_large_unique_recipe_pool() -> None:
     assert sum(1 for recipe in recipes if recipe.slot == "main") >= 4000
 
 
+@pytest.mark.slow_pdf_builder
 def test_five_repeat_generations_keep_key_meals_unique() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     plans = [build_one_day_plan(profile, variety_seed=seed) for seed in range(5)]
@@ -207,6 +212,7 @@ def test_five_repeat_generations_keep_key_meals_unique() -> None:
     assert len({tuple(meal.name for meal in plan.meals) for plan in plans}) == 5
 
 
+@pytest.mark.slow_pdf_builder
 def test_repeat_generations_can_avoid_recent_recipe_ids() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     avoided_recipe_ids: set[str] = set()
@@ -223,6 +229,7 @@ def test_repeat_generations_can_avoid_recent_recipe_ids() -> None:
         seen_recipe_ids.update(recipe_id for recipe_id in recipe_ids if recipe_id)
 
 
+@pytest.mark.slow_pdf_builder
 def test_repeat_generations_can_avoid_recent_recipe_families() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)
     avoided_recipe_keys: set[str] = set()
@@ -239,6 +246,7 @@ def test_repeat_generations_can_avoid_recent_recipe_families() -> None:
         seen_recipe_keys.update(recipe_key for recipe_key in recipe_keys if recipe_key)
 
 
+@pytest.mark.slow_pdf_builder
 def test_recipe_plan_has_no_empty_meals_or_placeholder_recipe_text() -> None:
     profile = profile_with(meal_count=5)
     plan = build_one_day_plan(profile)
@@ -258,6 +266,7 @@ def test_generated_recipe_text_uses_natural_cases() -> None:
     assert "добавьте огурцом" not in text.lower()
 
 
+@pytest.mark.slow_pdf_builder
 def test_recipe_plan_includes_usable_image_metadata() -> None:
     profile = profile_with(meal_count=5)
     plan = build_one_day_plan(profile)
@@ -272,6 +281,7 @@ def test_recipe_plan_includes_usable_image_metadata() -> None:
             assert (DATA_DIR / meal.image_url).exists()
 
 
+@pytest.mark.slow_pdf_builder
 def test_recipe_plan_prefers_vitamin_d_and_omega3_sources() -> None:
     profile = profile_with(meal_count=4)
     plan = build_one_day_plan(profile, variety_seed=0)

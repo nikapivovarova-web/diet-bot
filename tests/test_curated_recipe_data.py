@@ -2,6 +2,8 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import pytest
+
 from diet_bot.builder import _add_missing_garnishes
 from diet_bot.builder import build_one_day_plan
 from diet_bot.curated_data import _looks_incomplete_instruction, curated_foods, curated_recipes
@@ -190,6 +192,7 @@ def test_bare_animal_main_gets_deficit_based_garnish() -> None:
     assert "Гарнир:" in meals[1].recipe
 
 
+@pytest.mark.slow_pdf_builder
 def test_plan_can_use_curated_table_recipes() -> None:
     profile = UserProfile(
         age=32,
@@ -236,6 +239,7 @@ def test_curated_only_plan_uses_only_table_recipes_and_local_photos() -> None:
         assert all((DATA_DIR / meal.image_url).exists() for meal in plan.meals if meal.image_url)
 
 
+@pytest.mark.slow_pdf_builder
 def test_curated_only_plan_matches_requested_meal_count() -> None:
     for meal_count in (3, 4, 5):
         profile = UserProfile(

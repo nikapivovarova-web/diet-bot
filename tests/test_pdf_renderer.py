@@ -16,6 +16,9 @@ from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
 
 
+pytestmark = pytest.mark.slow_pdf_builder
+
+
 @pytest.fixture(scope="module")
 def sample_week_plans():
     profile = UserProfile(
