@@ -53,6 +53,14 @@ from .presentation import (
 )
 from .pdf_renderer import build_week_plan_pdf
 from .json_storage import atomic_write_json, json_storage_transaction
+from .payments import (
+    PaymentOrder,
+    PaymentOrderCreationCode,
+    PaymentProduct,
+    PaymentProvider,
+    build_payment_invoice_metadata,
+    get_payment_product_invoice_metadata,
+)
 from .postgres_store import PostgresDietBotStore
 from .promo_codes import PromoCodeActivation, activate_promo_code
 from .questionnaire import QuestionnaireSession, start_session
@@ -310,6 +318,23 @@ RUB_PAYMENT_PAYLOAD_DESCRIPTIONS = {
     PAYLOAD_RU_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
+PAYMENT_PAYLOAD_PRODUCTS = {
+    PAYLOAD_SUBSCRIPTION_MONTH: PaymentProduct.SUBSCRIPTION_MONTH,
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: PaymentProduct.SUBSCRIPTION_MONTH,
+    PAYLOAD_EXTRA_ONE_DAY: PaymentProduct.EXTRA_ONE_DAY,
+    PAYLOAD_RU_EXTRA_ONE_DAY: PaymentProduct.EXTRA_ONE_DAY,
+    PAYLOAD_EXTRA_WEEKLY_PDF: PaymentProduct.EXTRA_WEEKLY_PDF,
+    PAYLOAD_RU_EXTRA_WEEKLY_PDF: PaymentProduct.EXTRA_WEEKLY_PDF,
+}
+PAYMENT_PAYLOAD_PROVIDERS = {
+    PAYLOAD_SUBSCRIPTION_MONTH: PaymentProvider.TELEGRAM_STARS,
+    PAYLOAD_EXTRA_ONE_DAY: PaymentProvider.TELEGRAM_STARS,
+    PAYLOAD_EXTRA_WEEKLY_PDF: PaymentProvider.TELEGRAM_STARS,
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: PaymentProvider.YOOKASSA,
+    PAYLOAD_RU_EXTRA_ONE_DAY: PaymentProvider.YOOKASSA,
+    PAYLOAD_RU_EXTRA_WEEKLY_PDF: PaymentProvider.YOOKASSA,
+}
+PAYMENT_INVOICE_CREATION_FAILED_TEXT = "Не удалось создать счет для оплаты. Попробуйте позже."
 WELCOME_TEXT = (
     "Привет! Я FoodBalance — ваш персональный помощник по сбалансированному питанию 🥗\n\n"
     "Я подберу рецепты под ваши цели, рассчитаю КБЖУ, витамины и минералы, помогу собрать рацион так, "
@@ -1808,12 +1833,16 @@ async def _send_extra_purchase_subscription_notice_if_needed(message: Message) -
     entitlement = _entitlement_for_chat(message.chat.id)
     if entitlement.is_subscription_active() and not _is_free_preview_mode(message.chat.id, entitlement):
         return False
+    await _send_extra_purchase_subscription_required_message(message)
+    return True
+
+
+async def _send_extra_purchase_subscription_required_message(message: Message) -> None:
     await message.answer(
         "Разовые покупки доступны только при активной подписке.\n\n"
         "Чтобы продолжить, оформите месячный доступ.",
         reply_markup=_subscription_payment_keyboard(),
     )
-    return True
 
 
 def _active_subscription_notice_text(entitlement: Entitlement) -> str:
@@ -1835,20 +1864,106 @@ def _ru_card_payment_unavailable_text(payload: str) -> str:
     )
 
 
+def _payment_provider_for_payload(payload: str) -> PaymentProvider | None:
+    return PAYMENT_PAYLOAD_PROVIDERS.get(payload)
+
+
+def _payment_product_for_payload(payload: str) -> PaymentProduct | None:
+    return PAYMENT_PAYLOAD_PRODUCTS.get(payload)
+
+
+def _payment_user_id_for_message(message: Message) -> int | None:
+    user_id = _message_user_id(message)
+    if user_id is not None:
+        return user_id
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    return chat_id if isinstance(chat_id, int) else None
+
+
+async def _create_or_reuse_invoice_payment_order(
+    message: Message,
+    *,
+    provider: PaymentProvider,
+    product: PaymentProduct,
+) -> PaymentOrder | None:
+    store = _runtime_store()
+    if store is None:
+        await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
+        return None
+
+    buyer_id = _payment_user_id_for_message(message)
+    if buyer_id is None:
+        await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
+        return None
+
+    product_metadata = get_payment_product_invoice_metadata(provider, product)
+    result = store.create_or_reuse_pending_payment_order(
+        user_id=buyer_id,
+        delivery_chat_id=message.chat.id,
+        provider=provider,
+        product=product,
+        amount=product_metadata.amount,
+        currency=product_metadata.currency,
+    )
+    if result.accepted and result.order is not None:
+        return result.order
+    if result.code == PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED:
+        await _send_extra_purchase_subscription_required_message(message)
+        return None
+    await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
+    return None
+
+
+def _mark_payment_order_invoice_link(order: PaymentOrder, invoice_link: str) -> None:
+    store = _runtime_store()
+    marker = getattr(store, "mark_payment_order_invoice_link", None)
+    if callable(marker):
+        marker(order.order_id, invoice_link)
+
+
+def _mark_payment_order_invoice_creation_failed(order: PaymentOrder) -> None:
+    store = _runtime_store()
+    marker = getattr(store, "mark_payment_order_invoice_creation_failed", None)
+    if callable(marker):
+        marker(order.order_id)
+
+
 async def _send_stars_invoice_link(message: Message, payload: str) -> None:
-    amount = PAYMENT_PAYLOAD_AMOUNTS[payload]
+    provider = _payment_provider_for_payload(payload)
+    product = _payment_product_for_payload(payload)
+    if provider != PaymentProvider.TELEGRAM_STARS or product is None:
+        return
+    order = await _create_or_reuse_invoice_payment_order(
+        message,
+        provider=provider,
+        product=product,
+    )
+    if order is None:
+        return
+
+    metadata = build_payment_invoice_metadata(order)
     title = PAYMENT_PAYLOAD_TITLES[payload]
     description = PAYMENT_PAYLOAD_DESCRIPTIONS[payload]
-    subscription_period = SUBSCRIPTION_PERIOD_SECONDS if payload == PAYLOAD_SUBSCRIPTION_MONTH else None
-    invoice_link = await message.bot.create_invoice_link(
-        title=title,
-        description=description,
-        payload=payload,
-        currency="XTR",
-        prices=[LabeledPrice(label=title, amount=amount)],
-        provider_token="",
-        subscription_period=subscription_period,
-    )
+    amount = metadata.amount
+    if order.invoice_link:
+        invoice_link = order.invoice_link
+    else:
+        try:
+            invoice_link = await message.bot.create_invoice_link(
+                title=title,
+                description=description,
+                payload=metadata.payload,
+                currency=metadata.currency.value,
+                prices=[LabeledPrice(label=title, amount=amount)],
+                provider_token="",
+                subscription_period=metadata.subscription_period,
+            )
+        except TelegramAPIError:
+            _mark_payment_order_invoice_creation_failed(order)
+            await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
+            return
+        _mark_payment_order_invoice_link(order, invoice_link)
+
     await message.answer(
         f"{title}\n\nСтоимость: {amount} Stars.",
         reply_markup=InlineKeyboardMarkup(
@@ -1865,24 +1980,42 @@ async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
         await message.answer(_ru_card_payment_unavailable_text(payload))
         return
 
-    amount = RUB_PAYMENT_PAYLOAD_AMOUNTS[payload]
+    provider = _payment_provider_for_payload(payload)
+    product = _payment_product_for_payload(payload)
+    if provider != PaymentProvider.YOOKASSA or product is None:
+        return
+    order = await _create_or_reuse_invoice_payment_order(
+        message,
+        provider=provider,
+        product=product,
+    )
+    if order is None:
+        return
+
+    metadata = build_payment_invoice_metadata(order)
+    amount = metadata.amount
     title = RUB_PAYMENT_PAYLOAD_TITLES[payload]
     description = RUB_PAYMENT_PAYLOAD_DESCRIPTIONS[payload]
-    try:
-        invoice_link = await message.bot.create_invoice_link(
-            title=title,
-            description=description,
-            payload=payload,
-            currency="RUB",
-            prices=[LabeledPrice(label=title, amount=amount)],
-            provider_token=provider_token,
-            need_email=True,
-            send_email_to_provider=True,
-            provider_data=json.dumps(_yookassa_provider_data(payload), ensure_ascii=False),
-        )
-    except TelegramAPIError:
-        await message.answer("Не удалось создать счет для оплаты. Попробуйте позже.")
-        return
+    if order.invoice_link:
+        invoice_link = order.invoice_link
+    else:
+        try:
+            invoice_link = await message.bot.create_invoice_link(
+                title=title,
+                description=description,
+                payload=metadata.payload,
+                currency=metadata.currency.value,
+                prices=[LabeledPrice(label=title, amount=amount)],
+                provider_token=provider_token,
+                need_email=metadata.need_email,
+                send_email_to_provider=metadata.send_email_to_provider,
+                provider_data=json.dumps(metadata.provider_data, ensure_ascii=False),
+            )
+        except TelegramAPIError:
+            _mark_payment_order_invoice_creation_failed(order)
+            await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
+            return
+        _mark_payment_order_invoice_link(order, invoice_link)
 
     await message.answer(
         f"{title}\n\nСтоимость: {_format_kopecks_for_display(amount)} ₽.",

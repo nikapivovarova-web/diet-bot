@@ -1,5 +1,6 @@
 import json
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,17 @@ from diet_bot.domain import (
     SafetyResult,
     Sex,
     UserProfile,
+)
+from diet_bot.payments import (
+    PaymentCurrency,
+    PaymentOrder,
+    PaymentOrderCreationResult,
+    PaymentOrderStatus,
+    PaymentProduct,
+    PaymentProvider,
+    create_or_reuse_pending_payment_order,
+    decode_payment_order_payload,
+    is_active_pending_payment_order,
 )
 from diet_bot.presentation import format_meal_card, format_week_shopping_list
 from diet_bot.promo_codes import PromoCodeRecord, load_promo_codes, save_promo_codes
@@ -555,35 +567,106 @@ def test_pre_checkout_validates_payload_currency_and_amount() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_subscription_invoice_link_creates_recurring_stars_invoice() -> None:
+async def test_send_subscription_invoice_link_creates_recurring_stars_invoice(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
     message = FakeMessage()
 
     await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
 
     invoice = message.bot.invoice_links[0]
+    order_id, nonce = decode_payment_order_payload(invoice["payload"])
+    order = store.orders[0]
+
     assert invoice["currency"] == "XTR"
     assert invoice["provider_token"] == ""
-    assert invoice["payload"] == PAYLOAD_SUBSCRIPTION_MONTH
+    assert invoice["payload"] != PAYLOAD_SUBSCRIPTION_MONTH
+    assert invoice["payload"] == f"diet:order:{order_id}:{nonce}"
+    assert order.order_id == order_id
+    assert order.nonce == nonce
+    assert order.user_id == message.chat.id
+    assert order.delivery_chat_id == message.chat.id
+    assert order.provider == PaymentProvider.TELEGRAM_STARS
+    assert order.product == PaymentProduct.SUBSCRIPTION_MONTH
+    assert order.amount == SUBSCRIPTION_STARS_AMOUNT
+    assert order.currency == PaymentCurrency.XTR
+    assert order.invoice_link == "https://t.me/invoice/test"
+    assert store.invoice_link_updates == [(order.order_id, "https://t.me/invoice/test")]
     assert invoice["prices"][0].amount == SUBSCRIPTION_STARS_AMOUNT
     assert invoice["subscription_period"] == 2_592_000
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
 
 @pytest.mark.anyio
-async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice() -> None:
+async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkeypatch) -> None:
+    store = FakePaymentStore(entitlements={12345: _active_payment_entitlement()})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
     message = FakeMessage()
 
     await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
 
     invoice = message.bot.invoice_links[0]
+    order_id, nonce = decode_payment_order_payload(invoice["payload"])
+    order = store.orders[0]
+
     assert invoice["currency"] == "XTR"
-    assert invoice["payload"] == PAYLOAD_EXTRA_ONE_DAY
+    assert invoice["payload"] == f"diet:order:{order_id}:{nonce}"
+    assert order.product == PaymentProduct.EXTRA_ONE_DAY
     assert invoice["prices"][0].amount == 35
     assert invoice["subscription_period"] is None
 
 
 @pytest.mark.anyio
+async def test_repeated_stars_invoice_tap_reuses_active_pending_order(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage()
+
+    await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+    await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+
+    assert len(store.orders) == 1
+    assert len(message.bot.invoice_links) == 1
+    assert len(message.texts) == 2
+    assert store.orders[0].invoice_link == "https://t.me/invoice/test"
+    assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
+
+
+@pytest.mark.anyio
+async def test_extra_invoice_without_active_subscription_returns_refusal(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage()
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    assert store.orders == []
+    assert message.bot.invoice_links == []
+    sent_text, markup = message.texts[-1]
+    assert "Разовые покупки доступны только при активной подписке." in sent_text
+    assert markup.inline_keyboard[0][0].callback_data == CALLBACK_PAY_RU_CARD
+
+
+@pytest.mark.anyio
+async def test_create_invoice_link_failure_marks_payment_order_failed(monkeypatch) -> None:
+    store = FakePaymentStore(entitlements={12345: _active_payment_entitlement()})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage()
+    message.bot = FailingInvoiceBot()
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+
+    assert len(store.orders) == 1
+    assert store.orders[0].status == PaymentOrderStatus.FAILED_INVOICE_CREATION
+    assert store.failed_invoice_creation_order_ids == [store.orders[0].order_id]
+    assert message.bot.invoice_links == []
+    assert message.texts == [("Не удалось создать счет для оплаты. Попробуйте позже.", None)]
+
+
+@pytest.mark.anyio
 async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatch) -> None:
+    store = FakePaymentStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
     monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     message = FakeMessage()
@@ -598,12 +681,18 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert callback.answers == [None]
     assert invoice["currency"] == "RUB"
     assert invoice["provider_token"] == "provider-token"
-    assert invoice["payload"] == telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH
+    order_id, nonce = decode_payment_order_payload(invoice["payload"])
+    order = store.orders[0]
+    assert order.order_id == order_id
+    assert order.nonce == nonce
+    assert order.provider == PaymentProvider.YOOKASSA
+    assert order.product == PaymentProduct.SUBSCRIPTION_MONTH
+    assert invoice["payload"] == order.payload
     assert invoice["prices"][0].amount == 59_900
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
     assert item == {
-        "description": "FoodBalance: подписка на месяц",
+        "description": "FoodBalance monthly access",
         "quantity": "1.00",
         "amount": {
             "value": "599.00",
@@ -613,6 +702,7 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
         "payment_mode": "full_payment",
         "payment_subject": "service",
     }
+    assert store.invoice_link_updates == [(order.order_id, "https://t.me/invoice/test")]
     assert message.texts[-1][0] == "FoodBalance: подписка на месяц\n\nСтоимость: 599 ₽."
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
@@ -897,6 +987,103 @@ class FakeInvoiceBot:
         self.sent_messages.append(kwargs)
 
 
+class FailingInvoiceBot(FakeInvoiceBot):
+    async def create_invoice_link(self, **kwargs) -> str:
+        raise telegram_app.TelegramAPIError(SimpleNamespace(), "invoice unavailable")
+
+
+class FakePaymentStore:
+    def __init__(
+        self,
+        *,
+        entitlements: dict[int, telegram_app.Entitlement] | None = None,
+    ) -> None:
+        self.orders: list[PaymentOrder] = []
+        self.entitlements = dict(entitlements or {})
+        self.invoice_link_updates: list[tuple[str, str]] = []
+        self.failed_invoice_creation_order_ids: list[str] = []
+        self._sequence = 0
+
+    def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+        return self.entitlements.setdefault(user_id, telegram_app.Entitlement())
+
+    def save_entitlement(self, user_id: int, entitlement: telegram_app.Entitlement) -> None:
+        self.entitlements[user_id] = entitlement
+
+    def create_or_reuse_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider | str,
+        product: PaymentProduct | str,
+        amount: int,
+        currency: PaymentCurrency | str,
+        now: datetime | None = None,
+        ttl_seconds: int = 900,
+    ) -> PaymentOrderCreationResult:
+        self._sequence += 1
+        sequence = self._sequence
+        return create_or_reuse_pending_payment_order(
+            self,
+            user_id=user_id,
+            delivery_chat_id=delivery_chat_id,
+            provider=provider,
+            product=product,
+            amount=amount,
+            currency=currency,
+            now=now,
+            ttl_seconds=ttl_seconds,
+            order_id_factory=lambda: f"order_{sequence}",
+            nonce_factory=lambda: f"nonce_{sequence}",
+        )
+
+    def find_active_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: PaymentProvider,
+        product: PaymentProduct,
+        amount: int,
+        currency: PaymentCurrency,
+        now: datetime,
+    ) -> PaymentOrder | None:
+        for order in reversed(self.orders):
+            if (
+                order.user_id == user_id
+                and order.delivery_chat_id == delivery_chat_id
+                and order.provider == provider
+                and order.product == product
+                and order.amount == amount
+                and order.currency == currency
+                and is_active_pending_payment_order(order, now=now)
+            ):
+                return order
+        return None
+
+    def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder:
+        self.orders.append(order)
+        return order
+
+    def mark_payment_order_invoice_link(self, order_id: str, invoice_link: str) -> None:
+        self.invoice_link_updates.append((order_id, invoice_link))
+        for index, order in enumerate(self.orders):
+            if order.order_id == order_id:
+                self.orders[index] = replace(order, invoice_link=invoice_link)
+                return
+
+    def mark_payment_order_invoice_creation_failed(self, order_id: str) -> None:
+        self.failed_invoice_creation_order_ids.append(order_id)
+        for index, order in enumerate(self.orders):
+            if order.order_id == order_id:
+                self.orders[index] = replace(
+                    order,
+                    status=PaymentOrderStatus.FAILED_INVOICE_CREATION,
+                )
+                return
+
+
 def profile_with(**kwargs) -> UserProfile:
     data = {
         "age": 32,
@@ -1003,6 +1190,17 @@ def _save_active_subscription(
     entitlement.extra_one_day_remaining = extra_one_day_remaining
     entitlement.extra_weekly_pdf_remaining = extra_weekly_pdf_remaining
     telegram_app.save_entitlements(path, {chat_id: entitlement})
+    return entitlement
+
+
+def _active_payment_entitlement() -> telegram_app.Entitlement:
+    entitlement = telegram_app.Entitlement()
+    telegram_app.apply_subscription_payment(
+        entitlement,
+        "charge-active",
+        now=datetime(2026, 5, 8, tzinfo=UTC),
+    )
+    entitlement.subscription_period_end = (datetime.now(UTC) + timedelta(days=3)).isoformat()
     return entitlement
 
 
