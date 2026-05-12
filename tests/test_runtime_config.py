@@ -10,6 +10,7 @@ def test_runtime_config_prefers_diet_bot_token_over_legacy_alias() -> None:
         {
             "DIET_BOT_TOKEN": "new-token",
             "TELEGRAM_BOT_TOKEN": "legacy-token",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
         },
     )
 
@@ -17,7 +18,12 @@ def test_runtime_config_prefers_diet_bot_token_over_legacy_alias() -> None:
 
 
 def test_runtime_config_accepts_legacy_telegram_bot_token() -> None:
-    config = load_runtime_config({"TELEGRAM_BOT_TOKEN": "legacy-token"})
+    config = load_runtime_config(
+        {
+            "TELEGRAM_BOT_TOKEN": "legacy-token",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+        },
+    )
 
     assert config.bot_token == "legacy-token"
 
@@ -32,17 +38,35 @@ def test_runtime_config_allows_local_mode_without_production_storage() -> None:
         {
             "DIET_BOT_TOKEN": "local-token",
             "DIET_BOT_ENV": "development",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
         },
     )
 
     assert config.environment == "development"
+    assert config.database_url == ""
     assert config.local_json_storage_allowed is True
     assert config.state_file.name == "history.json"
     assert config.subscriptions_state_file.name == "subscriptions.json"
     assert config.promo_codes_state_file.name == "promo_codes.json"
 
 
-def test_runtime_config_rejects_production_mode_in_clean_runtime() -> None:
+def test_runtime_config_accepts_production_only_with_database_url() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+        },
+    )
+
+    assert config.environment == "production"
+    assert config.database_url == "postgresql://diet_bot@db.internal:5432/diet_bot"
+    assert config.local_json_storage_allowed is False
+    assert config.postgres_statement_timeout_ms == 5000
+    assert config.postgres_lock_timeout_ms == 1000
+
+
+def test_runtime_config_rejects_production_json_only() -> None:
     secret_token = "123456:VERY_SECRET_TOKEN"
 
     with pytest.raises(RuntimeConfigError) as exc_info:
@@ -50,19 +74,62 @@ def test_runtime_config_rejects_production_mode_in_clean_runtime() -> None:
             {
                 "DIET_BOT_TOKEN": secret_token,
                 "DIET_BOT_ENV": "production",
+                "DIET_BOT_ALLOW_JSON_STORAGE": "1",
             },
         )
 
     message = str(exc_info.value)
-    assert "DIET_BOT_ENV=production" in message
-    assert "durable production storage" in message
+    assert "DIET_BOT_DATABASE_URL" in message
     assert secret_token not in message
+
+
+def test_runtime_config_requires_explicit_json_fallback_in_development() -> None:
+    with pytest.raises(RuntimeConfigError) as exc_info:
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "local-token",
+                "DIET_BOT_ENV": "development",
+            },
+        )
+
+    assert "DIET_BOT_ALLOW_JSON_STORAGE=1" in str(exc_info.value)
+
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "local-token",
+            "DIET_BOT_ENV": "development",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+        },
+    )
+
+    assert config.local_json_storage_allowed is True
+    assert config.database_url == ""
+
+
+def test_runtime_config_rejects_placeholder_database_url_without_leaking_secrets() -> None:
+    placeholder_url = "postgresql://diet_bot:super-secret-db-password@example.com:5432/diet_bot"
+
+    with pytest.raises(RuntimeConfigError) as exc_info:
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_DATABASE_URL": placeholder_url,
+            },
+        )
+
+    message = str(exc_info.value)
+    assert "DIET_BOT_DATABASE_URL" in message
+    assert "placeholder" in message
+    assert placeholder_url not in message
+    assert "super-secret-db-password" not in message
 
 
 def test_runtime_config_parses_admin_and_tester_ids_without_crashing_on_invalid_values() -> None:
     config = load_runtime_config(
         {
             "DIET_BOT_TOKEN": "local-token",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
             "DIET_BOT_ADMIN_USER_IDS": "100, not-an-int; -200",
             "DIET_BOT_TESTER_CHAT_IDS": "300 400 broken",
         },
@@ -73,7 +140,12 @@ def test_runtime_config_parses_admin_and_tester_ids_without_crashing_on_invalid_
 
 
 def test_runtime_config_optional_provider_token_defaults_to_empty_string() -> None:
-    config = load_runtime_config({"DIET_BOT_TOKEN": "local-token"})
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "local-token",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+        },
+    )
 
     assert config.telegram_provider_token == ""
 
