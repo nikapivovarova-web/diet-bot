@@ -6,6 +6,7 @@ __pycache__/
 .diet_bot_state/
 .playwright-cli/
 .superpowers/
+.claude/
 node_modules/
 output/
 outputs/
