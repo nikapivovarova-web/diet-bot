@@ -11,7 +11,7 @@ from html import escape
 from pathlib import Path
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
@@ -43,15 +43,19 @@ from .shopping import build_week_shopping_groups
 
 DATA_DIR = Path(__file__).with_name("data")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PDF_LOGO_PATH = DATA_DIR / "foodbalance_pdf_logo.png"
+PDF_QR_PATH = DATA_DIR / "foodbalance_pdf_qr.png"
 PAGE_SIZE = A4
 PAGE_WIDTH, PAGE_HEIGHT = PAGE_SIZE
-PDF_MARGIN = 9 * mm
-BRAND_GREEN = colors.HexColor("#4F7D57")
-SOFT_GREEN = colors.HexColor("#EEF6EC")
-PALE_GREEN = colors.HexColor("#F7FBF5")
+PDF_MARGIN = 12 * mm
+BRAND_GREEN = colors.HexColor("#2F6B48")
+DEEP_GREEN = colors.HexColor("#1F3A2A")
+SOFT_GREEN = colors.HexColor("#EAF4EA")
+PALE_GREEN = colors.HexColor("#F6FAF5")
+PAGE_BACKGROUND = colors.HexColor("#FBFAF4")
 TEXT_COLOR = colors.HexColor("#243126")
 MUTED_COLOR = colors.HexColor("#66736A")
-LINE_COLOR = colors.HexColor("#D9E5D5")
+LINE_COLOR = colors.HexColor("#D8E2D3")
 EMOJI_RE = re.compile("[\U0001f300-\U0001faff\u2600-\u27bf\ufe0f]")
 LONG_TOKEN_MAX_CHARS = 48
 LONG_TOKEN_RE = re.compile(r"\S{" + str(LONG_TOKEN_MAX_CHARS + 1) + r",}")
@@ -99,8 +103,8 @@ def render_week_plan_pdf(
         pagesize=PAGE_SIZE,
         leftMargin=PDF_MARGIN,
         rightMargin=PDF_MARGIN,
-        topMargin=8 * mm,
-        bottomMargin=9 * mm,
+        topMargin=12 * mm,
+        bottomMargin=13 * mm,
         title="FoodBalance weekly ration",
         author="FoodBalance",
     )
@@ -157,12 +161,9 @@ def _cover_page(
     date_range = f"{plan_dates[0]:%d.%m.%Y} - {plan_dates[-1]:%d.%m.%Y}"
     meal_count = sum(len(plan.meals) for plan in plans)
     story: list = [
-        Spacer(1, 7 * mm),
-        _p("FoodBalance", styles["Brand"]),
-        Spacer(1, 6 * mm),
-        _p("Рацион на неделю", styles["Title"]),
-        _p(date_range, styles["Subtitle"]),
-        Spacer(1, 7 * mm),
+        Spacer(1, 8 * mm),
+        _cover_header(date_range, styles, doc_width),
+        Spacer(1, 11 * mm),
         _summary_table(first_plan, meal_count, styles),
         Spacer(1, 6 * mm),
         _section_title_with_icon("🧮", "Ваш расчет", styles, doc_width),
@@ -173,7 +174,69 @@ def _cover_page(
             story.append(_calculation_line(line, styles, doc_width))
         else:
             story.append(Spacer(1, 2 * mm))
+    qr_block = _cover_qr_block(styles, doc_width)
+    if qr_block is not None:
+        story.append(Spacer(1, 7 * mm))
+        story.append(qr_block)
     return story
+
+
+def _cover_header(date_range: str, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    logo = _asset_image(PDF_LOGO_PATH, 30 * mm, 30 * mm) or ""
+    text = [
+        _p("Food Balance", styles["CoverBrandLeft"]),
+        _p("Рацион на неделю", styles["CoverTitleLeft"]),
+        _p(date_range, styles["CoverSubtitleLeft"]),
+    ]
+    table = Table([[logo, text]], colWidths=[45 * mm, doc_width - 45 * mm], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return table
+
+
+def _cover_qr_block(styles: dict[str, ParagraphStyle], doc_width: float) -> Table | None:
+    qr = _asset_image(PDF_QR_PATH, 34 * mm, 34 * mm)
+    if qr is None:
+        return None
+    table = Table(
+        [[qr], [_p("@FOODBALANCERU_BOT", styles["QrCaption"])]],
+        colWidths=[doc_width],
+        hAlign="CENTER",
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
+    return table
+
+
+def _asset_image(path: Path, max_width: float, max_height: float) -> Image | None:
+    if not path.exists():
+        return None
+    try:
+        reader = ImageReader(str(path))
+        width, height = reader.getSize()
+        scale = min(max_width / width, max_height / height)
+        return Image(str(path), width=width * scale, height=height * scale)
+    except Exception:
+        return None
 
 
 def _summary_table(plan: MealPlan, meal_count: int, styles: dict[str, ParagraphStyle]) -> Table:
@@ -756,10 +819,10 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
         "FoodBalanceBody",
         parent=sample["BodyText"],
         fontName=base_font,
-        fontSize=13.4,
-        leading=16.5,
+        fontSize=10.6,
+        leading=14.2,
         textColor=TEXT_COLOR,
-        spaceAfter=1.4 * mm,
+        spaceAfter=1.2 * mm,
     )
     return {
         "Brand": ParagraphStyle(
@@ -767,16 +830,40 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             parent=body,
             fontName=bold_font,
             fontSize=17,
-            leading=19.5,
+            leading=20,
             alignment=TA_CENTER,
             textColor=BRAND_GREEN,
+        ),
+        "CoverBrandLeft": ParagraphStyle(
+            "FoodBalanceCoverBrandLeft",
+            parent=body,
+            fontName=bold_font,
+            fontSize=18,
+            leading=21,
+            textColor=BRAND_GREEN,
+        ),
+        "CoverTitleLeft": ParagraphStyle(
+            "FoodBalanceCoverTitleLeft",
+            parent=body,
+            fontName=bold_font,
+            fontSize=31,
+            leading=35,
+            textColor=DEEP_GREEN,
+            spaceAfter=1 * mm,
+        ),
+        "CoverSubtitleLeft": ParagraphStyle(
+            "FoodBalanceCoverSubtitleLeft",
+            parent=body,
+            fontSize=15,
+            leading=18,
+            textColor=MUTED_COLOR,
         ),
         "Title": ParagraphStyle(
             "FoodBalanceTitle",
             parent=body,
             fontName=bold_font,
-            fontSize=34,
-            leading=38,
+            fontSize=30,
+            leading=34,
             alignment=TA_CENTER,
             textColor=TEXT_COLOR,
             spaceAfter=2 * mm,
@@ -785,15 +872,15 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceTitleSmall",
             parent=body,
             fontName=bold_font,
-            fontSize=27,
-            leading=32,
+            fontSize=22,
+            leading=26,
             textColor=TEXT_COLOR,
         ),
         "Subtitle": ParagraphStyle(
             "FoodBalanceSubtitle",
             parent=body,
-            fontSize=16,
-            leading=19,
+            fontSize=15,
+            leading=18,
             alignment=TA_CENTER,
             textColor=MUTED_COLOR,
         ),
@@ -801,8 +888,8 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceSectionTitle",
             parent=body,
             fontName=bold_font,
-            fontSize=18,
-            leading=21.5,
+            fontSize=14.5,
+            leading=18,
             textColor=BRAND_GREEN,
             spaceBefore=2 * mm,
             spaceAfter=2 * mm,
@@ -811,8 +898,8 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceSectionEmoji",
             parent=body,
             fontName=emoji_font,
-            fontSize=18,
-            leading=21.5,
+            fontSize=14,
+            leading=17,
             textColor=BRAND_GREEN,
             alignment=TA_CENTER,
         ),
@@ -820,8 +907,8 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceInlineEmoji",
             parent=body,
             fontName=emoji_font,
-            fontSize=13.4,
-            leading=16.5,
+            fontSize=10.6,
+            leading=14.2,
             textColor=BRAND_GREEN,
             alignment=TA_CENTER,
         ),
@@ -829,45 +916,45 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceMetricEmoji",
             parent=body,
             fontName=emoji_font,
-            fontSize=12,
-            leading=14,
+            fontSize=13,
+            leading=15,
             textColor=BRAND_GREEN,
+            alignment=TA_CENTER,
         ),
         "DayTitle": ParagraphStyle(
             "FoodBalanceDayTitle",
             parent=body,
             fontName=bold_font,
             fontSize=23,
-            leading=26,
+            leading=27,
             textColor=colors.white,
         ),
         "DayDate": ParagraphStyle(
             "FoodBalanceDayDate",
             parent=body,
             fontName=bold_font,
-            fontSize=17,
-            leading=20,
-            alignment=TA_LEFT,
+            fontSize=15,
+            leading=18,
+            alignment=TA_RIGHT,
             textColor=colors.white,
         ),
         "MealTitle": ParagraphStyle(
             "FoodBalanceMealTitle",
             parent=body,
             fontName=bold_font,
-            fontSize=18,
-            leading=21.5,
-            textColor=TEXT_COLOR,
-            spaceAfter=1 * mm,
+            fontSize=14.3,
+            leading=17.5,
+            textColor=BRAND_GREEN,
         ),
         "Body": body,
         "Label": ParagraphStyle(
             "FoodBalanceLabel",
             parent=body,
             fontName=bold_font,
-            fontSize=13.4,
-            leading=16.5,
-            textColor=TEXT_COLOR,
-            spaceAfter=0.5 * mm,
+            fontSize=12,
+            leading=15,
+            textColor=BRAND_GREEN,
+            spaceAfter=1 * mm,
         ),
         "Credit": ParagraphStyle(
             "FoodBalanceCredit",
@@ -880,8 +967,8 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceChipText",
             parent=body,
             fontName=bold_font,
-            fontSize=12.4,
-            leading=15,
+            fontSize=10.8,
+            leading=13,
             textColor=BRAND_GREEN,
             backColor=PALE_GREEN,
             borderPadding=(3, 4, 3),
@@ -889,24 +976,27 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
         "MetricLabel": ParagraphStyle(
             "FoodBalanceMetricLabel",
             parent=body,
-            fontSize=10.2,
-            leading=12,
+            fontName=bold_font,
+            fontSize=9.4,
+            leading=11.5,
             textColor=MUTED_COLOR,
+            alignment=TA_CENTER,
         ),
         "MetricValue": ParagraphStyle(
             "FoodBalanceMetricValue",
             parent=body,
             fontName=bold_font,
-            fontSize=13.5,
-            leading=16.2,
-            textColor=TEXT_COLOR,
+            fontSize=12.8,
+            leading=16,
+            textColor=DEEP_GREEN,
+            alignment=TA_CENTER,
         ),
         "TableHeaderCenter": ParagraphStyle(
             "FoodBalanceTableHeaderCenter",
             parent=body,
             fontName=bold_font,
-            fontSize=11.2,
-            leading=13.5,
+            fontSize=9.5,
+            leading=11.5,
             alignment=TA_CENTER,
             textColor=TEXT_COLOR,
         ),
@@ -914,23 +1004,23 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceTableHeader",
             parent=body,
             fontName=bold_font,
-            fontSize=11.2,
-            leading=13.5,
+            fontSize=9.5,
+            leading=11.5,
             textColor=TEXT_COLOR,
         ),
         "TableCell": ParagraphStyle(
             "FoodBalanceTableCell",
             parent=body,
-            fontSize=10.9,
-            leading=13.2,
+            fontSize=9.4,
+            leading=12,
             textColor=TEXT_COLOR,
         ),
         "ShoppingGroupTitle": ParagraphStyle(
             "FoodBalanceShoppingGroupTitle",
             parent=body,
             fontName=bold_font,
-            fontSize=16,
-            leading=19,
+            fontSize=12.5,
+            leading=15,
             textColor=BRAND_GREEN,
             spaceBefore=1 * mm,
             spaceAfter=0.5 * mm,
@@ -938,18 +1028,27 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
         "ShoppingItem": ParagraphStyle(
             "FoodBalanceShoppingItem",
             parent=body,
-            fontSize=12.6,
-            leading=15.2,
+            fontSize=10.4,
+            leading=13,
             textColor=TEXT_COLOR,
             spaceAfter=0,
         ),
         "FinePrint": ParagraphStyle(
             "FoodBalanceFinePrint",
             parent=body,
-            fontSize=11.4,
-            leading=13.8,
+            fontSize=9.4,
+            leading=12.2,
             textColor=MUTED_COLOR,
             spaceAfter=0.8 * mm,
+        ),
+        "QrCaption": ParagraphStyle(
+            "FoodBalanceQrCaption",
+            parent=body,
+            fontName=bold_font,
+            fontSize=11,
+            leading=13,
+            alignment=TA_CENTER,
+            textColor=BRAND_GREEN,
         ),
         "DotGreen": ParagraphStyle(
             "FoodBalanceDotGreen",
@@ -1025,6 +1124,8 @@ def _soft_wrap_long_tokens(text: str) -> str:
 def _footer(base_font: str):
     def draw(canvas, doc) -> None:
         canvas.saveState()
+        canvas.setFillColor(PAGE_BACKGROUND)
+        canvas.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, stroke=0, fill=1)
         canvas.setFont(base_font, 8)
         canvas.setFillColor(MUTED_COLOR)
         canvas.drawString(doc.leftMargin, 8 * mm, "FoodBalance")

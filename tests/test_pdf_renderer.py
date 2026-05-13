@@ -7,10 +7,12 @@ from pathlib import Path
 
 import pytest
 from pypdf import PdfReader
+from reportlab.lib.units import mm
 
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult
+import diet_bot.pdf_renderer as pdf_renderer
 from diet_bot.pdf_renderer import _clean_text, _html, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
@@ -58,6 +60,28 @@ def test_week_pdf_contains_full_week_content(tmp_path: Path, sample_week_plans, 
     assert "●" in text
     assert "Список покупок" in text
     assert "ориентировочный расчёт" in text
+
+
+def test_week_pdf_uses_branded_cover_shell(tmp_path: Path, sample_week_dates) -> None:
+    plan = _plan_for_recipe(built_in_recipes()[0])
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "branded-shell.pdf")
+    text = _pdf_text(pdf_path)
+
+    assert "Food Balance" in text
+    assert "@FOODBALANCERU_BOT" in text
+
+
+def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
+    logo = pdf_renderer._asset_image(pdf_renderer.PDF_LOGO_PATH, 30 * mm, 30 * mm)
+    qr = pdf_renderer._asset_image(pdf_renderer.PDF_QR_PATH, 34 * mm, 34 * mm)
+
+    assert logo is not None
+    assert logo.drawWidth <= 30 * mm
+    assert logo.drawHeight <= 30 * mm
+    assert qr is not None
+    assert qr.drawWidth <= 34 * mm
+    assert qr.drawHeight <= 34 * mm
 
 
 def test_local_meal_photo_can_be_resolved(sample_week_plans) -> None:
