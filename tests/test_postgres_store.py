@@ -365,6 +365,188 @@ def test_postgres_promo_redemption_is_one_per_user_and_respects_max_uses() -> No
         _cleanup_promo_code(store, code)
 
 
+def test_postgres_create_and_get_active_promo_code() -> None:
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    code = _unique_promo_code()
+    expires_at = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    try:
+        created = store.create_promo_code(
+            PromoCodeDefinition(
+                code=code.lower().replace("-", " "),
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=10,
+                per_user_limit=2,
+                discount_percent=20,
+                expires_at=expires_at,
+            )
+        )
+        loaded = store.get_promo_code(code)
+        active = store.get_promo_code(
+            code,
+            active_only=True,
+            now=datetime(2026, 5, 13, tzinfo=UTC),
+        )
+
+        assert created.code == code
+        assert loaded == created
+        assert active == created
+        assert created.kind == PromoCodeKind.DISCOUNT
+        assert created.discount_percent == 20
+        assert created.max_redemptions == 10
+        assert created.per_user_limit == 2
+        assert _promo_events_for_code(store, code)[0]["event_type"] == "created"
+    finally:
+        _cleanup_promo_code(store, code)
+
+
+def test_postgres_one_time_monthly_promo_redeem_grants_once_and_is_audited() -> None:
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+    from diet_bot.subscriptions import MONTHLY_ONE_DAY_LIMIT, MONTHLY_WEEKLY_PDF_LIMIT
+
+    store = _store()
+    first_user_id = _unique_user_id()
+    second_user_id = _unique_user_id()
+    code = _unique_promo_code()
+    now = datetime(2026, 5, 13, 11, 0, tzinfo=UTC)
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                max_redemptions=1,
+                per_user_limit=1,
+                monthly_duration_months=1,
+            )
+        )
+
+        first = store.redeem_promo_code(first_user_id, code, now=now)
+        duplicate = store.redeem_promo_code(first_user_id, code, now=now)
+        exhausted = store.redeem_promo_code(second_user_id, code, now=now)
+
+        first_entitlement = store.get_entitlement(first_user_id)
+        second_entitlement = store.get_entitlement(second_user_id)
+        events = _promo_events_for_code(store, code)
+        redemptions = _promo_redemptions_for_code(store, code)
+
+        assert first.redeemed
+        assert first.redemption_id is not None
+        assert duplicate.status == "already_used"
+        assert exhausted.status == "already_used"
+        assert first_entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
+        assert first_entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+        assert second_entitlement == second_entitlement.__class__()
+        assert [event["event_type"] for event in events] == [
+            "created",
+            "redeemed",
+            "rejected",
+            "rejected",
+        ]
+        assert len(redemptions) == 1
+        assert redemptions[0]["status"] == "redeemed"
+        assert redemptions[0]["entitlement_event_id"] is not None
+    finally:
+        _cleanup_users(store, first_user_id, second_user_id)
+        _cleanup_promo_code(store, code)
+
+
+def test_postgres_reusable_discount_promo_respects_global_and_per_user_limits() -> None:
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    first_user_id = _unique_user_id()
+    second_user_id = _unique_user_id()
+    third_user_id = _unique_user_id()
+    code = _unique_promo_code()
+    now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=3,
+                per_user_limit=2,
+                discount_amount=5_000,
+            )
+        )
+
+        first = store.redeem_promo_code(first_user_id, code, now=now)
+        second_same_user = store.redeem_promo_code(first_user_id, code, now=now)
+        per_user_exhausted = store.redeem_promo_code(first_user_id, code, now=now)
+        second_user = store.redeem_promo_code(second_user_id, code, now=now)
+        global_exhausted = store.redeem_promo_code(third_user_id, code, now=now)
+
+        loaded = store.get_promo_code(code)
+        redemptions = _promo_redemptions_for_code(store, code)
+
+        assert first.redeemed
+        assert second_same_user.redeemed
+        assert per_user_exhausted.status == "already_used"
+        assert second_user.redeemed
+        assert global_exhausted.status == "already_used"
+        assert loaded is not None
+        assert loaded.used_count == 3
+        assert [int(row["user_id"]) for row in redemptions] == [
+            first_user_id,
+            first_user_id,
+            second_user_id,
+        ]
+        assert all(row["entitlement_event_id"] is None for row in redemptions)
+        assert store.get_entitlement(first_user_id) == store.get_entitlement(first_user_id).__class__()
+    finally:
+        _cleanup_users(store, first_user_id, second_user_id, third_user_id)
+        _cleanup_promo_code(store, code)
+
+
+def test_postgres_expired_or_disabled_promo_is_rejected_without_redemption() -> None:
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    user_id = _unique_user_id()
+    expired_code = _unique_promo_code()
+    disabled_code = _unique_promo_code()
+    now = datetime(2026, 5, 13, 13, 0, tzinfo=UTC)
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=expired_code,
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=5,
+                per_user_limit=1,
+                discount_percent=10,
+                expires_at=now - timedelta(seconds=1),
+            )
+        )
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=disabled_code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                active=False,
+            )
+        )
+
+        expired = store.redeem_promo_code(user_id, expired_code, now=now)
+        disabled = store.redeem_promo_code(user_id, disabled_code, now=now)
+
+        assert expired.status == "expired"
+        assert disabled.status == "disabled"
+        assert _promo_redemptions_for_code(store, expired_code) == []
+        assert _promo_redemptions_for_code(store, disabled_code) == []
+        assert [event["event_type"] for event in _promo_events_for_code(store, expired_code)] == [
+            "created",
+            "rejected",
+        ]
+        assert [event["event_type"] for event in _promo_events_for_code(store, disabled_code)] == [
+            "created",
+            "rejected",
+        ]
+    finally:
+        _cleanup_users(store, user_id)
+        _cleanup_promo_code(store, expired_code)
+        _cleanup_promo_code(store, disabled_code)
+
+
 def test_postgres_support_state_round_trips_without_raw_message_text() -> None:
     from diet_bot.storage import SupportState
 
@@ -803,6 +985,38 @@ def _cleanup_promo_code(store: Any, code: str) -> None:
     with store._connect() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM promo_codes WHERE code = %s", (code,))
+
+
+def _promo_redemptions_for_code(store: Any, code: str) -> list[dict[str, Any]]:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pr.*
+                FROM promo_redemptions pr
+                JOIN promo_codes pc ON pc.id = pr.promo_code_id
+                WHERE pc.code = %s
+                ORDER BY pr.id
+                """,
+                (code,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def _promo_events_for_code(store: Any, code: str) -> list[dict[str, Any]]:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pe.*
+                FROM promo_events pe
+                JOIN promo_codes pc ON pc.id = pe.promo_code_id
+                WHERE pc.code = %s
+                ORDER BY pe.id
+                """,
+                (code,),
+            )
+            return [dict(row) for row in cur.fetchall()]
 
 
 def _entitlement_event_count(store: Any, user_id: int) -> int:

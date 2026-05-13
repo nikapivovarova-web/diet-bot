@@ -1,6 +1,9 @@
+import pytest
 from datetime import UTC, datetime
 
 from diet_bot.promo_codes import (
+    PromoCodeDefinition,
+    PromoCodeKind,
     PromoCodeRecord,
     activate_promo_code,
     generate_promo_codes,
@@ -8,6 +11,33 @@ from diet_bot.promo_codes import (
     normalize_promo_code,
     save_promo_codes,
 )
+
+
+def test_promo_definition_normalizes_code_and_validates_discount() -> None:
+    promo = PromoCodeDefinition(
+        code="fb abcd efgh 2345",
+        kind=PromoCodeKind.DISCOUNT,
+        max_redemptions=10,
+        per_user_limit=2,
+        discount_percent=25,
+        expires_at=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+    )
+
+    assert promo.code == "FB-ABCD-EFGH-2345"
+    assert promo.kind == PromoCodeKind.DISCOUNT
+    assert promo.expires_at == "2026-06-01T12:00:00+00:00"
+
+    with pytest.raises(ValueError, match="discount"):
+        PromoCodeDefinition(code="FB-ABCD-EFGH-2345", kind=PromoCodeKind.DISCOUNT)
+
+
+def test_monthly_access_promo_definition_defaults_to_one_time_month() -> None:
+    promo = PromoCodeDefinition(code="FB-ABCD-EFGH-2345")
+
+    assert promo.kind == PromoCodeKind.MONTHLY_ACCESS
+    assert promo.max_redemptions == 1
+    assert promo.per_user_limit == 1
+    assert promo.monthly_duration_months == 1
 
 
 def test_generate_promo_codes_creates_unique_monthly_codes() -> None:
@@ -21,7 +51,7 @@ def test_generate_promo_codes_creates_unique_monthly_codes() -> None:
 
 def test_promo_code_activation_is_one_time(tmp_path) -> None:
     path = tmp_path / "promo_codes.json"
-    save_promo_codes(path, {"FB-ABCD-EFGH-2345": PromoCodeRecord()})
+    save_promo_codes(path, {"FB-ABCD-EFGH-2345": PromoCodeRecord.monthly_access()})
 
     first = activate_promo_code(
         path,
@@ -38,6 +68,30 @@ def test_promo_code_activation_is_one_time(tmp_path) -> None:
     assert second.used_by_chat_id == 123
     assert loaded["FB-ABCD-EFGH-2345"].used_by_chat_id == 123
     assert loaded["FB-ABCD-EFGH-2345"].used_at == "2026-05-09T10:00:00+00:00"
+
+
+def test_json_discount_promo_is_not_activated_as_monthly_access(tmp_path) -> None:
+    path = tmp_path / "promo_codes.json"
+    save_promo_codes(
+        path,
+        {
+            "FB-DISC-OUNT-2026": PromoCodeRecord.from_definition(
+                PromoCodeDefinition(
+                    code="FB-DISC-OUNT-2026",
+                    kind=PromoCodeKind.DISCOUNT,
+                    max_redemptions=5,
+                    per_user_limit=1,
+                    discount_percent=15,
+                )
+            )
+        },
+    )
+
+    result = activate_promo_code(path, "FB-DISC-OUNT-2026", 123)
+    loaded = load_promo_codes(path)
+
+    assert result.status == "not_found"
+    assert loaded["FB-DISC-OUNT-2026"].used_by_chat_id is None
 
 
 def test_unknown_promo_code_is_not_found(tmp_path) -> None:

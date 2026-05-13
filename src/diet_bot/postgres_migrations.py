@@ -135,19 +135,39 @@ BASE_SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS promo_codes (
         id BIGSERIAL PRIMARY KEY,
         code TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL DEFAULT 'subscription_month',
+        kind TEXT NOT NULL DEFAULT 'monthly_access',
         value INTEGER NOT NULL DEFAULT 1,
         max_uses INTEGER,
+        max_redemptions INTEGER,
+        per_user_limit INTEGER NOT NULL DEFAULT 1,
         used_count INTEGER NOT NULL DEFAULT 0,
         valid_from TIMESTAMPTZ,
         valid_until TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ,
         is_active BOOLEAN NOT NULL DEFAULT true,
+        discount_percent INTEGER,
+        discount_amount INTEGER,
+        monthly_duration_months INTEGER NOT NULL DEFAULT 1,
+        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CHECK (kind IN ('subscription_month', 'extra_one_day', 'extra_weekly_pdf', 'test_access_days')),
+        CHECK (kind IN (
+            'monthly_access',
+            'discount',
+            'subscription_month',
+            'extra_one_day',
+            'extra_weekly_pdf',
+            'test_access_days'
+        )),
         CHECK (value >= 1),
         CHECK (used_count >= 0),
         CHECK (max_uses IS NULL OR max_uses >= 0),
-        CHECK (max_uses IS NULL OR used_count <= max_uses)
+        CHECK (max_uses IS NULL OR used_count <= max_uses),
+        CHECK (max_redemptions IS NULL OR max_redemptions >= 0),
+        CHECK (max_redemptions IS NULL OR used_count <= max_redemptions),
+        CHECK (per_user_limit >= 1),
+        CHECK (discount_percent IS NULL OR discount_percent BETWEEN 1 AND 100),
+        CHECK (discount_amount IS NULL OR discount_amount > 0),
+        CHECK (monthly_duration_months >= 1)
     )
     """,
     """
@@ -155,8 +175,37 @@ BASE_SCHEMA_STATEMENTS = (
         id BIGSERIAL PRIMARY KEY,
         promo_code_id BIGINT NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
         user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'redeemed',
+        kind TEXT,
+        discount_amount INTEGER,
+        entitlement_event_id BIGINT REFERENCES entitlement_events(id) ON DELETE SET NULL,
+        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
         redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        UNIQUE(promo_code_id, user_id)
+        CHECK (status IN ('redeemed', 'reserved', 'released')),
+        CHECK (
+            kind IS NULL
+            OR kind IN (
+                'monthly_access',
+                'discount',
+                'subscription_month',
+                'extra_one_day',
+                'extra_weekly_pdf',
+                'test_access_days'
+            )
+        ),
+        CHECK (discount_amount IS NULL OR discount_amount >= 0)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS promo_events (
+        id BIGSERIAL PRIMARY KEY,
+        promo_code_id BIGINT REFERENCES promo_codes(id) ON DELETE CASCADE,
+        redemption_id BIGINT REFERENCES promo_redemptions(id) ON DELETE SET NULL,
+        user_id BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+        event_type TEXT NOT NULL,
+        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK (event_type IN ('created', 'redeemed', 'rejected', 'disabled'))
     )
     """,
     """
@@ -204,8 +253,20 @@ BASE_SCHEMA_STATEMENTS = (
         ON payment_orders(user_id, status)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_promo_codes_active_expires
+        ON promo_codes(is_active, expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_promo_redemptions_code_user
+        ON promo_redemptions(promo_code_id, user_id, redeemed_at DESC)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_promo_redemptions_user
         ON promo_redemptions(user_id, redeemed_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_promo_events_code_created
+        ON promo_events(promo_code_id, created_at DESC)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_support_state_status_updated
@@ -321,10 +382,251 @@ PAYMENT_SUCCESS_LEDGER_MIGRATION = PostgresMigration(
 )
 
 
+PROMO_STORAGE_FOUNDATION_MIGRATION = PostgresMigration(
+    version="202605130003",
+    description="Add explicit promo storage definitions and audit events",
+    statements=(
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS max_redemptions INTEGER
+        """,
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS per_user_limit INTEGER NOT NULL DEFAULT 1
+        """,
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS discount_percent INTEGER
+        """,
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS discount_amount INTEGER
+        """,
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS monthly_duration_months INTEGER NOT NULL DEFAULT 1
+        """,
+        """
+        ALTER TABLE promo_codes
+        ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+        """,
+        """
+        DO $$
+        BEGIN
+            UPDATE promo_codes
+            SET expires_at = COALESCE(expires_at, valid_until),
+                max_redemptions = COALESCE(max_redemptions, max_uses),
+                monthly_duration_months = GREATEST(1, COALESCE(monthly_duration_months, value, 1))
+            WHERE expires_at IS NULL
+               OR max_redemptions IS NULL
+               OR monthly_duration_months IS NULL;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_kind_check'
+            ) THEN
+                ALTER TABLE promo_codes DROP CONSTRAINT promo_codes_kind_check;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_kind_supported_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_kind_supported_check
+                CHECK (kind IN (
+                    'monthly_access',
+                    'discount',
+                    'subscription_month',
+                    'extra_one_day',
+                    'extra_weekly_pdf',
+                    'test_access_days'
+                ));
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_max_redemptions_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_max_redemptions_check
+                CHECK (max_redemptions IS NULL OR max_redemptions >= 0);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_max_redemptions_used_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_max_redemptions_used_check
+                CHECK (max_redemptions IS NULL OR used_count <= max_redemptions);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_per_user_limit_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_per_user_limit_check
+                CHECK (per_user_limit >= 1);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_discount_percent_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_discount_percent_check
+                CHECK (discount_percent IS NULL OR discount_percent BETWEEN 1 AND 100);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_discount_amount_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_discount_amount_check
+                CHECK (discount_amount IS NULL OR discount_amount > 0);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_codes'::regclass
+                  AND conname = 'promo_codes_monthly_duration_check'
+            ) THEN
+                ALTER TABLE promo_codes
+                ADD CONSTRAINT promo_codes_monthly_duration_check
+                CHECK (monthly_duration_months >= 1);
+            END IF;
+        END $$;
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        DROP CONSTRAINT IF EXISTS promo_redemptions_promo_code_id_user_id_key
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'redeemed'
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        ADD COLUMN IF NOT EXISTS kind TEXT
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        ADD COLUMN IF NOT EXISTS discount_amount INTEGER
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        ADD COLUMN IF NOT EXISTS entitlement_event_id BIGINT REFERENCES entitlement_events(id) ON DELETE SET NULL
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_redemptions'::regclass
+                  AND conname = 'promo_redemptions_status_supported_check'
+            ) THEN
+                ALTER TABLE promo_redemptions
+                ADD CONSTRAINT promo_redemptions_status_supported_check
+                CHECK (status IN ('redeemed', 'reserved', 'released'));
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_redemptions'::regclass
+                  AND conname = 'promo_redemptions_kind_supported_check'
+            ) THEN
+                ALTER TABLE promo_redemptions
+                ADD CONSTRAINT promo_redemptions_kind_supported_check
+                CHECK (
+                    kind IS NULL
+                    OR kind IN (
+                        'monthly_access',
+                        'discount',
+                        'subscription_month',
+                        'extra_one_day',
+                        'extra_weekly_pdf',
+                        'test_access_days'
+                    )
+                );
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_redemptions'::regclass
+                  AND conname = 'promo_redemptions_discount_amount_check'
+            ) THEN
+                ALTER TABLE promo_redemptions
+                ADD CONSTRAINT promo_redemptions_discount_amount_check
+                CHECK (discount_amount IS NULL OR discount_amount >= 0);
+            END IF;
+        END $$;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS promo_events (
+            id BIGSERIAL PRIMARY KEY,
+            promo_code_id BIGINT REFERENCES promo_codes(id) ON DELETE CASCADE,
+            redemption_id BIGINT REFERENCES promo_redemptions(id) ON DELETE SET NULL,
+            user_id BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CHECK (event_type IN ('created', 'redeemed', 'rejected', 'disabled'))
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_codes_active_expires
+            ON promo_codes(is_active, expires_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_redemptions_code_user
+            ON promo_redemptions(promo_code_id, user_id, redeemed_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_events_code_created
+            ON promo_events(promo_code_id, created_at DESC)
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
     PAYMENT_SUCCESS_LEDGER_MIGRATION,
+    PROMO_STORAGE_FOUNDATION_MIGRATION,
 )
 
 

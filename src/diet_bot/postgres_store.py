@@ -40,7 +40,15 @@ from .payments import (
     validate_successful_payment_order,
 )
 from .postgres_migrations import run_postgres_migrations
-from .promo_codes import PromoCodeActivation, PromoCodeRecord, normalize_promo_code
+from .promo_codes import (
+    PromoCodeActivation,
+    PromoCodeDefinition,
+    PromoCodeKind,
+    PromoCodeRecord,
+    PromoRedemptionResult,
+    PromoRedemptionStatus,
+    normalize_promo_code,
+)
 from .subscriptions import (
     AttemptConsumption,
     Entitlement,
@@ -62,6 +70,8 @@ ACTIVE_GENERATION_STATUSES = ("generating", "delivering")
 LEDGER_EVENT_CONSUME = "consume"
 LEDGER_EVENT_REFUND = "refund"
 LEDGER_EVENT_ENTITLEMENT_SNAPSHOT = "entitlement_snapshot"
+LEDGER_EVENT_PROMO_GRANT = "grant"
+PROMO_ACCESS_KINDS = frozenset({"monthly_access", "subscription_month"})
 
 
 class PostgresDietBotStore:
@@ -475,11 +485,27 @@ class PostgresDietBotStore:
                     self._remember_user_cur(cur, UserIdentity(used_by_chat_id))
                 cur.execute(
                     """
-                    INSERT INTO promo_codes (code, kind, value, max_uses, used_count, is_active)
-                    VALUES (%s, 'subscription_month', 1, 1, %s, true)
+                    INSERT INTO promo_codes (
+                        code,
+                        kind,
+                        value,
+                        max_uses,
+                        max_redemptions,
+                        per_user_limit,
+                        used_count,
+                        is_active,
+                        monthly_duration_months
+                    )
+                    VALUES (%s, 'monthly_access', 1, 1, 1, 1, %s, true, 1)
                     ON CONFLICT (code) DO UPDATE
                     SET used_count = GREATEST(promo_codes.used_count, EXCLUDED.used_count),
-                        is_active = true
+                        kind = 'monthly_access',
+                        value = 1,
+                        max_uses = 1,
+                        max_redemptions = 1,
+                        per_user_limit = 1,
+                        is_active = true,
+                        monthly_duration_months = 1
                     RETURNING id
                     """,
                     (normalized_code, 1 if used_by_chat_id is not None else 0),
@@ -491,11 +517,179 @@ class PostgresDietBotStore:
                     return
                 cur.execute(
                     """
-                    INSERT INTO promo_redemptions (promo_code_id, user_id, redeemed_at)
-                    VALUES (%s, %s, COALESCE(%s, now()))
-                    ON CONFLICT (promo_code_id, user_id) DO NOTHING
+                    SELECT 1
+                    FROM promo_redemptions
+                    WHERE promo_code_id = %s
+                      AND user_id = %s
+                    LIMIT 1
                     """,
-                    (int(row["id"]), used_by_chat_id, used_at),
+                    (int(row["id"]), used_by_chat_id),
+                )
+                if cur.fetchone() is not None:
+                    return
+                cur.execute(
+                    """
+                    INSERT INTO promo_redemptions (
+                        promo_code_id,
+                        user_id,
+                        status,
+                        kind,
+                        metadata_json,
+                        redeemed_at
+                    )
+                    VALUES (%s, %s, 'redeemed', 'monthly_access', %s, COALESCE(%s, now()))
+                    """,
+                    (
+                        int(row["id"]),
+                        used_by_chat_id,
+                        _jsonb({"legacy_json_import": True}),
+                        used_at,
+                    ),
+                )
+
+    def create_promo_code(self, promo: PromoCodeDefinition) -> PromoCodeDefinition:
+        definition = PromoCodeDefinition(**promo.to_dict())
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                row = self._upsert_promo_definition_cur(cur, definition)
+                self._insert_promo_event_cur(
+                    cur,
+                    int(row["id"]),
+                    "created",
+                    metadata=definition.to_dict(),
+                )
+        return _row_to_promo_definition(row)
+
+    def get_promo_code(
+        self,
+        raw_code: str,
+        *,
+        active_only: bool = False,
+        now: datetime | None = None,
+    ) -> PromoCodeDefinition | None:
+        code = normalize_promo_code(raw_code)
+        if not code:
+            return None
+
+        current_time = _normalize_datetime(now)
+        clauses = ["code = %s"]
+        params: list[Any] = [code]
+        if active_only:
+            clauses.append("is_active = true")
+            clauses.append(
+                "(COALESCE(expires_at, valid_until) IS NULL OR COALESCE(expires_at, valid_until) > %s)"
+            )
+            params.append(current_time)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM promo_codes
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        try:
+            return _row_to_promo_definition(row)
+        except ValueError:
+            return None
+
+    def redeem_promo_code(
+        self,
+        user_id: int,
+        raw_code: str,
+        *,
+        now: datetime | None = None,
+    ) -> PromoRedemptionResult:
+        code = normalize_promo_code(raw_code)
+        if not code:
+            return PromoRedemptionResult(PromoRedemptionStatus.NOT_FOUND, "")
+
+        current_time = _normalize_datetime(now)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                self._remember_user_cur(cur, UserIdentity(user_id))
+                promo = self._select_promo_for_update_cur(cur, code)
+                if promo is None:
+                    return PromoRedemptionResult(PromoRedemptionStatus.NOT_FOUND, code)
+
+                try:
+                    promo_kind = _promo_definition_kind(promo)
+                except ValueError:
+                    self._insert_promo_event_cur(
+                        cur,
+                        int(promo["id"]),
+                        "rejected",
+                        user_id=user_id,
+                        metadata={"status": "not_found", "code": code},
+                    )
+                    return PromoRedemptionResult(PromoRedemptionStatus.NOT_FOUND, code)
+
+                validation = self._validate_promo_redemption_cur(
+                    cur,
+                    promo,
+                    user_id,
+                    current_time,
+                )
+                if validation is not None:
+                    self._insert_promo_event_cur(
+                        cur,
+                        int(promo["id"]),
+                        "rejected",
+                        user_id=user_id,
+                        metadata={"status": str(validation.status), "code": code},
+                    )
+                    return validation
+
+                redemption_id = self._insert_promo_redemption_cur(
+                    cur,
+                    promo,
+                    user_id,
+                    current_time,
+                )
+                entitlement_event_id: int | None = None
+                if promo_kind == PromoCodeKind.MONTHLY_ACCESS:
+                    entitlement = self._select_entitlement_for_update_cur(cur, user_id)
+                    entitlement_event_id = self._apply_promo_grant_cur(
+                        cur,
+                        user_id,
+                        entitlement,
+                        promo,
+                        code,
+                        current_time,
+                    )
+                    self._update_entitlement_cur(cur, user_id, entitlement)
+                    self._insert_entitlement_snapshot_cur(cur, user_id, entitlement)
+                    self._link_promo_redemption_entitlement_event_cur(
+                        cur,
+                        redemption_id,
+                        entitlement_event_id,
+                    )
+
+                self._increment_promo_used_count_cur(cur, int(promo["id"]))
+                self._insert_promo_event_cur(
+                    cur,
+                    int(promo["id"]),
+                    "redeemed",
+                    user_id=user_id,
+                    redemption_id=redemption_id,
+                    metadata={
+                        "code": code,
+                        "kind": promo_kind.value,
+                        "entitlement_event_id": entitlement_event_id,
+                    },
+                )
+                return PromoRedemptionResult(
+                    PromoRedemptionStatus.REDEEMED,
+                    code,
+                    promo=_row_to_promo_definition(promo),
+                    redemption_id=redemption_id,
+                    used_by_chat_id=user_id,
                 )
 
     def activate_promo_code(self, user_id: int, raw_code: str) -> PromoCodeActivation:
@@ -506,64 +700,69 @@ class PostgresDietBotStore:
         current_time = datetime.now(UTC)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                entitlement = self._select_entitlement_for_update_cur(cur, user_id)
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM promo_codes
-                    WHERE code = %s
-                      AND is_active = true
-                      AND (valid_from IS NULL OR valid_from <= %s)
-                      AND (valid_until IS NULL OR valid_until > %s)
-                    FOR UPDATE
-                    """,
-                    (code, current_time, current_time),
-                )
-                promo = cur.fetchone()
+                self._remember_user_cur(cur, UserIdentity(user_id))
+                promo = self._select_promo_for_update_cur(cur, code)
                 if promo is None:
                     return PromoCodeActivation("not_found", code)
 
-                promo_id = int(promo["id"])
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM promo_redemptions
-                    WHERE promo_code_id = %s
-                      AND user_id = %s
-                    LIMIT 1
-                    """,
-                    (promo_id, user_id),
-                )
-                if cur.fetchone() is not None:
-                    return PromoCodeActivation("already_used", code, user_id)
+                if _promo_kind_value(promo) == PromoCodeKind.DISCOUNT.value:
+                    return PromoCodeActivation("not_found", code)
 
-                used_count = _non_negative_int(promo.get("used_count"))
-                max_uses = promo.get("max_uses")
-                if max_uses is not None and used_count >= _non_negative_int(max_uses):
+                validation = self._validate_promo_redemption_cur(
+                    cur,
+                    promo,
+                    user_id,
+                    current_time,
+                )
+                if validation is not None:
+                    self._insert_promo_event_cur(
+                        cur,
+                        int(promo["id"]),
+                        "rejected",
+                        user_id=user_id,
+                        metadata={"status": str(validation.status), "code": code},
+                    )
                     return PromoCodeActivation(
-                        "already_used",
+                        str(validation.status),
                         code,
-                        self._first_promo_redeemer_cur(cur, promo_id),
+                        validation.used_by_chat_id,
                     )
 
-                cur.execute(
-                    """
-                    INSERT INTO promo_redemptions (promo_code_id, user_id)
-                    VALUES (%s, %s)
-                    """,
-                    (promo_id, user_id),
+                entitlement = self._select_entitlement_for_update_cur(cur, user_id)
+                redemption_id = self._insert_promo_redemption_cur(
+                    cur,
+                    promo,
+                    user_id,
+                    current_time,
                 )
-                cur.execute(
-                    """
-                    UPDATE promo_codes
-                    SET used_count = used_count + 1
-                    WHERE id = %s
-                    """,
-                    (promo_id,),
+                entitlement_event_id = self._apply_promo_grant_cur(
+                    cur,
+                    user_id,
+                    entitlement,
+                    promo,
+                    code,
+                    current_time,
                 )
-                self._apply_promo_grant_cur(cur, user_id, entitlement, promo, code, current_time)
+                self._link_promo_redemption_entitlement_event_cur(
+                    cur,
+                    redemption_id,
+                    entitlement_event_id,
+                )
+                self._increment_promo_used_count_cur(cur, int(promo["id"]))
                 self._update_entitlement_cur(cur, user_id, entitlement)
                 self._insert_entitlement_snapshot_cur(cur, user_id, entitlement)
+                self._insert_promo_event_cur(
+                    cur,
+                    int(promo["id"]),
+                    "redeemed",
+                    user_id=user_id,
+                    redemption_id=redemption_id,
+                    metadata={
+                        "code": code,
+                        "kind": _promo_kind_value(promo),
+                        "entitlement_event_id": entitlement_event_id,
+                    },
+                )
                 return PromoCodeActivation("activated", code, user_id)
 
     def record_support_state(self, state: SupportState) -> None:
@@ -2075,6 +2274,230 @@ class PostgresDietBotStore:
         )
         return True
 
+    def _upsert_promo_definition_cur(
+        self,
+        cur: Any,
+        definition: PromoCodeDefinition,
+    ) -> dict[str, Any]:
+        cur.execute(
+            """
+            INSERT INTO promo_codes (
+                code,
+                kind,
+                value,
+                max_uses,
+                max_redemptions,
+                per_user_limit,
+                used_count,
+                valid_until,
+                expires_at,
+                is_active,
+                discount_percent,
+                discount_amount,
+                monthly_duration_months,
+                metadata_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (code) DO UPDATE
+            SET kind = EXCLUDED.kind,
+                value = EXCLUDED.value,
+                max_uses = EXCLUDED.max_uses,
+                max_redemptions = EXCLUDED.max_redemptions,
+                per_user_limit = EXCLUDED.per_user_limit,
+                used_count = GREATEST(promo_codes.used_count, EXCLUDED.used_count),
+                valid_until = EXCLUDED.valid_until,
+                expires_at = EXCLUDED.expires_at,
+                is_active = EXCLUDED.is_active,
+                discount_percent = EXCLUDED.discount_percent,
+                discount_amount = EXCLUDED.discount_amount,
+                monthly_duration_months = EXCLUDED.monthly_duration_months,
+                metadata_json = EXCLUDED.metadata_json
+            RETURNING *
+            """,
+            (
+                definition.code,
+                definition.kind.value,
+                _promo_definition_value(definition),
+                definition.max_redemptions,
+                definition.max_redemptions,
+                definition.per_user_limit or 1,
+                definition.used_count,
+                _parse_datetime(definition.expires_at),
+                _parse_datetime(definition.expires_at),
+                definition.active,
+                definition.discount_percent,
+                definition.discount_amount,
+                definition.monthly_duration_months,
+                _jsonb(definition.metadata),
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not create promo code.")
+        return dict(row)
+
+    def _select_promo_for_update_cur(self, cur: Any, code: str) -> dict[str, Any] | None:
+        cur.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE code = %s
+            FOR UPDATE
+            """,
+            (code,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row is not None else None
+
+    def _validate_promo_redemption_cur(
+        self,
+        cur: Any,
+        promo: dict[str, Any],
+        user_id: int,
+        now: datetime,
+    ) -> PromoRedemptionResult | None:
+        code = str(promo["code"])
+        promo_id = int(promo["id"])
+        if not bool(promo.get("is_active", True)):
+            return PromoRedemptionResult(PromoRedemptionStatus.DISABLED, code)
+
+        valid_from = _parse_datetime(promo.get("valid_from"))
+        if valid_from is not None and valid_from > now:
+            return PromoRedemptionResult(PromoRedemptionStatus.NOT_FOUND, code)
+
+        expires_at = _promo_expires_at(promo)
+        if expires_at is not None and expires_at <= now:
+            return PromoRedemptionResult(PromoRedemptionStatus.EXPIRED, code)
+
+        cur.execute(
+            """
+            SELECT count(*) AS redemption_count
+            FROM promo_redemptions
+            WHERE promo_code_id = %s
+              AND user_id = %s
+              AND status = 'redeemed'
+            """,
+            (promo_id, user_id),
+        )
+        user_redemption_count = int(cur.fetchone()["redemption_count"])
+        if user_redemption_count >= _promo_per_user_limit(promo):
+            return PromoRedemptionResult(
+                PromoRedemptionStatus.ALREADY_USED,
+                code,
+                used_by_chat_id=user_id,
+            )
+
+        max_redemptions = _promo_max_redemptions(promo)
+        if (
+            max_redemptions is not None
+            and _non_negative_int(promo.get("used_count")) >= max_redemptions
+        ):
+            return PromoRedemptionResult(
+                PromoRedemptionStatus.ALREADY_USED,
+                code,
+                used_by_chat_id=self._first_promo_redeemer_cur(cur, promo_id),
+            )
+        return None
+
+    def _insert_promo_redemption_cur(
+        self,
+        cur: Any,
+        promo: dict[str, Any],
+        user_id: int,
+        redeemed_at: datetime,
+    ) -> int:
+        kind = _promo_kind_value(promo)
+        cur.execute(
+            """
+            INSERT INTO promo_redemptions (
+                promo_code_id,
+                user_id,
+                status,
+                kind,
+                discount_amount,
+                metadata_json,
+                redeemed_at
+            )
+            VALUES (%s, %s, 'redeemed', %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                int(promo["id"]),
+                user_id,
+                kind,
+                (
+                    _non_negative_int(promo.get("discount_amount"))
+                    if promo.get("discount_amount") is not None
+                    else None
+                ),
+                _jsonb(
+                    {
+                        "code": str(promo["code"]),
+                        "kind": kind,
+                        "discount_percent": promo.get("discount_percent"),
+                        "discount_amount": promo.get("discount_amount"),
+                        "monthly_duration_months": _promo_monthly_duration(promo),
+                    }
+                ),
+                redeemed_at,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not create promo redemption.")
+        return int(row["id"])
+
+    def _increment_promo_used_count_cur(self, cur: Any, promo_id: int) -> None:
+        cur.execute(
+            """
+            UPDATE promo_codes
+            SET used_count = used_count + 1
+            WHERE id = %s
+            """,
+            (promo_id,),
+        )
+
+    def _link_promo_redemption_entitlement_event_cur(
+        self,
+        cur: Any,
+        redemption_id: int,
+        entitlement_event_id: int | None,
+    ) -> None:
+        if entitlement_event_id is None:
+            return
+        cur.execute(
+            """
+            UPDATE promo_redemptions
+            SET entitlement_event_id = %s
+            WHERE id = %s
+            """,
+            (entitlement_event_id, redemption_id),
+        )
+
+    def _insert_promo_event_cur(
+        self,
+        cur: Any,
+        promo_id: int,
+        event_type: str,
+        *,
+        user_id: int | None = None,
+        redemption_id: int | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        cur.execute(
+            """
+            INSERT INTO promo_events (
+                promo_code_id,
+                redemption_id,
+                user_id,
+                event_type,
+                metadata_json
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (promo_id, redemption_id, user_id, event_type, _jsonb(metadata or {})),
+        )
+
     def _first_promo_redeemer_cur(self, cur: Any, promo_id: int) -> int | None:
         cur.execute(
             """
@@ -2097,12 +2520,15 @@ class PostgresDietBotStore:
         promo: dict[str, Any],
         code: str,
         now: datetime,
-    ) -> None:
-        kind = str(promo["kind"])
-        value = max(1, _non_negative_int(promo.get("value")))
+    ) -> int:
+        kind = _promo_kind_value(promo)
+        value = _promo_monthly_duration(promo) if kind in PROMO_ACCESS_KINDS else max(
+            1,
+            _non_negative_int(promo.get("value")),
+        )
         charge_id = f"promo:{code}"
 
-        if kind == "subscription_month":
+        if kind in PROMO_ACCESS_KINDS:
             apply_subscription_payment(
                 entitlement,
                 charge_id,
@@ -2119,6 +2545,21 @@ class PostgresDietBotStore:
                 apply_extra_weekly_pdf_payment(entitlement, f"{charge_id}:extra_weekly_pdf:{index}")
         elif kind == "test_access_days":
             grant_test_access(entitlement, now=now, days=value)
+
+        return self._insert_entitlement_event_cur(
+            cur,
+            user_id,
+            LEDGER_EVENT_PROMO_GRANT,
+            source="promo",
+            amount=value,
+            delta_generations=0,
+            metadata={
+                "promo_code_id": int(promo["id"]),
+                "promo_code": code,
+                "promo_kind": kind,
+                "monthly_duration_months": value if kind in PROMO_ACCESS_KINDS else None,
+            },
+        )
 
 
 def _consume_entitlement_for_ration(
@@ -2142,6 +2583,32 @@ def _row_to_entitlement(row: dict[str, Any]) -> Entitlement:
         monthly_weekly_pdf_remaining=_non_negative_int(row.get("monthly_weekly_pdf_remaining")),
         extra_one_day_remaining=_non_negative_int(row.get("extra_one_day_remaining")),
         extra_weekly_pdf_remaining=_non_negative_int(row.get("extra_weekly_pdf_remaining")),
+    )
+
+
+def _row_to_promo_definition(row: dict[str, Any]) -> PromoCodeDefinition:
+    metadata = row.get("metadata_json")
+    return PromoCodeDefinition(
+        code=str(row["code"]),
+        kind=_promo_definition_kind(row),
+        active=bool(row.get("is_active", True)),
+        expires_at=_format_datetime(_promo_expires_at(row)),
+        max_redemptions=_promo_max_redemptions(row),
+        per_user_limit=_promo_per_user_limit(row),
+        discount_percent=(
+            _non_negative_int(row.get("discount_percent"))
+            if row.get("discount_percent") is not None
+            else None
+        ),
+        discount_amount=(
+            _non_negative_int(row.get("discount_amount"))
+            if row.get("discount_amount") is not None
+            else None
+        ),
+        monthly_duration_months=_promo_monthly_duration(row),
+        used_count=_non_negative_int(row.get("used_count")),
+        created_at=_format_datetime(row.get("created_at")),
+        metadata=dict(metadata) if isinstance(metadata, dict) else {},
     )
 
 
@@ -2249,6 +2716,49 @@ def _payment_event_status_for_successful_payment_code(
     if code == PaymentSuccessfulPaymentCode.ORDER_NOT_FOUND:
         return PaymentEventStatus.ORPHAN_RECOVERABLE
     return PaymentEventStatus.IGNORED_NON_TERMINAL
+
+
+def _promo_definition_value(definition: PromoCodeDefinition) -> int:
+    if definition.kind == PromoCodeKind.MONTHLY_ACCESS:
+        return definition.monthly_duration_months
+    return definition.discount_percent or definition.discount_amount or 1
+
+
+def _promo_kind_value(row: dict[str, Any]) -> str:
+    return str(row.get("kind") or PromoCodeKind.MONTHLY_ACCESS.value)
+
+
+def _promo_definition_kind(row: dict[str, Any]) -> PromoCodeKind:
+    kind = _promo_kind_value(row)
+    if kind in PROMO_ACCESS_KINDS:
+        return PromoCodeKind.MONTHLY_ACCESS
+    if kind == PromoCodeKind.DISCOUNT.value:
+        return PromoCodeKind.DISCOUNT
+    raise ValueError(f"Unsupported promo definition kind: {kind}")
+
+
+def _promo_expires_at(row: dict[str, Any]) -> datetime | None:
+    return _parse_datetime(row.get("expires_at") or row.get("valid_until"))
+
+
+def _promo_max_redemptions(row: dict[str, Any]) -> int | None:
+    value = row.get("max_redemptions")
+    if value is None:
+        value = row.get("max_uses")
+    if value is None:
+        return None
+    return _non_negative_int(value)
+
+
+def _promo_per_user_limit(row: dict[str, Any]) -> int:
+    return max(1, _non_negative_int(row.get("per_user_limit") or 1))
+
+
+def _promo_monthly_duration(row: dict[str, Any]) -> int:
+    value = row.get("monthly_duration_months")
+    if value is None:
+        value = row.get("value")
+    return max(1, _non_negative_int(value))
 
 
 def _plan_and_status(entitlement: Entitlement) -> tuple[str, str]:

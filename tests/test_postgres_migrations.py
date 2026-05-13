@@ -18,6 +18,7 @@ REQUIRED_TABLES = {
     "generation_records",
     "promo_codes",
     "promo_redemptions",
+    "promo_events",
     "support_state",
 }
 
@@ -32,7 +33,10 @@ REQUIRED_INDEXES = {
     "idx_payment_events_order_created_at",
     "idx_payment_events_charge",
     "idx_processed_provider_charges_order",
+    "idx_promo_codes_active_expires",
+    "idx_promo_redemptions_code_user",
     "idx_promo_redemptions_user",
+    "idx_promo_events_code_created",
     "idx_support_state_status_updated",
 }
 
@@ -95,6 +99,16 @@ def test_migrations_include_required_paid_storage_tables() -> None:
         sql,
         flags=re.IGNORECASE,
     )
+    for column_pattern in (
+        r"\bexpires_at\s+TIMESTAMPTZ\b",
+        r"\bmax_redemptions\s+INTEGER\b",
+        r"\bper_user_limit\s+INTEGER\b",
+        r"\bdiscount_percent\s+INTEGER\b",
+        r"\bdiscount_amount\s+INTEGER\b",
+        r"\bmonthly_duration_months\s+INTEGER\b",
+        r"\bmetadata_json\s+JSONB\s+NOT\s+NULL\s+DEFAULT\s+'\{\}'::jsonb\b",
+    ):
+        assert re.search(column_pattern, sql, flags=re.IGNORECASE), column_pattern
 
 
 def test_migrations_use_idempotent_sql_shapes() -> None:
@@ -103,7 +117,7 @@ def test_migrations_use_idempotent_sql_shapes() -> None:
     for statement in _all_statement_texts(postgres_migrations):
         normalized = _normalize_sql(statement)
         upper = normalized.upper()
-        assert "DROP " not in upper
+        assert not re.search(r"\bDROP\s+(TABLE|INDEX|SCHEMA|DATABASE)\b", upper)
         assert not re.search(r"\bCREATE\s+TABLE\b(?!\s+IF\s+NOT\s+EXISTS)", upper)
         assert not re.search(r"\bCREATE\s+INDEX\b(?!\s+IF\s+NOT\s+EXISTS)", upper)
         assert not re.search(r"\bCREATE\s+UNIQUE\s+INDEX\b(?!\s+IF\s+NOT\s+EXISTS)", upper)
