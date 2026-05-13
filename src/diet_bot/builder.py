@@ -27,6 +27,7 @@ from .safety import evaluate_safety, is_food_excluded
 
 RecipeSource = Literal["all", "curated_only"]
 TimeBucket = Literal["quick", "medium", "long"]
+RecipeRankingMode = Literal["balanced", "protein_floor"]
 
 PRIORITY_NUTRIENTS = {
     "energy_kcal": 1.0,
@@ -52,6 +53,7 @@ HIGH_PROTEIN_CEILING_MULTIPLIER = 1.35
 SMALL_PROTEIN_TARGET_CEILING_MULTIPLIER = 1.45
 SMALL_PROTEIN_TARGET_THRESHOLD_G = 90
 PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.95
+RECIPE_PLAN_CANDIDATE_COUNT = 1
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
@@ -270,6 +272,10 @@ VEGETABLE_GARNISH_IDS = frozenset(
 )
 
 
+class NutritionFloorError(ValueError):
+    """Raised when a generated plan misses a hard nutrition floor."""
+
+
 @dataclass(frozen=True)
 class MealSpec:
     name: str
@@ -326,13 +332,6 @@ def build_one_day_plan(
             recipe_source,
         )
     if recipe_meals:
-        used_grams = _used_grams(recipe_meals)
-        used_counts = Counter(
-            portion.food.id
-            for meal in recipe_meals
-            for portion in meal.portions
-        )
-        recipe_meals = _top_up_if_needed(recipe_meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
         return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
     if recipe_source == "curated_only":
         return MealPlan(meals=(), targets=targets, safety=safety)
@@ -372,6 +371,7 @@ def build_one_day_plan(
         meals.append(Meal(spec.name, tuple(portions), recipe_for(spec.name, tuple(portions))))
 
     meals = _top_up_if_needed(meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
+    _ensure_hard_nutrition_floors(meals, targets.targets)
     return MealPlan(meals=tuple(meals), targets=targets, safety=safety)
 
 
@@ -387,7 +387,7 @@ def _build_recipe_plan_for_time(
 ) -> list[Meal]:
     effort_constraints = _cooking_effort_constraints(cooking_time)
     for allowed_time_buckets in _time_filter_attempts(cooking_time):
-        meals = _build_recipe_plan(
+        meals = _build_recipe_plan_candidates_for_attempt(
             candidates,
             target,
             meal_count,
@@ -401,7 +401,7 @@ def _build_recipe_plan_for_time(
         if meals:
             return meals
 
-    return _build_recipe_plan(
+    return _build_recipe_plan_candidates_for_attempt(
         candidates,
         target,
         meal_count,
@@ -414,6 +414,47 @@ def _build_recipe_plan_for_time(
     )
 
 
+def _build_recipe_plan_candidates_for_attempt(
+    candidates: list[Food],
+    target: NutrientVector,
+    meal_count: int,
+    variety_seed: int,
+    avoided_recipe_ids: set[str] | frozenset[str],
+    avoided_recipe_keys: set[str] | frozenset[str],
+    recipe_source: RecipeSource,
+    allowed_time_buckets: frozenset[TimeBucket] | None,
+    effort_constraints: CookingEffortConstraints,
+) -> list[Meal]:
+    meal_candidates: list[list[Meal]] = []
+    seen_signatures: set[tuple[str | None, ...]] = set()
+    for ranking_mode in ("balanced", "protein_floor"):
+        for candidate_index in range(RECIPE_PLAN_CANDIDATE_COUNT):
+            seed = variety_seed + candidate_index
+            meals = _build_recipe_plan(
+                candidates,
+                target,
+                meal_count,
+                seed,
+                avoided_recipe_ids,
+                avoided_recipe_keys,
+                recipe_source,
+                allowed_time_buckets,
+                effort_constraints,
+                ranking_mode,
+            )
+            if not meals:
+                continue
+            meals = _finalize_recipe_meals(meals, candidates, target, seed)
+            signature = tuple(meal.recipe_id for meal in meals)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            meal_candidates.append(meals)
+            if ranking_mode == "balanced" and _passes_hard_nutrition_gates(meals, target):
+                return _select_best_hard_valid_meals(meal_candidates, target)
+    return _select_best_hard_valid_meals(meal_candidates, target)
+
+
 def _build_recipe_plan(
     candidates: list[Food],
     target: NutrientVector,
@@ -424,6 +465,7 @@ def _build_recipe_plan(
     recipe_source: RecipeSource,
     allowed_time_buckets: frozenset[TimeBucket] | None = None,
     effort_constraints: CookingEffortConstraints | None = None,
+    ranking_mode: RecipeRankingMode = "balanced",
 ) -> list[Meal]:
     food_by_id = {food.id: food for food in candidates}
     recipes = [
@@ -467,6 +509,7 @@ def _build_recipe_plan(
             total_energy * energy_slot.max_ratio,
             variety_seed,
             index,
+            ranking_mode,
         ):
             resolved = _resolve_recipe_ingredients(recipe, food_by_id)
             if resolved is None:
@@ -505,6 +548,88 @@ def _build_recipe_plan(
         return []
     meals = _add_missing_garnishes(meals, candidates, target, used_grams, used_food_ids, variety_seed)
     return _increase_existing_portions(meals, target, used_grams)
+
+
+def _finalize_recipe_meals(
+    meals: list[Meal],
+    candidates: list[Food],
+    target: NutrientVector,
+    variety_seed: int,
+) -> list[Meal]:
+    used_grams = _used_grams(meals)
+    used_counts = Counter(
+        portion.food.id
+        for meal in meals
+        for portion in meal.portions
+    )
+    return _top_up_if_needed(meals, candidates, target, used_grams, used_counts, variety_seed)
+
+
+def _select_best_hard_valid_meals(
+    meal_candidates: list[list[Meal]],
+    target: NutrientVector,
+) -> list[Meal]:
+    hard_valid = [
+        (candidate_index, meals)
+        for candidate_index, meals in enumerate(meal_candidates)
+        if _passes_hard_nutrition_gates(meals, target)
+    ]
+    if not hard_valid:
+        return []
+    _, selected = max(
+        hard_valid,
+        key=lambda item: (_meal_candidate_score(item[1], target), -item[0]),
+    )
+    return selected
+
+
+def _passes_hard_nutrition_gates(meals: list[Meal], target: NutrientVector) -> bool:
+    if not meals:
+        return False
+    total = NutrientVector.sum(meal.nutrients for meal in meals)
+    return total.get("protein_g") + 0.01 >= _protein_hard_floor(target)
+
+
+def _ensure_hard_nutrition_floors(meals: list[Meal], target: NutrientVector) -> None:
+    if _passes_hard_nutrition_gates(meals, target):
+        return
+    total = NutrientVector.sum(meal.nutrients for meal in meals)
+    raise NutritionFloorError(
+        "Generated plan misses hard protein floor: "
+        f"{total.get('protein_g'):.1f}g protein for "
+        f"{_protein_hard_floor(target):.1f}g minimum."
+    )
+
+
+def _protein_hard_floor(target: NutrientVector) -> float:
+    return target.get("protein_g") * PROTEIN_TOP_UP_TARGET_MULTIPLIER
+
+
+def _meal_candidate_score(meals: list[Meal], target: NutrientVector) -> tuple[float, float, float]:
+    total = NutrientVector.sum(meal.nutrients for meal in meals)
+    macro_gap = _relative_gap(total, target, "energy_kcal") * 3.0
+    macro_gap += _relative_gap(total, target, "fat_g")
+    macro_gap += _relative_gap(total, target, "carbohydrate_g")
+    protein_target = target.get("protein_g")
+    if protein_target > 0:
+        macro_gap += max(0.0, total.get("protein_g") - protein_target) / protein_target * 0.35
+
+    recipe_ids = [meal.recipe_id for meal in meals if meal.recipe_id]
+    unique_recipe_ratio = len(set(recipe_ids)) / max(1, len(recipe_ids))
+    repeated_food_penalty = _food_repeat_penalty(meals)
+    return (-macro_gap, unique_recipe_ratio, -repeated_food_penalty)
+
+
+def _relative_gap(total: NutrientVector, target: NutrientVector, nutrient: str) -> float:
+    target_value = target.get(nutrient)
+    if target_value <= 0:
+        return 0.0
+    return abs(total.get(nutrient) - target_value) / target_value
+
+
+def _food_repeat_penalty(meals: list[Meal]) -> float:
+    counts = Counter(portion.food.id for meal in meals for portion in meal.portions)
+    return sum(max(0, count - 1) for count in counts.values())
 
 
 def _time_filter_attempts(cooking_time: CookingTimePreference) -> tuple[frozenset[TimeBucket], ...]:
@@ -853,6 +978,7 @@ def _rank_recipes(
     slot_max_energy: float,
     variety_seed: int,
     index: int,
+    ranking_mode: RecipeRankingMode = "balanced",
 ) -> list[RecipeTemplate]:
     candidates = [recipe for recipe in recipes if recipe.slot == slot and recipe.id not in used_recipe_ids]
     if not candidates:
@@ -863,6 +989,15 @@ def _rank_recipes(
         seed_score = _seeded_score(recipe.id, variety_seed, index) * 2.0
         nutrient_bonus = _recipe_nutrient_bonus(recipe, current_total, target)
         macro_bonus = _recipe_projected_macro_gap_bonus(recipe, food_by_id, slot_energy_target, current_total, target)
+        if ranking_mode == "protein_floor":
+            seed_score = _seeded_score(recipe.id, variety_seed, index) * 0.25
+            macro_bonus += _recipe_projected_protein_floor_bonus(
+                recipe,
+                food_by_id,
+                slot_energy_target,
+                current_total,
+                target,
+            )
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
         format_penalty = used_formats[_recipe_format(recipe)] * 0.85
@@ -1053,6 +1188,26 @@ def _recipe_projected_macro_gap_bonus(
         if gap > nutrient_target * 0.15:
             bonus += min(estimated.get(nutrient), gap) / nutrient_target * weight
     return bonus
+
+
+def _recipe_projected_protein_floor_bonus(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target)
+    if estimated is None:
+        return 0.0
+
+    protein_floor = _protein_hard_floor(target)
+    protein_gap = protein_floor - current_total.get("protein_g")
+    if protein_gap <= 0:
+        return 0.0
+    estimated_protein = estimated.get("protein_g")
+    protein_density = estimated_protein / max(1.0, estimated.get("energy_kcal"))
+    return min(estimated_protein, protein_gap) / max(1.0, protein_floor) * 30.0 + protein_density * 10.0
 
 
 def _recipe_macro_penalty(recipe: RecipeTemplate, current_total: NutrientVector, target: NutrientVector) -> float:

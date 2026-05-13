@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from diet_bot.builder import (
+    _build_recipe_plan_for_time,
     _cooking_effort_constraints,
     _increase_existing_protein_if_needed,
     _meal_energy_slots,
@@ -61,6 +62,91 @@ def assert_meal_energy_distribution(plan) -> None:
 
         assert meal_energy >= target_energy * slot.min_ratio - 10
         assert meal_energy <= target_energy * slot.max_ratio + 10
+
+
+def _strict_floor_target() -> NutrientVector:
+    return NutrientVector(
+        {
+            "energy_kcal": 2000,
+            "protein_g": 100,
+            "fat_g": 60,
+            "carbohydrate_g": 250,
+        }
+    )
+
+
+def _strict_floor_foods() -> tuple[Food, Food]:
+    low_protein = Food(
+        id="strict_low_protein",
+        name="Strict low protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 1, "fat_g": 1}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=2080,
+    )
+    hard_valid_protein = Food(
+        id="strict_hard_valid_protein",
+        name="Strict hard valid protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 5, "fat_g": 1}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=2080,
+    )
+    return low_protein, hard_valid_protein
+
+
+def _strict_floor_recipes(*, high_alternatives: bool = True) -> tuple[RecipeTemplate, ...]:
+    recipes: list[RecipeTemplate] = []
+    slots = (
+        ("breakfast", 0, 500, 3),
+        ("main", 1, 700, 2),
+        ("snack", 2, 240, 0),
+        ("main", 3, 560, 2),
+    )
+    for slot, index, grams, suffix in slots:
+        recipes.append(
+            RecipeTemplate(
+                id=f"{slot}_low_{index}_{suffix}",
+                slot=slot,
+                title=f"Low protein {index}",
+                ingredients_g={"strict_low_protein": grams},
+                instructions="Low protein test recipe.",
+                tags=frozenset({"curated"}),
+                time_text="10 minutes",
+            )
+        )
+        if high_alternatives:
+            recipes.append(
+                RecipeTemplate(
+                    id=f"{slot}_high_{index}_{suffix}",
+                    slot=slot,
+                    title=f"Hard valid protein {index}",
+                    ingredients_g={"strict_hard_valid_protein": grams},
+                    instructions="Hard valid test recipe.",
+                    tags=frozenset({"curated"}),
+                    time_text="10 minutes",
+                )
+            )
+    return tuple(recipes)
+
+
+def _single_macro_meal(recipe_id: str, energy: float, protein: float, fat: float, carbohydrate: float) -> list[Meal]:
+    food = Food(
+        id=f"{recipe_id}_food",
+        name=f"{recipe_id} food",
+        category="protein",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": energy,
+                "protein_g": protein,
+                "fat_g": fat,
+                "carbohydrate_g": carbohydrate,
+            }
+        ),
+    )
+    return [Meal(recipe_id, (food.portion(100),), "test", recipe_id=recipe_id)]
 
 
 def test_apple_allergy_excludes_apple() -> None:
@@ -412,22 +498,104 @@ def test_protein_top_up_reaches_95_percent_floor_when_feasible() -> None:
     assert NutrientVector.sum(meal.nutrients for meal in updated).get("protein_g") >= 95
 
 
-def test_protein_top_up_uses_best_available_amount_when_95_percent_is_infeasible() -> None:
-    protein = Food(
-        id="limited_protein",
-        name="Limited protein",
-        category="protein",
-        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 20}),
-        roles=frozenset({MealRole.PROTEIN}),
-        max_per_meal_g=460,
-        max_per_day_g=460,
+def test_recipe_builder_regenerates_until_feasible_pool_reaches_protein_floor(monkeypatch) -> None:
+    low_protein, hard_valid_protein = _strict_floor_foods()
+    monkeypatch.setattr(
+        "diet_bot.builder.built_in_recipes",
+        lambda: _strict_floor_recipes(high_alternatives=True),
     )
-    meals = [Meal("test", (protein.portion(450),), "test")]
-    target = NutrientVector({"energy_kcal": 2000, "protein_g": 100})
 
-    updated = _increase_existing_protein_if_needed(meals, target, {"limited_protein": 450})
+    meals = _build_recipe_plan_for_time(
+        [low_protein, hard_valid_protein],
+        _strict_floor_target(),
+        4,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
 
-    assert NutrientVector.sum(meal.nutrients for meal in updated).get("protein_g") == 92
+    assert NutrientVector.sum(meal.nutrients for meal in meals).get("protein_g") >= 95
+
+
+def test_recipe_builder_filters_low_protein_candidates_before_scoring(monkeypatch) -> None:
+    low_protein, hard_valid_protein = _strict_floor_foods()
+    monkeypatch.setattr(
+        "diet_bot.builder.built_in_recipes",
+        lambda: _strict_floor_recipes(high_alternatives=True),
+    )
+
+    meals = _build_recipe_plan_for_time(
+        [low_protein, hard_valid_protein],
+        _strict_floor_target(),
+        4,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
+
+    assert meals
+    assert not any(meal.recipe_id and "_low_" in meal.recipe_id for meal in meals)
+
+
+def test_recipe_builder_returns_controlled_empty_status_when_protein_floor_is_infeasible(monkeypatch) -> None:
+    low_protein, _ = _strict_floor_foods()
+    monkeypatch.setattr(
+        "diet_bot.builder.built_in_recipes",
+        lambda: _strict_floor_recipes(high_alternatives=False),
+    )
+
+    meals = _build_recipe_plan_for_time(
+        [low_protein],
+        _strict_floor_target(),
+        4,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
+
+    assert meals == []
+
+
+def test_hard_valid_candidate_scoring_prefers_best_macro_fit() -> None:
+    from diet_bot import builder as builder_module
+
+    select_best = getattr(builder_module, "_select_best_hard_valid_meals", None)
+    assert select_best is not None
+
+    target = _strict_floor_target()
+    low_protein = _single_macro_meal("low_protein", 2000, 90, 60, 250)
+    hard_valid_worse = _single_macro_meal("hard_valid_worse", 1600, 100, 95, 120)
+    hard_valid_best = _single_macro_meal("hard_valid_best", 1980, 96, 61, 245)
+
+    selected = select_best([low_protein, hard_valid_worse, hard_valid_best], target)
+
+    assert [meal.recipe_id for meal in selected] == ["hard_valid_best"]
+
+
+def test_hard_floor_regeneration_respects_avoided_recipe_ids(monkeypatch) -> None:
+    low_protein, hard_valid_protein = _strict_floor_foods()
+    recipes = _strict_floor_recipes(high_alternatives=True)
+    avoided_ids = {recipe.id for recipe in recipes if "_high_" in recipe.id}
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        [low_protein, hard_valid_protein],
+        _strict_floor_target(),
+        4,
+        CookingTimePreference.SIMPLE,
+        0,
+        avoided_ids,
+        frozenset(),
+        "curated_only",
+    )
+
+    assert meals == []
 
 
 def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:
