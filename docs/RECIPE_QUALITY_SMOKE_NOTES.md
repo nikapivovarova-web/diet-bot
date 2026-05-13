@@ -161,6 +161,9 @@ PASS for the targeted `fdb61bd` smoke slice:
   - `meal_count=4`: meals by day `[4, 4, 4, 4, 4, 0, 4]`, total `24/28`.
   - `meal_count=5`: meals by day `[5, 5, 5, 5, 0, 0, 0]`, total `20/35`.
   - No repeated recipe IDs were present and max non-empty protein ratios stayed below `150%`, but the empty days should be followed up if maintenance weekly PDFs are in scope.
+- Follow-up `12f67bb` now rejects partial weekly plans as controlled failure instead of allowing them to proceed as a successful weekly ration/PDF payload.
+- The underlying `MAINTAIN` / `SIMPLE` / `5` meals limitation remains: the current weekly builder is greedy, so early-day selections can consume scarce simple curated main recipes while hard no-repeat and protein-floor constraints stay active.
+- Next needed recipe-quality slice: add a weekly optimizer/backtracking step, expand the curated simple maintenance recipe pool, or both. This was intentionally not solved in `12f67bb`.
 - No PDF tests were run.
 - No promo/payment tests were run.
 - No real Telegram user-client checks were performed.
