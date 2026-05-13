@@ -986,12 +986,12 @@ def _record_support_state(chat_id: int, status: str) -> None:
 def _format_support_admin_message(message: Message, text: str) -> str:
     chat_id = message.chat.id
     entitlement = _entitlement_for_chat(chat_id)
-    username = _format_support_username(message)
+    username = _payment_safe_support_text(_format_support_username(message))
     user_id = _message_user_id(message)
-    display_name = _format_support_display_name(message)
+    display_name = _payment_safe_support_text(_format_support_display_name(message))
     profile_status = "есть" if _profile_for_chat(chat_id) is not None else "нет"
     requested_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    request_text = _truncate_support_text(text.strip())
+    request_text = _truncate_support_text(_payment_safe_support_text(text.strip()))
 
     return "\n".join(
         [
@@ -1016,8 +1016,7 @@ def _format_support_admin_message(message: Message, text: str) -> str:
             f"subscription_period_start: {entitlement.subscription_period_start or 'нет'}",
             f"subscription_period_end: {entitlement.subscription_period_end or 'нет'}",
             f"test_access_until: {entitlement.test_access_until or 'нет'}",
-            "processed_payment_charge_ids: "
-            + (", ".join(entitlement.processed_payment_charge_ids[-5:]) or "нет"),
+            f"processed_payment_charge_count: {len(entitlement.processed_payment_charge_ids)}",
             "",
             "Текст обращения:",
             request_text,
@@ -1048,6 +1047,10 @@ def _truncate_support_text(text: str, limit: int = 2400) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 15].rstrip() + "\n...[сокращено]"
+
+
+def _payment_safe_support_text(text: object) -> str:
+    return _payment_admin_safe_reason(text) or ""
 
 
 async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> None:

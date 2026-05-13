@@ -305,6 +305,57 @@ async def test_support_message_is_sent_to_admin_chat_with_context(monkeypatch, t
         PROFILE_BY_CHAT_ID.pop(chat_id, None)
 
 
+def test_support_admin_message_redacts_payment_sensitive_text_and_charge_ids(monkeypatch, tmp_path) -> None:
+    chat_id = 80_104
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    telegram_app.save_entitlements(
+        subscriptions_path,
+        {
+            chat_id: telegram_app.Entitlement(
+                processed_payment_charge_ids=[
+                    "telegram_stars:tg-charge-support-secret",
+                    "provider-charge-support-secret",
+                ],
+            )
+        },
+    )
+    message = FakeMessage(
+        chat_id,
+        user_id=70_104,
+        username="client104",
+        first_name="buyer@example.com",
+        last_name="+79991234567",
+    )
+    admin_text = telegram_app._format_support_admin_message(
+        message,
+        (
+            "email buyer@example.com phone +79991234567 order_info provider_data "
+            "receipt customer bot 123456789:ABCdefGhijKLMnopQRStuVWXyz "
+            "provider 381764678:TEST:provider-secret "
+            "db postgresql://diet_bot:secret@example.com/db "
+            "telegram_payment_charge_id=tg-charge-support-secret "
+            "provider_payment_charge_id=provider-charge-support-secret"
+        ),
+    )
+
+    for secret in (
+        "buyer@example.com",
+        "+79991234567",
+        "order_info",
+        "provider_data",
+        "receipt",
+        "customer",
+        "123456789:ABCdefGhijKLMnopQRStuVWXyz",
+        "381764678:TEST:provider-secret",
+        "postgresql://diet_bot:secret@example.com/db",
+        "tg-charge-support-secret",
+        "provider-charge-support-secret",
+        "processed_payment_charge_ids",
+    ):
+        assert secret not in admin_text
+
+
 @pytest.mark.anyio
 async def test_support_message_without_config_exits_support_mode(monkeypatch, tmp_path) -> None:
     chat_id = 80_103
@@ -1117,7 +1168,13 @@ async def test_admin_ignore_orphan_command_closes_event_with_redacted_reason(mon
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
     monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
     message = FakeMessage(
-        text="/payment_event ignore evt_ignore_secret buyer@example.com +79991234567 order_info",
+        text=(
+            "/payment_event ignore evt_ignore_secret buyer@example.com +79991234567 "
+            "order_info provider_data receipt customer "
+            "123456789:ABCdefGhijKLMnopQRStuVWXyz "
+            "381764678:TEST:provider-secret "
+            "postgresql://diet_bot:secret@example.com/db"
+        ),
         user_id=admin_id,
     )
 
@@ -1946,7 +2003,12 @@ def _assert_admin_payment_response_is_redacted(response: str) -> None:
         "buyer@example.com",
         "+79991234567",
         "order_info",
+        "provider_data",
+        "receipt",
+        "customer",
         "123456789:ABCdefGhijKLMnopQRStuVWXyz",
+        "381764678:TEST:provider-secret",
+        "postgresql://diet_bot:secret@example.com/db",
         "order_refund_secret",
         "order_reconcile_secret",
         "evt_orphan_secret",

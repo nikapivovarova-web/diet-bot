@@ -242,14 +242,28 @@ _DATABASE_URL_RE = re.compile(
 )
 _BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 _PROVIDER_TOKEN_RE = re.compile(r"\b\d{6,}:(?:TEST|LIVE):[A-Za-z0-9_.:-]+\b", re.IGNORECASE)
+_PAYMENT_CHARGE_LABEL_RE = re.compile(
+    r"\b(?:[a-z]+_)*charge_?id\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_SENSITIVE_TEXT_WORD_RE = re.compile(
+    r"\b(?:order_info|provider_data|receipt|customer)\b",
+    re.IGNORECASE,
+)
 _SENSITIVE_KEY_NAMES = frozenset(
     {
+        "chargeid",
         "email",
         "phone",
         "phonenumber",
         "orderinfo",
+        "paymentchargeid",
+        "providerchargeid",
+        "providerpaymentchargeid",
         "providertoken",
         "bottoken",
+        "telegramchargeid",
+        "telegrampaymentchargeid",
         "databaseurl",
         "dburl",
         "postgresurl",
@@ -2519,7 +2533,11 @@ def _validate_payload_token(name: str, value: str) -> str:
 
 def _is_sensitive_key(key: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-    return normalized in _SENSITIVE_KEY_NAMES or normalized.endswith("token")
+    return (
+        normalized in _SENSITIVE_KEY_NAMES
+        or normalized.endswith("chargeid")
+        or normalized.endswith("token")
+    )
 
 
 def _redact_payment_text(value: str) -> str:
@@ -2527,7 +2545,9 @@ def _redact_payment_text(value: str) -> str:
     redacted = _PROVIDER_TOKEN_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
     redacted = _BOT_TOKEN_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
     redacted = _EMAIL_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
-    return _PHONE_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
+    redacted = _PHONE_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
+    redacted = _PAYMENT_CHARGE_LABEL_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
+    return _SENSITIVE_TEXT_WORD_RE.sub(REDACTED_PAYMENT_VALUE, redacted)
 
 
 def _pre_checkout_rejection(

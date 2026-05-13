@@ -510,6 +510,9 @@ def test_payment_payload_redaction_masks_private_customer_and_secret_values() ->
         "provider_token": "381764678:TEST:very-secret-provider-token",
         "bot_token": "123456789:ABCdefGhijKLMnopQRStuVWXyz",
         "database_url": "postgresql://diet_bot:secret@localhost:5432/foodbalance",
+        "telegram_payment_charge_id": "tg-charge-sensitive-123456",
+        "provider_payment_charge_id": "provider-charge-sensitive-123456",
+        "charge_id": "charge-sensitive-abcdef",
         "invoice_payload": "diet:order:order_123:nonce_456",
         "nested": {
             "message": (
@@ -532,11 +535,17 @@ def test_payment_payload_redaction_masks_private_customer_and_secret_values() ->
         "123456789:ABCdefGhijKLMnopQRStuVWXyz",
         "postgresql://diet_bot:secret@localhost:5432/foodbalance",
         "postgresql://user:pass@example.com/db",
+        "tg-charge-sensitive-123456",
+        "provider-charge-sensitive-123456",
+        "charge-sensitive-abcdef",
     ):
         assert secret not in serialized
     assert redacted["email"] == "[REDACTED]"
     assert redacted["phone_number"] == "[REDACTED]"
     assert redacted["order_info"] == "[REDACTED]"
+    assert redacted["telegram_payment_charge_id"] == "[REDACTED]"
+    assert redacted["provider_payment_charge_id"] == "[REDACTED]"
+    assert redacted["charge_id"] == "[REDACTED]"
     assert redacted["invoice_payload"] == "diet:order:order_123:nonce_456"
 
 
@@ -1260,6 +1269,8 @@ def test_successful_payment_event_raw_payload_is_redacted() -> None:
                 "order_info": {"email": "nested@example.com"},
                 "provider_token": "381764678:TEST:very-secret-provider-token",
                 "database_url": "postgresql://diet_bot:secret@localhost:5432/foodbalance",
+                "telegram_payment_charge_id": "tg-charge-raw-secret",
+                "provider_payment_charge_id": "provider-charge-raw-secret",
                 "invoice_payload": order.payload,
             },
         ),
@@ -1273,8 +1284,12 @@ def test_successful_payment_event_raw_payload_is_redacted() -> None:
     assert "+37499123456" not in serialized
     assert "very-secret-provider-token" not in serialized
     assert "postgresql://diet_bot:secret@localhost:5432/foodbalance" not in serialized
+    assert "tg-charge-raw-secret" not in serialized
+    assert "provider-charge-raw-secret" not in serialized
     assert result.event.raw_payload_redacted["raw_payload"]["email"] == "[REDACTED]"
     assert result.event.raw_payload_redacted["raw_payload"]["order_info"] == "[REDACTED]"
+    assert result.event.raw_payload_redacted["raw_payload"]["telegram_payment_charge_id"] == "[REDACTED]"
+    assert result.event.raw_payload_redacted["raw_payload"]["provider_payment_charge_id"] == "[REDACTED]"
 
 
 def test_refund_subscription_revokes_matching_paid_period() -> None:
@@ -1704,6 +1719,8 @@ def test_reversal_event_raw_metadata_is_redacted() -> None:
                 "order_info": {"email": "nested@example.com"},
                 "provider_token": "381764678:TEST:very-secret-provider-token",
                 "database_url": "postgresql://diet_bot:secret@localhost:5432/foodbalance",
+                "telegram_payment_charge_id": "tg-charge-reversal-secret",
+                "provider_payment_charge_id": "provider-charge-reversal-secret",
             },
         ),
         now=now + timedelta(hours=1),
@@ -1716,8 +1733,12 @@ def test_reversal_event_raw_metadata_is_redacted() -> None:
     assert "+37499123456" not in serialized
     assert "very-secret-provider-token" not in serialized
     assert "postgresql://diet_bot:secret@localhost:5432/foodbalance" not in serialized
+    assert "tg-charge-reversal-secret" not in serialized
+    assert "provider-charge-reversal-secret" not in serialized
     assert result.event.raw_payload_redacted["raw_payload"]["email"] == "[REDACTED]"
     assert result.event.raw_payload_redacted["raw_payload"]["order_info"] == "[REDACTED]"
+    assert result.event.raw_payload_redacted["raw_payload"]["telegram_payment_charge_id"] == "[REDACTED]"
+    assert result.event.raw_payload_redacted["raw_payload"]["provider_payment_charge_id"] == "[REDACTED]"
 
 
 def test_orphan_successful_payment_can_be_reconciled_to_matching_pending_order_once() -> None:
