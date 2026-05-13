@@ -1135,9 +1135,9 @@ def _recipe_rotation_bonus(recipe: RecipeTemplate, slot: str, variety_seed: int,
     preferred = MAIN_PROTEIN_ROTATION[(variety_seed + index - 1) % len(MAIN_PROTEIN_ROTATION)]
     secondary = MAIN_PROTEIN_ROTATION[(variety_seed * 3 + index - 1) % len(MAIN_PROTEIN_ROTATION)]
     if preferred in ingredients:
-        return 1.35
+        return 2.40
     if secondary in ingredients:
-        return 0.65
+        return 0.35
     if "salmon" in ingredients:
         return -0.2
     return 0.0
