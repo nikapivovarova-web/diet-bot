@@ -1229,30 +1229,25 @@ def _daily_totals_subtable(
 ) -> Table:
     rows = [
         [
-            _p("●", styles["TableHeaderCenter"]),
             _p("Нутриент", styles["TableHeader"]),
             _p("Факт / цель", styles["TableHeader"]),
-            _p("%", styles["TableHeader"]),
+            _p("%", styles["TableHeaderCenter"]),
         ]
     ]
-    row_styles: list[tuple] = []
     for key in nutrient_keys:
         value = plan.totals.get(key)
         target = plan.targets.targets.get(key)
-        dot_style = styles[_coverage_dot_style(value, target)]
-        row_index = len(rows)
+        percent_style = styles[_coverage_percent_style(value, target)]
         rows.append(
             [
-                _p("●", dot_style),
                 _p(NUTRIENT_LABELS[key], styles["TableCell"]),
                 _p(f"{value:.1f} / {target:.1f}", styles["TableCell"]),
-                _p(_coverage_percent(value, target), styles["TableCell"]),
+                _p(_coverage_percent(value, target), percent_style),
             ]
         )
-        row_styles.append(("TEXTCOLOR", (0, row_index), (0, row_index), _coverage_dot_color(value, target)))
     table = Table(
         rows,
-        colWidths=[width * 0.08, width * 0.43, width * 0.34, width * 0.15],
+        colWidths=[width * 0.46, width * 0.35, width * 0.19],
         repeatRows=1,
     )
     table.setStyle(
@@ -1265,7 +1260,6 @@ def _daily_totals_subtable(
                 ("TOPPADDING", (0, 0), (-1, -1), 4),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]
-            + row_styles
         )
     )
     return table
@@ -1688,18 +1682,18 @@ def _coverage_percent(value: float, target: float) -> str:
     return f"{value / target * 100:.0f}%"
 
 
-def _coverage_dot_style(value: float, target: float) -> str:
+def _coverage_percent_style(value: float, target: float) -> str:
     if target <= 0:
-        return "DotRed"
+        return "PercentRed"
     percent = value / target * 100
     if percent >= 95:
-        return "DotGreen"
+        return "PercentGreen"
     if percent >= 45:
-        return "DotYellow"
-    return "DotRed"
+        return "PercentYellow"
+    return "PercentRed"
 
 
-def _coverage_dot_color(value: float, target: float):
+def _coverage_percent_color(value: float, target: float):
     if target <= 0:
         return colors.HexColor("#C95B4A")
     percent = value / target * 100
@@ -2061,29 +2055,29 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             alignment=TA_CENTER,
             textColor=BRAND_GREEN,
         ),
-        "DotGreen": ParagraphStyle(
-            "FoodBalanceDotGreen",
+        "PercentGreen": ParagraphStyle(
+            "FoodBalancePercentGreen",
             parent=body,
             fontName=bold_font,
-            fontSize=12,
+            fontSize=9.4,
             leading=12,
             alignment=TA_CENTER,
             textColor=colors.HexColor("#4F9E5D"),
         ),
-        "DotYellow": ParagraphStyle(
-            "FoodBalanceDotYellow",
+        "PercentYellow": ParagraphStyle(
+            "FoodBalancePercentYellow",
             parent=body,
             fontName=bold_font,
-            fontSize=12,
+            fontSize=9.4,
             leading=12,
             alignment=TA_CENTER,
             textColor=colors.HexColor("#D8A23A"),
         ),
-        "DotRed": ParagraphStyle(
-            "FoodBalanceDotRed",
+        "PercentRed": ParagraphStyle(
+            "FoodBalancePercentRed",
             parent=body,
             fontName=bold_font,
-            fontSize=12,
+            fontSize=9.4,
             leading=12,
             alignment=TA_CENTER,
             textColor=colors.HexColor("#C95B4A"),

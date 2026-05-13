@@ -13,7 +13,7 @@ from reportlab.platypus import SimpleDocTemplate
 
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
-from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult, ShoppingItem
+from diet_bot.domain import Food, Meal, MealPlan, NutrientVector, NutritionTargets, SafetyResult, ShoppingItem
 import diet_bot.pdf_renderer as pdf_renderer
 from diet_bot.pdf_renderer import _clean_text, _html, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
@@ -62,7 +62,7 @@ def test_week_pdf_contains_full_week_content(tmp_path: Path, sample_week_plans, 
     assert "Примерная мера" in text
     assert "Как приготовить" in text
     assert "Итого за день" in text
-    assert "●" in text
+    assert "●" not in text
     assert "Список продуктов" in text
     assert "ориентировочный расчёт" in text
 
@@ -161,27 +161,103 @@ def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
     assert qr.drawHeight <= 34 * mm
 
 
-def test_nutrient_indicator_thresholds_for_pdf_display() -> None:
+def test_nutrient_percent_thresholds_for_pdf_display() -> None:
     cases = (
-        (100, "DotGreen", "#4F9E5D"),
-        (97, "DotGreen", "#4F9E5D"),
-        (95, "DotGreen", "#4F9E5D"),
-        (94, "DotYellow", "#D8A23A"),
-        (45, "DotYellow", "#D8A23A"),
-        (44, "DotRed", "#C95B4A"),
+        (100, "PercentGreen", "#4F9E5D"),
+        (97, "PercentGreen", "#4F9E5D"),
+        (95, "PercentGreen", "#4F9E5D"),
+        (94, "PercentYellow", "#D8A23A"),
+        (45, "PercentYellow", "#D8A23A"),
+        (44, "PercentRed", "#C95B4A"),
     )
 
     assert [
         (
             percent,
-            pdf_renderer._coverage_dot_style(percent, 100),
-            pdf_renderer._coverage_dot_color(percent, 100),
+            pdf_renderer._coverage_percent_style(percent, 100),
+            pdf_renderer._coverage_percent_color(percent, 100),
         )
         for percent, _expected_style, _expected_color in cases
     ] == [
         (percent, expected_style, pdf_renderer.colors.HexColor(expected_color))
         for percent, expected_style, expected_color in cases
     ]
+
+
+def test_daily_totals_table_uses_colored_percent_cells_without_dots() -> None:
+    base_font, bold_font, emoji_font = pdf_renderer._register_fonts()
+    styles = pdf_renderer._build_styles(base_font, bold_font, emoji_font)
+    plan = _plan_with_daily_percentages(
+        {
+            "energy_kcal": 100,
+            "protein_g": 94,
+            "fat_g": 45,
+            "carbohydrate_g": 44,
+        }
+    )
+
+    table = pdf_renderer._daily_totals_subtable(
+        plan,
+        ("energy_kcal", "protein_g", "fat_g", "carbohydrate_g"),
+        styles,
+        90 * mm,
+    )
+    cell_text = [[_paragraph_text(cell) for cell in row] for row in table._cellvalues]
+
+    assert cell_text[0] == ["Нутриент", "Факт / цель", "%"]
+    assert all("●" not in "".join(row) for row in cell_text)
+    assert [row[2] for row in cell_text[1:]] == ["100%", "94%", "45%", "44%"]
+    assert table._cellvalues[1][2].style.textColor == pdf_renderer.colors.HexColor("#4F9E5D")
+    assert table._cellvalues[2][2].style.textColor == pdf_renderer.colors.HexColor("#D8A23A")
+    assert table._cellvalues[3][2].style.textColor == pdf_renderer.colors.HexColor("#D8A23A")
+    assert table._cellvalues[4][2].style.textColor == pdf_renderer.colors.HexColor("#C95B4A")
+
+
+def test_week_pdf_daily_totals_text_contains_percentages(tmp_path: Path, sample_week_dates) -> None:
+    plan = _plan_with_daily_percentages(
+        {
+            "energy_kcal": 100,
+            "protein_g": 97,
+            "fat_g": 95,
+            "carbohydrate_g": 94,
+        }
+    )
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "daily-percentages.pdf")
+    text = _pdf_text(pdf_path)
+
+    assert "Итого за день" in text
+    assert "100%" in text
+    assert "97%" in text
+    assert "95%" in text
+    assert "94%" in text
+    assert "●" not in text
+
+
+def test_week_pdf_percent_daily_totals_handle_long_day_render(tmp_path: Path, sample_week_dates) -> None:
+    plan = _plan_with_daily_percentages(
+        {
+            "energy_kcal": 44,
+            "protein_g": 45,
+            "fat_g": 94,
+            "carbohydrate_g": 100,
+        }
+    )
+    long_recipe = " ".join(
+        f"Step {index}: add ingredients, stir, simmer, plate and serve warm."
+        for index in range(1, 54)
+    )
+    long_meal = replace(plan.meals[0], recipe=long_recipe, image_url=None)
+    long_plan = replace(plan, meals=(long_meal, replace(long_meal, name="Обед: controlled fixture")))
+
+    pdf_path = render_week_plan_pdf((long_plan,), (sample_week_dates[0],), tmp_path / "long-day-percentages.pdf")
+    reader = PdfReader(str(pdf_path))
+    text = _pdf_text(pdf_path)
+
+    assert pdf_path.exists()
+    assert len(reader.pages) >= 2
+    assert "Итого за день" in text
+    assert "●" not in text
 
 
 def test_week_pdf_renders_shopping_heading_categories_items(
@@ -453,6 +529,37 @@ def _plan_for_recipe(recipe) -> MealPlan:
     return MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
 
 
+def _plan_with_daily_percentages(percentages: dict[str, float]) -> MealPlan:
+    target_amounts = {key: 100.0 for key in pdf_renderer.NUTRIENT_ORDER}
+    meal_amounts = {
+        key: float(percentages.get(key, 100.0))
+        for key in pdf_renderer.NUTRIENT_ORDER
+    }
+    food = Food(
+        id="controlled-food",
+        name="Controlled food",
+        category="fixture",
+        nutrients_per_100g=NutrientVector(meal_amounts),
+    )
+    meal = Meal(
+        name="Ужин: controlled fixture",
+        portions=(food.portion(100),),
+        recipe="Mix the controlled fixture and serve.",
+        image_url=None,
+    )
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector(target_amounts),
+        calorie_bounds=(1500, 2500),
+        macro_bounds={},
+    )
+    return MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+
+
 def _dense_shopping_groups() -> tuple[ShoppingGroup, ...]:
     return (
         _shopping_group("grains", "Grains, bread and side dishes", 11),
@@ -488,6 +595,12 @@ def _shopping_group(category: str, title: str, item_count: int) -> ShoppingGroup
 def _pdf_text(path: Path) -> str:
     reader = PdfReader(str(path))
     return _compact_text("\n".join(page.extract_text() or "" for page in reader.pages))
+
+
+def _paragraph_text(value) -> str:
+    if hasattr(value, "getPlainText"):
+        return value.getPlainText()
+    return str(value)
 
 
 def _compact_text(text: str) -> str:
