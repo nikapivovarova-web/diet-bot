@@ -4,6 +4,7 @@ import pytest
 
 from diet_bot.builder import (
     _cooking_effort_constraints,
+    _increase_existing_protein_if_needed,
     _meal_energy_slots,
     _recipe_matches_cooking_effort,
     _recipe_time_bucket,
@@ -15,7 +16,11 @@ from diet_bot.domain import (
     ActivityLevel,
     ConditionCode,
     CookingTimePreference,
+    Food,
     Goal,
+    Meal,
+    MealRole,
+    NutrientVector,
     Restriction,
     RestrictionType,
     Sex,
@@ -24,6 +29,7 @@ from diet_bot.domain import (
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.recipe_catalog import RecipeTemplate
 from diet_bot.safety import evaluate_safety
+from diet_bot.telegram_app import _build_week_plans
 from diet_bot.validation import validate_plan
 
 
@@ -176,7 +182,7 @@ def test_curated_high_bmi_loss_plan_tops_up_protein_when_possible() -> None:
     profile = profile_with(height_cm=170, weight_kg=132, goal=Goal.LOSE)
     plan = build_one_day_plan(profile, variety_seed=43, recipe_source="curated_only")
 
-    assert plan.totals.get("protein_g") >= plan.targets.targets.get("protein_g") * 0.90
+    assert plan.totals.get("protein_g") >= plan.targets.targets.get("protein_g") * 0.95
     assert plan.totals.get("energy_kcal") <= plan.targets.targets.get("energy_kcal") * 1.04
 
 
@@ -341,13 +347,87 @@ def test_cooking_effort_constraints_change_simple_vs_interesting_generation() ->
         time_text="40 minutes",
     )
 
-    assert simple.max_active_minutes == 25
+    assert simple.max_active_minutes == 30
     assert simple.max_ingredients < interesting.max_ingredients
     assert not simple.allow_oven_or_sauces
     assert interesting.max_active_minutes == 45
     assert interesting.allow_oven_or_sauces
     assert not _recipe_matches_cooking_effort(complex_recipe, CookingTimePreference.SIMPLE)
     assert _recipe_matches_cooking_effort(complex_recipe, CookingTimePreference.INTERESTING)
+
+
+def test_simple_cooking_preference_excludes_waffle_iron_recipes() -> None:
+    waffle_recipe = next(recipe for recipe in built_in_recipes() if recipe.id == "r035_klassicheskie_vafli")
+
+    assert not _recipe_matches_cooking_effort(waffle_recipe, CookingTimePreference.SIMPLE)
+    assert _recipe_matches_cooking_effort(waffle_recipe, CookingTimePreference.INTERESTING)
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_recipe_plan_does_not_collapse_into_repeated_recipes() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    plans = _build_week_plans(profile, 101, set(), set())
+    recipe_ids = [meal.recipe_id for plan in plans for meal in plan.meals]
+
+    assert len(recipe_ids) == 35
+    assert len(set(recipe_ids)) >= 32
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_recipe_plan_does_not_reuse_recipe_ids_across_days_or_slots() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    plans = _build_week_plans(profile, 101, set(), set())
+    placements_by_recipe_id: dict[str, list[str]] = {}
+    for day_index, plan in enumerate(plans, start=1):
+        for meal_index, meal in enumerate(plan.meals, start=1):
+            assert meal.recipe_id
+            placements_by_recipe_id.setdefault(meal.recipe_id, []).append(
+                f"day {day_index}, meal {meal_index}: {meal.name}"
+            )
+
+    repeated_placements = {
+        recipe_id: placements
+        for recipe_id, placements in placements_by_recipe_id.items()
+        if len(placements) > 1
+    }
+
+    assert repeated_placements == {}
+
+
+def test_protein_top_up_reaches_95_percent_floor_when_feasible() -> None:
+    protein = Food(
+        id="lean_protein",
+        name="Lean protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 20}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=500,
+        max_per_day_g=500,
+    )
+    meals = [Meal("test", (protein.portion(450),), "test")]
+    target = NutrientVector({"energy_kcal": 2000, "protein_g": 100})
+
+    updated = _increase_existing_protein_if_needed(meals, target, {"lean_protein": 450})
+
+    assert NutrientVector.sum(meal.nutrients for meal in updated).get("protein_g") >= 95
+
+
+def test_protein_top_up_uses_best_available_amount_when_95_percent_is_infeasible() -> None:
+    protein = Food(
+        id="limited_protein",
+        name="Limited protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 20}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=460,
+        max_per_day_g=460,
+    )
+    meals = [Meal("test", (protein.portion(450),), "test")]
+    target = NutrientVector({"energy_kcal": 2000, "protein_g": 100})
+
+    updated = _increase_existing_protein_if_needed(meals, target, {"limited_protein": 450})
+
+    assert NutrientVector.sum(meal.nutrients for meal in updated).get("protein_g") == 92
 
 
 def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:

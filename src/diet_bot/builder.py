@@ -51,36 +51,57 @@ LOW_PROTEIN_CEILING_MULTIPLIER = 1.20
 HIGH_PROTEIN_CEILING_MULTIPLIER = 1.35
 SMALL_PROTEIN_TARGET_CEILING_MULTIPLIER = 1.45
 SMALL_PROTEIN_TARGET_THRESHOLD_G = 90
-PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.90
+PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.95
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
+CARBOHYDRATE_TOP_UP_CEILING_MULTIPLIER = 1.18
+CARBOHYDRATE_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.08
+CARBOHYDRATE_RECIPE_HARD_LIMIT_MULTIPLIER = 1.24
 SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
-    "духовк",
-    "запек",
     "выпек",
-    "против",
-    "соус",
     "марин",
     "охлажд",
     "ноч",
     "несколько этап",
+    "ваф",
+    "блендер",
+    "комбайн",
+    "гриль",
+    "аэрогриль",
+    "мультиварк",
+    "фритюр",
     "bake",
     "baking",
-    "oven",
-    "sauce",
     "marinat",
     "overnight",
+    "waffle",
+    "blender",
+    "processor",
+    "grill",
+    "air fryer",
+    "fryer",
 )
 SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS = (
     "several stages",
     "несколько этап",
+    "ваф",
+    "блендер",
+    "комбайн",
+    "гриль",
+    "аэрогриль",
+    "мультиварк",
+    "фритюр",
     "bake",
     "baking",
-    "oven",
-    "sauce",
     "marinat",
     "overnight",
+    "waffle",
+    "blender",
+    "processor",
+    "grill",
+    "air fryer",
+    "fryer",
 )
 
 
@@ -282,6 +303,17 @@ def build_one_day_plan(
         avoided_recipe_keys or frozenset(),
         recipe_source,
     )
+    if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
+        recipe_meals = _build_recipe_plan_for_time(
+            candidates,
+            targets.targets,
+            profile.meal_count,
+            profile.cooking_time,
+            variety_seed,
+            avoided_recipe_ids or frozenset(),
+            frozenset(),
+            recipe_source,
+        )
     if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
         recipe_meals = _build_recipe_plan_for_time(
             candidates,
@@ -492,8 +524,8 @@ def _cooking_effort_constraints(cooking_time: CookingTimePreference) -> CookingE
             allow_oven_or_sauces=True,
         )
     return CookingEffortConstraints(
-        max_active_minutes=25,
-        max_ingredients=9,
+        max_active_minutes=30,
+        max_ingredients=11,
         max_instruction_sentences=6,
         allow_oven_or_sauces=False,
     )
@@ -830,12 +862,14 @@ def _rank_recipes(
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
         seed_score = _seeded_score(recipe.id, variety_seed, index) * 2.0
         nutrient_bonus = _recipe_nutrient_bonus(recipe, current_total, target)
+        macro_bonus = _recipe_projected_macro_gap_bonus(recipe, food_by_id, slot_energy_target, current_total, target)
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
         format_penalty = used_formats[_recipe_format(recipe)] * 0.85
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
         macro_penalty += _recipe_projected_fat_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
+        macro_penalty += _recipe_projected_carbohydrate_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
         energy_penalty = _recipe_projected_energy_penalty(
             recipe,
             food_by_id,
@@ -843,7 +877,7 @@ def _rank_recipes(
             slot_min_energy,
             slot_max_energy,
         )
-        return seed_score + nutrient_bonus + rotation_bonus + curated_bonus - overlap * 0.55 - format_penalty - macro_penalty - energy_penalty
+        return seed_score + nutrient_bonus + macro_bonus + rotation_bonus + curated_bonus - overlap * 0.55 - format_penalty - macro_penalty - energy_penalty
 
     return sorted(candidates, key=score, reverse=True)
 
@@ -994,6 +1028,33 @@ def _recipe_nutrient_bonus(recipe: RecipeTemplate, current_total: NutrientVector
     return bonus
 
 
+def _recipe_projected_macro_gap_bonus(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target)
+    if estimated is None:
+        return 0.0
+
+    bonus = 0.0
+    protein_floor = target.get("protein_g") * PROTEIN_TOP_UP_TARGET_MULTIPLIER
+    protein_gap = protein_floor - current_total.get("protein_g")
+    if protein_gap > 0:
+        bonus += min(estimated.get("protein_g"), protein_gap) / max(1.0, protein_floor) * 8.0
+
+    for nutrient, weight in (("fat_g", 1.0), ("carbohydrate_g", 0.9)):
+        nutrient_target = target.get(nutrient)
+        if nutrient_target <= 0:
+            continue
+        gap = nutrient_target - current_total.get(nutrient)
+        if gap > nutrient_target * 0.15:
+            bonus += min(estimated.get(nutrient), gap) / nutrient_target * weight
+    return bonus
+
+
 def _recipe_macro_penalty(recipe: RecipeTemplate, current_total: NutrientVector, target: NutrientVector) -> float:
     protein_target = max(1.0, target.get("protein_g"))
     protein_pressure = current_total.get("protein_g") / protein_target
@@ -1067,6 +1128,33 @@ def _recipe_projected_fat_penalty(
         penalty += (projected_fat - soft_limit) / max(1.0, fat_target) * 10.0
     if projected_fat > hard_limit:
         penalty += (projected_fat - hard_limit) / max(1.0, fat_target) * 30.0
+    return penalty
+
+
+def _recipe_projected_carbohydrate_penalty(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    carbohydrate_target = target.get("carbohydrate_g")
+    if carbohydrate_target <= 0:
+        return 0.0
+
+    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target)
+    if estimated is None:
+        return 0.0
+
+    projected_carbohydrate = current_total.get("carbohydrate_g") + estimated.get("carbohydrate_g")
+    soft_limit = carbohydrate_target * CARBOHYDRATE_RECIPE_SOFT_LIMIT_MULTIPLIER
+    hard_limit = carbohydrate_target * CARBOHYDRATE_RECIPE_HARD_LIMIT_MULTIPLIER
+
+    penalty = 0.0
+    if projected_carbohydrate > soft_limit:
+        penalty += (projected_carbohydrate - soft_limit) / max(1.0, carbohydrate_target) * 8.0
+    if projected_carbohydrate > hard_limit:
+        penalty += (projected_carbohydrate - hard_limit) / max(1.0, carbohydrate_target) * 24.0
     return penalty
 
 
@@ -1392,7 +1480,7 @@ def _top_up_if_needed(
     lower_energy = target.get("energy_kcal") * 0.96
     upper_energy = target.get("energy_kcal") * 1.04
     if total.get("energy_kcal") >= lower_energy and not _has_meal_below_min_energy(meals, target):
-        return meals
+        return _increase_existing_protein_if_needed(meals, target, used_grams)
 
     slots = _meal_energy_slots(len(meals))
     for _ in range(4):
@@ -1427,6 +1515,7 @@ def _top_up_if_needed(
                 grams = round(max(0.0, grams), 1)
                 grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_fat_ceiling(food, grams, total, target, portions)
+                grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target, portions)
                 if grams <= 0:
                     continue
                 portion = food.portion(grams)
@@ -1495,6 +1584,7 @@ def _increase_existing_portions(
                         continue
                     grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
                     grams = _limit_grams_for_fat_ceiling(food, grams, total, target)
+                    grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
                     if grams <= 0:
                         continue
                     portions[portion_index] = FoodPortion(food=food, grams=round(portion.grams + grams, 1))
@@ -1574,6 +1664,7 @@ def _increase_existing_protein_if_needed(
                 )
                 grams = max(0.0, round(grams, 1))
                 grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
+                grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
                 if grams <= 0:
                     continue
 
@@ -1665,6 +1756,25 @@ def _limit_grams_for_fat_ceiling(
     if fat_room <= 0:
         return 0.0
     return round(min(grams, fat_room / fat_per_g), 1)
+
+
+def _limit_grams_for_carbohydrate_ceiling(
+    food: Food,
+    grams: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    pending_portions: list[FoodPortion] | None = None,
+) -> float:
+    carbohydrate_per_g = food.nutrients_per_100g.get("carbohydrate_g") / 100
+    if carbohydrate_per_g <= 0:
+        return grams
+
+    pending_total = NutrientVector.sum(portion.nutrients for portion in (pending_portions or ()))
+    carbohydrate_room = target.get("carbohydrate_g") * CARBOHYDRATE_TOP_UP_CEILING_MULTIPLIER
+    carbohydrate_room -= current_total.plus(pending_total).get("carbohydrate_g")
+    if carbohydrate_room <= 0:
+        return 0.0
+    return round(min(grams, carbohydrate_room / carbohydrate_per_g), 1)
 
 
 def _protein_ceiling_multiplier(target: NutrientVector) -> float:
