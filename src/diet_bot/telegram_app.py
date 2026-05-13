@@ -294,6 +294,7 @@ CALLBACK_SUPPORT = "diet:support"
 CALLBACK_ONE_DAY_PLAN = "diet:one_day"
 CALLBACK_WEEK_PLAN_PDF = "diet:week_pdf"
 CALLBACK_ANSWER_PREFIX = "diet:answer:"
+SELECTED_ANSWER_PREFIX = "✅ "
 PAYLOAD_SUBSCRIPTION_MONTH = "diet:stars:subscription_month"
 PAYLOAD_EXTRA_ONE_DAY = "diet:stars:extra_one_day"
 PAYLOAD_EXTRA_WEEKLY_PDF = "diet:stars:extra_weekly_pdf"
@@ -662,6 +663,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
             return
 
         await callback.answer(answer)
+        await _mark_questionnaire_answer_selected(message, session.current_question, option_index)
         await _handle_questionnaire_answer(message, answer)
         return
 
@@ -2940,15 +2942,25 @@ def _plan_choice_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _question_keyboard(question) -> InlineKeyboardMarkup | None:
+def _question_keyboard(question, *, selected_index: int | None = None) -> InlineKeyboardMarkup | None:
     if not question or not question.options:
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=option, callback_data=f"{CALLBACK_ANSWER_PREFIX}{index}")]
+            [
+                InlineKeyboardButton(
+                    text=f"{SELECTED_ANSWER_PREFIX}{option}" if index == selected_index else option,
+                    callback_data=f"{CALLBACK_ANSWER_PREFIX}{index}",
+                )
+            ]
             for index, option in enumerate(question.options)
         ],
     )
+
+
+async def _mark_questionnaire_answer_selected(message: Message, question, option_index: int) -> None:
+    with suppress(TelegramAPIError, AttributeError, TypeError):
+        await message.edit_reply_markup(reply_markup=_question_keyboard(question, selected_index=option_index))
 
 
 async def _send_welcome_photo(message: Message) -> None:

@@ -1376,6 +1376,35 @@ def test_trial_subscription_keyboard_has_cta_button() -> None:
     assert "5 дополнительных дневных рационов" in TRIAL_SUBSCRIPTION_TEXT
 
 
+def test_question_keyboard_marks_selected_option_only() -> None:
+    session, error = start_session().receive("32")
+    assert error is None
+    question = session.current_question
+
+    keyboard = telegram_app._question_keyboard(question, selected_index=1)
+    button_texts = [row[0].text for row in keyboard.inline_keyboard]
+
+    assert button_texts[1] == f"✅ {question.options[1]}"
+    assert button_texts[0] == question.options[0]
+    assert all(not text.startswith("✅ ") for text in button_texts[:1])
+
+
+def test_question_keyboard_switches_selected_marker_without_duplicates() -> None:
+    session, error = start_session().receive("32")
+    assert error is None
+    question = session.current_question
+
+    keyboard = telegram_app._question_keyboard(question, selected_index=0)
+    switched_keyboard = telegram_app._question_keyboard(question, selected_index=1)
+
+    first_texts = [row[0].text for row in keyboard.inline_keyboard]
+    switched_texts = [row[0].text for row in switched_keyboard.inline_keyboard]
+    assert sum(text.startswith("✅ ") for text in first_texts) == 1
+    assert sum(text.startswith("✅ ") for text in switched_texts) == 1
+    assert switched_texts[0] == question.options[0]
+    assert switched_texts[1] == f"✅ {question.options[1]}"
+
+
 def test_plan_choice_keyboard_has_day_and_week_pdf_buttons() -> None:
     keyboard = _plan_choice_keyboard()
     buttons = [row[0] for row in keyboard.inline_keyboard]
@@ -1546,6 +1575,7 @@ class FakeMessage:
         self.texts = []
         self.documents = []
         self.edits = []
+        self.reply_markup_edits = []
 
     async def answer_photo(self, **kwargs) -> None:
         self.photos.append(kwargs)
@@ -1556,6 +1586,9 @@ class FakeMessage:
 
     async def answer_document(self, **kwargs) -> None:
         self.documents.append(kwargs)
+
+    async def edit_reply_markup(self, reply_markup=None, **kwargs) -> None:
+        self.reply_markup_edits.append((reply_markup, kwargs))
 
 
 class FailingDocumentMessage(FakeMessage):
@@ -2539,6 +2572,35 @@ async def test_week_plan_with_access_refunds_limit_when_pdf_not_delivered(monkey
 
     assert sent is False
     assert entitlement.monthly_weekly_pdf_remaining == 1
+
+
+@pytest.mark.anyio
+async def test_answer_callback_marks_selected_option_and_sends_next_question(monkeypatch) -> None:
+    chat_id = 91_000
+    session, error = start_session().receive("32")
+    assert error is None
+    question = session.current_question
+    SESSION_BY_CHAT_ID[chat_id] = session
+    message = FakeMessage(chat_id)
+    callback = FakeCallback(f"{telegram_app.CALLBACK_ANSWER_PREFIX}1", message)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    try:
+        await telegram_app.handle_callback(callback)
+
+        edited_markup, edit_kwargs = message.reply_markup_edits[-1]
+        button_texts = [row[0].text for row in edited_markup.inline_keyboard]
+        assert edit_kwargs == {}
+        assert sum(text.startswith("✅ ") for text in button_texts) == 1
+        assert button_texts[0] == question.options[0]
+        assert button_texts[1] == f"✅ {question.options[1]}"
+
+        assert SESSION_BY_CHAT_ID[chat_id].current_question.key == "height_cm"
+        sent_text, sent_markup = message.texts[-1]
+        assert sent_text == SESSION_BY_CHAT_ID[chat_id].current_question.prompt
+        assert sent_markup is None
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
 
 
 @pytest.mark.anyio
