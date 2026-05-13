@@ -19,6 +19,7 @@ from .domain import (
     NutrientVector,
     SafetyResult,
     UserProfile,
+    normalize_cooking_time_preference,
 )
 from .recipe_catalog import RecipeTemplate, built_in_recipes
 from .safety import evaluate_safety, is_food_excluded
@@ -54,6 +55,33 @@ PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.90
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
+SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
+    "духовк",
+    "запек",
+    "выпек",
+    "против",
+    "соус",
+    "марин",
+    "охлажд",
+    "ноч",
+    "несколько этап",
+    "bake",
+    "baking",
+    "oven",
+    "sauce",
+    "marinat",
+    "overnight",
+)
+SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS = (
+    "several stages",
+    "несколько этап",
+    "bake",
+    "baking",
+    "oven",
+    "sauce",
+    "marinat",
+    "overnight",
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +90,14 @@ class MealEnergySlot:
     target_ratio: float
     min_ratio: float
     max_ratio: float
+
+
+@dataclass(frozen=True)
+class CookingEffortConstraints:
+    max_active_minutes: int
+    max_ingredients: int
+    max_instruction_sentences: int
+    allow_oven_or_sauces: bool
 
 
 MEAL_ENERGY_PROFILES: dict[int, tuple[MealEnergySlot, ...]] = {
@@ -317,6 +353,7 @@ def _build_recipe_plan_for_time(
     avoided_recipe_keys: set[str] | frozenset[str],
     recipe_source: RecipeSource,
 ) -> list[Meal]:
+    effort_constraints = _cooking_effort_constraints(cooking_time)
     for allowed_time_buckets in _time_filter_attempts(cooking_time):
         meals = _build_recipe_plan(
             candidates,
@@ -327,6 +364,7 @@ def _build_recipe_plan_for_time(
             avoided_recipe_keys,
             recipe_source,
             allowed_time_buckets,
+            effort_constraints,
         )
         if meals:
             return meals
@@ -340,6 +378,7 @@ def _build_recipe_plan_for_time(
         avoided_recipe_keys,
         recipe_source,
         None,
+        effort_constraints,
     )
 
 
@@ -352,6 +391,7 @@ def _build_recipe_plan(
     avoided_recipe_keys: set[str] | frozenset[str],
     recipe_source: RecipeSource,
     allowed_time_buckets: frozenset[TimeBucket] | None = None,
+    effort_constraints: CookingEffortConstraints | None = None,
 ) -> list[Meal]:
     food_by_id = {food.id: food for food in candidates}
     recipes = [
@@ -362,6 +402,7 @@ def _build_recipe_plan(
         and _recipe_memory_key(recipe) not in avoided_recipe_keys
         and (recipe_source != "curated_only" or "curated" in recipe.tags)
         and (allowed_time_buckets is None or _recipe_time_bucket(recipe) in allowed_time_buckets)
+        and (effort_constraints is None or _recipe_matches_cooking_effort(recipe, effort_constraints))
     ]
     if not recipes:
         return []
@@ -428,11 +469,61 @@ def _build_recipe_plan(
 
 
 def _time_filter_attempts(cooking_time: CookingTimePreference) -> tuple[frozenset[TimeBucket], ...]:
-    if cooking_time == CookingTimePreference.QUICK:
-        return (frozenset({"quick"}), frozenset({"quick", "medium"}))
-    if cooking_time == CookingTimePreference.MEDIUM:
-        return (frozenset({"quick", "medium"}), frozenset({"quick", "medium", "long"}))
+    preference = normalize_cooking_time_preference(cooking_time)
+    if preference == CookingTimePreference.SIMPLE:
+        return (frozenset({"quick", "medium"}),)
     return (frozenset({"quick", "medium", "long"}),)
+
+
+def _cooking_effort_constraints(cooking_time: CookingTimePreference) -> CookingEffortConstraints:
+    preference = normalize_cooking_time_preference(cooking_time)
+    if preference == CookingTimePreference.INTERESTING:
+        return CookingEffortConstraints(
+            max_active_minutes=45,
+            max_ingredients=12,
+            max_instruction_sentences=7,
+            allow_oven_or_sauces=True,
+        )
+    return CookingEffortConstraints(
+        max_active_minutes=25,
+        max_ingredients=9,
+        max_instruction_sentences=6,
+        allow_oven_or_sauces=False,
+    )
+
+
+def _recipe_matches_cooking_effort(
+    recipe: RecipeTemplate,
+    cooking_time: CookingTimePreference | CookingEffortConstraints,
+) -> bool:
+    constraints = (
+        cooking_time
+        if isinstance(cooking_time, CookingEffortConstraints)
+        else _cooking_effort_constraints(cooking_time)
+    )
+    active_minutes = _parse_active_minutes(recipe.time_text)
+    if active_minutes is not None and active_minutes > constraints.max_active_minutes:
+        return False
+    if len(recipe.ingredients_g) > constraints.max_ingredients:
+        return False
+    if _instruction_sentence_count(recipe.instructions) > constraints.max_instruction_sentences:
+        return False
+    if not constraints.allow_oven_or_sauces and _has_complex_cooking_technique(recipe):
+        return False
+    return True
+
+
+def _instruction_sentence_count(text: str) -> int:
+    sentences = [part.strip() for part in re.split(r"[.!?]+", text) if part.strip()]
+    return len(sentences)
+
+
+def _has_complex_cooking_technique(recipe: RecipeTemplate) -> bool:
+    title_and_time = " ".join((recipe.title, recipe.time_text)).lower()
+    instructions = recipe.instructions.lower()
+    return any(keyword in title_and_time for keyword in SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS) or any(
+        keyword in instructions for keyword in SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS
+    )
 
 
 def _recipe_time_bucket(recipe: RecipeTemplate) -> TimeBucket:

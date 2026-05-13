@@ -2,7 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from diet_bot.builder import _meal_energy_slots, _recipe_time_bucket, build_one_day_plan, filter_foods
+from diet_bot.builder import (
+    _cooking_effort_constraints,
+    _meal_energy_slots,
+    _recipe_matches_cooking_effort,
+    _recipe_time_bucket,
+    build_one_day_plan,
+    filter_foods,
+)
 from diet_bot.catalog import built_in_foods
 from diet_bot.domain import (
     ActivityLevel,
@@ -15,6 +22,7 @@ from diet_bot.domain import (
     UserProfile,
 )
 from diet_bot.recipe_catalog import built_in_recipes
+from diet_bot.recipe_catalog import RecipeTemplate
 from diet_bot.safety import evaluate_safety
 from diet_bot.validation import validate_plan
 
@@ -60,7 +68,7 @@ def test_apple_allergy_excludes_apple() -> None:
 def test_excluded_mushrooms_filter_curated_recipes_by_alias() -> None:
     profile = profile_with(
         restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "не ем грибы"),),
-        cooking_time=CookingTimePreference.QUICK,
+        cooking_time=CookingTimePreference.SIMPLE,
         meal_count=5,
     )
     plan = build_one_day_plan(profile, variety_seed=1, recipe_source="curated_only")
@@ -290,17 +298,38 @@ def test_recipe_plan_prefers_vitamin_d_and_omega3_sources() -> None:
     assert plan.totals.get("vitamin_d_mcg") > 0
 
 
-def test_quick_cooking_preference_filters_curated_recipe_times() -> None:
-    profile = profile_with(cooking_time=CookingTimePreference.QUICK, meal_count=5)
+def test_simple_cooking_preference_filters_curated_recipe_effort() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
     plan = build_one_day_plan(profile, variety_seed=1, recipe_source="curated_only")
     recipes_by_id = {recipe.id: recipe for recipe in built_in_recipes()}
 
     assert len(plan.meals) == 5
-    assert {
-        _recipe_time_bucket(recipes_by_id[meal.recipe_id])
+    assert all(
+        _recipe_matches_cooking_effort(recipes_by_id[meal.recipe_id], CookingTimePreference.SIMPLE)
         for meal in plan.meals
         if meal.recipe_id
-    } <= {"quick", "medium"}
+    )
+
+
+def test_cooking_effort_constraints_change_simple_vs_interesting_generation() -> None:
+    simple = _cooking_effort_constraints(CookingTimePreference.SIMPLE)
+    interesting = _cooking_effort_constraints(CookingTimePreference.INTERESTING)
+    complex_recipe = RecipeTemplate(
+        id="complex",
+        slot="main",
+        title="Complex recipe",
+        ingredients_g={f"food_{index}": 10 for index in range(10)},
+        instructions="Make a sauce. Bake vegetables. Finish in several stages.",
+        time_text="40 minutes",
+    )
+
+    assert simple.max_active_minutes == 25
+    assert simple.max_ingredients < interesting.max_ingredients
+    assert not simple.allow_oven_or_sauces
+    assert interesting.max_active_minutes == 45
+    assert interesting.allow_oven_or_sauces
+    assert not _recipe_matches_cooking_effort(complex_recipe, CookingTimePreference.SIMPLE)
+    assert _recipe_matches_cooking_effort(complex_recipe, CookingTimePreference.INTERESTING)
 
 
 def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:
@@ -312,7 +341,7 @@ def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:
         goal=Goal.MAINTAIN,
         activity=ActivityLevel.MODERATE,
         meal_count=5,
-        cooking_time=CookingTimePreference.QUICK,
+        cooking_time=CookingTimePreference.SIMPLE,
     )
 
     plan = build_one_day_plan(profile, variety_seed=3, recipe_source="curated_only")

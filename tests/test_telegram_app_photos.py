@@ -2025,10 +2025,37 @@ def profile_with(**kwargs) -> UserProfile:
         "goal": Goal.LOSE,
         "activity": ActivityLevel.MODERATE,
         "meal_count": 4,
-        "cooking_time": CookingTimePreference.QUICK,
+        "cooking_time": CookingTimePreference.SIMPLE,
     }
     data.update(kwargs)
     return UserProfile(**data)
+
+
+def test_saved_profile_maps_legacy_cooking_time_values_to_effort_modes() -> None:
+    raw_profile = {
+        "age": 32,
+        "sex": "male",
+        "height_cm": 178,
+        "weight_kg": 86,
+        "goal": "lose",
+        "activity": "moderate",
+        "meal_count": 4,
+    }
+
+    quick_profile = telegram_app._profile_from_dict({**raw_profile, "cooking_time": "quick"})
+    medium_profile = telegram_app._profile_from_dict({**raw_profile, "cooking_time": "medium"})
+    long_profile = telegram_app._profile_from_dict({**raw_profile, "cooking_time": "long"})
+    unknown_profile = telegram_app._profile_from_dict({**raw_profile, "cooking_time": "surprise"})
+
+    assert quick_profile is not None
+    assert medium_profile is not None
+    assert long_profile is not None
+    assert unknown_profile is not None
+    assert quick_profile.cooking_time == CookingTimePreference.SIMPLE
+    assert medium_profile.cooking_time == CookingTimePreference.SIMPLE
+    assert long_profile.cooking_time == CookingTimePreference.INTERESTING
+    assert unknown_profile.cooking_time == CookingTimePreference.SIMPLE
+    assert telegram_app._profile_to_dict(long_profile)["cooking_time"] == "interesting"
 
 
 def _telegram_week_plan_fixture() -> tuple[MealPlan, ...]:
@@ -2434,7 +2461,7 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
             "похудение",
             "умеренная",
             "4",
-            "до 15 минут",
+            "Побыстрее и попроще",
             "нет",
             "нет",
             "нет",
@@ -2443,7 +2470,7 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
             await _handle_questionnaire_answer(message, answer)
 
         assert chat_id not in SESSION_BY_CHAT_ID
-        assert PROFILE_BY_CHAT_ID[chat_id].cooking_time == "quick"
+        assert PROFILE_BY_CHAT_ID[chat_id].cooking_time == "simple"
         sent_text, markup = message.texts[-1]
         assert "Ваш расчет" in sent_text
         assert "Считаю рацион" not in "\n".join(text for text, _ in message.texts)
@@ -2478,7 +2505,7 @@ async def test_saved_questionnaire_profile_survives_memory_reset(monkeypatch, tm
             "похудение",
             "умеренная",
             "4",
-            "до 15 минут",
+            "Побыстрее и попроще",
             "нет",
             "нет",
             "нет",
@@ -2594,7 +2621,7 @@ async def test_trial_questionnaire_completion_sends_one_day_plan_and_subscriptio
 
         assert chat_id not in SESSION_BY_CHAT_ID
         assert chat_id not in TRIAL_CHAT_IDS
-        assert PROFILE_BY_CHAT_ID[chat_id].cooking_time == "quick"
+        assert PROFILE_BY_CHAT_ID[chat_id].cooking_time == "simple"
         assert "Ваш расчет" in sent_text
         assert "Считаю рацион" in sent_text
         assert final_text.startswith(TRIAL_SUBSCRIPTION_TEXT)

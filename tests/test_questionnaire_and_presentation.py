@@ -1,7 +1,17 @@
 from diet_bot.builder import build_one_day_plan
 from diet_bot.calculator import calculate_targets
 from diet_bot.chef import clean_recipe_instruction_text, format_display_grams, format_ingredient
-from diet_bot.domain import ConditionCode, CookingTimePreference, Food, FoodPortion, Goal, Meal, NutrientVector, Sex
+from diet_bot.domain import (
+    ConditionCode,
+    CookingTimePreference,
+    Food,
+    FoodPortion,
+    Goal,
+    Meal,
+    NutrientVector,
+    Sex,
+    normalize_cooking_time_preference,
+)
 from diet_bot.presentation import format_calculation_summary, format_meal_card, format_plan_response
 from diet_bot.questionnaire import QUESTIONS, start_session
 from diet_bot.safety import evaluate_safety
@@ -18,7 +28,7 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
         "похудение",
         "умеренная",
         "4",
-        "до 15 минут",
+        "Побыстрее и попроще",
         "яблоко",
         "лактоза",
         "ХПН",
@@ -34,7 +44,7 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
     assert profile.age == 32
     assert profile.sex == Sex.MALE
     assert profile.goal == Goal.LOSE
-    assert profile.cooking_time == CookingTimePreference.QUICK
+    assert profile.cooking_time == CookingTimePreference.SIMPLE
     assert ConditionCode.LACTOSE_INTOLERANCE in profile.conditions
     assert ConditionCode.CKD in profile.conditions
     assert profile.restrictions[0].value == "яблоко"
@@ -46,7 +56,7 @@ def test_button_questions_have_options() -> None:
     assert questions["sex"].options == ("👨 Мужчина", "👩 Женщина")
     assert questions["goal"].options == ("⬇️ Похудение", "⚖️ Поддержание", "💪 Набор")
     assert questions["meal_count"].options == ("3", "4", "5")
-    assert questions["cooking_time"].options == ("до 15 минут", "15–30 минут", "более 30 минут")
+    assert questions["cooking_time"].options == ("Побыстрее и попроще", "Можно чуть интереснее")
     assert "⚡ Очень высокая" in questions["activity"].options
     assert questions["allergies"].options == ("Нет",)
     assert questions["intolerances"].options == ("Нет",)
@@ -64,7 +74,7 @@ def test_questionnaire_accepts_decimal_comma_weight() -> None:
         "поддержание",
         "легкая",
         "3",
-        "15–30 минут",
+        "Можно чуть интереснее",
         "нет",
         "нет",
         "нет",
@@ -76,6 +86,18 @@ def test_questionnaire_accepts_decimal_comma_weight() -> None:
         assert error is None
 
     assert session.build_profile().weight_kg == 62.5
+    assert session.build_profile().cooking_time == CookingTimePreference.INTERESTING
+
+
+def test_legacy_cooking_time_values_map_to_two_effort_modes() -> None:
+    assert normalize_cooking_time_preference("quick") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("до 15 минут") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("medium") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("15–30 минут") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("long") == CookingTimePreference.INTERESTING
+    assert normalize_cooking_time_preference("более 30 минут") == CookingTimePreference.INTERESTING
+    assert normalize_cooking_time_preference("") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("что-то непонятное") == CookingTimePreference.SIMPLE
 
 
 def test_questionnaire_rejects_invalid_meal_count() -> None:

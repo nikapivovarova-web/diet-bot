@@ -45,6 +45,7 @@ from .domain import (
     RestrictionType,
     Sex,
     UserProfile,
+    normalize_cooking_time_preference,
 )
 from .presentation import (
     format_calculation_summary,
@@ -1715,7 +1716,7 @@ def _profile_to_dict(profile: UserProfile) -> dict[str, object]:
         "goal": profile.goal.value,
         "activity": profile.activity.value,
         "meal_count": profile.meal_count,
-        "cooking_time": profile.cooking_time.value,
+        "cooking_time": normalize_cooking_time_preference(profile.cooking_time).value,
         "restrictions": [
             {
                 "type": restriction.type.value,
@@ -1756,7 +1757,7 @@ def _profile_from_dict(raw: dict[str, object]) -> UserProfile | None:
             goal=Goal(str(raw["goal"])),
             activity=ActivityLevel(str(raw["activity"])),
             meal_count=int(raw.get("meal_count", 4)),
-            cooking_time=CookingTimePreference(str(raw.get("cooking_time", CookingTimePreference.LONG.value))),
+            cooking_time=normalize_cooking_time_preference(raw.get("cooking_time")),
             restrictions=restrictions,
             conditions=conditions,
             allow_lactose_free_dairy=bool(raw.get("allow_lactose_free_dairy", True)),
