@@ -110,6 +110,45 @@ def test_week_pdf_keeps_cover_separate_from_day_one(tmp_path: Path, sample_week_
     assert _compact_text(first_meal_title) in _compact_text(first_day_text)
 
 
+def test_week_pdf_repeats_day_header_on_recipe_content_pages(tmp_path: Path, sample_week_dates) -> None:
+    recipe = built_in_recipes()[0]
+    plan = _plan_for_recipe(recipe)
+    long_recipe = " ".join(
+        f"Step {index}: add ingredients, stir, simmer, plate and serve warm."
+        for index in range(1, 34)
+    )
+    long_meal = replace(plan.meals[0], recipe=long_recipe, image_url=None)
+    lunch_meal = replace(long_meal, name=f"\u041e\u0431\u0435\u0434: {recipe.title}")
+    long_plan = replace(plan, meals=(long_meal, lunch_meal))
+
+    pdf_path = render_week_plan_pdf((long_plan,), (sample_week_dates[0],), tmp_path / "day-headers.pdf")
+    reader = PdfReader(str(pdf_path))
+    page_texts = [_compact_text(page.extract_text() or "") for page in reader.pages]
+    shopping_page_index = next(
+        index
+        for index, text in enumerate(page_texts)
+        if "\u0421\u043f\u0438\u0441\u043e\u043a \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u043e\u0432" in text
+    )
+
+    assert "\u0414\u0435\u043d\u044c 1" not in page_texts[0]
+    for page_text in page_texts[1:shopping_page_index]:
+        assert "\u0414\u0435\u043d\u044c 1" in page_text
+
+
+def test_recipe_header_uses_rounded_pills_and_badges() -> None:
+    base_font, bold_font, emoji_font = pdf_renderer._register_fonts()
+    styles = pdf_renderer._build_styles(base_font, bold_font, emoji_font)
+    meal = _plan_for_recipe(built_in_recipes()[0]).meals[0]
+
+    header = pdf_renderer._meal_header_table(meal, styles, 180 * mm)
+    pill = pdf_renderer._meal_type_pill("\u0417\u0430\u0432\u0442\u0440\u0430\u043a", styles)
+    badge = pdf_renderer._nutrition_badge("\u0411\u0435\u043b\u043a\u0438", "30 \u0433", styles, 32 * mm)
+
+    assert header._cornerRadii == [7, 7, 7, 7]
+    assert pill._cornerRadii == [7, 7, 7, 7]
+    assert badge._cornerRadii == [6, 6, 6, 6]
+
+
 def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
     logo = pdf_renderer._asset_image(pdf_renderer.PDF_LOGO_PATH, 30 * mm, 30 * mm)
     qr = pdf_renderer._asset_image(pdf_renderer.PDF_QR_PATH, 34 * mm, 34 * mm)
@@ -292,6 +331,29 @@ def test_week_pdf_ignores_missing_meal_photo(
     assert pdf_path.stat().st_size > 1_000
 
 
+def test_meal_photo_white_border_is_cropped_and_scaled(tmp_path: Path) -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    recipe = next(recipe for recipe in built_in_recipes() if recipe.image_url)
+    plan = _plan_for_recipe(recipe)
+    photo_path = tmp_path / "bordered-photo.jpg"
+    image = pil_image.new("RGB", (500, 320), "white")
+    for x in range(60, 440):
+        for y in range(40, 280):
+            image.putpixel((x, y), (64, 132, 92))
+    image.save(photo_path, format="JPEG", quality=95)
+    meal = replace(plan.meals[0], image_url=str(photo_path), image_attribution=None, source_url=None)
+    base_font, bold_font, emoji_font = pdf_renderer._register_fonts()
+    styles = pdf_renderer._build_styles(base_font, bold_font, emoji_font)
+
+    flowables = pdf_renderer._meal_image_flowables(meal, styles)
+
+    assert flowables
+    rendered_image = flowables[0]
+    assert isinstance(rendered_image, pdf_renderer.Image)
+    assert rendered_image.drawWidth > 60 * mm
+    assert rendered_image.drawHeight <= 46 * mm
+
+
 def test_week_pdf_html_soft_wraps_long_unbroken_tokens() -> None:
     html = _html("TOKEN" + "A" * 160)
 
@@ -331,7 +393,7 @@ def test_week_pdf_removes_partial_output_when_render_fails(monkeypatch, tmp_path
     recipe = built_in_recipes()[0]
     plan = _plan_for_recipe(recipe)
     pdf_path = tmp_path / "partial.pdf"
-    monkeypatch.setattr("diet_bot.pdf_renderer.SimpleDocTemplate", FailingDoc)
+    monkeypatch.setattr(pdf_renderer, "_document_template", lambda output, *_args: FailingDoc(output))
 
     with pytest.raises(RuntimeError, match="render failed"):
         render_week_plan_pdf((plan,), (sample_week_dates[0],), pdf_path)

@@ -20,19 +20,24 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
     Image,
     KeepTogether,
+    NextPageTemplate,
     PageBreak,
+    PageTemplate,
     Paragraph,
-    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
 )
+from reportlab.platypus.doctemplate import ActionFlowable
 
-PILImage = None
+PILImage = ImageChops = ImageOps = None
 with suppress(ImportError):
     from PIL import Image as PILImage
+    from PIL import ImageChops, ImageOps
 
 from .chef import format_display_grams, format_ingredient
 from .domain import Meal, MealPlan
@@ -67,6 +72,10 @@ WARNING_TEXT = colors.HexColor("#875A1C")
 EMOJI_RE = re.compile("[\U0001f300-\U0001faff\u2600-\u27bf\ufe0f]")
 LONG_TOKEN_MAX_CHARS = 48
 LONG_TOKEN_RE = re.compile(r"\S{" + str(LONG_TOKEN_MAX_CHARS + 1) + r",}")
+CONTENT_HEADER_GAP = 4 * mm
+MEAL_SPACING = 5 * mm
+PHOTO_MAX_WIDTH = 64 * mm
+PHOTO_MAX_HEIGHT = 46 * mm
 
 
 def build_week_plan_pdf(
@@ -106,7 +115,20 @@ def render_week_plan_pdf(
     remove_output_on_error = not output.exists()
     base_font, bold_font, emoji_font = _register_fonts()
     styles = _build_styles(base_font, bold_font, emoji_font)
-    doc = SimpleDocTemplate(
+    doc = _document_template(output, base_font, styles)
+    story = _build_story(plans, plan_dates, styles, doc.width)
+    try:
+        doc.build(story)
+    except Exception:
+        if remove_output_on_error:
+            with suppress(OSError):
+                output.unlink()
+        raise
+    return output
+
+
+def _document_template(output: Path, base_font: str, styles: dict[str, ParagraphStyle]) -> BaseDocTemplate:
+    doc = BaseDocTemplate(
         str(output),
         pagesize=PAGE_SIZE,
         leftMargin=PDF_MARGIN,
@@ -116,15 +138,62 @@ def render_week_plan_pdf(
         title="FoodBalance weekly ration",
         author="FoodBalance",
     )
-    story = _build_story(plans, plan_dates, styles, doc.width)
-    try:
-        doc.build(story, onFirstPage=_footer(base_font), onLaterPages=_footer(base_font))
-    except Exception:
-        if remove_output_on_error:
-            with suppress(OSError):
-                output.unlink()
-        raise
-    return output
+    day_header_height = _day_header(1, date(2000, 1, 1), styles, doc.width).wrap(doc.width, PAGE_HEIGHT)[1]
+    content_top_margin = PDF_MARGIN + day_header_height + CONTENT_HEADER_GAP
+
+    def frame(frame_id: str, top_margin: float, *, padded: bool) -> Frame:
+        kwargs = {} if padded else {"leftPadding": 0, "rightPadding": 0, "topPadding": 0, "bottomPadding": 0}
+        return Frame(
+            doc.leftMargin,
+            doc.bottomMargin,
+            doc.width,
+            PAGE_HEIGHT - top_margin - doc.bottomMargin,
+            id=frame_id,
+            **kwargs,
+        )
+
+    doc.addPageTemplates(
+        [
+            PageTemplate(id="cover", frames=[frame("cover", doc.topMargin, padded=True)], onPage=_footer(base_font)),
+            PageTemplate(
+                id="content",
+                frames=[frame("content", content_top_margin, padded=False)],
+                onPage=_content_page_header(base_font, styles, doc.width),
+            ),
+            PageTemplate(id="plain", frames=[frame("plain", doc.topMargin, padded=True)], onPage=_footer(base_font)),
+        ]
+    )
+    return doc
+
+
+def _content_page_header(base_font: str, styles: dict[str, ParagraphStyle], doc_width: float):
+    footer = _footer(base_font)
+
+    def draw(canvas, doc) -> None:
+        footer(canvas, doc)
+        day_context = getattr(doc, "_foodbalance_day_header", None)
+        if not day_context:
+            return
+
+        day_index, plan_date = day_context
+        header = _day_header(day_index, plan_date, styles, doc_width)
+        _, header_height = header.wrapOn(canvas, doc_width, PAGE_HEIGHT)
+        header.drawOn(canvas, doc.leftMargin, PAGE_HEIGHT - PDF_MARGIN - header_height)
+
+    return draw
+
+
+class _DayPageContext(ActionFlowable):
+    def __init__(self, day_index: int | None, plan_date: date | None) -> None:
+        super().__init__(())
+        self.day_index = day_index
+        self.plan_date = plan_date
+
+    def apply(self, doc) -> None:
+        if self.day_index is None or self.plan_date is None:
+            doc._foodbalance_day_header = None
+            return
+        doc._foodbalance_day_header = (self.day_index, self.plan_date)
 
 
 def resolve_local_meal_image_path(meal: Meal) -> Path | None:
@@ -147,12 +216,16 @@ def _build_story(
 ) -> list:
     story: list = []
     story.extend(_cover_page(plans, plan_dates, styles, doc_width))
-    story.append(PageBreak())
 
     for day_index, (plan, plan_date) in enumerate(zip(plans, plan_dates), start=1):
+        story.append(_DayPageContext(day_index, plan_date))
+        if day_index == 1:
+            story.append(NextPageTemplate("content"))
+        story.append(PageBreak())
         story.extend(_day_section(plan, plan_date, day_index, styles, doc_width))
-        story.append(Spacer(1, 5 * mm))
 
+    story.append(_DayPageContext(None, None))
+    story.append(NextPageTemplate("plain"))
     story.append(PageBreak())
     story.extend(_shopping_section(plans, styles, doc_width))
 
@@ -445,13 +518,10 @@ def _day_section(
     styles: dict[str, ParagraphStyle],
     doc_width: float,
 ) -> list:
-    story: list = [
-        _day_header(day_index, plan_date, styles, doc_width),
-        Spacer(1, 3 * mm),
-    ]
+    story: list = []
     for meal in plan.meals:
         story.extend(_meal_card(meal, styles, doc_width))
-        story.append(Spacer(1, 3 * mm))
+        story.append(Spacer(1, MEAL_SPACING))
 
     story.append(
         KeepTogether(
@@ -471,7 +541,7 @@ def _day_header(
     doc_width: float,
 ) -> Table:
     data = [[_p(f"День {day_index}", styles["DayTitle"]), _p(f"{plan_date:%d.%m.%Y}", styles["DayDate"])]]
-    table = Table(data, colWidths=[doc_width * 0.55, doc_width * 0.45])
+    table = Table(data, colWidths=[doc_width * 0.55, doc_width * 0.45], hAlign="LEFT")
     table.setStyle(
         TableStyle(
             [
@@ -550,6 +620,7 @@ def _meal_header_table(meal: Meal, styles: dict[str, ParagraphStyle], doc_width:
                 ("BACKGROUND", (0, 0), (-1, -1), SOFT_GREEN),
                 ("SPAN", (0, 1), (-1, 1)),
                 ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
+                ("ROUNDEDCORNERS", [7, 7, 7, 7]),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("TOPPADDING", (0, 0), (-1, 0), 9),
                 ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
@@ -569,6 +640,7 @@ def _meal_type_pill(meal_type: str, styles: dict[str, ParagraphStyle]) -> Table:
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, -1), BRAND_GREEN),
+                ("ROUNDEDCORNERS", [7, 7, 7, 7]),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                 ("TOPPADDING", (0, 0), (-1, -1), 5),
@@ -625,6 +697,7 @@ def _nutrition_badge(label: str, value: str, styles: dict[str, ParagraphStyle], 
             [
                 ("BACKGROUND", (0, 0), (-1, -1), CARD_BACKGROUND),
                 ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
+                ("ROUNDEDCORNERS", [6, 6, 6, 6]),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
@@ -671,7 +744,12 @@ def _ingredient_table(portions: Sequence, styles: dict[str, ParagraphStyle], doc
                 ]
             )
 
-    table = Table(rows, colWidths=[doc_width * 0.46, doc_width * 0.22, doc_width * 0.32], repeatRows=1)
+    table = Table(
+        rows,
+        colWidths=[doc_width * 0.46, doc_width * 0.22, doc_width * 0.32],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
     row_styles = [
         ("BACKGROUND", (0, row_index), (-1, row_index), PALE_GREEN if row_index % 2 else CARD_BACKGROUND)
         for row_index in range(1, len(rows))
@@ -738,8 +816,8 @@ def _recipe_media_table(
     styles: dict[str, ParagraphStyle],
     doc_width: float,
 ) -> Table:
-    image_width = doc_width * 0.34
-    text_width = doc_width - image_width - 8 * mm
+    image_width = doc_width * 0.37
+    text_width = doc_width - image_width
     table = Table(
         [[_recipe_steps_table(steps, styles, text_width), image]],
         colWidths=[text_width, image_width],
@@ -750,8 +828,8 @@ def _recipe_media_table(
             [
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (0, 0), 0),
-                ("RIGHTPADDING", (0, 0), (0, 0), 6),
-                ("LEFTPADDING", (1, 0), (1, 0), 6),
+                ("RIGHTPADDING", (0, 0), (0, 0), 4),
+                ("LEFTPADDING", (1, 0), (1, 0), 4),
                 ("RIGHTPADDING", (1, 0), (1, 0), 0),
                 ("TOPPADDING", (0, 0), (-1, -1), 0),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
@@ -1052,10 +1130,13 @@ def _meal_image_flowables(meal: Meal, styles: dict[str, ParagraphStyle]) -> list
     if image_path is None:
         return None
     try:
-        reader = ImageReader(str(image_path))
+        image_source = _cropped_image_source(image_path)
+        reader = ImageReader(image_source)
         width, height = reader.getSize()
-        scale = min((58 * mm) / width, (42 * mm) / height)
-        flowables: list = [Image(str(image_path), width=width * scale, height=height * scale)]
+        if hasattr(image_source, "seek"):
+            image_source.seek(0)
+        scale = min(PHOTO_MAX_WIDTH / width, PHOTO_MAX_HEIGHT / height)
+        flowables: list = [Image(image_source, width=width * scale, height=height * scale)]
     except Exception:
         return None
 
@@ -1066,6 +1147,49 @@ def _meal_image_flowables(meal: Meal, styles: dict[str, ParagraphStyle]) -> list
         flowables.append(Spacer(1, 1.5 * mm))
         flowables.append(_p(credit, styles["Credit"]))
     return flowables
+
+
+def _cropped_image_source(image_path: Path):
+    if PILImage is None or ImageChops is None or ImageOps is None:
+        return str(image_path)
+
+    try:
+        with PILImage.open(image_path) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            white = PILImage.new("RGB", image.size, (255, 255, 255))
+            diff = ImageChops.difference(image, white)
+            mask = diff.convert("L").point(lambda pixel: 255 if pixel > 10 else 0)
+            bbox = mask.getbbox()
+            if bbox is None:
+                return str(image_path)
+
+            left, top, right, bottom = bbox
+            width, height = image.size
+            margin = max(2, round(min(width, height) * 0.005))
+            crop_box = (
+                max(0, left - margin),
+                max(0, top - margin),
+                min(width, right + margin),
+                min(height, bottom + margin),
+            )
+            cropped_width = crop_box[2] - crop_box[0]
+            cropped_height = crop_box[3] - crop_box[1]
+            saved_border = (
+                crop_box[0] > 3
+                or crop_box[1] > 3
+                or width - crop_box[2] > 3
+                or height - crop_box[3] > 3
+            )
+            if not saved_border or cropped_width < width * 0.45 or cropped_height < height * 0.45:
+                return str(image_path)
+
+            cropped = image.crop(crop_box)
+            buffer = BytesIO()
+            cropped.save(buffer, format="JPEG", quality=92)
+            buffer.seek(0)
+            return buffer
+    except Exception:
+        return str(image_path)
 
 
 def _meal_nutrition_text(meal: Meal) -> str:
