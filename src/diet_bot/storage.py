@@ -20,6 +20,7 @@ from .payments import (
 from .promo_codes import (
     PromoCodeActivation,
     PromoCodeDefinition,
+    PromoCodeKind,
     PromoCodeRecord,
     PromoRedemptionResult,
 )
@@ -75,12 +76,25 @@ class DietBotStore(Protocol):
     def cleanup_stale_generations(self, now: datetime | None = None) -> int: ...
     def upsert_promo_code(self, code: str, record: PromoCodeRecord) -> None: ...
     def create_promo_code(self, promo: PromoCodeDefinition) -> PromoCodeDefinition: ...
+    def list_promo_codes(
+        self,
+        *,
+        kind: PromoCodeKind | str | None = None,
+        active_only: bool = False,
+        now: datetime | None = None,
+    ) -> list[PromoCodeDefinition]: ...
     def get_promo_code(
         self,
         raw_code: str,
         *,
         active_only: bool = False,
         now: datetime | None = None,
+    ) -> PromoCodeDefinition | None: ...
+    def disable_promo_code(
+        self,
+        raw_code: str,
+        *,
+        kind: PromoCodeKind | str | None = None,
     ) -> PromoCodeDefinition | None: ...
     def redeem_promo_code(
         self,

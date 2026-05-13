@@ -103,6 +103,71 @@ class FakeGenerationStore:
         self.refunded.append((user_id, consumption.ration_kind, error_message))
 
 
+class FakePromoAdminStore:
+    def __init__(
+        self,
+        promos: list[telegram_app.PromoCodeDefinition] | None = None,
+    ) -> None:
+        self.promos: dict[str, telegram_app.PromoCodeDefinition] = {}
+        self.disabled_codes: list[str] = []
+        for promo in promos or []:
+            self.promos[promo.code] = promo
+
+    def create_promo_code(
+        self,
+        promo: telegram_app.PromoCodeDefinition,
+    ) -> telegram_app.PromoCodeDefinition:
+        definition = telegram_app.PromoCodeDefinition(**promo.to_dict())
+        self.promos[definition.code] = definition
+        return definition
+
+    def get_promo_code(
+        self,
+        raw_code: str,
+        *,
+        active_only: bool = False,
+        now=None,
+    ) -> telegram_app.PromoCodeDefinition | None:
+        code = telegram_app.normalize_promo_code(raw_code)
+        promo = self.promos.get(code)
+        if promo is None:
+            return None
+        if active_only and not promo.is_active_at(now):
+            return None
+        return promo
+
+    def list_promo_codes(
+        self,
+        *,
+        kind=None,
+        active_only: bool = False,
+        now=None,
+    ) -> list[telegram_app.PromoCodeDefinition]:
+        promos = list(self.promos.values())
+        if kind is not None:
+            promos = [promo for promo in promos if promo.kind == kind]
+        if active_only:
+            promos = [promo for promo in promos if promo.is_active_at(now)]
+        return sorted(promos, key=lambda promo: promo.code)
+
+    def disable_promo_code(
+        self,
+        raw_code: str,
+        *,
+        kind=None,
+    ) -> telegram_app.PromoCodeDefinition | None:
+        code = telegram_app.normalize_promo_code(raw_code)
+        promo = self.promos.get(code)
+        if promo is None or (kind is not None and promo.kind != kind):
+            return None
+        disabled = telegram_app.PromoCodeDefinition(
+            **{**promo.to_dict(), "active": False}
+        )
+        self.promos[code] = disabled
+        self.disabled_codes.append(code)
+        return disabled
+
+
 @pytest.fixture(autouse=True)
 def isolated_telegram_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
@@ -119,6 +184,16 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_004,
         51_005,
         51_006,
+        51_007,
+        51_008,
+        51_009,
+        51_010,
+        51_011,
+        51_012,
+        51_013,
+        51_014,
+        51_015,
+        51_016,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -126,6 +201,8 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
         telegram_app.SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
         telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+        telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "ADMIN_PROMO_ACTION_BY_CHAT_ID", {}).pop(chat_id, None)
     yield
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -133,6 +210,8 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
         telegram_app.SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
         telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+        telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "ADMIN_PROMO_ACTION_BY_CHAT_ID", {}).pop(chat_id, None)
 
 
 @pytest.mark.anyio
@@ -190,6 +269,278 @@ async def test_admin_command_flow_bypasses_private_chat_guard(monkeypatch, tmp_p
     assert message.texts
     assert str(target_chat_id) in message.texts[-1][0]
     assert target_chat_id in telegram_app.load_entitlements(tmp_path / "subscriptions.json")
+
+
+@pytest.mark.anyio
+async def test_admin_panel_contains_discount_management_buttons(monkeypatch) -> None:
+    admin_user_id = 51_007
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    message = FakeMessage(admin_user_id, text="/330366", user_id=admin_user_id)
+
+    await telegram_app.handle_answer(message)
+
+    reply_markup = message.texts[-1][1]
+    button_texts = [
+        button.text
+        for row in reply_markup.inline_keyboard
+        for button in row
+    ]
+    assert button_texts == [
+        "🎟 Создать код на месяц",
+        "🏷 Создать/обновить скидку",
+        "📋 Список скидок",
+        "🚫 Отключить скидку",
+    ]
+
+
+@pytest.mark.anyio
+async def test_non_admin_330366_does_not_show_admin_panel(monkeypatch) -> None:
+    admin_user_id = 51_007
+    non_admin_user_id = 51_016
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    message = FakeMessage(non_admin_user_id, text="/330366", user_id=non_admin_user_id)
+
+    await telegram_app.handle_answer(message)
+
+    assert message.texts
+    assert message.texts[-1][0] != telegram_app.ADMIN_PROMO_PANEL_TEXT
+    assert message.texts[-1][1] is None
+
+
+@pytest.mark.anyio
+async def test_admin_can_create_update_and_apply_discount_from_state_input(
+    monkeypatch,
+) -> None:
+    admin_user_id = 51_008
+    customer_id = 51_009
+    store = FakePromoAdminStore()
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(admin_user_id, user_id=admin_user_id)
+
+    callback = FakeCallback(
+        "diet:admin:create_discount_promo",
+        message,
+        from_user_id=admin_user_id,
+    )
+    await telegram_app.handle_callback(callback)
+    await telegram_app.handle_answer(
+        FakeMessage(admin_user_id, text=" anna20 20 ", user_id=admin_user_id)
+    )
+
+    created = store.promos["ANNA20"]
+    assert created.kind == telegram_app.PromoCodeKind.DISCOUNT
+    assert created.active
+    assert created.discount_percent == 20
+
+    update_callback = FakeCallback(
+        "diet:admin:create_discount_promo",
+        message,
+        from_user_id=admin_user_id,
+    )
+    await telegram_app.handle_callback(update_callback)
+    update_message = FakeMessage(admin_user_id, text="anna20 30", user_id=admin_user_id)
+    await telegram_app.handle_answer(update_message)
+
+    updated = store.promos["ANNA20"]
+    assert updated.active
+    assert updated.discount_percent == 30
+    assert "ANNA20" in update_message.texts[-1][0]
+    assert "30%" in update_message.texts[-1][0]
+    assert telegram_app._remember_discount_promo_code_for_chat(customer_id, "anna20")
+    assert telegram_app._pending_discount_promo_code_for_order(
+        customer_id,
+        telegram_app.PaymentProduct.SUBSCRIPTION_MONTH,
+    ) == "ANNA20"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "admin_text",
+    ["", "ANNA20", "ANNA20 xx", "ANNA20 0", "ANNA20 100", "AN NA20 20"],
+)
+async def test_admin_discount_create_rejects_invalid_input(
+    monkeypatch,
+    admin_text: str,
+) -> None:
+    admin_user_id = 51_010
+    store = FakePromoAdminStore()
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(admin_user_id, user_id=admin_user_id)
+    callback = FakeCallback(
+        "diet:admin:create_discount_promo",
+        message,
+        from_user_id=admin_user_id,
+    )
+
+    await telegram_app.handle_callback(callback)
+    input_message = FakeMessage(admin_user_id, text=admin_text, user_id=admin_user_id)
+    await telegram_app.handle_answer(input_message)
+
+    assert store.promos == {}
+    assert input_message.texts
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "callback_data",
+    [
+        "diet:admin:create_discount_promo",
+        "diet:admin:list_discount_promos",
+        "diet:admin:disable_discount_promo",
+    ],
+)
+async def test_non_admin_cannot_trigger_admin_discount_callback_or_state(
+    monkeypatch,
+    callback_data: str,
+) -> None:
+    admin_user_id = 51_011
+    non_admin_user_id = 51_012
+    store = FakePromoAdminStore()
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    non_admin_message = FakeMessage(non_admin_user_id, user_id=non_admin_user_id)
+    callback = FakeCallback(
+        callback_data,
+        non_admin_message,
+        from_user_id=non_admin_user_id,
+    )
+
+    await telegram_app.handle_callback(callback)
+    getattr(telegram_app, "ADMIN_PROMO_ACTION_BY_CHAT_ID", {})[
+        non_admin_user_id
+    ] = "create_discount"
+    await telegram_app.handle_answer(
+        FakeMessage(non_admin_user_id, text="BAD20 20", user_id=non_admin_user_id)
+    )
+
+    assert callback.answers == ["Command is available only to admins."]
+    assert store.promos == {}
+
+
+@pytest.mark.anyio
+async def test_admin_discount_list_shows_active_discounts_only(monkeypatch) -> None:
+    admin_user_id = 51_013
+    store = FakePromoAdminStore(
+        [
+            telegram_app.PromoCodeDefinition(
+                code="ANNA20",
+                kind=telegram_app.PromoCodeKind.DISCOUNT,
+                max_redemptions=10,
+                per_user_limit=1,
+                discount_percent=20,
+                used_count=3,
+                expires_at="2026-06-01T12:00:00+00:00",
+            ),
+            telegram_app.PromoCodeDefinition(
+                code="OLD10",
+                kind=telegram_app.PromoCodeKind.DISCOUNT,
+                active=False,
+                max_redemptions=10,
+                discount_percent=10,
+            ),
+            telegram_app.PromoCodeDefinition(
+                code="ACCESS1",
+                kind=telegram_app.PromoCodeKind.MONTHLY_ACCESS,
+                active=True,
+            ),
+        ]
+    )
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(admin_user_id, user_id=admin_user_id)
+    callback = FakeCallback(
+        "diet:admin:list_discount_promos",
+        message,
+        from_user_id=admin_user_id,
+    )
+
+    await telegram_app.handle_callback(callback)
+
+    response_text = message.texts[-1][0]
+    assert "ANNA20" in response_text
+    assert "20%" in response_text
+    assert "3/10" in response_text
+    assert "2026-06-01" in response_text
+    assert "OLD10" not in response_text
+    assert "ACCESS1" not in response_text
+
+
+@pytest.mark.anyio
+async def test_admin_discount_disable_deactivates_discount_and_rejects_monthly(
+    monkeypatch,
+) -> None:
+    admin_user_id = 51_014
+    store = FakePromoAdminStore(
+        [
+            telegram_app.PromoCodeDefinition(
+                code="ANNA20",
+                kind=telegram_app.PromoCodeKind.DISCOUNT,
+                max_redemptions=10,
+                discount_percent=20,
+            ),
+            telegram_app.PromoCodeDefinition(
+                code="ACCESS1",
+                kind=telegram_app.PromoCodeKind.MONTHLY_ACCESS,
+            ),
+        ]
+    )
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(admin_user_id, user_id=admin_user_id)
+
+    await telegram_app.handle_callback(
+        FakeCallback(
+            "diet:admin:disable_discount_promo",
+            message,
+            from_user_id=admin_user_id,
+        )
+    )
+    disabled_message = FakeMessage(admin_user_id, text="anna20", user_id=admin_user_id)
+    await telegram_app.handle_answer(disabled_message)
+
+    assert not store.promos["ANNA20"].active
+    assert store.disabled_codes == ["ANNA20"]
+    assert "ANNA20" in disabled_message.texts[-1][0]
+
+    await telegram_app.handle_callback(
+        FakeCallback(
+            "diet:admin:disable_discount_promo",
+            message,
+            from_user_id=admin_user_id,
+        )
+    )
+    monthly_message = FakeMessage(admin_user_id, text="ACCESS1", user_id=admin_user_id)
+    await telegram_app.handle_answer(monthly_message)
+
+    assert store.promos["ACCESS1"].active
+    assert store.disabled_codes == ["ANNA20"]
+    assert "monthly_access" in monthly_message.texts[-1][0]
+
+
+@pytest.mark.anyio
+async def test_admin_monthly_access_button_still_creates_monthly_code(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    admin_user_id = 51_015
+    promo_path = tmp_path / "promo_codes.json"
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    message = FakeMessage(admin_user_id, user_id=admin_user_id)
+    callback = FakeCallback(
+        telegram_app.CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE,
+        message,
+        from_user_id=admin_user_id,
+    )
+
+    await telegram_app.handle_callback(callback)
+
+    promo_codes = telegram_app.load_promo_codes(promo_path)
+    assert len(promo_codes) == 1
+    assert next(iter(promo_codes.values())).is_monthly_access()
+    assert "Access: 1 month." in message.texts[-1][0]
 
 
 @pytest.mark.anyio

@@ -124,10 +124,13 @@ RECENT_RECIPE_KEYS_BY_CHAT_ID: dict[int, list[str]] = {}
 SUPPORT_REQUEST_CHAT_IDS: set[int] = set()
 PROMO_CODE_REQUEST_CHAT_IDS: set[int] = set()
 DISCOUNT_PROMO_CODE_BY_CHAT_ID: dict[int, str] = {}
+ADMIN_PROMO_ACTION_BY_CHAT_ID: dict[int, str] = {}
 router = Router()
 DEFAULT_SUPPORT_CHAT_ID = -5_271_779_108
 _RUNTIME_STORE: DietBotStore | None = None
 ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT = 20
+ADMIN_PROMO_ACTION_CREATE_DISCOUNT = "create_discount"
+ADMIN_PROMO_ACTION_DISABLE_DISCOUNT = "disable_discount"
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
@@ -310,11 +313,34 @@ CALLBACK_FEATURES = "diet:features"
 CALLBACK_PROMO_CODE = "diet:promo_code"
 CALLBACK_SUPPORT = "diet:support"
 CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE = "diet:admin:create_monthly_access_code"
+CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO = "diet:admin:create_discount_promo"
+CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS = "diet:admin:list_discount_promos"
+CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO = "diet:admin:disable_discount_promo"
+ADMIN_PROMO_CALLBACKS = frozenset(
+    {
+        CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE,
+        CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO,
+        CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+        CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO,
+    }
+)
 CALLBACK_ONE_DAY_PLAN = "diet:one_day"
 CALLBACK_WEEK_PLAN_PDF = "diet:week_pdf"
 CALLBACK_ANSWER_PREFIX = "diet:answer:"
 ADMIN_CREATE_MONTHLY_ACCESS_CODE_TEXT = "🎟 Создать код на месяц"
+ADMIN_CREATE_DISCOUNT_PROMO_TEXT = "🏷 Создать/обновить скидку"
+ADMIN_LIST_DISCOUNT_PROMOS_TEXT = "📋 Список скидок"
+ADMIN_DISABLE_DISCOUNT_PROMO_TEXT = "🚫 Отключить скидку"
 ADMIN_PROMO_PANEL_TEXT = "Админ-панель\n\nВыберите действие:"
+ADMIN_DISCOUNT_PROMO_INPUT_TEXT = (
+    "Отправьте discount promo в формате:\n"
+    "CODE PERCENT\n\n"
+    "Пример: ANNA20 20"
+)
+ADMIN_DISABLE_DISCOUNT_PROMO_INPUT_TEXT = "Отправьте CODE скидки, которую нужно отключить."
+ADMIN_PROMO_STORAGE_UNAVAILABLE_TEXT = (
+    "Discount promo storage не настроен. Скидки можно управлять только при включенном payment storage."
+)
 SELECTED_ANSWER_PREFIX = "✅ "
 PAYLOAD_SUBSCRIPTION_MONTH = "diet:stars:subscription_month"
 PAYLOAD_EXTRA_ONE_DAY = "diet:stars:extra_one_day"
@@ -577,13 +603,41 @@ async def handle_callback(callback: CallbackQuery) -> None:
         SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     if data != CALLBACK_PROMO_CODE:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    if data not in ADMIN_PROMO_CALLBACKS:
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
 
     if data == CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE:
         if not _is_admin_callback(callback):
             await callback.answer("Command is available only to admins.")
             return
         await callback.answer()
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
         await _send_admin_monthly_access_code(message)
+        return
+
+    if data == CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        await _start_admin_discount_promo_create(message)
+        return
+
+    if data == CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await _send_admin_discount_promo_list(message)
+        return
+
+    if data == CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        await _start_admin_discount_promo_disable(message)
         return
 
     if data == CALLBACK_SUPPORT:
@@ -770,6 +824,13 @@ async def handle_answer(message: Message) -> None:
         await payment_event_reconciliation_command(message)
         return
     if not await ensure_private_chat(message):
+        return
+    if chat_id in ADMIN_PROMO_ACTION_BY_CHAT_ID and normalized_command is None:
+        if not _is_admin_message(message):
+            ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(chat_id, None)
+            await message.answer("Command is available only to admins.")
+            return
+        await _handle_admin_promo_action_input(message, text)
         return
     if text == SUPPORT_TEXT:
         await _start_support_request(message)
@@ -2735,6 +2796,24 @@ def _admin_promo_panel_keyboard() -> InlineKeyboardMarkup:
                     callback_data=CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE,
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_CREATE_DISCOUNT_PROMO_TEXT,
+                    callback_data=CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_LIST_DISCOUNT_PROMOS_TEXT,
+                    callback_data=CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_DISABLE_DISCOUNT_PROMO_TEXT,
+                    callback_data=CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO,
+                ),
+            ],
         ],
     )
 
@@ -2744,6 +2823,201 @@ async def _send_admin_promo_panel(message: Message) -> None:
         ADMIN_PROMO_PANEL_TEXT,
         reply_markup=_admin_promo_panel_keyboard(),
     )
+
+
+@dataclass(frozen=True)
+class _AdminDiscountPromoInput:
+    code: str
+    percent: int
+
+
+def _set_admin_promo_action(chat_id: int, action: str) -> None:
+    SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+    PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+    SESSION_BY_CHAT_ID.pop(chat_id, None)
+    ADMIN_PROMO_ACTION_BY_CHAT_ID[chat_id] = action
+
+
+async def _start_admin_discount_promo_create(message: Message) -> None:
+    _set_admin_promo_action(message.chat.id, ADMIN_PROMO_ACTION_CREATE_DISCOUNT)
+    await message.answer(ADMIN_DISCOUNT_PROMO_INPUT_TEXT)
+
+
+async def _start_admin_discount_promo_disable(message: Message) -> None:
+    _set_admin_promo_action(message.chat.id, ADMIN_PROMO_ACTION_DISABLE_DISCOUNT)
+    await message.answer(ADMIN_DISABLE_DISCOUNT_PROMO_INPUT_TEXT)
+
+
+async def _handle_admin_promo_action_input(message: Message, text: str) -> None:
+    action = ADMIN_PROMO_ACTION_BY_CHAT_ID.get(message.chat.id)
+    if action == ADMIN_PROMO_ACTION_CREATE_DISCOUNT:
+        parsed, error = _parse_admin_discount_promo_input(text)
+        if error is not None or parsed is None:
+            await message.answer(error or ADMIN_DISCOUNT_PROMO_INPUT_TEXT)
+            return
+        promo, error = _create_or_update_admin_discount_promo(parsed)
+        if error is not None or promo is None:
+            await message.answer(error or ADMIN_PROMO_STORAGE_UNAVAILABLE_TEXT)
+            return
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await message.answer(
+            f"Скидка активна: {promo.code}\nРазмер скидки: {promo.discount_percent}%."
+        )
+        return
+
+    if action == ADMIN_PROMO_ACTION_DISABLE_DISCOUNT:
+        code, error = _parse_admin_discount_code_input(text)
+        if error is not None or code is None:
+            await message.answer(error or ADMIN_DISABLE_DISCOUNT_PROMO_INPUT_TEXT)
+            return
+        promo, error = _disable_admin_discount_promo(code)
+        if error is not None or promo is None:
+            await message.answer(error or f"Discount promo code {code} не найден.")
+            return
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await message.answer(f"Скидка отключена: {promo.code}.")
+        return
+
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+
+
+def _parse_admin_discount_promo_input(
+    text: str,
+) -> tuple[_AdminDiscountPromoInput | None, str | None]:
+    stripped = text.strip()
+    if not stripped:
+        return None, "Отправьте код и процент скидки в формате CODE PERCENT."
+
+    parts = stripped.split()
+    if len(parts) == 1:
+        return None, "Не указан процент скидки. Формат: CODE PERCENT."
+    if len(parts) > 2:
+        return None, "Код должен быть без пробелов. Формат: CODE PERCENT."
+
+    code = normalize_promo_code(parts[0].strip().upper())
+    if not code:
+        return None, "Код не должен быть пустым."
+
+    try:
+        percent = int(parts[1])
+    except ValueError:
+        return None, "Процент скидки должен быть числом от 1 до 90."
+
+    if percent < 1 or percent > 90:
+        return None, "Процент скидки должен быть от 1 до 90."
+    return _AdminDiscountPromoInput(code=code, percent=percent), None
+
+
+def _parse_admin_discount_code_input(text: str) -> tuple[str | None, str | None]:
+    stripped = text.strip()
+    if not stripped:
+        return None, "Отправьте CODE скидки."
+    parts = stripped.split()
+    if len(parts) != 1:
+        return None, "Код скидки должен быть без пробелов."
+    code = normalize_promo_code(parts[0].strip().upper())
+    if not code:
+        return None, "Код не должен быть пустым."
+    return code, None
+
+
+def _create_or_update_admin_discount_promo(
+    parsed: _AdminDiscountPromoInput,
+) -> tuple[PromoCodeDefinition | None, str | None]:
+    store = _runtime_store()
+    getter = getattr(store, "get_promo_code", None)
+    creator = getattr(store, "create_promo_code", None)
+    if store is None or not callable(getter) or not callable(creator):
+        return None, ADMIN_PROMO_STORAGE_UNAVAILABLE_TEXT
+
+    existing = getter(parsed.code)
+    if existing is not None and existing.kind != PromoCodeKind.DISCOUNT:
+        return (
+            None,
+            f"Код {parsed.code} уже существует как {existing.kind.value}. Через discount flow его не меняю.",
+        )
+
+    definition = PromoCodeDefinition(
+        code=parsed.code,
+        kind=PromoCodeKind.DISCOUNT,
+        active=True,
+        expires_at=existing.expires_at if existing is not None else None,
+        max_redemptions=existing.max_redemptions if existing is not None else None,
+        per_user_limit=existing.per_user_limit if existing is not None else 1,
+        discount_percent=parsed.percent,
+        used_count=existing.used_count if existing is not None else 0,
+        metadata={"source": "admin_discount_panel"},
+    )
+    return creator(definition), None
+
+
+async def _send_admin_discount_promo_list(message: Message) -> None:
+    promos, error = _list_admin_discount_promos()
+    if error is not None:
+        await message.answer(error)
+        return
+    await message.answer(_format_admin_discount_promo_list(promos))
+
+
+def _list_admin_discount_promos() -> tuple[list[PromoCodeDefinition], str | None]:
+    store = _runtime_store()
+    lister = getattr(store, "list_promo_codes", None)
+    if store is None or not callable(lister):
+        return [], ADMIN_PROMO_STORAGE_UNAVAILABLE_TEXT
+    promos = lister(kind=PromoCodeKind.DISCOUNT, active_only=True)
+    return [
+        promo
+        for promo in promos
+        if promo.kind == PromoCodeKind.DISCOUNT and promo.is_active_at()
+    ], None
+
+
+def _format_admin_discount_promo_list(promos: list[PromoCodeDefinition]) -> str:
+    if not promos:
+        return "Активных discount promo codes нет."
+
+    lines = ["Активные discount promo codes:"]
+    for promo in sorted(promos, key=lambda item: item.code):
+        discount = (
+            f"{promo.discount_percent}%"
+            if promo.discount_percent is not None
+            else f"{promo.discount_amount} minor units"
+        )
+        limit = str(promo.max_redemptions) if promo.max_redemptions is not None else "без лимита"
+        expires_at = f", до {promo.expires_at[:10]}" if promo.expires_at else ""
+        lines.append(
+            f"{promo.code} — {discount}, использовано {promo.used_count}/{limit}{expires_at}"
+        )
+    return "\n".join(lines)
+
+
+def _disable_admin_discount_promo(
+    code: str,
+) -> tuple[PromoCodeDefinition | None, str | None]:
+    store = _runtime_store()
+    getter = getattr(store, "get_promo_code", None)
+    disabler = getattr(store, "disable_promo_code", None)
+    creator = getattr(store, "create_promo_code", None)
+    if store is None or not callable(getter):
+        return None, ADMIN_PROMO_STORAGE_UNAVAILABLE_TEXT
+
+    existing = getter(code)
+    if existing is None:
+        return None, f"Discount promo code {code} не найден."
+    if existing.kind != PromoCodeKind.DISCOUNT:
+        return (
+            None,
+            f"Код {code} имеет тип {existing.kind.value}. Через discount flow отключаются только discount promo.",
+        )
+
+    if callable(disabler):
+        disabled = disabler(code, kind=PromoCodeKind.DISCOUNT)
+        return disabled, None if disabled is not None else f"Discount promo code {code} не найден."
+
+    if not callable(creator):
+        return None, ADMIN_PROMO_STORAGE_UNAVAILABLE_TEXT
+    disabled = PromoCodeDefinition(**{**existing.to_dict(), "active": False})
+    return creator(disabled), None
 
 
 async def _admin_access_code_command(message: Message) -> None:

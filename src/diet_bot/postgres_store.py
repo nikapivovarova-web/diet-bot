@@ -603,6 +603,74 @@ class PostgresDietBotStore:
         except ValueError:
             return None
 
+    def list_promo_codes(
+        self,
+        *,
+        kind: PromoCodeKind | str | None = None,
+        active_only: bool = False,
+        now: datetime | None = None,
+    ) -> list[PromoCodeDefinition]:
+        expected_kind = PromoCodeKind(kind) if kind is not None else None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if expected_kind is None:
+                    cur.execute("SELECT * FROM promo_codes ORDER BY code")
+                else:
+                    cur.execute(
+                        "SELECT * FROM promo_codes WHERE kind = %s ORDER BY code",
+                        (expected_kind.value,),
+                    )
+                rows = cur.fetchall()
+
+        promos: list[PromoCodeDefinition] = []
+        for row in rows:
+            try:
+                promos.append(_row_to_promo_definition(row))
+            except ValueError:
+                continue
+        if active_only:
+            current_time = _normalize_datetime(now)
+            promos = [promo for promo in promos if promo.is_active_at(current_time)]
+        return promos
+
+    def disable_promo_code(
+        self,
+        raw_code: str,
+        *,
+        kind: PromoCodeKind | str | None = None,
+    ) -> PromoCodeDefinition | None:
+        code = normalize_promo_code(raw_code)
+        if not code:
+            return None
+        expected_kind = PromoCodeKind(kind) if kind is not None else None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                promo = self._select_promo_for_update_cur(cur, code)
+                if promo is None:
+                    return None
+                promo_kind = _promo_definition_kind(promo)
+                if expected_kind is not None and promo_kind != expected_kind:
+                    return None
+                cur.execute(
+                    """
+                    UPDATE promo_codes
+                    SET is_active = false
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (int(promo["id"]),),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError("Could not disable promo code.")
+                self._insert_promo_event_cur(
+                    cur,
+                    int(row["id"]),
+                    "disabled",
+                    metadata=promo_code_audit_metadata(code, kind=promo_kind.value),
+                )
+        return _row_to_promo_definition(row)
+
     def redeem_promo_code(
         self,
         user_id: int,
