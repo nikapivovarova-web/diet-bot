@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from contextlib import suppress
 from datetime import date
 from html import escape
+from io import BytesIO
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -28,6 +29,10 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+
+PILImage = None
+with suppress(ImportError):
+    from PIL import Image as PILImage
 
 from .chef import format_display_grams, format_ingredient
 from .domain import Meal, MealPlan
@@ -57,6 +62,8 @@ CARD_BACKGROUND = colors.HexColor("#FFFFFF")
 TEXT_COLOR = colors.HexColor("#243126")
 MUTED_COLOR = colors.HexColor("#66736A")
 LINE_COLOR = colors.HexColor("#D8E2D3")
+WARNING_BG = colors.HexColor("#FFF1DC")
+WARNING_TEXT = colors.HexColor("#875A1C")
 EMOJI_RE = re.compile("[\U0001f300-\U0001faff\u2600-\u27bf\ufe0f]")
 LONG_TOKEN_MAX_CHARS = 48
 LONG_TOKEN_RE = re.compile(r"\S{" + str(LONG_TOKEN_MAX_CHARS + 1) + r",}")
@@ -164,26 +171,42 @@ def _cover_page(
     story: list = [
         Spacer(1, 8 * mm),
         _cover_header(date_range, styles, doc_width),
-        Spacer(1, 11 * mm),
-        _summary_table(first_plan, meal_count, styles),
-        Spacer(1, 6 * mm),
+        Spacer(1, 13 * mm),
+        _summary_table(first_plan, meal_count, styles, doc_width),
+        Spacer(1, 13 * mm),
         _section_title_with_icon("🧮", "Ваш расчет", styles, doc_width),
     ]
 
-    for line in format_calculation_summary(first_plan.targets, first_plan.safety).splitlines():
-        if line.strip():
+    calculation_lines = [
+        line
+        for line in format_calculation_summary(first_plan.targets, first_plan.safety).splitlines()
+        if _clean_text(line)
+    ]
+    if calculation_lines and _clean_text(calculation_lines[0]).lower() == "ваш расчет":
+        calculation_lines = calculation_lines[1:]
+
+    for line in calculation_lines:
+        if _clean_text(line):
             story.append(_calculation_line(line, styles, doc_width))
         else:
-            story.append(Spacer(1, 2 * mm))
+            story.append(Spacer(1, 1.5 * mm))
+
+    story.append(Spacer(1, 7 * mm))
+    story.append(_notice_box("Медицинский дисклеймер", _cover_notice_text(first_plan), styles, doc_width))
+    story.append(Spacer(1, 5 * mm))
+    story.append(_p(_cover_drinks_note(first_plan), styles["Body"]))
+
     qr_block = _cover_qr_block(styles, doc_width)
-    if qr_block is not None:
-        story.append(Spacer(1, 7 * mm))
+    if qr_block:
+        story.append(Spacer(1, 8 * mm))
         story.append(qr_block)
+        story.append(Spacer(1, 3 * mm))
+    story.append(_p(_cover_variation_note(), styles["CoverFinePrint"]))
     return story
 
 
 def _cover_header(date_range: str, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
-    logo = _asset_image(PDF_LOGO_PATH, 30 * mm, 30 * mm) or ""
+    logo = _cover_logo_image(30 * mm, 30 * mm) or ""
     text = [
         _p("Food Balance", styles["CoverBrandLeft"]),
         _p("Рацион на неделю", styles["CoverTitleLeft"]),
@@ -232,33 +255,183 @@ def _asset_image(path: Path, max_width: float, max_height: float) -> Image | Non
     if not path.exists():
         return None
     try:
-        reader = ImageReader(str(path))
-        width, height = reader.getSize()
-        scale = min(max_width / width, max_height / height)
-        return Image(str(path), width=width * scale, height=height * scale)
+        return _image_from_source(str(path), max_width, max_height)
     except Exception:
         return None
 
 
-def _summary_table(plan: MealPlan, meal_count: int, styles: dict[str, ParagraphStyle]) -> Table:
+def _cover_logo_image(max_width: float, max_height: float) -> Image | None:
+    if not PDF_LOGO_PATH.exists():
+        return None
+    try:
+        return _image_from_source(_transparent_logo_source(PDF_LOGO_PATH), max_width, max_height)
+    except Exception:
+        return _asset_image(PDF_LOGO_PATH, max_width, max_height)
+
+
+def _image_from_source(source, max_width: float, max_height: float) -> Image:
+    reader = ImageReader(source)
+    width, height = reader.getSize()
+    if hasattr(source, "seek"):
+        source.seek(0)
+    scale = min(max_width / width, max_height / height)
+    return Image(source, width=width * scale, height=height * scale)
+
+
+def _transparent_logo_source(path: Path):
+    if PILImage is None:
+        return str(path)
+
+    try:
+        with PILImage.open(path) as source:
+            image = source.convert("RGBA")
+            pixels = image.load()
+            width, height = image.size
+            visited = bytearray(width * height)
+            stack: list[tuple[int, int]] = []
+
+            def index(x: int, y: int) -> int:
+                return y * width + x
+
+            def is_light_background(x: int, y: int) -> bool:
+                red, green, blue, alpha = pixels[x, y]
+                return alpha > 0 and min(red, green, blue) >= 235
+
+            for x in range(width):
+                for y in (0, height - 1):
+                    if is_light_background(x, y):
+                        stack.append((x, y))
+            for y in range(height):
+                for x in (0, width - 1):
+                    if is_light_background(x, y):
+                        stack.append((x, y))
+
+            removed = 0
+            while stack:
+                x, y = stack.pop()
+                pos = index(x, y)
+                if visited[pos] or not is_light_background(x, y):
+                    continue
+                visited[pos] = 1
+                red, green, blue, _alpha = pixels[x, y]
+                pixels[x, y] = (red, green, blue, 0)
+                removed += 1
+                if x > 0:
+                    stack.append((x - 1, y))
+                if x + 1 < width:
+                    stack.append((x + 1, y))
+                if y > 0:
+                    stack.append((x, y - 1))
+                if y + 1 < height:
+                    stack.append((x, y + 1))
+
+            if removed == 0:
+                return str(path)
+
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            buffer.seek(0)
+            return buffer
+    except Exception:
+        return str(path)
+
+
+def _cover_notice_text(plan: MealPlan) -> str:
+    return (
+        "Этот рацион не является медицинским назначением, диагнозом или клинической рекомендацией. "
+        "При заболеваниях, беременности, кормлении грудью, расстройствах пищевого поведения, "
+        "выраженном дефиците или избытке массы тела, а также при плохом самочувствии согласуйте рацион с врачом."
+    )
+
+
+def _cover_drinks_note(plan: MealPlan) -> str:
+    return (
+        "Если вы пьете соки, газировку, сладкий чай, энергетики или другие калорийные напитки, "
+        "учитывайте их отдельно: они могут заметно добавить калории и сахар."
+    )
+
+
+def _cover_variation_note() -> str:
+    return (
+        "Это ориентировочный расчет. В реальности значения могут немного отличаться из-за бренда продуктов, "
+        "способа приготовления и точности порций."
+    )
+
+
+def _summary_table(plan: MealPlan, meal_count: int, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
     targets = plan.targets.targets
-    data = [[
-        [_emoji_label("📌", "ИМТ", styles), _p(str(plan.targets.bmi), styles["MetricValue"])],
-        [_emoji_label("🎯", "Цель", styles), _p(f"{targets.get('energy_kcal'):.0f} ккал/день", styles["MetricValue"])],
-        [_emoji_label("💧", "Вода", styles), _p(f"{plan.targets.water_l:.1f} л/день", styles["MetricValue"])],
-        [_emoji_label("🍽️", "Блюд", styles), _p(f"{meal_count} за неделю", styles["MetricValue"])],
+    bmi = float(plan.targets.bmi or 0)
+    bmi_text = f"{bmi:g}" if bmi > 0 else "-"
+    data = [
+        [
+            _metric_card("📌", "ИМТ", bmi_text, _bmi_category_label(plan.targets.bmi_category), styles),
+            _metric_card(
+                "🎯",
+                "Цель",
+                f"{targets.get('energy_kcal'):.0f} ккал/день",
+                "суточный ориентир",
+                styles,
+            ),
+            _metric_card("💧", "Вода", f"{plan.targets.water_l:.1f} л/день", "питьевая вода", styles),
+            _metric_card("🍽", "Рацион", f"{meal_count} приемов пищи", "на 7 дней", styles),
+        ]
     ]
-    ]
-    table = Table(data, colWidths=[42 * mm, 42 * mm, 42 * mm, 42 * mm], hAlign="LEFT")
+    table = Table(data, colWidths=[doc_width / 4] * 4, hAlign="LEFT")
     table.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, -1), SOFT_GREEN),
                 ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
-                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.white),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, LINE_COLOR),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+            ]
+        )
+    )
+    return table
+
+
+def _metric_card(icon: str, label: str, value: str, hint: str, styles: dict[str, ParagraphStyle]) -> list:
+    return [
+        _emoji_p(icon, styles["MetricEmoji"]),
+        Spacer(1, 1 * mm),
+        _p(label, styles["MetricLabel"]),
+        Spacer(1, 1.5 * mm),
+        _p(value, styles["MetricValue"]),
+        Spacer(1, 1 * mm),
+        _p(hint, styles["MetricHint"]),
+    ]
+
+
+def _bmi_category_label(category: str) -> str:
+    labels = {
+        "underweight": "дефицит массы",
+        "normal": "нормальный ИМТ",
+        "overweight": "избыточная масса",
+    }
+    return labels.get(category, category)
+
+
+def _notice_box(title: str, text: str, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    table = Table(
+        [[_p(title, styles["NoticeTitle"])], [_p(text, styles["NoticeBody"])]],
+        colWidths=[doc_width],
+        hAlign="LEFT",
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), WARNING_BG),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E7C28D")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("TOPPADDING", (0, 0), (-1, -1), 7),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ("LEFTPADDING", (0, 0), (-1, -1), 9),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 9),
             ]
         )
     )
@@ -1470,8 +1643,8 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             "FoodBalanceCoverBrandLeft",
             parent=body,
             fontName=bold_font,
-            fontSize=18,
-            leading=21,
+            fontSize=21,
+            leading=24,
             textColor=BRAND_GREEN,
         ),
         "CoverTitleLeft": ParagraphStyle(
@@ -1597,6 +1770,21 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             textColor=BRAND_GREEN,
             spaceAfter=1 * mm,
         ),
+        "NoticeTitle": ParagraphStyle(
+            "FoodBalanceNoticeTitle",
+            parent=body,
+            fontName=bold_font,
+            fontSize=11.8,
+            leading=14.5,
+            textColor=WARNING_TEXT,
+        ),
+        "NoticeBody": ParagraphStyle(
+            "FoodBalanceNoticeBody",
+            parent=body,
+            fontSize=10.5,
+            leading=14,
+            textColor=WARNING_TEXT,
+        ),
         "Credit": ParagraphStyle(
             "FoodBalanceCredit",
             parent=body,
@@ -1656,6 +1844,14 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             fontSize=12.8,
             leading=16,
             textColor=DEEP_GREEN,
+            alignment=TA_CENTER,
+        ),
+        "MetricHint": ParagraphStyle(
+            "FoodBalanceMetricHint",
+            parent=body,
+            fontSize=8.8,
+            leading=10.5,
+            textColor=MUTED_COLOR,
             alignment=TA_CENTER,
         ),
         "TableHeaderCenter": ParagraphStyle(
@@ -1722,6 +1918,15 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             leading=12.2,
             textColor=MUTED_COLOR,
             spaceAfter=0.8 * mm,
+        ),
+        "CoverFinePrint": ParagraphStyle(
+            "FoodBalanceCoverFinePrint",
+            parent=body,
+            fontSize=8.3,
+            leading=10.2,
+            alignment=TA_CENTER,
+            textColor=MUTED_COLOR,
+            spaceAfter=0,
         ),
         "QrCaption": ParagraphStyle(
             "FoodBalanceQrCaption",

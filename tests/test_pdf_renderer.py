@@ -77,6 +77,24 @@ def test_week_pdf_uses_branded_cover_shell(tmp_path: Path, sample_week_dates) ->
     assert "@FOODBALANCERU_BOT" in text
 
 
+def test_week_pdf_cover_notes_and_summary_labels(tmp_path: Path, sample_week_dates) -> None:
+    plan = _plan_for_recipe(built_in_recipes()[0])
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "cover-notes.pdf")
+    reader = PdfReader(str(pdf_path))
+    cover_text = _compact_text(reader.pages[0].extract_text() or "")
+
+    assert "Медицинский дисклеймер" in cover_text
+    assert "Если вы пьете соки, газировку, сладкий чай, энергетики" in cover_text
+    assert "учитывайте их отдельно" in cover_text
+    assert "ориентировочный расчет" in cover_text
+    assert "В реальности значения могут немного отличаться из-за бренда продуктов" in cover_text
+    assert "точности порций" in cover_text
+    assert cover_text.count("Ваш расчет") == 1
+    assert "Рацион" in cover_text
+    assert "Блюд" not in cover_text
+
+
 def test_week_pdf_keeps_cover_separate_from_day_one(tmp_path: Path, sample_week_dates) -> None:
     plan = _plan_for_recipe(built_in_recipes()[0])
 
