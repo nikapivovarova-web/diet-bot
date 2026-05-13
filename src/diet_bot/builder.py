@@ -63,50 +63,25 @@ CARBOHYDRATE_TOP_UP_CEILING_MULTIPLIER = 1.18
 CARBOHYDRATE_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.08
 CARBOHYDRATE_RECIPE_HARD_LIMIT_MULTIPLIER = 1.24
 SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
-    "выпек",
-    "марин",
-    "охлажд",
-    "ноч",
     "несколько этап",
     "ваф",
     "блендер",
     "комбайн",
-    "гриль",
-    "аэрогриль",
+    "грил",
+    "аэрогрил",
     "мультиварк",
     "фритюр",
-    "bake",
-    "baking",
-    "marinat",
-    "overnight",
-    "waffle",
-    "blender",
-    "processor",
-    "grill",
-    "air fryer",
-    "fryer",
-)
-SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS = (
     "several stages",
-    "несколько этап",
-    "ваф",
-    "блендер",
-    "комбайн",
-    "гриль",
-    "аэрогриль",
-    "мультиварк",
-    "фритюр",
-    "bake",
-    "baking",
-    "marinat",
-    "overnight",
     "waffle",
     "blender",
+    "food processor",
     "processor",
     "grill",
     "air fryer",
     "fryer",
 )
+SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS = SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS
+MATCH_TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
 
 
 @dataclass(frozen=True)
@@ -271,6 +246,45 @@ VEGETABLE_GARNISH_IDS = frozenset(
         "tomato",
         "zucchini",
     }
+)
+MAIN_LIKE_SNACK_PROTEIN_IDS = ANIMAL_GARNISH_PROTEIN_IDS | frozenset(
+    {
+        "black_beans",
+        "chickpeas",
+        "edamame",
+        "egg",
+        "egg_white",
+        "egg_white_extra",
+        "hummus",
+        "kidney_beans",
+        "lentils",
+        "tempeh",
+        "tofu",
+        "white_beans",
+    }
+)
+MAIN_LIKE_SNACK_STRUCTURE_IDS = STARCHY_GARNISH_IDS | VEGETABLE_GARNISH_IDS | frozenset(
+    {
+        "avocado",
+        "pita_extra",
+    }
+)
+MAIN_LIKE_SNACK_BLOCKED_FORMAT_KEYWORDS = (
+    "маффин",
+    "панкейк",
+    "олад",
+    "овсян",
+    "пудинг",
+    "парфе",
+    "смузи",
+    "сырник",
+    "muffin",
+    "pancake",
+    "oat",
+    "pudding",
+    "parfait",
+    "smoothie",
+    "syrniki",
 )
 
 
@@ -553,7 +567,7 @@ def _build_recipe_plan(
                 image_attribution=recipe.image_attribution,
                 source_url=recipe.source_url,
                 recipe_id=recipe.id,
-                recipe_key=_recipe_memory_key(recipe),
+                recipe_key=_recipe_memory_key(recipe, slot),
             )
         )
 
@@ -711,9 +725,26 @@ def _instruction_sentence_count(text: str) -> int:
 def _has_complex_cooking_technique(recipe: RecipeTemplate) -> bool:
     title_and_time = " ".join((recipe.title, recipe.time_text)).lower()
     instructions = recipe.instructions.lower()
-    return any(keyword in title_and_time for keyword in SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS) or any(
-        keyword in instructions for keyword in SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS
+    return any(_text_contains_keyword(title_and_time, keyword) for keyword in SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS) or any(
+        _text_contains_keyword(instructions, keyword) for keyword in SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS
     )
+
+
+def _text_contains_keyword(text: str, keyword: str) -> bool:
+    normalized_keyword = keyword.lower().strip()
+    if not normalized_keyword:
+        return False
+    keyword_tokens = MATCH_TOKEN_RE.findall(normalized_keyword)
+    if not keyword_tokens:
+        return normalized_keyword in text.lower()
+    text_tokens = MATCH_TOKEN_RE.findall(text.lower())
+    if len(keyword_tokens) == 1:
+        keyword_token = keyword_tokens[0]
+        return any(token == keyword_token or token.startswith(keyword_token) for token in text_tokens)
+    for index in range(0, len(text_tokens) - len(keyword_tokens) + 1):
+        if text_tokens[index : index + len(keyword_tokens)] == keyword_tokens:
+            return True
+    return False
 
 
 def _recipe_time_bucket(recipe: RecipeTemplate) -> TimeBucket:
@@ -730,18 +761,19 @@ def _recipe_time_bucket(recipe: RecipeTemplate) -> TimeBucket:
 def _parse_active_minutes(time_text: str) -> float | None:
     normalized = time_text.lower().replace("–", "-").replace("—", "-")
     active_text = normalized.split("+", 1)[0]
+    active_text = re.split(r"\bplus\b", active_text, maxsplit=1)[0]
     hour_minute_matches = re.findall(
-        r"(\d+(?:[,.]\d+)?)\s*(?:ч|час\w*)\s*(?:(\d+)\s*мин)?",
+        r"(\d+(?:[,.]\d+)?)\s*(?:ч|час\w*|h|hr|hrs|hour\w*)\s*(?:(\d+)\s*(?:мин|m|min|mins|minute\w*))?",
         active_text,
     )
     if hour_minute_matches:
         return max(float(hours.replace(",", ".")) * 60 + float(minutes or 0) for hours, minutes in hour_minute_matches)
 
-    minute_matches = re.findall(r"(\d+)(?:\s*-\s*(\d+))?\s*мин", active_text)
+    minute_matches = re.findall(r"(\d+)(?:\s*-\s*(\d+))?\s*(?:мин|m|min|mins|minute\w*)", active_text)
     if minute_matches:
         return max(float(end or start) for start, end in minute_matches)
 
-    hour_matches = re.findall(r"(\d+(?:[,.]\d+)?)\s*(?:ч|час)", active_text)
+    hour_matches = re.findall(r"(\d+(?:[,.]\d+)?)\s*(?:ч|час|h|hr|hrs|hour\w*)", active_text)
     if hour_matches:
         return max(float(value.replace(",", ".")) * 60 for value in hour_matches)
 
@@ -990,6 +1022,47 @@ def _select_recipe(
     return ranked[0] if ranked else None
 
 
+def _recipe_is_eligible_for_slot(
+    recipe: RecipeTemplate,
+    slot: str,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    target: NutrientVector,
+) -> bool:
+    if recipe.slot == slot:
+        return True
+    if slot == "main":
+        return _snack_recipe_can_fill_main_slot(recipe, food_by_id, slot_energy_target, target)
+    return False
+
+
+def _snack_recipe_can_fill_main_slot(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    target: NutrientVector,
+) -> bool:
+    if recipe.slot != "snack":
+        return False
+    title_and_id = f"{recipe.id} {recipe.title}".lower()
+    if any(_text_contains_keyword(title_and_id, keyword) for keyword in MAIN_LIKE_SNACK_BLOCKED_FORMAT_KEYWORDS):
+        return False
+
+    ingredients = set(recipe.ingredients_g)
+    if not ingredients & MAIN_LIKE_SNACK_PROTEIN_IDS:
+        return False
+    if not ingredients & MAIN_LIKE_SNACK_STRUCTURE_IDS:
+        return False
+
+    projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target)
+    if projected is None:
+        return False
+    protein = projected.get("protein_g")
+    protein_floor = max(18.0, target.get("protein_g") * 0.18)
+    protein_density = protein / max(1.0, projected.get("energy_kcal"))
+    return protein >= protein_floor and protein_density >= 0.035
+
+
 def _rank_recipes(
     recipes: list[RecipeTemplate],
     slot: str,
@@ -1006,7 +1079,12 @@ def _rank_recipes(
     index: int,
     ranking_mode: RecipeRankingMode = "balanced",
 ) -> list[RecipeTemplate]:
-    candidates = [recipe for recipe in recipes if recipe.slot == slot and recipe.id not in used_recipe_ids]
+    candidates = [
+        recipe
+        for recipe in recipes
+        if recipe.id not in used_recipe_ids
+        and _recipe_is_eligible_for_slot(recipe, slot, food_by_id, slot_energy_target, target)
+    ]
     if not candidates:
         return []
 
@@ -1026,6 +1104,7 @@ def _rank_recipes(
             )
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
+        slot_mismatch_penalty = 5.0 if recipe.slot != slot else 0.0
         format_penalty = used_formats[_recipe_format(recipe)] * 0.85
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
@@ -1038,7 +1117,18 @@ def _rank_recipes(
             slot_min_energy,
             slot_max_energy,
         )
-        return seed_score + nutrient_bonus + macro_bonus + rotation_bonus + curated_bonus - overlap * 0.55 - format_penalty - macro_penalty - energy_penalty
+        return (
+            seed_score
+            + nutrient_bonus
+            + macro_bonus
+            + rotation_bonus
+            + curated_bonus
+            - overlap * 0.55
+            - slot_mismatch_penalty
+            - format_penalty
+            - macro_penalty
+            - energy_penalty
+        )
 
     return sorted(candidates, key=score, reverse=True)
 
@@ -1069,15 +1159,16 @@ def _recipe_format(recipe: RecipeTemplate) -> str:
     return "simple"
 
 
-def _recipe_memory_key(recipe: RecipeTemplate) -> str:
+def _recipe_memory_key(recipe: RecipeTemplate, slot_override: str | None = None) -> str:
+    slot = slot_override or recipe.slot
     if "curated" in recipe.tags:
-        return f"{recipe.slot}:curated:{recipe.id}"
+        return f"{slot}:curated:{recipe.id}"
 
     ingredients = set(recipe.ingredients_g)
     recipe_format = _recipe_format(recipe)
-    if recipe.slot == "breakfast":
+    if slot == "breakfast":
         return f"breakfast:{_breakfast_primary(recipe)}:{recipe_format}:{_first_present(ingredients, ('banana', 'orange', 'berries', 'apple', 'tomato', 'cucumber', 'bell_pepper', 'spinach'))}"
-    if recipe.slot == "snack":
+    if slot == "snack":
         base = _first_present(
             ingredients,
             (

@@ -28,6 +28,7 @@ RED_FLAG_CONDITIONS = {
     ConditionCode.ONCOLOGY: "oncology treatment",
     ConditionCode.SEVERE_LIVER_DISEASE: "severe liver disease",
 }
+MATCH_TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
 
 
 @dataclass(frozen=True)
@@ -657,7 +658,25 @@ def _matches_excluded_name(normalized_food_name: str, excluded_name: str) -> boo
                 normalized_food_name,
             )
         )
-    return normalized_excluded in normalized_food_name or normalized_food_name in normalized_excluded
+    return _tokenized_name_match(normalized_food_name, normalized_excluded) or _tokenized_name_match(
+        normalized_excluded,
+        normalized_food_name,
+    )
+
+
+def _tokenized_name_match(haystack: str, needle: str) -> bool:
+    haystack_tokens = MATCH_TOKEN_RE.findall(haystack)
+    needle_tokens = MATCH_TOKEN_RE.findall(needle)
+    if not haystack_tokens or not needle_tokens:
+        return False
+    if len(needle_tokens) == 1:
+        needle_token = needle_tokens[0]
+        return any(token == needle_token or token.startswith(needle_token) for token in haystack_tokens)
+    for index in range(0, len(haystack_tokens) - len(needle_tokens) + 1):
+        window = haystack_tokens[index : index + len(needle_tokens)]
+        if all(token == expected or token.startswith(expected) for token, expected in zip(window, needle_tokens)):
+            return True
+    return False
 
 
 def _has_match_exception(normalized_food_name: str, normalized_excluded: str) -> bool:
