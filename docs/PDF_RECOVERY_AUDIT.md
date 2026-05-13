@@ -91,4 +91,11 @@ Note: old `pdf_renderer.py` also contains helper pages such as `_calculation_pag
   - page 3: recipe content plus day totals;
   - page 18: shopping list.
 - Visual check result: cover logo and QR are visible; recipe photo on page 3 is visible; shopping list text is readable; warm page background and margins render consistently; no obvious text overlap, black squares, or broken images were seen in the checked pages.
-- Remaining baseline layout issues to keep in mind before restoring recipe cards/day layout: the cover currently flows directly into day 1 content on the same page, day totals can share a page with the next day header, and the shopping list continues onto page 19.
+- Remaining baseline layout issues to keep in mind before restoring recipe cards/day layout: before the closeout slice, the cover flowed directly into day 1 content on the same page; day totals could share a page with the next day header, and the shopping list continued onto page 19.
+
+## Cover flow closeout - 2026-05-13
+
+- Old `_build_story` inserted a `PageBreak()` before Day 1, so the old design used a separate cover page.
+- Clean `_build_story` now restores the cover-to-Day 1 page break with a targeted change after `_cover_page(...)`.
+- Day-to-day flow, daily totals placement, recipe cards, and shopping list layout were intentionally left unchanged for this narrow closeout slice.
+- Targeted regression coverage: `test_week_pdf_keeps_cover_separate_from_day_one` checks that page 1 has no Day 1 or meal content and page 2 starts Day 1.

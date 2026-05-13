@@ -77,6 +77,21 @@ def test_week_pdf_uses_branded_cover_shell(tmp_path: Path, sample_week_dates) ->
     assert "@FOODBALANCERU_BOT" in text
 
 
+def test_week_pdf_keeps_cover_separate_from_day_one(tmp_path: Path, sample_week_dates) -> None:
+    plan = _plan_for_recipe(built_in_recipes()[0])
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "cover-flow.pdf")
+    reader = PdfReader(str(pdf_path))
+    cover_text = _compact_text(reader.pages[0].extract_text() or "")
+    first_day_text = _compact_text(reader.pages[1].extract_text() or "")
+    first_meal_title = _clean_text(plan.meals[0].name).split(":", 1)[1].strip()
+
+    assert "\u0414\u0435\u043d\u044c 1" not in cover_text
+    assert _compact_text(first_meal_title) not in _compact_text(cover_text)
+    assert "\u0414\u0435\u043d\u044c 1" in first_day_text
+    assert _compact_text(first_meal_title) in _compact_text(first_day_text)
+
+
 def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
     logo = pdf_renderer._asset_image(pdf_renderer.PDF_LOGO_PATH, 30 * mm, 30 * mm)
     qr = pdf_renderer._asset_image(pdf_renderer.PDF_QR_PATH, 34 * mm, 34 * mm)

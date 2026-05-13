@@ -140,7 +140,7 @@ def _build_story(
 ) -> list:
     story: list = []
     story.extend(_cover_page(plans, plan_dates, styles, doc_width))
-    story.append(Spacer(1, 6 * mm))
+    story.append(PageBreak())
 
     for day_index, (plan, plan_date) in enumerate(zip(plans, plan_dates), start=1):
         story.extend(_day_section(plan, plan_date, day_index, styles, doc_width))
