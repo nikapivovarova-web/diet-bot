@@ -22,7 +22,7 @@ from .domain import (
     normalize_cooking_time_preference,
 )
 from .recipe_catalog import RecipeTemplate, built_in_recipes
-from .safety import evaluate_safety, is_food_excluded
+from .safety import evaluate_safety, is_food_excluded, is_name_excluded
 
 
 RecipeSource = Literal["all", "curated_only"]
@@ -311,6 +311,7 @@ def build_one_day_plan(
         avoided_recipe_ids or frozenset(),
         avoided_recipe_keys or frozenset(),
         recipe_source,
+        excluded_food_names=safety.excluded_food_names,
     )
     if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
         recipe_meals = _build_recipe_plan_for_time(
@@ -322,6 +323,7 @@ def build_one_day_plan(
             avoided_recipe_ids or frozenset(),
             frozenset(),
             recipe_source,
+            excluded_food_names=safety.excluded_food_names,
         )
     if not recipe_meals and allow_avoided_recipe_relaxation and (avoided_recipe_ids or avoided_recipe_keys):
         recipe_meals = _build_recipe_plan_for_time(
@@ -333,6 +335,7 @@ def build_one_day_plan(
             frozenset(),
             frozenset(),
             recipe_source,
+            excluded_food_names=safety.excluded_food_names,
         )
     if recipe_meals:
         return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
@@ -387,6 +390,7 @@ def _build_recipe_plan_for_time(
     avoided_recipe_ids: set[str] | frozenset[str],
     avoided_recipe_keys: set[str] | frozenset[str],
     recipe_source: RecipeSource,
+    excluded_food_names: frozenset[str] = frozenset(),
 ) -> list[Meal]:
     effort_constraints = _cooking_effort_constraints(cooking_time)
     for allowed_time_buckets in _time_filter_attempts(cooking_time):
@@ -400,6 +404,7 @@ def _build_recipe_plan_for_time(
             recipe_source,
             allowed_time_buckets,
             effort_constraints,
+            excluded_food_names,
         )
         if meals:
             return meals
@@ -414,6 +419,7 @@ def _build_recipe_plan_for_time(
         recipe_source,
         None,
         effort_constraints,
+        excluded_food_names,
     )
 
 
@@ -427,6 +433,7 @@ def _build_recipe_plan_candidates_for_attempt(
     recipe_source: RecipeSource,
     allowed_time_buckets: frozenset[TimeBucket] | None,
     effort_constraints: CookingEffortConstraints,
+    excluded_food_names: frozenset[str] = frozenset(),
 ) -> list[Meal]:
     meal_candidates: list[list[Meal]] = []
     seen_signatures: set[tuple[str | None, ...]] = set()
@@ -444,6 +451,7 @@ def _build_recipe_plan_candidates_for_attempt(
                 allowed_time_buckets,
                 effort_constraints,
                 ranking_mode,
+                excluded_food_names,
             )
             if not meals:
                 continue
@@ -469,6 +477,7 @@ def _build_recipe_plan(
     allowed_time_buckets: frozenset[TimeBucket] | None = None,
     effort_constraints: CookingEffortConstraints | None = None,
     ranking_mode: RecipeRankingMode = "balanced",
+    excluded_food_names: frozenset[str] = frozenset(),
 ) -> list[Meal]:
     food_by_id = {food.id: food for food in candidates}
     recipes = [
@@ -480,6 +489,7 @@ def _build_recipe_plan(
         and (recipe_source != "curated_only" or "curated" in recipe.tags)
         and (allowed_time_buckets is None or _recipe_time_bucket(recipe) in allowed_time_buckets)
         and (effort_constraints is None or _recipe_matches_cooking_effort(recipe, effort_constraints))
+        and not _recipe_title_uses_excluded_food(recipe, excluded_food_names)
     ]
     if not recipes:
         return []
@@ -684,6 +694,13 @@ def _recipe_matches_cooking_effort(
     if not constraints.allow_oven_or_sauces and _has_complex_cooking_technique(recipe):
         return False
     return True
+
+
+def _recipe_title_uses_excluded_food(
+    recipe: RecipeTemplate,
+    excluded_food_names: frozenset[str],
+) -> bool:
+    return bool(excluded_food_names) and is_name_excluded(recipe.title, excluded_food_names)
 
 
 def _instruction_sentence_count(text: str) -> int:

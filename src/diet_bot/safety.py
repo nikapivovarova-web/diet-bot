@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from .domain import (
     ConditionCode,
@@ -29,30 +30,43 @@ RED_FLAG_CONDITIONS = {
 }
 
 
-FOOD_EXCLUSION_ALIASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (
-        ("\u044f\u0439", "egg"),
-        (
+@dataclass(frozen=True)
+class FoodExclusionCategory:
+    canonical_id: str
+    canonical_name: str
+    trigger_aliases: tuple[str, ...]
+    ingredient_ids: tuple[str, ...]
+    aliases: tuple[str, ...]
+    excluded_tags: tuple[str, ...] = ()
+
+
+FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
+    FoodExclusionCategory(
+        canonical_id="egg",
+        canonical_name="eggs",
+        trigger_aliases=("\u044f\u0439", "\u044f\u0438\u0447", "egg", "eggs"),
+        ingredient_ids=("egg", "egg_white", "egg_white_extra", "egg_yolk", "egg_noodles"),
+        aliases=(
             "\u044f\u0439\u0446\u043e",
             "\u044f\u0439\u0446\u0430",
             "\u044f\u0438\u0446",
-            "\u044f\u0438\u0447",
+            "\u044f\u0438\u0447\u043d\u044b\u0439",
             "\u044f\u0438\u0447\u043d\u044b\u0439 \u0431\u0435\u043b\u043e\u043a",
             "\u044f\u0438\u0447\u043d\u044b\u0439 \u0436\u0435\u043b\u0442\u043e\u043a",
             "\u0436\u0435\u043b\u0442\u043e\u043a",
             "egg",
             "eggs",
-            "egg yolk",
             "egg white",
+            "egg yolk",
             "egg noodles",
-            "egg_noodles",
-            "egg_yolk",
-            "egg_white_extra",
         ),
     ),
-    (
-        ("\u0431\u0440\u043e\u043a", "broccoli", "broccolini"),
-        (
+    FoodExclusionCategory(
+        canonical_id="broccoli",
+        canonical_name="broccoli",
+        trigger_aliases=("\u0431\u0440\u043e\u043a\u043a\u043e\u043b", "broccoli", "broccolini"),
+        ingredient_ids=("broccoli",),
+        aliases=(
             "\u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438",
             "\u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438\u043d\u0438",
             "broccoli",
@@ -60,65 +74,413 @@ FOOD_EXCLUSION_ALIASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
             "broccoli rabe",
         ),
     ),
-    (
-        ("гриб", "шампиньон", "mushroom"),
-        ("гриб", "грибы", "шампиньон", "шампиньоны", "mushroom", "mushrooms", "шиитаке", "shiitake"),
+    FoodExclusionCategory(
+        canonical_id="dairy",
+        canonical_name="milk and dairy",
+        trigger_aliases=(
+            "\u043c\u043e\u043b\u043e\u043a",
+            "\u043c\u043e\u043b\u043e\u0447",
+            "\u043b\u0430\u043a\u0442\u043e\u0437",
+            "milk",
+            "dairy",
+            "lactose",
+        ),
+        ingredient_ids=(
+            "milk",
+            "buttermilk",
+            "greek_yogurt",
+            "lactose_free_yogurt",
+            "cottage_cheese",
+            "lactose_free_cottage_cheese",
+            "cream_cheese",
+            "goat_cheese",
+            "american_cheese",
+            "processed_cheese",
+            "swiss_cheese",
+            "gouda",
+            "cheddar",
+            "feta",
+            "mozzarella",
+            "parmesan",
+            "ricotta",
+            "mascarpone",
+        ),
+        aliases=(
+            "\u043c\u043e\u043b\u043e\u043a\u043e",
+            "\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+            "\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0439",
+            "\u043c\u043e\u043b\u043e\u0447\u043d\u0430\u044f",
+            "\u043c\u043e\u043b\u043e\u0447\u043d\u043e\u0435",
+            "\u0439\u043e\u0433\u0443\u0440\u0442",
+            "\u0442\u0432\u043e\u0440\u043e\u0433",
+            "\u0441\u044b\u0440",
+            "milk",
+            "dairy",
+            "yogurt",
+            "cottage cheese",
+            "cheese",
+        ),
     ),
-    (
-        ("орех", "nuts"),
-        (
-            "орех",
-            "орехи",
-            "грецкий орех",
-            "грецкие орехи",
-            "миндаль",
-            "арахис",
-            "кешью",
-            "пекан",
-            "фисташки",
+    FoodExclusionCategory(
+        canonical_id="cottage_cheese",
+        canonical_name="cottage cheese",
+        trigger_aliases=("\u0442\u0432\u043e\u0440\u043e\u0433", "\u0442\u0432\u043e\u0440\u043e\u0436", "cottage cheese"),
+        ingredient_ids=("cottage_cheese", "lactose_free_cottage_cheese"),
+        aliases=(
+            "\u0442\u0432\u043e\u0440\u043e\u0433",
+            "\u0442\u0432\u043e\u0440\u043e\u0436\u043d\u044b\u0439",
+            "\u0442\u0432\u043e\u0440\u043e\u0436\u043d\u0430\u044f",
+            "\u0442\u0432\u043e\u0440\u043e\u0436\u043d\u044b\u0435",
+            "cottage cheese",
+            "curd",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="cheese",
+        canonical_name="cheese",
+        trigger_aliases=("\u0441\u044b\u0440", "cheese"),
+        ingredient_ids=(
+            "cream_cheese",
+            "goat_cheese",
+            "american_cheese",
+            "processed_cheese",
+            "swiss_cheese",
+            "gouda",
+            "cheddar",
+            "feta",
+            "mozzarella",
+            "parmesan",
+            "ricotta",
+            "mascarpone",
+        ),
+        aliases=(
+            "\u0441\u044b\u0440",
+            "\u0441\u044b\u0440\u043d\u044b\u0439",
+            "\u0441\u044b\u0440\u043d\u0430\u044f",
+            "\u0441\u044b\u0440\u043d\u044b\u0435",
+            "\u0444\u0435\u0442\u0430",
+            "\u0447\u0435\u0434\u0434\u0435\u0440",
+            "\u0433\u0430\u0443\u0434\u0430",
+            "\u043f\u0430\u0440\u043c\u0435\u0437\u0430\u043d",
+            "\u0440\u0438\u043a\u043e\u0442\u0442\u0430",
+            "\u043c\u043e\u0446\u0430\u0440\u0435\u043b\u043b\u0430",
+            "cheese",
+            "cheddar",
+            "gouda",
+            "feta",
+            "parmesan",
+            "ricotta",
+            "mozzarella",
+            "cream cheese",
+            "goat cheese",
+            "swiss cheese",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="tree_nuts",
+        canonical_name="nuts",
+        trigger_aliases=("\u043e\u0440\u0435\u0445", "nut", "nuts"),
+        ingredient_ids=(
+            "almond_butter",
+            "almonds",
+            "brazil_nuts",
+            "cashews",
+            "mixed_nuts",
+            "nuts_mix",
+            "pecans",
+            "pine_nuts",
+            "pistachios",
+            "walnuts",
+            "peanut_butter",
+            "peanut_oil",
+            "peanuts",
+        ),
+        aliases=(
+            "\u043e\u0440\u0435\u0445",
+            "\u043e\u0440\u0435\u0445\u0438",
+            "\u043c\u0438\u043d\u0434\u0430\u043b\u044c",
+            "\u043a\u0435\u0448\u044c\u044e",
+            "\u043f\u0435\u043a\u0430\u043d",
+            "\u0444\u0438\u0441\u0442\u0430\u0448\u043a\u0438",
+            "\u0433\u0440\u0435\u0446\u043a\u0438\u0439 \u043e\u0440\u0435\u0445",
+            "\u0433\u0440\u0435\u0446\u043a\u0438\u0435 \u043e\u0440\u0435\u0445\u0438",
+            "\u0431\u0440\u0430\u0437\u0438\u043b\u044c\u0441\u043a\u0438\u0435 \u043e\u0440\u0435\u0445\u0438",
+            "\u043a\u0435\u0434\u0440\u043e\u0432\u044b\u0435 \u043e\u0440\u0435\u0445\u0438",
+            "\u0430\u0440\u0430\u0445\u0438\u0441",
+            "nut",
+            "nuts",
             "walnut",
             "walnuts",
             "almond",
             "almonds",
-            "peanut",
-            "peanuts",
             "cashew",
             "cashews",
             "pecan",
             "pecans",
             "pistachio",
             "pistachios",
-            "nuts",
+            "brazil nut",
+            "brazil nuts",
+            "pine nut",
+            "pine nuts",
+            "peanut",
+            "peanuts",
         ),
     ),
-    (
-        ("арахис", "peanut"),
-        ("арахис", "арахисовая паста", "peanut", "peanuts", "peanut butter"),
-    ),
-    (
-        ("молок", "молоч", "dairy", "milk"),
-        (
-            "молоко",
-            "молочные продукты",
-            "творог",
-            "йогурт",
-            "сыр",
-            "milk",
-            "dairy",
-            "cottage cheese",
-            "yogurt",
-            "cheese",
+    FoodExclusionCategory(
+        canonical_id="peanut",
+        canonical_name="peanut",
+        trigger_aliases=("\u0430\u0440\u0430\u0445\u0438\u0441", "peanut"),
+        ingredient_ids=("peanut_butter", "peanut_oil", "peanuts"),
+        aliases=(
+            "\u0430\u0440\u0430\u0445\u0438\u0441",
+            "\u0430\u0440\u0430\u0445\u0438\u0441\u043e\u0432\u0430\u044f \u043f\u0430\u0441\u0442\u0430",
+            "\u0430\u0440\u0430\u0445\u0438\u0441\u043e\u0432\u043e\u0435 \u043c\u0430\u0441\u043b\u043e",
+            "peanut",
+            "peanuts",
+            "peanut butter",
+            "peanut oil",
         ),
     ),
-    (
-        ("рыб", "fish"),
-        ("рыба", "лосось", "тунец", "треска", "fish", "salmon", "tuna", "cod", "white fish"),
+    FoodExclusionCategory(
+        canonical_id="fish",
+        canonical_name="fish",
+        trigger_aliases=("\u0440\u044b\u0431", "fish", "salmon", "tuna", "cod"),
+        ingredient_ids=(
+            "cod_fillet",
+            "fish_sauce",
+            "fish_stock",
+            "mackerel",
+            "salmon",
+            "smoked_white_fish",
+            "tuna",
+            "tuna_steak",
+            "white_fish",
+        ),
+        aliases=(
+            "\u0440\u044b\u0431\u0430",
+            "\u0440\u044b\u0431\u043d\u044b\u0439",
+            "\u043b\u043e\u0441\u043e\u0441\u044c",
+            "\u0442\u0443\u043d\u0435\u0446",
+            "\u0442\u0440\u0435\u0441\u043a\u0430",
+            "\u0441\u043a\u0443\u043c\u0431\u0440\u0438\u044f",
+            "\u0431\u0435\u043b\u0430\u044f \u0440\u044b\u0431\u0430",
+            "fish",
+            "salmon",
+            "tuna",
+            "cod",
+            "mackerel",
+            "white fish",
+            "fish sauce",
+            "fish stock",
+        ),
     ),
-    (
-        ("морепродукт", "кревет", "seafood", "shrimp"),
-        ("морепродукты", "креветки", "мидии", "кальмар", "seafood", "shrimp", "mussels", "calamari"),
+    FoodExclusionCategory(
+        canonical_id="seafood",
+        canonical_name="seafood",
+        trigger_aliases=(
+            "\u043c\u043e\u0440\u0435\u043f\u0440\u043e\u0434\u0443\u043a\u0442",
+            "\u043a\u0440\u0435\u0432\u0435\u0442",
+            "\u043c\u0438\u0434\u0438",
+            "\u043a\u0430\u043b\u044c\u043c\u0430\u0440",
+            "seafood",
+            "shrimp",
+            "prawn",
+            "mussel",
+            "calamari",
+        ),
+        ingredient_ids=("calamari", "clams", "crab_sticks", "mussels", "scallops", "seafood_mix", "shrimp"),
+        aliases=(
+            "\u043c\u043e\u0440\u0435\u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+            "\u043a\u0440\u0435\u0432\u0435\u0442\u043a\u0438",
+            "\u043a\u0440\u0435\u0432\u0435\u0442\u043a\u0430",
+            "\u043c\u0438\u0434\u0438\u0438",
+            "\u043a\u0430\u043b\u044c\u043c\u0430\u0440",
+            "\u0433\u0440\u0435\u0431\u0435\u0448\u043a\u0438",
+            "\u043a\u0440\u0430\u0431",
+            "seafood",
+            "shrimp",
+            "shrimps",
+            "prawn",
+            "prawns",
+            "mussels",
+            "calamari",
+            "scallops",
+            "clams",
+            "crab",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="chicken",
+        canonical_name="chicken",
+        trigger_aliases=("\u043a\u0443\u0440\u0438\u0446", "\u043a\u0443\u0440\u0438\u043d", "chicken"),
+        ingredient_ids=(
+            "chicken_breast",
+            "chicken_breast_cooked",
+            "chicken_broth",
+            "chicken_drumstick",
+            "chicken_ground",
+            "chicken_thigh",
+            "chicken_thigh_skinless",
+            "turkey_or_chicken_breast",
+        ),
+        aliases=(
+            "\u043a\u0443\u0440\u0438\u0446\u0430",
+            "\u043a\u0443\u0440\u0438\u043d\u044b\u0439",
+            "\u043a\u0443\u0440\u0438\u043d\u0430\u044f",
+            "\u043a\u0443\u0440\u0438\u043d\u043e\u0435",
+            "\u043a\u0443\u0440\u0438\u043d\u0430\u044f \u0433\u0440\u0443\u0434\u043a\u0430",
+            "\u043a\u0443\u0440\u0438\u043d\u044b\u0439 \u0431\u0443\u043b\u044c\u043e\u043d",
+            "chicken",
+            "chicken breast",
+            "chicken thigh",
+            "chicken broth",
+            "chicken drumstick",
+            "ground chicken",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="pork",
+        canonical_name="pork",
+        trigger_aliases=("\u0441\u0432\u0438\u043d", "\u0431\u0435\u043a\u043e\u043d", "\u0432\u0435\u0442\u0447\u0438\u043d", "pork", "bacon", "ham"),
+        ingredient_ids=(
+            "bacon",
+            "chorizo",
+            "ham",
+            "italian_sausage",
+            "pork_chop",
+            "pork_loin",
+            "pork_tenderloin",
+            "prosciutto",
+            "sausage",
+        ),
+        aliases=(
+            "\u0441\u0432\u0438\u043d\u0438\u043d\u0430",
+            "\u0441\u0432\u0438\u043d\u043e\u0439",
+            "\u0441\u0432\u0438\u043d\u0430\u044f",
+            "\u0441\u0432\u0438\u043d\u0430\u044f \u0432\u044b\u0440\u0435\u0437\u043a\u0430",
+            "\u0441\u0432\u0438\u043d\u0430\u044f \u043e\u0442\u0431\u0438\u0432\u043d\u0430\u044f",
+            "\u0431\u0435\u043a\u043e\u043d",
+            "\u0432\u0435\u0442\u0447\u0438\u043d\u0430",
+            "\u0447\u043e\u0440\u0438\u0437\u043e",
+            "\u043f\u0440\u043e\u0448\u0443\u0442\u0442\u043e",
+            "pork",
+            "pork chop",
+            "pork loin",
+            "pork tenderloin",
+            "bacon",
+            "ham",
+            "chorizo",
+            "prosciutto",
+            "sausage",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="beef",
+        canonical_name="beef",
+        trigger_aliases=("\u0433\u043e\u0432\u044f\u0434", "beef"),
+        ingredient_ids=("beef_broth", "beef_chuck", "beef_ground", "beef_sirloin", "beef_stew", "ground_meat"),
+        aliases=(
+            "\u0433\u043e\u0432\u044f\u0434\u0438\u043d\u0430",
+            "\u0433\u043e\u0432\u044f\u0436\u0438\u0439",
+            "\u0433\u043e\u0432\u044f\u0436\u044c\u044f",
+            "\u0433\u043e\u0432\u044f\u0436\u0438\u0439 \u0444\u0430\u0440\u0448",
+            "\u0433\u043e\u0432\u044f\u0436\u0438\u0439 \u0431\u0443\u043b\u044c\u043e\u043d",
+            "beef",
+            "ground beef",
+            "beef broth",
+            "beef chuck",
+            "beef sirloin",
+            "beef stew",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="gluten_wheat",
+        canonical_name="gluten and wheat",
+        trigger_aliases=("\u0433\u043b\u044e\u0442\u0435\u043d", "\u043f\u0448\u0435\u043d", "gluten", "wheat"),
+        ingredient_ids=(
+            "breadcrumbs",
+            "bulgur",
+            "couscous",
+            "egg_noodles",
+            "gnocchi",
+            "lavash",
+            "orzo",
+            "pasta_generic",
+            "pita",
+            "rye_flour",
+            "spaghetti",
+            "spelt",
+            "thin_flatbread",
+            "wheat_flour",
+            "wheat_germ",
+            "whole_grain_bread",
+            "whole_wheat_pasta",
+        ),
+        aliases=(
+            "\u0433\u043b\u044e\u0442\u0435\u043d",
+            "\u043f\u0448\u0435\u043d\u0438\u0446\u0430",
+            "\u043f\u0448\u0435\u043d\u0438\u0447\u043d\u044b\u0439",
+            "\u043f\u0448\u0435\u043d\u0438\u0447\u043d\u0430\u044f \u043c\u0443\u043a\u0430",
+            "\u0440\u0436\u0430\u043d\u0430\u044f \u043c\u0443\u043a\u0430",
+            "\u043f\u0430\u0441\u0442\u0430",
+            "\u043c\u0430\u043a\u0430\u0440\u043e\u043d\u044b",
+            "\u0445\u043b\u0435\u0431",
+            "\u043b\u0430\u0432\u0430\u0448",
+            "\u043f\u0438\u0442\u0430",
+            "\u043a\u0443\u0441\u043a\u0443\u0441",
+            "\u0431\u0443\u043b\u0433\u0443\u0440",
+            "gluten",
+            "wheat",
+            "wheat flour",
+            "whole wheat",
+            "whole grain bread",
+            "bread",
+            "pasta",
+            "rye",
+            "spelt",
+            "bulgur",
+            "couscous",
+            "lavash",
+            "pita",
+        ),
+        excluded_tags=("gluten",),
+    ),
+    FoodExclusionCategory(
+        canonical_id="mushrooms",
+        canonical_name="mushrooms",
+        trigger_aliases=("\u0433\u0440\u0438\u0431", "\u0448\u0430\u043c\u043f\u0438\u043d\u044c\u043e\u043d", "mushroom"),
+        ingredient_ids=("mushrooms", "shiitake"),
+        aliases=(
+            "\u0433\u0440\u0438\u0431",
+            "\u0433\u0440\u0438\u0431\u044b",
+            "\u0448\u0430\u043c\u043f\u0438\u043d\u044c\u043e\u043d",
+            "\u0448\u0430\u043c\u043f\u0438\u043d\u044c\u043e\u043d\u044b",
+            "\u0448\u0438\u0438\u0442\u0430\u043a\u0435",
+            "mushroom",
+            "mushrooms",
+            "shiitake",
+        ),
     ),
 )
+
+PLANT_MILK_EXCEPTIONS = (
+    "almond milk",
+    "coconut milk",
+    "oat milk",
+    "rice milk",
+    "soy milk",
+    "soya milk",
+    "\u043c\u0438\u043d\u0434\u0430\u043b\u044c\u043d\u043e\u0435 \u043c\u043e\u043b\u043e\u043a\u043e",
+    "\u043a\u043e\u043a\u043e\u0441\u043e\u0432\u043e\u0435 \u043c\u043e\u043b\u043e\u043a\u043e",
+    "\u043e\u0432\u0441\u044f\u043d\u043e\u0435 \u043c\u043e\u043b\u043e\u043a\u043e",
+    "\u0440\u0438\u0441\u043e\u0432\u043e\u0435 \u043c\u043e\u043b\u043e\u043a\u043e",
+    "\u0441\u043e\u0435\u0432\u043e\u0435 \u043c\u043e\u043b\u043e\u043a\u043e",
+)
+MATCH_EXCEPTIONS_BY_EXCLUDED_NAME = {
+    "milk": PLANT_MILK_EXCEPTIONS,
+    "\u043c\u043e\u043b\u043e\u043a\u043e": PLANT_MILK_EXCEPTIONS,
+}
 
 
 def evaluate_safety(profile: UserProfile) -> SafetyResult:
@@ -165,10 +527,13 @@ def _apply_restrictions(
     for restriction in profile.restrictions:
         value = restriction.normalized_value
         if restriction.type in {RestrictionType.ALLERGY, RestrictionType.EXCLUDED_FOOD}:
-            excluded_food_names.update(_expanded_excluded_food_names(value))
-        if "лактоз" in value or "lactose" in value:
+            categories = _matching_exclusion_categories(value)
+            excluded_food_names.update(_expanded_excluded_food_names(value, categories))
+            for category in categories:
+                excluded_tags.update(category.excluded_tags)
+        if "\u043b\u0430\u043a\u0442\u043e\u0437" in value or "lactose" in value:
             excluded_tags.add("lactose")
-        if "глютен" in value or "gluten" in value:
+        if "\u0433\u043b\u044e\u0442\u0435\u043d" in value or "gluten" in value:
             excluded_tags.add("gluten")
 
 
@@ -225,6 +590,13 @@ def is_name_excluded(food_name: str, excluded_names: frozenset[str]) -> bool:
 
 
 def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
+    normalized_ids = {
+        _normalize_exclusion_match_text(food.id),
+        _normalize_exclusion_match_text(food.id.replace("_", " ")),
+    }
+    normalized_excluded = {_normalize_exclusion_match_text(name) for name in excluded_names}
+    if normalized_ids & normalized_excluded:
+        return True
     return any(
         is_name_excluded(value, excluded_names)
         for value in (
@@ -235,22 +607,49 @@ def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
     )
 
 
-def _expanded_excluded_food_names(value: str) -> set[str]:
-    names = {value}
-    for needles, aliases in FOOD_EXCLUSION_ALIASES:
-        if any(needle in value for needle in needles):
-            names.update(normalize_text(alias) for alias in aliases)
+def _expanded_excluded_food_names(
+    value: str,
+    categories: tuple[FoodExclusionCategory, ...] | None = None,
+) -> set[str]:
+    names = {_normalize_exclusion_match_text(value)}
+    matched_categories = categories if categories is not None else _matching_exclusion_categories(value)
+    for category in matched_categories:
+        names.update(
+            _normalize_exclusion_match_text(term)
+            for term in (
+                category.canonical_id,
+                category.canonical_name,
+                *category.ingredient_ids,
+                *category.aliases,
+            )
+        )
     return {name for name in names if name}
 
 
+def _matching_exclusion_categories(value: str) -> tuple[FoodExclusionCategory, ...]:
+    normalized_value = _normalize_exclusion_match_text(value)
+    return tuple(
+        category
+        for category in FOOD_EXCLUSION_CATEGORIES
+        if any(_matches_excluded_name(normalized_value, trigger) for trigger in category.trigger_aliases)
+    )
+
+
 def _normalize_exclusion_match_text(value: str) -> str:
-    return normalize_text(value).replace("_", " ")
+    normalized = normalize_text(value)
+    for separator in ("_", "-", "\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015"):
+        normalized = normalized.replace(separator, " ")
+    return " ".join(normalized.split())
 
 
 def _matches_excluded_name(normalized_food_name: str, excluded_name: str) -> bool:
     normalized_excluded = _normalize_exclusion_match_text(excluded_name)
     if not normalized_excluded:
         return False
+    if _has_match_exception(normalized_food_name, normalized_excluded):
+        return False
+    if normalized_food_name == normalized_excluded:
+        return True
     if _is_latin_exclusion(normalized_excluded):
         return bool(
             re.search(
@@ -259,6 +658,14 @@ def _matches_excluded_name(normalized_food_name: str, excluded_name: str) -> boo
             )
         )
     return normalized_excluded in normalized_food_name or normalized_food_name in normalized_excluded
+
+
+def _has_match_exception(normalized_food_name: str, normalized_excluded: str) -> bool:
+    exceptions = MATCH_EXCEPTIONS_BY_EXCLUDED_NAME.get(normalized_excluded, ())
+    return normalized_food_name in {
+        _normalize_exclusion_match_text(exception)
+        for exception in exceptions
+    }
 
 
 def _is_latin_exclusion(value: str) -> bool:

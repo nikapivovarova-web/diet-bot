@@ -31,7 +31,7 @@ from diet_bot.domain import (
 )
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.recipe_catalog import RecipeTemplate
-from diet_bot.safety import evaluate_safety
+from diet_bot.safety import evaluate_safety, is_food_excluded, is_name_excluded
 from diet_bot.telegram_app import _build_week_plans
 from diet_bot.validation import validate_plan
 
@@ -195,6 +195,171 @@ def _egg_only_recipes() -> tuple[RecipeTemplate, ...]:
             time_text="10 minutes",
         ),
     )
+
+
+def _high_protein_food(food_id: str = "safe_high_protein") -> Food:
+    return Food(
+        id=food_id,
+        name=f"{food_id} food",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 120, "protein_g": 24, "fat_g": 2}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=3000,
+    )
+
+
+def _title_only_excluded_recipes(title_term: str) -> tuple[RecipeTemplate, ...]:
+    slots = ("breakfast", "main", "main")
+    return tuple(
+        RecipeTemplate(
+            id=f"title_only_excluded_{index}",
+            slot=slot,
+            title=f"{title_term} style recipe {index}",
+            ingredients_g={"safe_high_protein": 280},
+            instructions="Cook the safe protein.",
+            tags=frozenset({"curated"}),
+            time_text="10 minutes",
+        )
+        for index, slot in enumerate(slots)
+    )
+
+
+def _safety_for_exclusion(value: str):
+    return evaluate_safety(
+        profile_with(restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, value),))
+    )
+
+
+def _eligible_food_ids_for_exclusion(value: str) -> set[str]:
+    safety = _safety_for_exclusion(value)
+    return {food.id for food in filter_foods(built_in_foods(), safety)}
+
+
+@pytest.mark.parametrize(
+    ("restriction_value", "blocked_food_ids"),
+    (
+        ("\u044f\u0439\u0446\u0430", {"egg", "egg_white", "egg_white_extra", "egg_yolk", "egg_noodles"}),
+        ("\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438", {"broccoli"}),
+        ("\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b", {"milk", "greek_yogurt", "cottage_cheese"}),
+        ("\u0442\u0432\u043e\u0440\u043e\u0433", {"cottage_cheese", "lactose_free_cottage_cheese"}),
+        ("\u0441\u044b\u0440", {"cream_cheese", "goat_cheese", "swiss_cheese"}),
+        ("\u043e\u0440\u0435\u0445\u0438", {"walnuts", "almonds", "cashews", "pecans"}),
+        ("\u0430\u0440\u0430\u0445\u0438\u0441", {"peanuts", "peanut_butter", "peanut_oil"}),
+        ("\u0440\u044b\u0431\u0430", {"salmon", "tuna", "cod_fillet", "white_fish"}),
+        ("\u043c\u043e\u0440\u0435\u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b", {"shrimp", "mussels", "calamari", "scallops"}),
+        ("\u043a\u0443\u0440\u0438\u0446\u0430", {"chicken_breast", "chicken_thigh", "chicken_ground"}),
+        ("\u0441\u0432\u0438\u043d\u0438\u043d\u0430", {"pork_chop", "pork_tenderloin", "bacon"}),
+        ("\u0433\u043e\u0432\u044f\u0434\u0438\u043d\u0430", {"beef_ground", "beef_chuck", "beef_stew"}),
+        ("\u043f\u0448\u0435\u043d\u0438\u0446\u0430", {"wheat_flour", "whole_wheat_pasta", "whole_grain_bread"}),
+    ),
+)
+def test_food_exclusion_categories_filter_recipe_ingredient_ids(
+    restriction_value: str,
+    blocked_food_ids: set[str],
+) -> None:
+    all_food_ids = {food.id for food in built_in_foods()}
+    available_blocked_ids = blocked_food_ids & all_food_ids
+    eligible_ids = _eligible_food_ids_for_exclusion(restriction_value)
+
+    assert available_blocked_ids
+    assert available_blocked_ids.isdisjoint(eligible_ids)
+
+
+@pytest.mark.parametrize(
+    ("restriction_value", "blocked_food_id"),
+    (
+        ("eggs", "egg_yolk"),
+        ("broccolini", "broccoli"),
+        ("dairy", "greek_yogurt"),
+        ("cottage cheese", "cottage_cheese"),
+        ("cheese", "cream_cheese"),
+        ("nuts", "walnuts"),
+        ("peanut butter", "peanut_butter"),
+        ("fish", "salmon"),
+        ("seafood", "shrimp"),
+        ("chicken", "chicken_breast"),
+        ("pork", "pork_tenderloin"),
+        ("beef", "beef_ground"),
+        ("gluten", "whole_grain_bread"),
+    ),
+)
+def test_english_food_exclusion_aliases_filter_ingredients(
+    restriction_value: str,
+    blocked_food_id: str,
+) -> None:
+    assert blocked_food_id not in _eligible_food_ids_for_exclusion(restriction_value)
+
+
+@pytest.mark.parametrize(
+    ("restriction_value", "blocked_food_id"),
+    (
+        ("\u044f\u0438\u0447\u043d\u044b\u0439 \u0431\u0435\u043b\u043e\u043a", "egg_white"),
+        ("\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438\u043d\u0438", "broccoli"),
+        ("\u043c\u043e\u043b\u043e\u043a\u043e", "milk"),
+        ("\u0442\u0432\u043e\u0440\u043e\u0436\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b", "cottage_cheese"),
+        ("\u0430\u0440\u0430\u0445\u0438\u0441\u043e\u0432\u0430\u044f \u043f\u0430\u0441\u0442\u0430", "peanut_butter"),
+        ("\u043a\u0440\u0435\u0432\u0435\u0442\u043a\u0438", "shrimp"),
+        ("\u043a\u0443\u0440\u0438\u043d\u0430\u044f \u0433\u0440\u0443\u0434\u043a\u0430", "chicken_breast"),
+        ("\u043f\u0448\u0435\u043d\u0438\u0447\u043d\u0430\u044f \u043c\u0443\u043a\u0430", "wheat_flour"),
+    ),
+)
+def test_russian_food_exclusion_aliases_filter_ingredients(
+    restriction_value: str,
+    blocked_food_id: str,
+) -> None:
+    assert blocked_food_id not in _eligible_food_ids_for_exclusion(restriction_value)
+
+
+def test_food_exclusion_word_boundaries_avoid_false_positives() -> None:
+    egg_safety = _safety_for_exclusion("egg")
+    eggplant = Food("eggplant", "eggplant", "vegetable", NutrientVector())
+    egg = Food("egg", "egg", "protein", NutrientVector())
+
+    assert not is_food_excluded(eggplant, egg_safety.excluded_food_names)
+    assert is_food_excluded(egg, egg_safety.excluded_food_names)
+
+    milk_safety = _safety_for_exclusion("milk")
+    coconut_milk = Food("coconut_milk", "coconut milk", "dairy", NutrientVector())
+    milk = Food("milk", "milk", "dairy", NutrientVector())
+
+    assert not is_food_excluded(coconut_milk, milk_safety.excluded_food_names)
+    assert is_food_excluded(milk, milk_safety.excluded_food_names)
+
+    nut_safety = _safety_for_exclusion("nut")
+    nutrition_yeast = Food("nutrition_yeast", "nutrition yeast", "other", NutrientVector())
+    nutmeg = Food("nutmeg", "nutmeg", "spice", NutrientVector())
+    walnuts = Food("walnuts", "walnuts", "nuts_seeds", NutrientVector())
+
+    assert not is_food_excluded(nutrition_yeast, nut_safety.excluded_food_names)
+    assert not is_food_excluded(nutmeg, nut_safety.excluded_food_names)
+    assert is_food_excluded(walnuts, nut_safety.excluded_food_names)
+
+    broccoli_safety = _safety_for_exclusion("\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438")
+    assert is_name_excluded("broccolini salad", broccoli_safety.excluded_food_names)
+    assert not is_name_excluded("broccolinium supplement", broccoli_safety.excluded_food_names)
+
+
+def test_recipe_title_exclusions_are_applied_after_ingredient_id_pool(monkeypatch) -> None:
+    safety = _safety_for_exclusion("egg")
+    monkeypatch.setattr(
+        "diet_bot.builder.built_in_recipes",
+        lambda: _title_only_excluded_recipes("Egg"),
+    )
+
+    meals = _build_recipe_plan_for_time(
+        [_high_protein_food()],
+        NutrientVector({"energy_kcal": 1000, "protein_g": 60, "fat_g": 30, "carbohydrate_g": 120}),
+        3,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+        excluded_food_names=safety.excluded_food_names,
+    )
+
+    assert meals == []
 
 
 def test_apple_allergy_excludes_apple() -> None:
@@ -563,6 +728,26 @@ def test_weekly_generation_with_enough_pool_has_no_repeated_recipe_id() -> None:
 
     assert len(recipe_ids) == 35
     assert len(set(recipe_ids)) == len(recipe_ids)
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_generation_respects_food_exclusions_across_all_days() -> None:
+    profile = profile_with(
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438"),
+        ),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+
+    plans = _build_week_plans(profile, 101, set(), set())
+    forbidden_ids = {"broccoli"}
+
+    assert len(plans) == 7
+    for plan in plans:
+        assert len(plan.meals) == 5
+        assert forbidden_ids.isdisjoint(food_ids(plan))
+        assert forbidden_ids.isdisjoint(recipe_ingredient_ids(plan))
 
 
 @pytest.mark.slow_pdf_builder
