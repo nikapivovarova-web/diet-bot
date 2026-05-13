@@ -78,10 +78,15 @@ from .payments import (
 from .postgres_store import PostgresDietBotStore
 from .promo_codes import (
     PromoCodeActivation,
+    PromoCodeDefinition,
     PromoCodeKind,
+    PromoCodeRecord,
     activate_promo_code,
+    generate_promo_codes,
+    load_promo_codes,
     normalize_promo_code,
     promo_code_grant_charge_id,
+    save_promo_codes,
 )
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import RuntimeConfig, is_production_environment, load_runtime_config
@@ -122,6 +127,7 @@ DISCOUNT_PROMO_CODE_BY_CHAT_ID: dict[int, str] = {}
 router = Router()
 DEFAULT_SUPPORT_CHAT_ID = -5_271_779_108
 _RUNTIME_STORE: DietBotStore | None = None
+ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT = 20
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
@@ -466,6 +472,10 @@ async def myid(message: Message) -> None:
 
 @router.message(Command("330366"))
 async def secret_access_command(message: Message) -> None:
+    if _is_admin_access_code_command_text(message.text or ""):
+        await _admin_access_code_command(message)
+        return
+
     action, target_chat_id = _parse_test_access_command(message.text or "")
     if target_chat_id is not None:
         if not _is_admin_message(message):
@@ -2685,6 +2695,78 @@ def _short_payment_identifier(value: str | None) -> str:
 def _enum_value(value: object) -> str:
     enum_value = getattr(value, "value", None)
     return str(enum_value if enum_value is not None else value)
+
+
+def _is_admin_access_code_command_text(text: str) -> bool:
+    args = text.split()[1:]
+    return len(args) == 1 and args[0].strip().lower() == "code"
+
+
+async def _admin_access_code_command(message: Message) -> None:
+    if not _is_admin_message(message):
+        await message.answer("Command is available only to admins.")
+        return
+
+    promo = _create_admin_monthly_access_promo_code()
+    await message.answer(
+        "\n".join(
+            [
+                "Created promo code:",
+                promo.code,
+                "Access: 1 month.",
+            ]
+        )
+    )
+
+
+def _create_admin_monthly_access_promo_code() -> PromoCodeDefinition:
+    store = _runtime_store()
+    if store is not None:
+        return _create_admin_monthly_access_promo_code_in_store(store)
+    return _create_admin_monthly_access_promo_code_in_json(PROMO_CODES_STATE_FILE)
+
+
+def _create_admin_monthly_access_promo_code_in_store(
+    store: DietBotStore,
+) -> PromoCodeDefinition:
+    for _attempt in range(ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT):
+        code = _generate_admin_monthly_access_promo_code()
+        if store.get_promo_code(code) is not None:
+            continue
+        return store.create_promo_code(_admin_monthly_access_promo_definition(code))
+    raise RuntimeError("Could not generate a unique monthly access promo code.")
+
+
+def _create_admin_monthly_access_promo_code_in_json(path: Path) -> PromoCodeDefinition:
+    with json_storage_transaction(path):
+        promo_codes = load_promo_codes(path)
+        for _attempt in range(ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT):
+            code = _generate_admin_monthly_access_promo_code(set(promo_codes))
+            if code in promo_codes:
+                continue
+            definition = _admin_monthly_access_promo_definition(code)
+            promo_codes[code] = PromoCodeRecord.from_definition(definition)
+            save_promo_codes(path, promo_codes)
+            return definition
+    raise RuntimeError("Could not generate a unique monthly access promo code.")
+
+
+def _generate_admin_monthly_access_promo_code(
+    existing_codes: set[str] | None = None,
+) -> str:
+    return generate_promo_codes(1, existing_codes=existing_codes)[0]
+
+
+def _admin_monthly_access_promo_definition(code: str) -> PromoCodeDefinition:
+    return PromoCodeDefinition(
+        code=code,
+        kind=PromoCodeKind.MONTHLY_ACCESS,
+        active=True,
+        max_redemptions=1,
+        per_user_limit=1,
+        monthly_duration_months=1,
+        metadata={"source": "admin_access_code_command"},
+    )
 
 
 def _parse_test_access_command(text: str) -> tuple[str, int | None]:

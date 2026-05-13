@@ -357,6 +357,139 @@ async def test_promo_code_activation_extends_existing_monthly_access(
 
 
 @pytest.mark.anyio
+async def test_admin_code_command_creates_generated_monthly_access_code(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    admin_id = 80_260
+    user_id = 80_261
+    code = "FB-7KQ9-MNT2-2026"
+    promo_path = tmp_path / "promo_codes.json"
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        lambda count, *, existing_codes=None: [code],
+        raising=False,
+    )
+
+    admin_message = FakeMessage(admin_id, text="/330366 code", user_id=admin_id)
+    await secret_access_command(admin_message)
+
+    response = admin_message.texts[-1][0]
+    promo_codes = load_promo_codes(promo_path)
+    created = promo_codes[code]
+
+    assert response.count(code) == 1
+    assert "1 month" in response
+    assert "monthly_access" not in response
+    assert "storage" not in response.lower()
+    assert created.is_monthly_access()
+    assert created.active
+    assert created.max_redemptions == 1
+    assert created.per_user_limit == 1
+    assert created.monthly_duration_months == 1
+
+    try:
+        await handle_answer(FakeMessage(user_id, text=PROMO_CODE_TEXT))
+        activation_message = FakeMessage(user_id, text=code.lower().replace("-", " "))
+        await handle_answer(activation_message)
+
+        entitlement = telegram_app.load_entitlements(subscriptions_path)[user_id]
+        reloaded = load_promo_codes(promo_path)
+
+        assert entitlement.is_subscription_active()
+        assert entitlement.monthly_one_day_remaining == telegram_app.MONTHLY_ONE_DAY_LIMIT
+        assert entitlement.monthly_weekly_pdf_remaining == telegram_app.MONTHLY_WEEKLY_PDF_LIMIT
+        assert reloaded[code].used_by_chat_id == user_id
+    finally:
+        PROMO_CODE_REQUEST_CHAT_IDS.discard(user_id)
+
+
+@pytest.mark.anyio
+async def test_admin_code_command_skips_generated_collision(monkeypatch, tmp_path) -> None:
+    admin_id = 80_262
+    existing_code = "FB-DUPL-ICAT-2026"
+    created_code = "FB-UNIQ-CODE-2026"
+    promo_path = tmp_path / "promo_codes.json"
+    generated = [existing_code, created_code]
+    save_promo_codes(promo_path, {existing_code: PromoCodeRecord()})
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+
+    def fake_generate_promo_codes(count, *, existing_codes=None):
+        return [generated.pop(0)]
+
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        fake_generate_promo_codes,
+        raising=False,
+    )
+
+    message = FakeMessage(admin_id, text="/330366 code", user_id=admin_id)
+    await secret_access_command(message)
+
+    promo_codes = load_promo_codes(promo_path)
+
+    assert created_code in promo_codes
+    assert existing_code in promo_codes
+    assert message.texts[-1][0].count(created_code) == 1
+    assert existing_code not in message.texts[-1][0]
+
+
+@pytest.mark.anyio
+async def test_non_admin_code_command_is_rejected_without_creating_code(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    promo_path = tmp_path / "promo_codes.json"
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {80_263})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        lambda count, *, existing_codes=None: pytest.fail("non-admin must not generate codes"),
+        raising=False,
+    )
+
+    message = FakeMessage(80_264, text="/330366 code", user_id=80_264)
+    await secret_access_command(message)
+
+    assert message.texts
+    assert load_promo_codes(promo_path) == {}
+
+
+@pytest.mark.anyio
+async def test_admin_code_command_does_not_accept_custom_code_argument(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    admin_id = 80_265
+    promo_path = tmp_path / "promo_codes.json"
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        lambda count, *, existing_codes=None: pytest.fail("custom code args must not generate codes"),
+        raising=False,
+    )
+
+    message = FakeMessage(admin_id, text="/330366 code MYCODE", user_id=admin_id)
+    await secret_access_command(message)
+
+    assert load_promo_codes(promo_path) == {}
+
+
+@pytest.mark.anyio
 async def test_features_button_sends_capabilities_text(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     message = FakeMessage(text=FEATURES_TEXT)
