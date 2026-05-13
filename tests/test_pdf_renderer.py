@@ -104,6 +104,29 @@ def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
     assert qr.drawHeight <= 34 * mm
 
 
+def test_nutrient_indicator_thresholds_for_pdf_display() -> None:
+    cases = (
+        (100, "DotGreen", "#4F9E5D"),
+        (97, "DotGreen", "#4F9E5D"),
+        (95, "DotGreen", "#4F9E5D"),
+        (94, "DotYellow", "#D8A23A"),
+        (45, "DotYellow", "#D8A23A"),
+        (44, "DotRed", "#C95B4A"),
+    )
+
+    assert [
+        (
+            percent,
+            pdf_renderer._coverage_dot_style(percent, 100),
+            pdf_renderer._coverage_dot_color(percent, 100),
+        )
+        for percent, _expected_style, _expected_color in cases
+    ] == [
+        (percent, expected_style, pdf_renderer.colors.HexColor(expected_color))
+        for percent, expected_style, expected_color in cases
+    ]
+
+
 def test_week_pdf_renders_shopping_heading_categories_items(
     monkeypatch,
     tmp_path: Path,

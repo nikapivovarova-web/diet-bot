@@ -1395,9 +1395,9 @@ def _coverage_dot_style(value: float, target: float) -> str:
     if target <= 0:
         return "DotRed"
     percent = value / target * 100
-    if percent >= 100:
+    if percent >= 95:
         return "DotGreen"
-    if percent >= 50:
+    if percent >= 45:
         return "DotYellow"
     return "DotRed"
 
@@ -1406,9 +1406,9 @@ def _coverage_dot_color(value: float, target: float):
     if target <= 0:
         return colors.HexColor("#C95B4A")
     percent = value / target * 100
-    if percent >= 100:
+    if percent >= 95:
         return colors.HexColor("#4F9E5D")
-    if percent >= 50:
+    if percent >= 45:
         return colors.HexColor("#D8A23A")
     return colors.HexColor("#C95B4A")
 

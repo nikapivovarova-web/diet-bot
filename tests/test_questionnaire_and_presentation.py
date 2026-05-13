@@ -12,6 +12,7 @@ from diet_bot.domain import (
     Sex,
     normalize_cooking_time_preference,
 )
+import diet_bot.presentation as presentation
 from diet_bot.presentation import format_calculation_summary, format_meal_card, format_plan_response
 from diet_bot.questionnaire import QUESTIONS, start_session
 from diet_bot.safety import evaluate_safety
@@ -191,6 +192,19 @@ def test_totals_use_consistent_percent_style_and_status_dots() -> None:
         for line in totals_section.splitlines()
         if line.startswith("- ")
     )
+
+
+def test_nutrient_indicator_thresholds_for_telegram_display() -> None:
+    cases = (
+        (100, "\U0001f7e2"),
+        (97, "\U0001f7e2"),
+        (95, "\U0001f7e2"),
+        (94, "\U0001f7e1"),
+        (45, "\U0001f7e1"),
+        (44, "\U0001f534"),
+    )
+
+    assert tuple((percent, presentation._coverage_dot(percent, 100)) for percent, _expected in cases) == cases
 
 
 def test_calculation_summary_warns_for_very_low_bmi_without_refusing() -> None:
