@@ -365,7 +365,7 @@ TRIAL_SUBSCRIPTION_TEXT = (
 BOT_COMMANDS = (
     BotCommand(command="start", description="Открыть стартовое меню"),
     BotCommand(command="plan", description="Заполнить анкету для рациона"),
-    BotCommand(command="cancel", description="Сбросить активную анкету"),
+    BotCommand(command="cancel", description="Отменить текущее действие"),
 )
 
 
@@ -418,7 +418,15 @@ async def cancel(message: Message) -> None:
         return
     if not await ensure_private_chat(message):
         return
-    await message.answer("Анкета сброшена ✅", reply_markup=_main_menu_keyboard(message.chat.id))
+    if _profile_for_chat(message.chat.id) is not None:
+        cancel_text = (
+            f"Текущее действие отменено ✅\n\n"
+            f"Сохраненная анкета осталась без изменений. "
+            f"Чтобы изменить ее, нажмите «{CHANGE_PROFILE_TEXT}» в меню."
+        )
+    else:
+        cancel_text = "Текущее действие отменено ✅\n\nЧтобы пройти анкету, выберите нужный пункт в меню."
+    await message.answer(cancel_text, reply_markup=_main_menu_keyboard(message.chat.id))
 
 
 @router.message(Command("myid"))

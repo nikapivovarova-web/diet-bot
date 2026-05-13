@@ -2148,9 +2148,48 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
     assert [(command.command, command.description) for command in bot.commands] == [
         ("start", "Открыть стартовое меню"),
         ("plan", "Заполнить анкету для рациона"),
-        ("cancel", "Сбросить активную анкету"),
+        ("cancel", "Отменить текущее действие"),
     ]
     assert "myid" not in [command.command for command in bot.commands]
+
+
+@pytest.mark.anyio
+async def test_cancel_clarifies_saved_profile_is_kept() -> None:
+    chat_id = 91_031
+    saved_profile = profile_with()
+    SESSION_BY_CHAT_ID[chat_id] = start_session()
+    TRIAL_CHAT_IDS.add(chat_id)
+    SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
+    PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+    PROFILE_BY_CHAT_ID[chat_id] = saved_profile
+    message = FakeMessage(chat_id, text="/cancel")
+    try:
+        await telegram_app.cancel(message)
+
+        sent_text, markup = message.texts[-1]
+        buttons = [row[0] for row in markup.inline_keyboard]
+
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in TRIAL_CHAT_IDS
+        assert chat_id not in SUPPORT_REQUEST_CHAT_IDS
+        assert chat_id not in PROMO_CODE_REQUEST_CHAT_IDS
+        assert PROFILE_BY_CHAT_ID[chat_id] is saved_profile
+        assert sent_text.startswith("Текущее действие отменено")
+        assert "Сохраненная анкета осталась" in sent_text
+        assert CHANGE_PROFILE_TEXT in sent_text
+        assert "Анкета сброшена" not in sent_text
+        assert [(button.text, button.callback_data) for button in buttons] == [
+            (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
+            (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
+            (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        ]
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+        SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+        PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
 
 
 @pytest.mark.anyio
