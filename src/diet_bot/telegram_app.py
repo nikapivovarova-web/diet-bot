@@ -1557,6 +1557,7 @@ def _select_week_day_plan(
             avoided_recipe_ids=avoided_recipe_ids,
             avoided_recipe_keys=avoided_recipe_keys,
             recipe_source="curated_only",
+            allow_avoided_recipe_relaxation=False,
         )
         candidate_carryovers = _copy_carryovers(carryovers)
         plan = _apply_batch_carryovers(plan, candidate_carryovers)
@@ -1574,6 +1575,7 @@ def _select_week_day_plan(
                 avoided_recipe_ids=avoided_recipe_ids,
                 avoided_recipe_keys=avoided_recipe_keys,
                 recipe_source="curated_only",
+                allow_avoided_recipe_relaxation=False,
             ),
             carryovers,
         )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .domain import (
     ConditionCode,
     Food,
@@ -28,6 +30,36 @@ RED_FLAG_CONDITIONS = {
 
 
 FOOD_EXCLUSION_ALIASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("\u044f\u0439", "egg"),
+        (
+            "\u044f\u0439\u0446\u043e",
+            "\u044f\u0439\u0446\u0430",
+            "\u044f\u0438\u0446",
+            "\u044f\u0438\u0447",
+            "\u044f\u0438\u0447\u043d\u044b\u0439 \u0431\u0435\u043b\u043e\u043a",
+            "\u044f\u0438\u0447\u043d\u044b\u0439 \u0436\u0435\u043b\u0442\u043e\u043a",
+            "\u0436\u0435\u043b\u0442\u043e\u043a",
+            "egg",
+            "eggs",
+            "egg yolk",
+            "egg white",
+            "egg noodles",
+            "egg_noodles",
+            "egg_yolk",
+            "egg_white_extra",
+        ),
+    ),
+    (
+        ("\u0431\u0440\u043e\u043a", "broccoli", "broccolini"),
+        (
+            "\u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438",
+            "\u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438\u043d\u0438",
+            "broccoli",
+            "broccolini",
+            "broccoli rabe",
+        ),
+    ),
     (
         ("гриб", "шампиньон", "mushroom"),
         ("гриб", "грибы", "шампиньон", "шампиньоны", "mushroom", "mushrooms", "шиитаке", "shiitake"),
@@ -188,8 +220,8 @@ def _apply_conditions(
 
 
 def is_name_excluded(food_name: str, excluded_names: frozenset[str]) -> bool:
-    normalized = normalize_text(food_name)
-    return any(name in normalized or normalized in name for name in excluded_names)
+    normalized = _normalize_exclusion_match_text(food_name)
+    return any(_matches_excluded_name(normalized, name) for name in excluded_names)
 
 
 def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
@@ -209,3 +241,25 @@ def _expanded_excluded_food_names(value: str) -> set[str]:
         if any(needle in value for needle in needles):
             names.update(normalize_text(alias) for alias in aliases)
     return {name for name in names if name}
+
+
+def _normalize_exclusion_match_text(value: str) -> str:
+    return normalize_text(value).replace("_", " ")
+
+
+def _matches_excluded_name(normalized_food_name: str, excluded_name: str) -> bool:
+    normalized_excluded = _normalize_exclusion_match_text(excluded_name)
+    if not normalized_excluded:
+        return False
+    if _is_latin_exclusion(normalized_excluded):
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(normalized_excluded)}(?![a-z0-9])",
+                normalized_food_name,
+            )
+        )
+    return normalized_excluded in normalized_food_name or normalized_food_name in normalized_excluded
+
+
+def _is_latin_exclusion(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9 ]*[a-z0-9]", value))

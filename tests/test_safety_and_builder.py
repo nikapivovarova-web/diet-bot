@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from diet_bot.builder import (
     _cooking_effort_constraints,
     _increase_existing_protein_if_needed,
     _meal_energy_slots,
+    _rank_recipes,
     _recipe_matches_cooking_effort,
     _recipe_time_bucket,
     build_one_day_plan,
@@ -53,6 +55,20 @@ def profile_with(**kwargs) -> UserProfile:
 
 def food_names(plan) -> set[str]:
     return {portion.food.name for meal in plan.meals for portion in meal.portions}
+
+
+def food_ids(plan) -> set[str]:
+    return {portion.food.id for meal in plan.meals for portion in meal.portions}
+
+
+def recipe_ingredient_ids(plan) -> set[str]:
+    recipes_by_id = {recipe.id: recipe for recipe in built_in_recipes()}
+    return {
+        food_id
+        for meal in plan.meals
+        if meal.recipe_id and meal.recipe_id in recipes_by_id
+        for food_id in recipes_by_id[meal.recipe_id].ingredients_g
+    }
 
 
 def assert_meal_energy_distribution(plan) -> None:
@@ -149,12 +165,71 @@ def _single_macro_meal(recipe_id: str, energy: float, protein: float, fat: float
     return [Meal(recipe_id, (food.portion(100),), "test", recipe_id=recipe_id)]
 
 
+def _egg_only_recipes() -> tuple[RecipeTemplate, ...]:
+    return (
+        RecipeTemplate(
+            id="egg_only_breakfast",
+            slot="breakfast",
+            title="Egg only breakfast",
+            ingredients_g={"egg": 100},
+            instructions="Cook the egg.",
+            tags=frozenset({"curated"}),
+            time_text="10 minutes",
+        ),
+        RecipeTemplate(
+            id="egg_only_lunch",
+            slot="main",
+            title="Egg only lunch",
+            ingredients_g={"egg": 100},
+            instructions="Cook the egg.",
+            tags=frozenset({"curated"}),
+            time_text="10 minutes",
+        ),
+        RecipeTemplate(
+            id="egg_only_dinner",
+            slot="main",
+            title="Egg only dinner",
+            ingredients_g={"egg": 100},
+            instructions="Cook the egg.",
+            tags=frozenset({"curated"}),
+            time_text="10 minutes",
+        ),
+    )
+
+
 def test_apple_allergy_excludes_apple() -> None:
     profile = profile_with(restrictions=(Restriction(RestrictionType.ALLERGY, "яблоко"),))
     plan = build_one_day_plan(profile)
 
     assert "яблоко" not in food_names(plan)
     assert validate_plan(plan).ok
+
+
+def test_egg_allergy_excludes_recipes_with_egg_variants() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.ALLERGY, "\u044f\u0439\u0446\u0430"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=0, recipe_source="curated_only")
+    egg_ids = {"egg", "egg_yolk", "egg_white_extra", "egg_noodles"}
+
+    assert len(plan.meals) == 5
+    assert egg_ids.isdisjoint(food_ids(plan))
+    assert egg_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+
+def test_broccoli_exclusion_excludes_broccoli_recipes() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043d\u0435 \u0435\u043c \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=0, recipe_source="curated_only")
+
+    assert len(plan.meals) == 5
+    assert "broccoli" not in food_ids(plan)
+    assert "broccoli" not in recipe_ingredient_ids(plan)
 
 
 def test_excluded_mushrooms_filter_curated_recipes_by_alias() -> None:
@@ -480,6 +555,29 @@ def test_weekly_recipe_plan_does_not_reuse_recipe_ids_across_days_or_slots() -> 
     assert repeated_placements == {}
 
 
+@pytest.mark.slow_pdf_builder
+def test_weekly_generation_with_enough_pool_has_no_repeated_recipe_id() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    plans = _build_week_plans(profile, 101, set(), set())
+    recipe_ids = [meal.recipe_id for plan in plans for meal in plan.meals]
+
+    assert len(recipe_ids) == 35
+    assert len(set(recipe_ids)) == len(recipe_ids)
+
+
+@pytest.mark.slow_pdf_builder
+def test_same_recipe_id_is_not_reused_across_week_slots_when_alternatives_exist() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    plans = _build_week_plans(profile, 101, set(), set())
+    placements_by_recipe_id: dict[str, set[str]] = {}
+    for day_index, plan in enumerate(plans, start=1):
+        for meal in plan.meals:
+            assert meal.recipe_id
+            placements_by_recipe_id.setdefault(meal.recipe_id, set()).add(f"day {day_index}: {meal.name}")
+
+    assert all(len(placements) == 1 for placements in placements_by_recipe_id.values())
+
+
 def test_protein_top_up_reaches_95_percent_floor_when_feasible() -> None:
     protein = Food(
         id="lean_protein",
@@ -576,6 +674,99 @@ def test_hard_valid_candidate_scoring_prefers_best_macro_fit() -> None:
     selected = select_best([low_protein, hard_valid_worse, hard_valid_best], target)
 
     assert [meal.recipe_id for meal in selected] == ["hard_valid_best"]
+
+
+def test_protein_scoring_prefers_reasonable_floor_candidate_over_large_overshoot() -> None:
+    from diet_bot import builder as builder_module
+
+    select_best = getattr(builder_module, "_select_best_hard_valid_meals", None)
+    assert select_best is not None
+
+    target = _strict_floor_target()
+    reasonable = _single_macro_meal("protein_120_percent", 1900, 120, 60, 250)
+    excessive = _single_macro_meal("protein_155_percent", 2000, 155, 60, 250)
+
+    selected = select_best([excessive, reasonable], target)
+
+    assert [meal.recipe_id for meal in selected] == ["protein_120_percent"]
+
+
+def test_recipe_ranking_prefers_130_percent_protein_candidate_over_150_plus_candidate() -> None:
+    target = NutrientVector({"energy_kcal": 1000, "protein_g": 100, "fat_g": 40, "carbohydrate_g": 100})
+    current_total = NutrientVector({"energy_kcal": 500, "protein_g": 95, "fat_g": 20, "carbohydrate_g": 50})
+    moderate_food = Food(
+        id="moderate_candidate",
+        name="Moderate candidate",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 7, "fat_g": 1, "carbohydrate_g": 1}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    excessive_food = Food(
+        id="excessive_candidate",
+        name="Excessive candidate",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 100, "protein_g": 13, "fat_g": 1, "carbohydrate_g": 1}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    recipes = [
+        RecipeTemplate(
+            id="excessive_recipe",
+            slot="main",
+            title="Excessive protein",
+            ingredients_g={"excessive_candidate": 500},
+            instructions="Cook.",
+        ),
+        RecipeTemplate(
+            id="moderate_recipe",
+            slot="main",
+            title="Moderate protein",
+            ingredients_g={"moderate_candidate": 500},
+            instructions="Cook.",
+        ),
+    ]
+
+    ranked = _rank_recipes(
+        recipes,
+        "main",
+        set(),
+        Counter(),
+        Counter(),
+        {food.id: food for food in (moderate_food, excessive_food)},
+        current_total,
+        target,
+        500,
+        400,
+        600,
+        0,
+        0,
+    )
+
+    assert ranked[0].id == "moderate_recipe"
+
+
+def test_exclusion_infeasible_case_returns_controlled_empty_plan_not_unsafe_ration(monkeypatch) -> None:
+    egg = Food(
+        id="egg",
+        name="\u044f\u0439\u0446\u043e",
+        category="protein",
+        nutrients_per_100g=NutrientVector({"energy_kcal": 180, "protein_g": 60, "fat_g": 5}),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=500,
+        max_per_day_g=2000,
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", _egg_only_recipes)
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.ALLERGY, "\u044f\u0439\u0446\u0430"),),
+        meal_count=3,
+    )
+
+    plan = build_one_day_plan(profile, foods=[egg], variety_seed=0, recipe_source="curated_only")
+
+    assert plan.meals == ()
 
 
 def test_hard_floor_regeneration_respects_avoided_recipe_ids(monkeypatch) -> None:

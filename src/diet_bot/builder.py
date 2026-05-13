@@ -53,6 +53,8 @@ HIGH_PROTEIN_CEILING_MULTIPLIER = 1.35
 SMALL_PROTEIN_TARGET_CEILING_MULTIPLIER = 1.45
 SMALL_PROTEIN_TARGET_THRESHOLD_G = 90
 PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.95
+PROTEIN_REASONABLE_CEILING_MULTIPLIER = 1.30
+PROTEIN_EXCESSIVE_CEILING_MULTIPLIER = 1.50
 RECIPE_PLAN_CANDIDATE_COUNT = 1
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
@@ -289,6 +291,7 @@ def build_one_day_plan(
     avoided_recipe_ids: set[str] | frozenset[str] | None = None,
     avoided_recipe_keys: set[str] | frozenset[str] | None = None,
     recipe_source: RecipeSource = "all",
+    allow_avoided_recipe_relaxation: bool = True,
 ) -> MealPlan:
     safety = evaluate_safety(profile)
     targets = calculate_targets(profile)
@@ -297,7 +300,7 @@ def build_one_day_plan(
 
     candidates = filter_foods(foods or built_in_foods(), safety)
     if not candidates:
-        raise ValueError("No eligible foods after restrictions.")
+        return MealPlan(meals=(), targets=targets, safety=safety)
 
     recipe_meals = _build_recipe_plan_for_time(
         candidates,
@@ -320,7 +323,7 @@ def build_one_day_plan(
             frozenset(),
             recipe_source,
         )
-    if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
+    if not recipe_meals and allow_avoided_recipe_relaxation and (avoided_recipe_ids or avoided_recipe_keys):
         recipe_meals = _build_recipe_plan_for_time(
             candidates,
             targets.targets,
@@ -612,7 +615,13 @@ def _meal_candidate_score(meals: list[Meal], target: NutrientVector) -> tuple[fl
     macro_gap += _relative_gap(total, target, "carbohydrate_g")
     protein_target = target.get("protein_g")
     if protein_target > 0:
-        macro_gap += max(0.0, total.get("protein_g") - protein_target) / protein_target * 0.35
+        protein_ratio = total.get("protein_g") / protein_target
+        if protein_ratio > 1.0:
+            macro_gap += (protein_ratio - 1.0) * 0.35
+        if protein_ratio > PROTEIN_REASONABLE_CEILING_MULTIPLIER:
+            macro_gap += (protein_ratio - PROTEIN_REASONABLE_CEILING_MULTIPLIER) * 4.0
+        if protein_ratio > PROTEIN_EXCESSIVE_CEILING_MULTIPLIER:
+            macro_gap += (protein_ratio - PROTEIN_EXCESSIVE_CEILING_MULTIPLIER) * 10.0
 
     recipe_ids = [meal.recipe_id for meal in meals if meal.recipe_id]
     unique_recipe_ratio = len(set(recipe_ids)) / max(1, len(recipe_ids))
@@ -1235,7 +1244,7 @@ def _recipe_projected_protein_penalty(
     target: NutrientVector,
 ) -> float:
     protein_target = target.get("protein_g")
-    if protein_target >= SMALL_PROTEIN_TARGET_THRESHOLD_G:
+    if protein_target <= 0:
         return 0.0
 
     estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target)
@@ -1243,16 +1252,16 @@ def _recipe_projected_protein_penalty(
         return 0.0
     estimated_protein = estimated.get("protein_g")
     projected_protein = current_total.get("protein_g") + estimated_protein
-    soft_limit = protein_target * 1.25
-    hard_limit = protein_target * SMALL_PROTEIN_TARGET_CEILING_MULTIPLIER
+    soft_limit = protein_target * PROTEIN_REASONABLE_CEILING_MULTIPLIER
+    hard_limit = protein_target * PROTEIN_EXCESSIVE_CEILING_MULTIPLIER
 
     penalty = 0.0
-    if estimated_protein > protein_target * 0.35:
-        penalty += (estimated_protein - protein_target * 0.35) / max(1.0, protein_target) * 10.0
+    if estimated_protein > protein_target * 0.40:
+        penalty += (estimated_protein - protein_target * 0.40) / max(1.0, protein_target) * 8.0
     if projected_protein > soft_limit:
-        penalty += (projected_protein - soft_limit) / max(1.0, protein_target) * 12.0
+        penalty += (projected_protein - soft_limit) / max(1.0, protein_target) * 16.0
     if projected_protein > hard_limit:
-        penalty += (projected_protein - hard_limit) / max(1.0, protein_target) * 35.0
+        penalty += (projected_protein - hard_limit) / max(1.0, protein_target) * 45.0
     return penalty
 
 
