@@ -78,3 +78,17 @@ Note: old `pdf_renderer.py` also contains helper pages such as `_calculation_pag
 7. Shopping cards and pagination: restore two-column shopping cards and the dense-list two-page packing test.
 8. Page background and final typography pass: add page background, rounded card styles, smaller old type scale, and visual smoke checks if a rendered PDF comparison workflow is added.
 9. Optional data-only slice: restore specific recipe text/nutrition fixes only with targeted data tests; do not combine this with renderer layout.
+
+## Visual QA baseline - 2026-05-13
+
+- Source sample: `tmp\pdfs\foodbalance-branded-shell-sample.pdf` from the branded shell state.
+- Poppler CLI tools were not available in PATH or the bundled Codex runtime: `pdftoppm`, `pdfinfo`, and `pdftocairo` were not found. `mutool` was also not found.
+- Reliable renderer found: system Python 3.12 at `C:\Users\adck8\AppData\Local\Programs\Python\Python312\python.exe` with PyMuPDF (`fitz`) already installed. Local `.venv` does not currently include PyMuPDF or pypdfium2.
+- Render workflow used:
+  `python -c "... import fitz; doc = fitz.open(pdf); page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).save(out) ..."`
+- Rendered baseline PNGs were written to `tmp\pdfs\visual-baseline\` for pages 1, 3, and 18:
+  - page 1: cover plus the start of day 1;
+  - page 3: recipe content plus day totals;
+  - page 18: shopping list.
+- Visual check result: cover logo and QR are visible; recipe photo on page 3 is visible; shopping list text is readable; warm page background and margins render consistently; no obvious text overlap, black squares, or broken images were seen in the checked pages.
+- Remaining baseline layout issues to keep in mind before restoring recipe cards/day layout: the cover currently flows directly into day 1 content on the same page, day totals can share a page with the next day header, and the shopping list continues onto page 19.
