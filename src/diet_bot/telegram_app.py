@@ -1404,6 +1404,11 @@ async def _send_week_plan(
         )
         plan_dates = _week_plan_dates()
 
+        if not _week_plans_are_complete(plans, profile):
+            await _stop_week_pdf_status(status_task)
+            await _edit_week_pdf_status(status_message, WEEK_PDF_FAILURE_TEXT)
+            return False
+
         first_plan = plans[0]
         if not first_plan.safety.can_generate_plan:
             await _stop_week_pdf_status(status_task)
@@ -1533,9 +1538,13 @@ def _build_week_plans(
             week_food_ids,
             carryovers,
         )
+        if not _week_day_plan_is_complete(plan, profile):
+            return ()
         plans.append(plan)
         week_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
         week_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
+    if not _week_plans_are_complete(plans, profile):
+        return ()
     return tuple(plans)
 
 
@@ -1580,6 +1589,18 @@ def _select_week_day_plan(
             carryovers,
         )
     return best_plan, best_carryovers
+
+
+def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) -> bool:
+    return len(plans) == WEEK_PLAN_DAYS and all(_week_day_plan_is_complete(plan, profile) for plan in plans)
+
+
+def _week_day_plan_is_complete(plan: MealPlan, profile: UserProfile) -> bool:
+    return plan.safety.can_generate_plan and len(plan.meals) == _expected_meal_count(profile)
+
+
+def _expected_meal_count(profile: UserProfile) -> int:
+    return min(5, max(3, profile.meal_count))
 
 
 def _copy_carryovers(carryovers: dict[str, "_BatchCarryover"]) -> dict[str, "_BatchCarryover"]:

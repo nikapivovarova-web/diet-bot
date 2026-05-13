@@ -22,6 +22,7 @@ from diet_bot.domain import (
     Food,
     Goal,
     Meal,
+    MealPlan,
     MealRole,
     NutrientVector,
     Restriction,
@@ -728,6 +729,49 @@ def test_weekly_generation_with_enough_pool_has_no_repeated_recipe_id() -> None:
 
     assert len(recipe_ids) == 35
     assert len(set(recipe_ids)) == len(recipe_ids)
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_partial_day_returns_controlled_failure(monkeypatch) -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=4)
+    complete_day = build_one_day_plan(profile, variety_seed=101, recipe_source="curated_only")
+    empty_day = MealPlan((), complete_day.targets, complete_day.safety)
+    calls = 0
+
+    def select_day(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return (complete_day if calls == 1 else empty_day), args[-1]
+
+    monkeypatch.setattr("diet_bot.telegram_app._select_week_day_plan", select_day)
+
+    plans = _build_week_plans(profile, 101, set(), set())
+
+    assert plans == ()
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_plan_success_contains_no_empty_days() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    plans = _build_week_plans(profile, 101, set(), set())
+
+    assert len(plans) == 7
+    assert [len(plan.meals) for plan in plans] == [5, 5, 5, 5, 5, 5, 5]
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_infeasible_pool_returns_controlled_failure_not_partial_success(monkeypatch) -> None:
+    low_protein, hard_valid_protein = _strict_floor_foods()
+    monkeypatch.setattr("diet_bot.builder.built_in_foods", lambda: [low_protein, hard_valid_protein])
+    monkeypatch.setattr(
+        "diet_bot.builder.built_in_recipes",
+        lambda: _strict_floor_recipes(high_alternatives=True),
+    )
+    profile = profile_with(goal=Goal.MAINTAIN, weight_kg=65, meal_count=4, cooking_time=CookingTimePreference.SIMPLE)
+
+    plans = _build_week_plans(profile, 101, set(), set())
+
+    assert plans == ()
 
 
 @pytest.mark.slow_pdf_builder
