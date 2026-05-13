@@ -388,7 +388,8 @@ async def start(message: Message) -> None:
     profile = _profile_for_chat(message.chat.id)
     if profile is not None:
         await message.answer(
-            "Анкета уже сохранена. Ниже ваш актуальный расчет.\n\n"
+            "Анкета уже сохранена. Ниже ваш актуальный расчет.\n"
+            f"Чтобы изменить данные, нажмите «{CHANGE_PROFILE_TEXT}» в меню.\n\n"
             f"{_format_profile_report(message.chat.id)}",
             reply_markup=_main_menu_keyboard(message.chat.id),
         )
@@ -824,7 +825,12 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     if is_trial:
         await _send_trial_plan(message, profile)
         return
-    await _send_calculation_options(message, profile)
+    await _send_calculation_options(
+        message,
+        profile,
+        intro_text="Анкета сохранена ✅",
+        footer_text=f"Чтобы изменить данные, нажмите «{CHANGE_PROFILE_TEXT}» в меню.",
+    )
 
 
 def create_dispatcher() -> Dispatcher:
@@ -1086,8 +1092,20 @@ async def _repeat_plan(message: Message) -> None:
     await _send_one_day_plan_with_access(message, profile)
 
 
-async def _send_calculation_options(message: Message, profile: UserProfile) -> None:
-    await _send_calculation_report(message, profile, reply_markup=_ration_choice_keyboard_for_chat(message.chat.id))
+async def _send_calculation_options(
+    message: Message,
+    profile: UserProfile,
+    *,
+    intro_text: str | None = None,
+    footer_text: str | None = None,
+) -> None:
+    await _send_calculation_report(
+        message,
+        profile,
+        reply_markup=_ration_choice_keyboard_for_chat(message.chat.id),
+        intro_text=intro_text,
+        footer_text=footer_text,
+    )
 
 
 async def _send_calculation_report(
@@ -1095,11 +1113,18 @@ async def _send_calculation_report(
     profile: UserProfile,
     *,
     reply_markup: InlineKeyboardMarkup | None = None,
+    intro_text: str | None = None,
+    footer_text: str | None = None,
 ) -> None:
     targets = calculate_targets(profile)
     safety = evaluate_safety(profile)
+    text = format_calculation_summary(targets, safety)
+    if intro_text:
+        text = f"{intro_text}\n\n{text}"
+    if footer_text:
+        text = f"{text}\n\n{footer_text}"
     await message.answer(
-        format_calculation_summary(targets, safety),
+        text,
         reply_markup=reply_markup,
     )
 

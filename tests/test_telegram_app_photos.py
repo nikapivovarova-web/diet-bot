@@ -2568,7 +2568,9 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
         assert chat_id not in SESSION_BY_CHAT_ID
         assert PROFILE_BY_CHAT_ID[chat_id].cooking_time == "simple"
         sent_text, markup = message.texts[-1]
+        assert "Анкета сохранена" in sent_text
         assert "Ваш расчет" in sent_text
+        assert CHANGE_PROFILE_TEXT in sent_text
         assert "Считаю рацион" not in "\n".join(text for text, _ in message.texts)
         assert [(row[0].text, row[0].callback_data) for row in markup.inline_keyboard] == [
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
