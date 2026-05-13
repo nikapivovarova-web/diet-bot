@@ -6,6 +6,7 @@ from diet_bot.promo_codes import (
     PromoCodeKind,
     PromoCodeRecord,
     activate_promo_code,
+    calculate_discount_amount,
     generate_promo_codes,
     load_promo_codes,
     normalize_promo_code,
@@ -38,6 +39,35 @@ def test_monthly_access_promo_definition_defaults_to_one_time_month() -> None:
     assert promo.max_redemptions == 1
     assert promo.per_user_limit == 1
     assert promo.monthly_duration_months == 1
+
+
+def test_discount_amount_calculation_reduces_price_without_free_order() -> None:
+    percent = PromoCodeDefinition(
+        code="FB-DISC-OUNT-2026",
+        kind=PromoCodeKind.DISCOUNT,
+        max_redemptions=10,
+        discount_percent=20,
+    )
+    fixed = PromoCodeDefinition(
+        code="FB-FIXD-OUNT-2026",
+        kind=PromoCodeKind.DISCOUNT,
+        max_redemptions=10,
+        discount_amount=1_500,
+    )
+    access = PromoCodeDefinition(code="FB-ACCE-SSSS-2026")
+    free = PromoCodeDefinition(
+        code="FB-FREE-EEEE-2026",
+        kind=PromoCodeKind.DISCOUNT,
+        max_redemptions=10,
+        discount_percent=100,
+    )
+
+    assert calculate_discount_amount(percent, 59_900) == 11_980
+    assert calculate_discount_amount(fixed, 59_900) == 1_500
+    with pytest.raises(ValueError, match="discount"):
+        calculate_discount_amount(access, 59_900)
+    with pytest.raises(ValueError, match="positive"):
+        calculate_discount_amount(free, 59_900)
 
 
 def test_generate_promo_codes_creates_unique_monthly_codes() -> None:

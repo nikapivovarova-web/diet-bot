@@ -595,6 +595,109 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
     assert item["payment_subject"] == "service"
 
 
+def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metadata() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_discount1",
+        "nonce_discount1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.YOOKASSA,
+        amount=47_920,
+        currency=PaymentCurrency.RUB,
+        expires_at=now + timedelta(minutes=5),
+        list_amount=59_900,
+        discount_amount=11_980,
+        promo_code_id=42,
+        promo_redemption_id=77,
+        promo_code_hash="a" * 64,
+        promo_code_suffix="2026",
+        metadata={
+            "promo_code_id": 42,
+            "promo_code_hash": "a" * 64,
+            "promo_code_suffix": "2026",
+            "discount_amount": 11_980,
+            "final_amount": 47_920,
+        },
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    metadata = build_payment_invoice_metadata(order)
+    pre_checkout = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=47_920,
+        expected_provider=order.provider,
+        expected_product=order.product,
+        now=now,
+    )
+    success = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-charge-discount1",
+            provider_charge_id="provider-charge-discount1",
+            total_amount=47_920,
+        ),
+        now=now,
+    )
+    serialized_metadata = json.dumps(order.metadata, sort_keys=True)
+
+    assert metadata.amount == 47_920
+    assert metadata.provider_data is not None
+    assert metadata.provider_data["receipt"]["items"][0]["amount"] == {
+        "value": "479.20",
+        "currency": "RUB",
+    }
+    assert pre_checkout.approved is True
+    assert success.processed is True
+    assert repository.get_entitlement(order.user_id).is_subscription_active(now)
+    assert "FB-DISC-OUNT-2026" not in serialized_metadata
+    assert order.promo_code_suffix == "2026"
+
+
+def test_discounted_order_rejects_catalog_amount_at_pre_checkout_and_success() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_discount1",
+        "nonce_discount1",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=300,
+        expires_at=now + timedelta(minutes=5),
+        list_amount=400,
+        discount_amount=100,
+        promo_code_id=42,
+        promo_code_hash="b" * 64,
+        promo_code_suffix="2026",
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    pre_checkout = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=order.currency,
+        total_amount=400,
+        now=now,
+    )
+    success = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-charge-discount1",
+            total_amount=400,
+        ),
+        now=now,
+    )
+
+    assert pre_checkout.approved is False
+    assert pre_checkout.code == PaymentPreCheckoutCode.AMOUNT_MISMATCH
+    assert success.processed is False
+    assert success.code == PaymentSuccessfulPaymentCode.AMOUNT_MISMATCH
+    assert repository.get_entitlement(order.user_id) == Entitlement()
+
+
 @pytest.mark.parametrize(
     ("provider", "product", "currency", "amount"),
     [
@@ -2038,6 +2141,7 @@ class InMemoryPaymentOrderRepository:
         amount: int,
         currency: PaymentCurrency,
         now: datetime,
+        promo_code_id: int | None = None,
     ) -> PaymentOrder | None:
         for order in reversed(self.orders):
             if (
@@ -2047,6 +2151,7 @@ class InMemoryPaymentOrderRepository:
                 and order.product == product
                 and order.amount == amount
                 and order.currency == currency
+                and order.promo_code_id == promo_code_id
                 and order.status == PaymentOrderStatus.PENDING
                 and order.expires_at is not None
                 and order.expires_at > now
@@ -2232,6 +2337,13 @@ def _payment_order(
     delivery_chat_id: int | None = 2002,
     expires_at: datetime | None = None,
     pre_checkout_approved_at: datetime | None = None,
+    list_amount: int | None = None,
+    discount_amount: int = 0,
+    promo_code_id: int | None = None,
+    promo_redemption_id: int | None = None,
+    promo_code_hash: str | None = None,
+    promo_code_suffix: str | None = None,
+    metadata: dict[str, object] | None = None,
 ) -> PaymentOrder:
     return PaymentOrder(
         order_id=order_id,
@@ -2245,6 +2357,13 @@ def _payment_order(
         status=status,
         expires_at=expires_at,
         pre_checkout_approved_at=pre_checkout_approved_at,
+        list_amount=list_amount,
+        discount_amount=discount_amount,
+        promo_code_id=promo_code_id,
+        promo_redemption_id=promo_redemption_id,
+        promo_code_hash=promo_code_hash,
+        promo_code_suffix=promo_code_suffix,
+        metadata=metadata or {},
     )
 
 

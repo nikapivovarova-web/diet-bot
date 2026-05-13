@@ -28,6 +28,7 @@ from diet_bot.payments import (
     PaymentEventStatus,
     PaymentEventType,
     PaymentOrder,
+    PaymentOrderCreationCode,
     PaymentOrderCreationResult,
     PaymentOrderStatus,
     PaymentProduct,
@@ -49,10 +50,14 @@ from diet_bot.payments import (
 )
 from diet_bot.presentation import format_meal_card, format_week_shopping_list
 from diet_bot.promo_codes import (
+    PromoCodeActivation,
     PromoCodeDefinition,
     PromoCodeKind,
     PromoCodeRecord,
+    calculate_discount_amount,
     load_promo_codes,
+    normalize_promo_code,
+    promo_code_audit_metadata,
     save_promo_codes,
 )
 from diet_bot.telegram_app import (
@@ -1456,6 +1461,45 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
 
 
 @pytest.mark.anyio
+async def test_entered_discount_code_applies_to_next_yookassa_invoice(monkeypatch) -> None:
+    code = "FB-DISC-OUNT-2026"
+    store = FakePaymentStore(
+        promo_codes={
+            code: PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=5,
+                discount_percent=20,
+            )
+        }
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage()
+    PROMO_CODE_REQUEST_CHAT_IDS.add(message.chat.id)
+
+    await handle_answer(FakeMessage(message.chat.id, text=code))
+    callback = FakeCallback(CALLBACK_PAY_RU_CARD, message)
+    await telegram_app.handle_callback(callback)
+
+    invoice = message.bot.invoice_links[0]
+    order = store.orders[0]
+    provider_data = json.loads(invoice["provider_data"])
+    assert invoice["prices"][0].amount == 47_920
+    assert provider_data["receipt"]["items"][0]["amount"] == {
+        "value": "479.20",
+        "currency": "RUB",
+    }
+    assert order.amount == 47_920
+    assert order.list_amount == 59_900
+    assert order.discount_amount == 11_980
+    assert order.promo_code_suffix == "2026"
+    assert store.payment_order_promo_codes == [code]
+    assert code not in str(order.metadata)
+
+
+@pytest.mark.anyio
 async def test_active_subscription_cannot_buy_monthly_card_again(monkeypatch, tmp_path) -> None:
     chat_id = 81_007
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
@@ -1798,9 +1842,14 @@ class FakePaymentStore:
         self,
         *,
         entitlements: dict[int, telegram_app.Entitlement] | None = None,
+        promo_codes: dict[str, PromoCodeDefinition] | None = None,
     ) -> None:
         self.orders: list[PaymentOrder] = []
         self.entitlements = dict(entitlements or {})
+        self.promo_codes = {
+            normalize_promo_code(code): promo for code, promo in dict(promo_codes or {}).items()
+        }
+        self.payment_order_promo_codes: list[str] = []
         self.invoice_link_updates: list[tuple[str, str]] = []
         self.failed_invoice_creation_order_ids: list[str] = []
         self.pre_checkout_approvals: list[str] = []
@@ -1832,10 +1881,45 @@ class FakePaymentStore:
         currency: PaymentCurrency | str,
         now: datetime | None = None,
         ttl_seconds: int = 900,
+        promo_code: str | None = None,
     ) -> PaymentOrderCreationResult:
+        list_amount = amount
+        discount_amount = 0
+        promo_code_id = None
+        promo_redemption_id = None
+        promo_code_hash = None
+        promo_code_suffix = None
+        metadata: dict[str, object] = {}
+        if promo_code is not None:
+            normalized = normalize_promo_code(promo_code)
+            promo = self.promo_codes.get(normalized)
+            if promo is None:
+                return PaymentOrderCreationResult(
+                    accepted=False,
+                    code=PaymentOrderCreationCode.PROMO_NOT_FOUND,
+                )
+            if promo.kind != PromoCodeKind.DISCOUNT:
+                return PaymentOrderCreationResult(
+                    accepted=False,
+                    code=PaymentOrderCreationCode.PROMO_NOT_DISCOUNT,
+                )
+            discount_amount = calculate_discount_amount(promo, list_amount)
+            amount = list_amount - discount_amount
+            promo_code_id = 1
+            promo_redemption_id = len(self.payment_order_promo_codes) + 1
+            audit_metadata = promo_code_audit_metadata(
+                normalized,
+                promo_code_id=promo_code_id,
+                discount_amount=discount_amount,
+                final_amount=amount,
+            )
+            promo_code_hash = str(audit_metadata["code_hash"])
+            promo_code_suffix = str(audit_metadata["code_suffix"])
+            metadata = audit_metadata
+            self.payment_order_promo_codes.append(normalized)
         self._sequence += 1
         sequence = self._sequence
-        return create_or_reuse_pending_payment_order(
+        result = create_or_reuse_pending_payment_order(
             self,
             user_id=user_id,
             delivery_chat_id=delivery_chat_id,
@@ -1848,6 +1932,20 @@ class FakePaymentStore:
             order_id_factory=lambda: f"order_{sequence}",
             nonce_factory=lambda: f"nonce_{sequence}",
         )
+        if result.order is None or promo_code is None:
+            return result
+        discounted_order = replace(
+            result.order,
+            list_amount=list_amount,
+            discount_amount=discount_amount,
+            promo_code_id=promo_code_id,
+            promo_redemption_id=promo_redemption_id,
+            promo_code_hash=promo_code_hash,
+            promo_code_suffix=promo_code_suffix,
+            metadata=metadata,
+        )
+        self.orders[-1] = discounted_order
+        return replace(result, order=discounted_order)
 
     def find_active_pending_payment_order(
         self,
@@ -1859,6 +1957,7 @@ class FakePaymentStore:
         amount: int,
         currency: PaymentCurrency,
         now: datetime,
+        promo_code_id: int | None = None,
     ) -> PaymentOrder | None:
         for order in reversed(self.orders):
             if (
@@ -1868,6 +1967,7 @@ class FakePaymentStore:
                 and order.product == product
                 and order.amount == amount
                 and order.currency == currency
+                and order.promo_code_id == promo_code_id
                 and is_active_pending_payment_order(order, now=now)
             ):
                 return order
@@ -1876,6 +1976,28 @@ class FakePaymentStore:
     def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder:
         self.orders.append(order)
         return order
+
+    def get_promo_code(
+        self,
+        raw_code: str,
+        *,
+        active_only: bool = False,
+        now: datetime | None = None,
+    ) -> PromoCodeDefinition | None:
+        promo = self.promo_codes.get(normalize_promo_code(raw_code))
+        if promo is None:
+            return None
+        if active_only and not promo.is_active_at(now):
+            return None
+        return promo
+
+    def activate_promo_code(self, user_id: int, raw_code: str) -> PromoCodeActivation:
+        promo = self.promo_codes.get(normalize_promo_code(raw_code))
+        if promo is None:
+            return PromoCodeActivation("not_found", normalize_promo_code(raw_code))
+        if promo.kind != PromoCodeKind.MONTHLY_ACCESS:
+            return PromoCodeActivation("not_access_code", promo.code)
+        return PromoCodeActivation("activated", promo.code, user_id)
 
     def load_payment_order(self, order_id: str) -> PaymentOrder | None:
         for order in self.orders:

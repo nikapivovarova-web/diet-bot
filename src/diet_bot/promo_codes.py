@@ -239,6 +239,21 @@ def promo_code_grant_charge_id(raw_code: str) -> str:
     return f"promo:{promo_code_audit_hash(raw_code)[:24]}"
 
 
+def calculate_discount_amount(promo: PromoCodeDefinition, list_amount: int) -> int:
+    if list_amount <= 0:
+        raise ValueError("Discount requires a positive list amount")
+    definition = PromoCodeDefinition(**promo.to_dict())
+    if definition.kind != PromoCodeKind.DISCOUNT:
+        raise ValueError("Promo code is not a discount")
+    if definition.discount_percent is not None:
+        discount_amount = (list_amount * definition.discount_percent) // 100
+    else:
+        discount_amount = definition.discount_amount or 0
+    final_amount = list_amount - discount_amount
+    if discount_amount <= 0 or final_amount <= 0:
+        raise ValueError("Discount must leave a positive final amount")
+    return discount_amount
+
 def load_promo_codes(path: Path) -> dict[str, PromoCodeRecord]:
     if not path.exists():
         return {}

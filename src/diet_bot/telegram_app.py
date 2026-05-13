@@ -76,7 +76,13 @@ from .payments import (
     validate_payment_pre_checkout,
 )
 from .postgres_store import PostgresDietBotStore
-from .promo_codes import PromoCodeActivation, activate_promo_code, promo_code_grant_charge_id
+from .promo_codes import (
+    PromoCodeActivation,
+    PromoCodeKind,
+    activate_promo_code,
+    normalize_promo_code,
+    promo_code_grant_charge_id,
+)
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import RuntimeConfig, is_production_environment, load_runtime_config
 from .safety import evaluate_safety
@@ -90,6 +96,7 @@ from .subscriptions import (
     PaymentApplication,
     RationKind,
     apply_monthly_access_promo_grant,
+    apply_subscription_payment,
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
     grant_test_access,
@@ -111,6 +118,7 @@ RECENT_RECIPE_IDS_BY_CHAT_ID: dict[int, list[str]] = {}
 RECENT_RECIPE_KEYS_BY_CHAT_ID: dict[int, list[str]] = {}
 SUPPORT_REQUEST_CHAT_IDS: set[int] = set()
 PROMO_CODE_REQUEST_CHAT_IDS: set[int] = set()
+DISCOUNT_PROMO_CODE_BY_CHAT_ID: dict[int, str] = {}
 router = Router()
 DEFAULT_SUPPORT_CHAT_ID = -5_271_779_108
 _RUNTIME_STORE: DietBotStore | None = None
@@ -226,6 +234,7 @@ PROMO_CODE_ALREADY_USED_TEXT = "Этот промокод уже был акти
 PROMO_CODE_DISABLED_TEXT = "Этот промокод сейчас не активен. Если вы получили его от поддержки, напишите нам."
 PROMO_CODE_EXPIRED_TEXT = "Срок действия этого промокода закончился."
 PROMO_CODE_NOT_ACCESS_TEXT = "Этот промокод не активирует месячный доступ. Сейчас здесь можно применить только промокод на доступ."
+PROMO_CODE_DISCOUNT_APPLIED_TEXT = "Промокод на скидку применен. Выберите способ оплаты, и я пересчитаю счет."
 SUPPORT_TEXT = "🛟 Техподдержка"
 SUPPORT_PROMPT_TEXT = (
     "Опишите проблему одним сообщением.\n\n"
@@ -968,6 +977,13 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
         await message.answer(PROMO_CODE_EXPIRED_TEXT)
         return
     if activation.status == "not_access_code":
+        if _remember_discount_promo_code_for_chat(message.chat.id, text):
+            PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+            await message.answer(
+                PROMO_CODE_DISCOUNT_APPLIED_TEXT,
+                reply_markup=_subscription_payment_keyboard(),
+            )
+            return
         await message.answer(PROMO_CODE_NOT_ACCESS_TEXT)
         return
     await message.answer(PROMO_CODE_NOT_FOUND_TEXT)
@@ -1997,6 +2013,7 @@ async def _create_or_reuse_invoice_payment_order(
         return None
 
     product_metadata = get_payment_product_invoice_metadata(provider, product)
+    promo_code = _pending_discount_promo_code_for_order(message.chat.id, product)
     result = store.create_or_reuse_pending_payment_order(
         user_id=buyer_id,
         delivery_chat_id=message.chat.id,
@@ -2004,8 +2021,10 @@ async def _create_or_reuse_invoice_payment_order(
         product=product,
         amount=product_metadata.amount,
         currency=product_metadata.currency,
+        promo_code=promo_code,
     )
     if result.accepted and result.order is not None:
+        _clear_pending_discount_promo_code(message.chat.id, promo_code)
         return result.order
     if result.code == PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED:
         await _send_extra_purchase_subscription_required_message(message)
@@ -2321,6 +2340,37 @@ def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeAct
         )
         _save_entitlement_for_chat(chat_id, entitlement)
         return activation
+
+
+def _remember_discount_promo_code_for_chat(chat_id: int, promo_code: str) -> bool:
+    store = _runtime_store()
+    getter = getattr(store, "get_promo_code", None)
+    if not callable(getter):
+        return False
+    try:
+        promo = getter(promo_code, active_only=True)
+    except Exception:
+        return False
+    if promo is None or getattr(promo, "kind", None) != PromoCodeKind.DISCOUNT:
+        return False
+    DISCOUNT_PROMO_CODE_BY_CHAT_ID[chat_id] = normalize_promo_code(promo_code)
+    return True
+
+
+def _pending_discount_promo_code_for_order(
+    chat_id: int,
+    product: PaymentProduct,
+) -> str | None:
+    if product != PaymentProduct.SUBSCRIPTION_MONTH:
+        return None
+    return DISCOUNT_PROMO_CODE_BY_CHAT_ID.get(chat_id)
+
+
+def _clear_pending_discount_promo_code(chat_id: int, promo_code: str | None) -> None:
+    if promo_code is None:
+        return
+    if DISCOUNT_PROMO_CODE_BY_CHAT_ID.get(chat_id) == promo_code:
+        DISCOUNT_PROMO_CODE_BY_CHAT_ID.pop(chat_id, None)
 
 
 def _promo_code_success_text(chat_id: int) -> str:

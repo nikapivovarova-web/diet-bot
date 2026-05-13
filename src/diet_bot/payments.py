@@ -56,6 +56,12 @@ class PaymentOrderCreationCode(StrEnum):
     CREATED = "created"
     REUSED = "reused"
     ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+    PROMO_NOT_FOUND = "promo_not_found"
+    PROMO_NOT_DISCOUNT = "promo_not_discount"
+    PROMO_DISABLED = "promo_disabled"
+    PROMO_EXPIRED = "promo_expired"
+    PROMO_ALREADY_USED = "promo_already_used"
+    PROMO_INVALID_DISCOUNT = "promo_invalid_discount"
 
 
 class PaymentEventType(StrEnum):
@@ -333,14 +339,42 @@ class PaymentOrder:
     updated_at: datetime | None = None
     invoice_link: str | None = None
     pre_checkout_approved_at: datetime | None = None
+    list_amount: int | None = None
+    discount_amount: int = 0
+    promo_code_id: int | None = None
+    promo_redemption_id: int | None = None
+    promo_code_hash: str | None = None
+    promo_code_suffix: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "provider", PaymentProvider(self.provider))
         object.__setattr__(self, "product", PaymentProduct(self.product))
         object.__setattr__(self, "currency", PaymentCurrency(self.currency))
         object.__setattr__(self, "status", PaymentOrderStatus(self.status))
-        if self.amount < 0:
-            raise ValueError("payment amount must be non-negative")
+        list_amount = self.amount if self.list_amount is None else int(self.list_amount)
+        discount_amount = int(self.discount_amount)
+        if self.amount <= 0:
+            raise ValueError("payment amount must be positive")
+        if list_amount <= 0:
+            raise ValueError("payment list amount must be positive")
+        if discount_amount < 0:
+            raise ValueError("payment discount amount must be non-negative")
+        if list_amount - discount_amount != self.amount:
+            raise ValueError("payment discount metadata must match final amount")
+        if discount_amount > 0 and (
+            self.promo_code_id is None
+            or not str(self.promo_code_hash or "").strip()
+            or not str(self.promo_code_suffix or "").strip()
+        ):
+            raise ValueError("discounted payment orders require promo metadata")
+        if self.promo_code_hash is not None:
+            object.__setattr__(self, "promo_code_hash", str(self.promo_code_hash).strip() or None)
+        if self.promo_code_suffix is not None:
+            object.__setattr__(self, "promo_code_suffix", str(self.promo_code_suffix).strip() or None)
+        object.__setattr__(self, "list_amount", list_amount)
+        object.__setattr__(self, "discount_amount", discount_amount)
+        object.__setattr__(self, "metadata", dict(self.metadata))
         encode_payment_order_payload(self.order_id, self.nonce)
 
     @property
@@ -371,6 +405,7 @@ class PaymentOrderRepository(Protocol):
         amount: int,
         currency: PaymentCurrency,
         now: datetime,
+        promo_code_id: int | None = None,
     ) -> PaymentOrder | None: ...
 
     def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder: ...
@@ -1171,19 +1206,27 @@ def get_payment_product_invoice_metadata(
 
 def build_payment_invoice_metadata(order: PaymentOrder) -> PaymentInvoiceMetadata:
     product_metadata = get_payment_product_invoice_metadata(order.provider, order.product)
-    if order.amount != product_metadata.amount or order.currency != product_metadata.currency:
+    if (
+        order.list_amount != product_metadata.amount
+        or order.currency != product_metadata.currency
+        or order.discount_amount != order.list_amount - order.amount
+    ):
         raise ValueError("payment order does not match production invoice metadata")
 
     return PaymentInvoiceMetadata(
         provider=product_metadata.provider,
         product=product_metadata.product,
         currency=product_metadata.currency,
-        amount=product_metadata.amount,
+        amount=order.amount,
         payload=build_payment_invoice_payload(order),
         subscription_period=product_metadata.subscription_period,
         need_email=product_metadata.need_email,
         send_email_to_provider=product_metadata.send_email_to_provider,
-        provider_data=product_metadata.provider_data,
+        provider_data=(
+            _build_yookassa_provider_data(order.product, order.amount)
+            if order.provider == PaymentProvider.YOOKASSA
+            else product_metadata.provider_data
+        ),
     )
 
 
@@ -1201,6 +1244,13 @@ def create_or_reuse_pending_payment_order(
     order_id_factory: TokenFactory | None = None,
     nonce_factory: TokenFactory | None = None,
     has_active_subscription: bool | None = None,
+    promo_code_id: int | None = None,
+    promo_redemption_id: int | None = None,
+    list_amount: int | None = None,
+    discount_amount: int = 0,
+    promo_code_hash: str | None = None,
+    promo_code_suffix: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> PaymentOrderCreationResult:
     provider_value = PaymentProvider(provider)
     product_value = PaymentProduct(product)
@@ -1235,6 +1285,7 @@ def create_or_reuse_pending_payment_order(
         amount=amount,
         currency=currency_value,
         now=current_time,
+        promo_code_id=promo_code_id,
     )
     if existing is not None:
         return PaymentOrderCreationResult(
@@ -1257,6 +1308,13 @@ def create_or_reuse_pending_payment_order(
         created_at=current_time,
         expires_at=current_time + timedelta(seconds=ttl_seconds),
         updated_at=current_time,
+        list_amount=list_amount,
+        discount_amount=discount_amount,
+        promo_code_id=promo_code_id,
+        promo_redemption_id=promo_redemption_id,
+        promo_code_hash=promo_code_hash,
+        promo_code_suffix=promo_code_suffix,
+        metadata=dict(metadata or {}),
     )
     return PaymentOrderCreationResult(
         accepted=True,
@@ -2387,7 +2445,19 @@ def _validate_order_against_invoice_catalog(
         return PaymentSuccessfulPaymentCode.PRODUCT_MISMATCH
     if order.currency != metadata.currency:
         return PaymentSuccessfulPaymentCode.CURRENCY_MISMATCH
-    if order.amount != metadata.amount:
+    if (
+        order.list_amount != metadata.amount
+        or order.discount_amount != order.list_amount - order.amount
+        or (
+            order.discount_amount > 0
+            and (
+                order.promo_code_id is None
+                or not order.promo_code_hash
+                or not order.promo_code_suffix
+            )
+        )
+        or order.amount <= 0
+    ):
         return PaymentSuccessfulPaymentCode.AMOUNT_MISMATCH
     return None
 

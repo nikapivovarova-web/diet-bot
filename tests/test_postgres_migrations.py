@@ -32,9 +32,11 @@ REQUIRED_INDEXES = {
     "idx_payment_orders_user_status",
     "idx_payment_events_order_created_at",
     "idx_payment_events_charge",
+    "idx_payment_orders_promo_code",
     "idx_processed_provider_charges_order",
     "idx_promo_codes_active_expires",
     "idx_promo_redemptions_code_user",
+    "idx_promo_redemptions_order",
     "idx_promo_redemptions_user",
     "idx_promo_events_code_created",
     "idx_support_state_status_updated",
@@ -101,6 +103,9 @@ def test_migrations_include_required_paid_storage_tables() -> None:
     )
     for column_pattern in (
         r"\bexpires_at\s+TIMESTAMPTZ\b",
+        r"\blist_amount\s+INTEGER\b",
+        r"\bpromo_code_id\s+BIGINT\b",
+        r"\border_id\s+TEXT\b",
         r"\bmax_redemptions\s+INTEGER\b",
         r"\bper_user_limit\s+INTEGER\b",
         r"\bdiscount_percent\s+INTEGER\b",

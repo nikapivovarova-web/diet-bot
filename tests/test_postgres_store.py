@@ -1081,6 +1081,284 @@ def test_postgres_successful_payment_applies_order_and_records_charge_aliases() 
         _cleanup_users(store, user_id)
 
 
+def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_payment() -> None:
+    from diet_bot.payments import (
+        PaymentCurrency,
+        PaymentOrderCreationCode,
+        PaymentPreCheckoutCode,
+        PaymentProduct,
+        PaymentProvider,
+        PaymentSuccessfulPaymentCode,
+        PaymentSuccessfulPaymentInput,
+        validate_payment_pre_checkout,
+    )
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    user_id = _unique_user_id()
+    second_user_id = _unique_user_id()
+    code = _unique_promo_code()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=1,
+                per_user_limit=1,
+                discount_percent=20,
+            )
+        )
+
+        first = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.YOOKASSA,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=59_900,
+            currency=PaymentCurrency.RUB,
+            promo_code=code,
+            now=now,
+        )
+        repeated = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.YOOKASSA,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=59_900,
+            currency=PaymentCurrency.RUB,
+            promo_code=code,
+            now=now + timedelta(minutes=1),
+        )
+        exhausted = store.create_or_reuse_pending_payment_order(
+            user_id=second_user_id,
+            delivery_chat_id=second_user_id + 10,
+            provider=PaymentProvider.YOOKASSA,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=59_900,
+            currency=PaymentCurrency.RUB,
+            promo_code=code,
+            now=now,
+        )
+
+        assert first.accepted is True
+        assert first.code == PaymentOrderCreationCode.CREATED
+        assert repeated.code == PaymentOrderCreationCode.REUSED
+        assert exhausted.accepted is False
+        assert exhausted.code == PaymentOrderCreationCode.PROMO_ALREADY_USED
+        order = first.order
+        assert order is not None
+        assert order.amount == 47_920
+        assert order.list_amount == 59_900
+        assert order.discount_amount == 11_980
+        assert order.promo_code_id is not None
+        assert order.promo_redemption_id is not None
+        assert order.promo_code_suffix == code[-4:]
+        assert code not in str(order.metadata)
+
+        redemptions = _promo_redemptions_for_code(store, code)
+        assert len(redemptions) == 1
+        assert redemptions[0]["status"] == "reserved"
+        assert redemptions[0]["order_id"] == order.order_id
+        assert redemptions[0]["discount_amount"] == 11_980
+        assert code not in str(redemptions[0]["metadata_json"])
+
+        pre_checkout = validate_payment_pre_checkout(
+            store,
+            payload=order.payload,
+            user_id=user_id,
+            currency=PaymentCurrency.RUB,
+            total_amount=47_920,
+            expected_provider=PaymentProvider.YOOKASSA,
+            expected_product=PaymentProduct.SUBSCRIPTION_MONTH,
+            now=now,
+        )
+        payment = PaymentSuccessfulPaymentInput(
+            payload=order.payload,
+            provider=PaymentProvider.YOOKASSA,
+            telegram_charge_id="tg-charge-discount1",
+            provider_charge_id="provider-charge-discount1",
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            currency=PaymentCurrency.RUB,
+            total_amount=47_920,
+        )
+        success = store.apply_successful_payment(payment, now=now)
+        duplicate = store.apply_successful_payment(payment, now=now + timedelta(seconds=10))
+
+        redeemed = _promo_redemptions_for_code(store, code)
+        events = _promo_events_for_code(store, code)
+
+        assert pre_checkout.code == PaymentPreCheckoutCode.APPROVED
+        assert success.code == PaymentSuccessfulPaymentCode.PROCESSED
+        assert duplicate.code == PaymentSuccessfulPaymentCode.DUPLICATE
+        assert redeemed[0]["status"] == "redeemed"
+        assert [row["status"] for row in redeemed] == ["redeemed"]
+        assert [event["event_type"] for event in events].count("reserved") == 1
+        assert [event["event_type"] for event in events].count("redeemed") == 1
+    finally:
+        _cleanup_promo_code(store, code)
+        _cleanup_users(store, user_id, second_user_id)
+
+
+def test_postgres_discount_promo_rejects_monthly_access_code_for_payment_order() -> None:
+    from diet_bot.payments import (
+        PaymentCurrency,
+        PaymentOrderCreationCode,
+        PaymentProduct,
+        PaymentProvider,
+    )
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    user_id = _unique_user_id()
+    code = _unique_promo_code()
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                max_redemptions=1,
+            )
+        )
+
+        result = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            promo_code=code,
+        )
+
+        assert result.accepted is False
+        assert result.code == PaymentOrderCreationCode.PROMO_NOT_DISCOUNT
+        assert result.order is None
+        assert _promo_redemptions_for_code(store, code) == []
+    finally:
+        _cleanup_promo_code(store, code)
+        _cleanup_users(store, user_id)
+
+
+@pytest.mark.parametrize(
+    ("active", "expires_delta"),
+    [
+        (False, timedelta(days=1)),
+        (True, timedelta(minutes=-1)),
+    ],
+)
+def test_postgres_discount_promo_rejects_disabled_or_expired_order_discount(
+    active: bool,
+    expires_delta: timedelta,
+) -> None:
+    from diet_bot.payments import (
+        PaymentCurrency,
+        PaymentOrderCreationCode,
+        PaymentProduct,
+        PaymentProvider,
+    )
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    user_id = _unique_user_id()
+    code = _unique_promo_code()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.DISCOUNT,
+                active=active,
+                expires_at=now + expires_delta,
+                max_redemptions=5,
+                discount_percent=10,
+            )
+        )
+
+        result = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            promo_code=code,
+            now=now,
+        )
+
+        assert result.accepted is False
+        assert result.code == (
+            PaymentOrderCreationCode.PROMO_DISABLED
+            if not active
+            else PaymentOrderCreationCode.PROMO_EXPIRED
+        )
+        assert result.order is None
+        assert _promo_redemptions_for_code(store, code) == []
+    finally:
+        _cleanup_promo_code(store, code)
+        _cleanup_users(store, user_id)
+
+
+def test_postgres_discount_reservation_is_released_when_invoice_creation_fails() -> None:
+    from diet_bot.payments import (
+        PaymentCurrency,
+        PaymentOrderCreationCode,
+        PaymentProduct,
+        PaymentProvider,
+    )
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    user_id = _unique_user_id()
+    second_user_id = _unique_user_id()
+    code = _unique_promo_code()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=1,
+                discount_amount=100,
+            )
+        )
+        first = store.create_or_reuse_pending_payment_order(
+            user_id=user_id,
+            delivery_chat_id=user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            promo_code=code,
+            now=now,
+        )
+        assert first.order is not None
+
+        store.mark_payment_order_invoice_creation_failed(first.order.order_id)
+        second = store.create_or_reuse_pending_payment_order(
+            user_id=second_user_id,
+            delivery_chat_id=second_user_id + 10,
+            provider=PaymentProvider.TELEGRAM_STARS,
+            product=PaymentProduct.SUBSCRIPTION_MONTH,
+            amount=400,
+            currency=PaymentCurrency.XTR,
+            promo_code=code,
+            now=now + timedelta(minutes=1),
+        )
+
+        redemptions = _promo_redemptions_for_code(store, code)
+        loaded = store.get_promo_code(code)
+        assert second.accepted is True
+        assert second.code == PaymentOrderCreationCode.CREATED
+        assert loaded is not None
+        assert loaded.used_count == 1
+        assert [row["status"] for row in redemptions] == ["released", "reserved"]
+    finally:
+        _cleanup_promo_code(store, code)
+        _cleanup_users(store, user_id, second_user_id)
+
+
 def _store(**kwargs: Any):
     from diet_bot.postgres_store import PostgresDietBotStore
 

@@ -61,4 +61,9 @@ def test_storage_contract_exposes_paid_production_methods() -> None:
 
     success_signature = inspect.signature(storage.DietBotStore.apply_successful_payment)
     assert "successful_payment" in success_signature.parameters
+
+    create_order_signature = inspect.signature(
+        storage.DietBotStore.create_or_reuse_pending_payment_order
+    )
+    assert "promo_code" in create_order_signature.parameters
     assert "now" in success_signature.parameters

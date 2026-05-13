@@ -94,10 +94,17 @@ BASE_SCHEMA_STATEMENTS = (
         product TEXT NOT NULL,
         provider TEXT NOT NULL,
         amount INTEGER NOT NULL,
+        list_amount INTEGER NOT NULL,
+        discount_amount INTEGER NOT NULL DEFAULT 0,
         currency TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
         invoice_link TEXT,
         pre_checkout_approved_at TIMESTAMPTZ,
+        promo_code_id BIGINT,
+        promo_redemption_id BIGINT,
+        promo_code_hash TEXT,
+        promo_code_suffix TEXT,
+        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         expires_at TIMESTAMPTZ NOT NULL,
         paid_at TIMESTAMPTZ,
@@ -105,7 +112,10 @@ BASE_SCHEMA_STATEMENTS = (
         CHECK (product IN ('subscription_month', 'extra_one_day', 'extra_weekly_pdf')),
         CHECK (provider IN ('telegram_stars', 'yookassa')),
         CHECK (status IN ('pending', 'paid', 'expired', 'failed_invoice_creation')),
-        CHECK (amount >= 0)
+        CHECK (amount > 0),
+        CHECK (list_amount > 0),
+        CHECK (discount_amount >= 0),
+        CHECK (list_amount - discount_amount = amount)
     )
     """,
     """
@@ -175,6 +185,7 @@ BASE_SCHEMA_STATEMENTS = (
         id BIGSERIAL PRIMARY KEY,
         promo_code_id BIGINT NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
         user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+        order_id TEXT REFERENCES payment_orders(order_id) ON DELETE SET NULL,
         status TEXT NOT NULL DEFAULT 'redeemed',
         kind TEXT,
         discount_amount INTEGER,
@@ -205,7 +216,7 @@ BASE_SCHEMA_STATEMENTS = (
         event_type TEXT NOT NULL,
         metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CHECK (event_type IN ('created', 'redeemed', 'rejected', 'disabled'))
+        CHECK (event_type IN ('created', 'reserved', 'redeemed', 'released', 'rejected', 'disabled'))
     )
     """,
     """
@@ -622,11 +633,162 @@ PROMO_STORAGE_FOUNDATION_MIGRATION = PostgresMigration(
 )
 
 
+PROMO_PAYMENT_DISCOUNT_MIGRATION = PostgresMigration(
+    version="202605130004",
+    description="Attach discount promo reservations to payment orders",
+    statements=(
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS list_amount INTEGER
+        """,
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS discount_amount INTEGER NOT NULL DEFAULT 0
+        """,
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS promo_code_id BIGINT
+        """,
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS promo_redemption_id BIGINT
+        """,
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS promo_code_hash TEXT
+        """,
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS promo_code_suffix TEXT
+        """,
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+        """,
+        """
+        ALTER TABLE promo_redemptions
+        ADD COLUMN IF NOT EXISTS order_id TEXT
+        """,
+        """
+        DO $$
+        BEGIN
+            UPDATE payment_orders
+            SET list_amount = COALESCE(list_amount, amount),
+                discount_amount = COALESCE(discount_amount, 0),
+                metadata_json = COALESCE(metadata_json, '{}'::jsonb)
+            WHERE list_amount IS NULL
+               OR discount_amount IS NULL
+               OR metadata_json IS NULL;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'payment_orders'::regclass
+                  AND conname = 'payment_orders_list_amount_check'
+            ) THEN
+                ALTER TABLE payment_orders
+                ADD CONSTRAINT payment_orders_list_amount_check
+                CHECK (list_amount > 0);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'payment_orders'::regclass
+                  AND conname = 'payment_orders_discount_amount_check'
+            ) THEN
+                ALTER TABLE payment_orders
+                ADD CONSTRAINT payment_orders_discount_amount_check
+                CHECK (discount_amount >= 0);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'payment_orders'::regclass
+                  AND conname = 'payment_orders_final_amount_check'
+            ) THEN
+                ALTER TABLE payment_orders
+                ADD CONSTRAINT payment_orders_final_amount_check
+                CHECK (amount > 0 AND list_amount - discount_amount = amount);
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'payment_orders'::regclass
+                  AND conname = 'payment_orders_promo_code_id_fkey'
+            ) THEN
+                ALTER TABLE payment_orders
+                ADD CONSTRAINT payment_orders_promo_code_id_fkey
+                FOREIGN KEY (promo_code_id) REFERENCES promo_codes(id) ON DELETE SET NULL;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'payment_orders'::regclass
+                  AND conname = 'payment_orders_promo_redemption_id_fkey'
+            ) THEN
+                ALTER TABLE payment_orders
+                ADD CONSTRAINT payment_orders_promo_redemption_id_fkey
+                FOREIGN KEY (promo_redemption_id) REFERENCES promo_redemptions(id) ON DELETE SET NULL;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_redemptions'::regclass
+                  AND conname = 'promo_redemptions_order_id_fkey'
+            ) THEN
+                ALTER TABLE promo_redemptions
+                ADD CONSTRAINT promo_redemptions_order_id_fkey
+                FOREIGN KEY (order_id) REFERENCES payment_orders(order_id) ON DELETE SET NULL;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_events'::regclass
+                  AND conname = 'promo_events_event_type_check'
+            ) THEN
+                ALTER TABLE promo_events DROP CONSTRAINT promo_events_event_type_check;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'promo_events'::regclass
+                  AND conname = 'promo_events_event_type_supported_check'
+            ) THEN
+                ALTER TABLE promo_events
+                ADD CONSTRAINT promo_events_event_type_supported_check
+                CHECK (event_type IN ('created', 'reserved', 'redeemed', 'released', 'rejected', 'disabled'));
+            END IF;
+        END $$;
+        """,
+        """
+        ALTER TABLE payment_orders
+        ALTER COLUMN list_amount SET NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_payment_orders_promo_code
+            ON payment_orders(promo_code_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_redemptions_order
+            ON promo_redemptions(order_id)
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
     PAYMENT_SUCCESS_LEDGER_MIGRATION,
     PROMO_STORAGE_FOUNDATION_MIGRATION,
+    PROMO_PAYMENT_DISCOUNT_MIGRATION,
 )
 
 

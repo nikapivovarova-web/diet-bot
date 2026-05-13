@@ -47,6 +47,7 @@ from .promo_codes import (
     PromoCodeRecord,
     PromoRedemptionResult,
     PromoRedemptionStatus,
+    calculate_discount_amount,
     normalize_promo_code,
     promo_code_audit_metadata,
     promo_code_grant_charge_id,
@@ -881,6 +882,13 @@ class PostgresDietBotStore:
         amount: int,
         currency: str,
         expires_at: datetime,
+        list_amount: int | None = None,
+        discount_amount: int = 0,
+        promo_code_id: int | None = None,
+        promo_redemption_id: int | None = None,
+        promo_code_hash: str | None = None,
+        promo_code_suffix: str | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> PaymentOrder:
         created_at = datetime.now(UTC)
         order = PaymentOrder(
@@ -896,6 +904,13 @@ class PostgresDietBotStore:
             created_at=created_at,
             expires_at=_normalize_datetime(expires_at),
             updated_at=created_at,
+            list_amount=list_amount,
+            discount_amount=discount_amount,
+            promo_code_id=promo_code_id,
+            promo_redemption_id=promo_redemption_id,
+            promo_code_hash=promo_code_hash,
+            promo_code_suffix=promo_code_suffix,
+            metadata=metadata or {},
         )
         return self.insert_payment_order(order)
 
@@ -910,6 +925,7 @@ class PostgresDietBotStore:
         currency: PaymentCurrency | str,
         now: datetime | None = None,
         ttl_seconds: int = PAYMENT_ORDER_TTL_SECONDS,
+        promo_code: str | None = None,
     ) -> PaymentOrderCreationResult:
         provider_value = PaymentProvider(provider)
         product_value = PaymentProduct(product)
@@ -923,6 +939,7 @@ class PostgresDietBotStore:
 
         current_time = _normalize_datetime(now)
         requires_active_subscription = product_value in EXTRA_PAYMENT_PRODUCTS
+        normalized_promo_code = normalize_promo_code(promo_code) if promo_code else None
         with self._connect() as conn:
             with conn.cursor() as cur:
                 self._remember_user_cur(cur, UserIdentity(user_id))
@@ -936,15 +953,76 @@ class PostgresDietBotStore:
                             message="Active subscription is required for this extra.",
                             requires_active_subscription=True,
                         )
+                list_amount = amount
+                final_amount = amount
+                discount_amount = 0
+                promo: dict[str, Any] | None = None
+                promo_id: int | None = None
+                promo_metadata: dict[str, object] = {}
+                promo_code_hash: str | None = None
+                promo_code_suffix: str | None = None
+                if normalized_promo_code is not None:
+                    promo = self._select_promo_for_update_cur(cur, normalized_promo_code)
+                    rejected = self._discount_promo_order_rejection_cur(
+                        cur,
+                        promo,
+                        user_id=user_id,
+                        code=normalized_promo_code,
+                        now=current_time,
+                        validate_limits=False,
+                    )
+                    if rejected is not None:
+                        return rejected
+                    assert promo is not None
+                    promo_id = int(promo["id"])
+                    try:
+                        discount_amount = calculate_discount_amount(
+                            _row_to_promo_definition(promo),
+                            list_amount,
+                        )
+                    except ValueError:
+                        self._insert_promo_event_cur(
+                            cur,
+                            promo_id,
+                            "rejected",
+                            user_id=user_id,
+                            metadata=promo_code_audit_metadata(
+                                normalized_promo_code,
+                                status=PaymentOrderCreationCode.PROMO_INVALID_DISCOUNT.value,
+                                list_amount=list_amount,
+                            ),
+                        )
+                        return PaymentOrderCreationResult(
+                            accepted=False,
+                            code=PaymentOrderCreationCode.PROMO_INVALID_DISCOUNT,
+                            message="Promo discount cannot be applied to this order.",
+                        )
+                    final_amount = list_amount - discount_amount
+                    self._release_expired_discount_reservations_cur(
+                        cur,
+                        promo_id,
+                        now=current_time,
+                    )
+                    promo = self._select_promo_by_id_for_update_cur(cur, promo_id) or promo
+                    promo_metadata = promo_code_audit_metadata(
+                        normalized_promo_code,
+                        promo_code_id=promo_id,
+                        discount_amount=discount_amount,
+                        list_amount=list_amount,
+                        final_amount=final_amount,
+                    )
+                    promo_code_hash = str(promo_metadata["code_hash"])
+                    promo_code_suffix = str(promo_metadata["code_suffix"])
                 existing = self._find_active_pending_payment_order_cur(
                     cur,
                     user_id=user_id,
                     delivery_chat_id=delivery_chat_id,
                     provider=provider_value,
                     product=product_value,
-                    amount=amount,
+                    amount=final_amount,
                     currency=currency_value,
                     now=current_time,
+                    promo_code_id=promo_id,
                 )
                 if existing is not None:
                     return PaymentOrderCreationResult(
@@ -953,6 +1031,17 @@ class PostgresDietBotStore:
                         order=existing,
                         requires_active_subscription=requires_active_subscription,
                     )
+                if normalized_promo_code is not None:
+                    rejected = self._discount_promo_order_rejection_cur(
+                        cur,
+                        promo,
+                        user_id=user_id,
+                        code=normalized_promo_code,
+                        now=current_time,
+                        validate_limits=True,
+                    )
+                    if rejected is not None:
+                        return rejected
                 order = PaymentOrder(
                     order_id=_payment_token(),
                     nonce=_payment_token(),
@@ -960,17 +1049,48 @@ class PostgresDietBotStore:
                     delivery_chat_id=delivery_chat_id,
                     product=product_value,
                     provider=provider_value,
-                    amount=amount,
+                    amount=final_amount,
                     currency=currency_value,
                     status=PaymentOrderStatus.PENDING,
                     created_at=current_time,
                     expires_at=current_time + timedelta(seconds=ttl_seconds),
                     updated_at=current_time,
+                    list_amount=list_amount,
+                    discount_amount=discount_amount,
+                    promo_code_id=promo_id,
+                    promo_code_hash=promo_code_hash,
+                    promo_code_suffix=promo_code_suffix,
+                    metadata=promo_metadata,
                 )
+                inserted = self._insert_payment_order_cur(cur, order)
+                if promo is not None and normalized_promo_code is not None:
+                    redemption_id = self._reserve_discount_promo_redemption_cur(
+                        cur,
+                        promo,
+                        user_id=user_id,
+                        order_id=inserted.order_id,
+                        discount_amount=discount_amount,
+                        metadata=promo_metadata,
+                        reserved_at=current_time,
+                    )
+                    self._increment_promo_used_count_cur(cur, int(promo["id"]))
+                    inserted = self._set_payment_order_promo_redemption_cur(
+                        cur,
+                        inserted.order_id,
+                        redemption_id,
+                    ) or inserted
+                    self._insert_promo_event_cur(
+                        cur,
+                        int(promo["id"]),
+                        "reserved",
+                        user_id=user_id,
+                        redemption_id=redemption_id,
+                        metadata=promo_metadata,
+                    )
                 return PaymentOrderCreationResult(
                     accepted=True,
                     code=PaymentOrderCreationCode.CREATED,
-                    order=self._insert_payment_order_cur(cur, order),
+                    order=inserted,
                     requires_active_subscription=requires_active_subscription,
                 )
 
@@ -984,6 +1104,7 @@ class PostgresDietBotStore:
         amount: int,
         currency: PaymentCurrency,
         now: datetime,
+        promo_code_id: int | None = None,
     ) -> PaymentOrder | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -996,6 +1117,7 @@ class PostgresDietBotStore:
                     amount=amount,
                     currency=currency,
                     now=now,
+                    promo_code_id=promo_code_id,
                 )
 
     def insert_payment_order(self, order: PaymentOrder) -> PaymentOrder:
@@ -1049,6 +1171,11 @@ class PostgresDietBotStore:
     def mark_payment_order_expired(self, order_id: str) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
+                self._release_discount_promo_reservation_for_order_cur(
+                    cur,
+                    order_id,
+                    reason="order_expired",
+                )
                 cur.execute(
                     """
                     UPDATE payment_orders
@@ -1062,6 +1189,11 @@ class PostgresDietBotStore:
     def mark_payment_order_invoice_creation_failed(self, order_id: str) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
+                self._release_discount_promo_reservation_for_order_cur(
+                    cur,
+                    order_id,
+                    reason="invoice_creation_failed",
+                )
                 cur.execute(
                     """
                     UPDATE payment_orders
@@ -1382,6 +1514,7 @@ class PostgresDietBotStore:
         self._update_entitlement_cur(cur, order.user_id, entitlement)
         self._insert_entitlement_snapshot_cur(cur, order.user_id, entitlement)
         paid_order = self._mark_payment_order_paid_cur(cur, order.order_id, now) or order
+        self._redeem_discount_promo_reservation_cur(cur, paid_order, redeemed_at=now)
         return PaymentSuccessfulPaymentResult(
             processed=True,
             code=PaymentSuccessfulPaymentCode.PROCESSED,
@@ -1832,6 +1965,7 @@ class PostgresDietBotStore:
         amount: int,
         currency: PaymentCurrency,
         now: datetime,
+        promo_code_id: int | None = None,
     ) -> PaymentOrder | None:
         cur.execute(
             """
@@ -1843,6 +1977,7 @@ class PostgresDietBotStore:
               AND product = %s
               AND amount = %s
               AND currency = %s
+              AND promo_code_id IS NOT DISTINCT FROM %s
               AND status = 'pending'
               AND expires_at > %s
             ORDER BY created_at DESC
@@ -1856,6 +1991,7 @@ class PostgresDietBotStore:
                 product.value,
                 amount,
                 currency.value,
+                promo_code_id,
                 _normalize_datetime(now),
             ),
         )
@@ -1873,16 +2009,23 @@ class PostgresDietBotStore:
                 product,
                 provider,
                 amount,
+                list_amount,
+                discount_amount,
                 currency,
                 status,
                 invoice_link,
                 pre_checkout_approved_at,
+                promo_code_id,
+                promo_redemption_id,
+                promo_code_hash,
+                promo_code_suffix,
+                metadata_json,
                 created_at,
                 expires_at,
                 paid_at,
                 updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -1893,6 +2036,8 @@ class PostgresDietBotStore:
                 order.product.value,
                 order.provider.value,
                 order.amount,
+                order.list_amount,
+                order.discount_amount,
                 order.currency.value,
                 order.status.value,
                 order.invoice_link,
@@ -1901,6 +2046,11 @@ class PostgresDietBotStore:
                     if order.pre_checkout_approved_at is not None
                     else None
                 ),
+                order.promo_code_id,
+                order.promo_redemption_id,
+                order.promo_code_hash,
+                order.promo_code_suffix,
+                _jsonb(order.metadata),
                 _normalize_datetime(order.created_at),
                 _normalize_datetime(order.expires_at),
                 _normalize_datetime(order.paid_at) if order.paid_at is not None else None,
@@ -2399,6 +2549,23 @@ class PostgresDietBotStore:
         row = cur.fetchone()
         return dict(row) if row is not None else None
 
+    def _select_promo_by_id_for_update_cur(
+        self,
+        cur: Any,
+        promo_id: int,
+    ) -> dict[str, Any] | None:
+        cur.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (promo_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row is not None else None
+
     def _validate_promo_redemption_cur(
         self,
         cur: Any,
@@ -2425,7 +2592,7 @@ class PostgresDietBotStore:
             FROM promo_redemptions
             WHERE promo_code_id = %s
               AND user_id = %s
-              AND status = 'redeemed'
+              AND status IN ('reserved', 'redeemed')
             """,
             (promo_id, user_id),
         )
@@ -2446,6 +2613,177 @@ class PostgresDietBotStore:
                 PromoRedemptionStatus.ALREADY_USED,
                 code,
                 used_by_chat_id=self._first_promo_redeemer_cur(cur, promo_id),
+            )
+        return None
+
+    def _discount_promo_order_rejection_cur(
+        self,
+        cur: Any,
+        promo: dict[str, Any] | None,
+        *,
+        user_id: int,
+        code: str,
+        now: datetime,
+        validate_limits: bool,
+    ) -> PaymentOrderCreationResult | None:
+        if promo is None:
+            self._insert_promo_event_cur(
+                cur,
+                None,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_NOT_FOUND.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_NOT_FOUND,
+                message="Promo code was not found.",
+            )
+
+        promo_id = int(promo["id"])
+        try:
+            promo_kind = _promo_definition_kind(promo)
+        except ValueError:
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_NOT_FOUND.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_NOT_FOUND,
+                message="Promo code was not found.",
+            )
+
+        if promo_kind != PromoCodeKind.DISCOUNT:
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_NOT_DISCOUNT.value,
+                    kind=promo_kind.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_NOT_DISCOUNT,
+                message="Promo code is not a payment discount.",
+            )
+
+        if not bool(promo.get("is_active", True)):
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_DISABLED.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_DISABLED,
+                message="Promo code is disabled.",
+            )
+
+        valid_from = _parse_datetime(promo.get("valid_from"))
+        if valid_from is not None and valid_from > now:
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_NOT_FOUND.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_NOT_FOUND,
+                message="Promo code was not found.",
+            )
+
+        expires_at = _promo_expires_at(promo)
+        if expires_at is not None and expires_at <= now:
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_EXPIRED.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_EXPIRED,
+                message="Promo code is expired.",
+            )
+
+        if not validate_limits:
+            return None
+
+        cur.execute(
+            """
+            SELECT count(*) AS redemption_count
+            FROM promo_redemptions
+            WHERE promo_code_id = %s
+              AND user_id = %s
+              AND status IN ('reserved', 'redeemed')
+            """,
+            (promo_id, user_id),
+        )
+        user_redemption_count = int(cur.fetchone()["redemption_count"])
+        if user_redemption_count >= _promo_per_user_limit(promo):
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_ALREADY_USED.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_ALREADY_USED,
+                message="Promo code has already been used.",
+            )
+
+        max_redemptions = _promo_max_redemptions(promo)
+        if (
+            max_redemptions is not None
+            and _non_negative_int(promo.get("used_count")) >= max_redemptions
+        ):
+            self._insert_promo_event_cur(
+                cur,
+                promo_id,
+                "rejected",
+                user_id=user_id,
+                metadata=promo_code_audit_metadata(
+                    code,
+                    status=PaymentOrderCreationCode.PROMO_ALREADY_USED.value,
+                ),
+            )
+            return PaymentOrderCreationResult(
+                accepted=False,
+                code=PaymentOrderCreationCode.PROMO_ALREADY_USED,
+                message="Promo code has already been used.",
             )
         return None
 
@@ -2496,6 +2834,198 @@ class PostgresDietBotStore:
         if row is None:
             raise RuntimeError("Could not create promo redemption.")
         return int(row["id"])
+
+    def _reserve_discount_promo_redemption_cur(
+        self,
+        cur: Any,
+        promo: dict[str, Any],
+        *,
+        user_id: int,
+        order_id: str,
+        discount_amount: int,
+        metadata: dict[str, object],
+        reserved_at: datetime,
+    ) -> int:
+        cur.execute(
+            """
+            INSERT INTO promo_redemptions (
+                promo_code_id,
+                user_id,
+                order_id,
+                status,
+                kind,
+                discount_amount,
+                metadata_json,
+                redeemed_at
+            )
+            VALUES (%s, %s, %s, 'reserved', 'discount', %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                int(promo["id"]),
+                user_id,
+                order_id,
+                discount_amount,
+                _jsonb(metadata),
+                reserved_at,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not reserve promo discount.")
+        return int(row["id"])
+
+    def _set_payment_order_promo_redemption_cur(
+        self,
+        cur: Any,
+        order_id: str,
+        redemption_id: int,
+    ) -> PaymentOrder | None:
+        cur.execute(
+            """
+            UPDATE payment_orders
+            SET promo_redemption_id = %s,
+                updated_at = now()
+            WHERE order_id = %s
+            RETURNING *
+            """,
+            (redemption_id, order_id),
+        )
+        row = cur.fetchone()
+        return _row_to_payment_order(row) if row is not None else None
+
+    def _redeem_discount_promo_reservation_cur(
+        self,
+        cur: Any,
+        order: PaymentOrder,
+        *,
+        redeemed_at: datetime,
+    ) -> None:
+        if order.promo_redemption_id is None:
+            return
+        cur.execute(
+            """
+            UPDATE promo_redemptions
+            SET status = 'redeemed',
+                redeemed_at = %s,
+                metadata_json = metadata_json || %s
+            WHERE id = %s
+              AND status = 'reserved'
+            RETURNING promo_code_id, user_id, metadata_json
+            """,
+            (
+                _normalize_datetime(redeemed_at),
+                _jsonb({"finalized_by": "successful_payment"}),
+                order.promo_redemption_id,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return
+        metadata = dict(row["metadata_json"]) if isinstance(row.get("metadata_json"), dict) else {}
+        metadata["finalized_by"] = "successful_payment"
+        self._insert_promo_event_cur(
+            cur,
+            int(row["promo_code_id"]),
+            "redeemed",
+            user_id=int(row["user_id"]),
+            redemption_id=order.promo_redemption_id,
+            metadata=metadata,
+        )
+
+    def _release_discount_promo_reservation_for_order_cur(
+        self,
+        cur: Any,
+        order_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        cur.execute(
+            """
+            SELECT *
+            FROM payment_orders
+            WHERE order_id = %s
+            FOR UPDATE
+            """,
+            (order_id,),
+        )
+        order_row = cur.fetchone()
+        if order_row is None or order_row.get("promo_redemption_id") is None:
+            return
+        redemption_id = int(order_row["promo_redemption_id"])
+        cur.execute(
+            """
+            UPDATE promo_redemptions
+            SET status = 'released',
+                metadata_json = metadata_json || %s
+            WHERE id = %s
+              AND status = 'reserved'
+            RETURNING promo_code_id, user_id, metadata_json
+            """,
+            (_jsonb({"release_reason": reason}), redemption_id),
+        )
+        redemption_row = cur.fetchone()
+        if redemption_row is None:
+            return
+        promo_id = int(redemption_row["promo_code_id"])
+        cur.execute(
+            """
+            UPDATE promo_codes
+            SET used_count = GREATEST(used_count - 1, 0)
+            WHERE id = %s
+            """,
+            (promo_id,),
+        )
+        metadata = (
+            dict(redemption_row["metadata_json"])
+            if isinstance(redemption_row.get("metadata_json"), dict)
+            else {}
+        )
+        metadata["release_reason"] = reason
+        self._insert_promo_event_cur(
+            cur,
+            promo_id,
+            "released",
+            user_id=int(redemption_row["user_id"]),
+            redemption_id=redemption_id,
+            metadata=metadata,
+        )
+
+    def _release_expired_discount_reservations_cur(
+        self,
+        cur: Any,
+        promo_id: int,
+        *,
+        now: datetime,
+    ) -> None:
+        cur.execute(
+            """
+            SELECT order_id
+            FROM payment_orders
+            WHERE promo_code_id = %s
+              AND status = 'pending'
+              AND expires_at <= %s
+            FOR UPDATE
+            """,
+            (promo_id, _normalize_datetime(now)),
+        )
+        order_ids = [str(row["order_id"]) for row in cur.fetchall()]
+        for order_id in order_ids:
+            self._release_discount_promo_reservation_for_order_cur(
+                cur,
+                order_id,
+                reason="order_expired",
+            )
+            cur.execute(
+                """
+                UPDATE payment_orders
+                SET status = 'expired',
+                    updated_at = now()
+                WHERE order_id = %s
+                  AND status = 'pending'
+                """,
+                (order_id,),
+            )
 
     def _increment_promo_used_count_cur(self, cur: Any, promo_id: int) -> None:
         cur.execute(
@@ -2673,6 +3203,29 @@ def _row_to_payment_order(row: dict[str, Any]) -> PaymentOrder:
         amount=int(row["amount"]),
         currency=str(row["currency"]),
         status=str(row["status"]),
+        list_amount=(
+            int(row["list_amount"]) if row.get("list_amount") is not None else None
+        ),
+        discount_amount=_non_negative_int(row.get("discount_amount")),
+        promo_code_id=(
+            int(row["promo_code_id"]) if row.get("promo_code_id") is not None else None
+        ),
+        promo_redemption_id=(
+            int(row["promo_redemption_id"])
+            if row.get("promo_redemption_id") is not None
+            else None
+        ),
+        promo_code_hash=(
+            str(row["promo_code_hash"]) if row.get("promo_code_hash") is not None else None
+        ),
+        promo_code_suffix=(
+            str(row["promo_code_suffix"])
+            if row.get("promo_code_suffix") is not None
+            else None
+        ),
+        metadata=(
+            dict(row["metadata_json"]) if isinstance(row.get("metadata_json"), dict) else {}
+        ),
         invoice_link=(
             str(row["invoice_link"]) if row["invoice_link"] is not None else None
         ),
