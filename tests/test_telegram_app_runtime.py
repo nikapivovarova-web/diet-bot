@@ -60,10 +60,54 @@ class FakeCallback:
         self.answers.append(text if show_alert is None else (text, show_alert))
 
 
+class FakeGenerationStore:
+    def __init__(self) -> None:
+        self.entitlement = telegram_app.Entitlement(
+            free_trial_used=True,
+            test_access_until="2099-01-01T00:00:00+00:00",
+            test_access_enabled=True,
+        )
+        self.consumed: list[tuple[int, str]] = []
+        self.completed: list[tuple[int, str, str | None, int | None]] = []
+        self.refunded: list[tuple[int, str, str | None]] = []
+
+    def get_entitlement(self, user_id: int) -> object:
+        return self.entitlement
+
+    def save_entitlement(self, user_id: int, entitlement: object) -> None:
+        self.entitlement = entitlement
+
+    def consume_generation_attempt(self, user_id: int, ration_kind: str) -> object:
+        self.consumed.append((user_id, ration_kind))
+        consumption = telegram_app.AttemptConsumption(True, ration_kind, "test_access")
+        object.__setattr__(consumption, "_postgres_generation_id", len(self.consumed))
+        return consumption
+
+    def complete_generation_attempt(
+        self,
+        user_id: int,
+        consumption: object,
+        *,
+        pdf_path: str | None = None,
+        telegram_message_id: int | None = None,
+    ) -> None:
+        self.completed.append((user_id, consumption.ration_kind, pdf_path, telegram_message_id))
+
+    def refund_generation_attempt(
+        self,
+        user_id: int,
+        consumption: object,
+        *,
+        error_message: str | None = None,
+    ) -> None:
+        self.refunded.append((user_id, consumption.ration_kind, error_message))
+
+
 @pytest.fixture(autouse=True)
 def isolated_telegram_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
     touched_ids = {
         -100_510_001,
         -100_510_002,
@@ -199,6 +243,65 @@ async def test_run_bot_rejects_blank_token_before_creating_bot(monkeypatch) -> N
         await telegram_app.run_bot()
 
     assert created_tokens == []
+
+
+def profile_with(**kwargs) -> object:
+    data = {
+        "age": 35,
+        "sex": telegram_app.Sex.FEMALE,
+        "height_cm": 170.0,
+        "weight_kg": 70.0,
+        "goal": telegram_app.Goal.MAINTAIN,
+        "activity": telegram_app.ActivityLevel.LIGHT,
+        "meal_count": 4,
+        "cooking_time": telegram_app.CookingTimePreference.SIMPLE,
+        "restrictions": (),
+        "conditions": (),
+        "allow_lactose_free_dairy": True,
+        "allow_gluten_free_oats": False,
+    }
+    data.update(kwargs)
+    return telegram_app.UserProfile(**data)
+
+
+@pytest.mark.anyio
+async def test_successful_one_day_access_generation_completes_postgres_lock(monkeypatch) -> None:
+    chat_id = 52_001
+    store = FakeGenerationStore()
+    message = FakeMessage(chat_id)
+
+    async def fake_send_plan(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+
+    sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+    assert sent is True
+    assert store.consumed == [(chat_id, "one_day")]
+    assert store.completed == [(chat_id, "one_day", None, None)]
+    assert store.refunded == []
+
+
+@pytest.mark.anyio
+async def test_successful_weekly_pdf_access_generation_completes_postgres_lock(monkeypatch) -> None:
+    chat_id = 52_002
+    store = FakeGenerationStore()
+    message = FakeMessage(chat_id)
+
+    async def fake_send_week_plan(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    assert sent is True
+    assert store.consumed == [(chat_id, "weekly_pdf")]
+    assert store.completed == [(chat_id, "weekly_pdf", None, None)]
+    assert store.refunded == []
 
 
 @pytest.mark.anyio

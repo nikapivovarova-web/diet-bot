@@ -1120,6 +1120,7 @@ async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
         return
 
     if sent:
+        _complete_generation_attempt(message.chat.id, consumption)
         await message.answer(
             TRIAL_SUBSCRIPTION_TEXT + "\n\n" + _format_entitlement_status(message.chat.id),
             reply_markup=_trial_subscription_keyboard(),
@@ -1144,6 +1145,8 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
 
     if not sent:
         _refund_generation_attempt(message.chat.id, consumption)
+    else:
+        _complete_generation_attempt(message.chat.id, consumption)
     return sent
 
 
@@ -1165,6 +1168,8 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
 
     if not sent:
         _refund_generation_attempt(message.chat.id, consumption)
+    else:
+        _complete_generation_attempt(message.chat.id, consumption)
     return sent
 
 
@@ -2732,6 +2737,12 @@ def _refund_generation_attempt(chat_id: int, consumption: AttemptConsumption) ->
     entitlement = _load_entitlement_for_chat(chat_id)
     refund_attempt(entitlement, consumption)
     _save_entitlement_for_chat(chat_id, entitlement)
+
+
+def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
+    store = _runtime_store()
+    if store is not None and getattr(consumption, "_postgres_generation_id", None) is not None:
+        store.complete_generation_attempt(chat_id, consumption)
 
 
 def _entitlement_for_chat(chat_id: int) -> Entitlement:
