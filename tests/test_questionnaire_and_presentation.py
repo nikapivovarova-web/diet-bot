@@ -154,7 +154,7 @@ def test_presentation_contains_plan_sections_and_shopping_list() -> None:
     assert "добавленный сахар" not in text
     assert "Это ориентировочный расчёт" in text
     assert "Рацион на день" in text
-    assert "Список покупок" in text
+    assert "🛒 Список продуктов" in text
     assert "Что осталось доработать" not in text
     assert "Техническая проверка" not in text
     assert "яблоко" not in {portion.food.name for meal in plan.meals for portion in meal.portions}

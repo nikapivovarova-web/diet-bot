@@ -132,7 +132,7 @@ def format_daily_totals(plan: MealPlan) -> str:
 
 
 def format_week_shopping_list(plans: Sequence[MealPlan]) -> str:
-    shopping: list[str] = ["🛒 Общий список покупок на неделю"]
+    shopping: list[str] = ["🛒 Общий список продуктов на неделю"]
     meals = (meal for plan in plans for meal in plan.meals)
     groups = build_shopping_groups_for_meals(meals)
     if not groups:
@@ -182,7 +182,7 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
 
     totals = format_daily_totals(plan)
 
-    shopping: list[str] = ["🛒 Список покупок"]
+    shopping: list[str] = ["🛒 Список продуктов"]
     for item in build_shopping_list(plan):
         shopping.append(f"- {item.food_name}: {format_display_grams(item.grams)} г")
 

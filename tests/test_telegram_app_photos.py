@@ -2780,7 +2780,7 @@ async def test_one_day_generation_still_sends_status_meal_and_final_keyboard(mon
         assert sent is True
         assert message.texts[0][0].startswith("Считаю рацион")
         assert "One Day Text Sentinel" in sent_text
-        assert "Список покупок" in final_text
+        assert "🛒 Список продуктов" in final_text
         assert [(button.text, button.callback_data) for button in final_buttons] == [
             (telegram_app.REPEAT_PLAN_TEXT, telegram_app.CALLBACK_REPEAT),
             (telegram_app.NEW_PROFILE_TEXT, CALLBACK_NEW),
