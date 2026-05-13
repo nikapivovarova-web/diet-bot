@@ -94,6 +94,117 @@ INSTRUCTION_FIXES_BY_RECIPE_ID = {
         "Выпекайте 12-15 минут до золотистых краев, затем остудите на решетке."
     ),
 }
+CIS_UNFRIENDLY_FOOD_IDS = frozenset(
+    {
+        "agave_syrup",
+        "almond_milk",
+        "garam_masala",
+        "kale",
+        "monterey_jack",
+        "sambal_olek",
+        "tamari",
+        "turkey_or_chicken_breast",
+        "tzatziki",
+        "wensleydale_cheese",
+    }
+)
+CIS_FRIENDLY_FOOD_ID_REPLACEMENTS = {
+    "agave_syrup": "honey",
+    "almond_milk": "milk",
+    "garam_masala": "curry_powder",
+    "kale": "spinach",
+    "monterey_jack": "gouda",
+    "sambal_olek": "sriracha",
+    "tamari": "soy_sauce",
+    "turkey_or_chicken_breast": "turkey_breast_cooked",
+    "tzatziki": "greek_yogurt",
+    "wensleydale_cheese": "gouda",
+}
+CIS_FRIENDLY_INGREDIENT_ROW_OVERRIDES = {
+    (43, 3): ("chicken_breast_cooked", None),
+    (117, 15): ("greek_yogurt", 35.0),
+    (159, 5): ("gouda", 40.0),
+    (355, 4): ("turkey_breast_cooked", None),
+}
+CIS_FRIENDLY_TEXT_REPLACEMENTS = (
+    ("готовая индейка или куриная грудка", "готовая куриная грудка"),
+    ("готовую индейку или куриную грудку", "готовую куриную грудку"),
+    ("готовая грудка индейки или курицы", "готовая грудка индейки"),
+    ("индейкой или курицей", "курицей"),
+    ("чеддера или грюйера", "чеддера или другого полутвердого сыра"),
+    ("сыр венслидейл или молодой рассольный сыр или вегетарианская альтернатива", "полутвердый сыр"),
+    ("сыр монтерей джек", "полутвердый сыр"),
+    ("монтерей джек", "полутвердый сыр"),
+    ("грюйером", "полутвердым сыром"),
+    ("грюйера", "полутвердого сыра"),
+    ("грюйер", "полутвердый сыр"),
+    ("венслидейл", "полутвердый сыр"),
+    ("монтерей", "полутвердый сыр"),
+    ("кокосовый йогурт", "натуральный йогурт"),
+    ("несладкое ванильное миндальное молоко", "молоко"),
+    ("несладкое миндальное молоко", "молоко"),
+    ("миндальное молоко", "молоко"),
+    ("сироп агавы или мед", "мед"),
+    ("сироп агавы", "мед"),
+    ("самбал олек, срирача или любая чили-паста", "срирача"),
+    ("самбал оелек", "срирача"),
+    ("самбал олек", "срирача"),
+    ("самбал", "срирача"),
+    ("кокосовые аминокислоты, соевый соус или тамари", "соевый соус"),
+    ("тамари или кокосовые аминокислоты", "соевый соус"),
+    ("кокосовые аминокислоты или тамари", "соевый соус"),
+    ("кокосовыми аминокислотами или тамари", "соевым соусом"),
+    ("тамари", "соевый соус"),
+    ("для цацики", "для йогуртового соуса"),
+    ("с цацики", "с йогуртовым соусом"),
+    ("цацики", "йогуртовый соус"),
+    ("гарам масала", "карри"),
+    ("тандури масала", "карри"),
+    ("смесь пряностей", "карри"),
+    ("шалот или лук", "лук"),
+    ("шалот", "лук"),
+    ("кинзой или тайским базиликом", "зеленью"),
+    ("кинзу или тайский базилик", "зелень"),
+    ("хумус из эдамаме", "хумус"),
+    ("черный или обычный кунжут", "кунжут"),
+    ("плоский хлеб или тонкий", "лаваш или тонкий"),
+    ("кейл, листовая капуста или плотный шпинат", "шпинат"),
+    ("кейл, шпинат или листовая капуста", "шпинат"),
+    ("мангольд или кейл", "шпинат"),
+    ("молодой кейл или шпинат", "шпинат"),
+    ("шпинат или кейл", "шпинат"),
+    ("кейл или шпинат", "шпинат"),
+    ("кейл или листовую капусту", "шпинат"),
+    ("кейлом", "шпинатом"),
+    ("кейла", "шпината"),
+    ("кейл", "шпинат"),
+    ("соевый соус или соевый соус", "соевый соус"),
+    ("соевым соусом или соевым соусом", "соевым соусом"),
+)
+CHICKEN_BREAST_COOKED_NUTRIENTS = {
+    "energy_kcal": 165.0,
+    "protein_g": 31.0,
+    "fat_g": 3.6,
+    "saturated_fat_g": 1.0,
+    "sodium_mg": 74.0,
+    "potassium_mg": 256.0,
+    "calcium_mg": 15.0,
+    "magnesium_mg": 29.0,
+    "iron_mg": 1.0,
+    "zinc_mg": 1.0,
+    "selenium_mcg": 27.6,
+    "phosphorus_mg": 228.0,
+    "vitamin_b12_mcg": 0.3,
+    "folate_mcg_dfe": 4.0,
+    "vitamin_b1_mg": 0.1,
+    "vitamin_b2_mg": 0.1,
+    "vitamin_b3_mg": 13.7,
+    "vitamin_b6_mg": 0.6,
+    "vitamin_a_mcg_rae": 6.0,
+    "vitamin_e_mg": 0.3,
+    "vitamin_k_mcg": 0.3,
+    "omega_3_mg": 100.0,
+}
 
 
 def _load_json(name: str) -> Any:
@@ -103,7 +214,7 @@ def _load_json(name: str) -> Any:
 def _recipe_instruction(row: dict[str, Any]) -> str | None:
     recipe_id = str(row.get("recipe_id") or "")
     raw_text = INSTRUCTION_FIXES_BY_RECIPE_ID.get(recipe_id, str(row.get("instructions_ru") or ""))
-    text = clean_recipe_instruction_text(raw_text)
+    text = _cis_friendly_text(clean_recipe_instruction_text(raw_text))
     if _looks_incomplete_instruction(text):
         return None
     return text
@@ -123,27 +234,109 @@ def _role(value: str) -> MealRole | None:
         return None
 
 
+def _preserve_initial_case(replacement: str, matched: str) -> str:
+    if matched[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def _cis_friendly_text(text: str) -> str:
+    normalized = text
+    for old, new in CIS_FRIENDLY_TEXT_REPLACEMENTS:
+        normalized = re.sub(
+            re.escape(old),
+            lambda match, replacement=new: _preserve_initial_case(replacement, match.group(0)),
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    return normalized
+
+
+def _ingredient_row_key(row: dict[str, Any]) -> tuple[int, int]:
+    try:
+        return int(row.get("recipe_no") or 0), int(row.get("line_index") or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def _cis_friendly_ingredient(row: dict[str, Any]) -> tuple[str, float]:
+    food_id = str(row.get("food_id") or "")
+    grams = float(row.get("grams") or 0.0)
+    override = CIS_FRIENDLY_INGREDIENT_ROW_OVERRIDES.get(_ingredient_row_key(row))
+    if override is not None:
+        replacement_id, replacement_grams = override
+        food_id = replacement_id
+        if replacement_grams is not None:
+            grams = replacement_grams
+    else:
+        food_id = CIS_FRIENDLY_FOOD_ID_REPLACEMENTS.get(food_id, food_id)
+    return food_id, grams
+
+
+def _food_from_row(row: dict[str, Any]) -> Food:
+    roles = frozenset(role for value in row.get("roles", ()) if (role := _role(value)) is not None)
+    nutrients = {
+        key: float(row.get("nutrients_per_100g", {}).get(key, 0.0))
+        for key in NUTRIENT_FIELDS
+    }
+    return Food(
+        id=str(row["food_id"]),
+        name=str(row["name_ru"]),
+        category=str(row["category"]),
+        tags=frozenset(row.get("tags", ())),
+        roles=roles,
+        max_per_meal_g=float(row.get("max_per_meal_g", 250)),
+        max_per_day_g=float(row.get("max_per_day_g", 400)),
+        nutrients_per_100g=NutrientVector(nutrients),
+    )
+
+
+def _extra_cis_friendly_food_rows(rows_by_id: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    chicken = dict(rows_by_id["chicken_breast"])
+    chicken.update(
+        {
+            "food_id": "chicken_breast_cooked",
+            "name_ru": "готовая куриная грудка",
+            "name_en": "chicken breast meat only cooked roasted",
+            "default_state": "cooked",
+            "max_per_meal_g": 220,
+            "max_per_day_g": 340,
+            "nutrients_per_100g": CHICKEN_BREAST_COOKED_NUTRIENTS,
+        }
+    )
+
+    turkey_base = rows_by_id.get("turkey_or_chicken_breast", rows_by_id["turkey"])
+    turkey = dict(turkey_base)
+    turkey.update(
+        {
+            "food_id": "turkey_breast_cooked",
+            "name_ru": "готовая грудка индейки",
+            "name_en": "turkey breast meat cooked roasted",
+            "default_state": "cooked",
+            "max_per_meal_g": 220,
+            "max_per_day_g": 340,
+        }
+    )
+    return chicken, turkey
+
+
 @lru_cache(maxsize=1)
 def curated_foods() -> tuple[Food, ...]:
+    source_rows = _load_json("curated_foods.json")
+    rows_by_id = {str(row["food_id"]): row for row in source_rows}
     foods: list[Food] = []
-    for row in _load_json("curated_foods.json"):
-        roles = frozenset(role for value in row.get("roles", ()) if (role := _role(value)) is not None)
-        nutrients = {
-            key: float(row.get("nutrients_per_100g", {}).get(key, 0.0))
-            for key in NUTRIENT_FIELDS
-        }
-        foods.append(
-            Food(
-                id=str(row["food_id"]),
-                name=str(row["name_ru"]),
-                category=str(row["category"]),
-                tags=frozenset(row.get("tags", ())),
-                roles=roles,
-                max_per_meal_g=float(row.get("max_per_meal_g", 250)),
-                max_per_day_g=float(row.get("max_per_day_g", 400)),
-                nutrients_per_100g=NutrientVector(nutrients),
-            )
-        )
+    seen: set[str] = set()
+    for row in source_rows:
+        food_id = str(row["food_id"])
+        if food_id in CIS_UNFRIENDLY_FOOD_IDS:
+            continue
+        foods.append(_food_from_row(row))
+        seen.add(food_id)
+    for row in _extra_cis_friendly_food_rows(rows_by_id):
+        food_id = str(row["food_id"])
+        if food_id not in seen:
+            foods.append(_food_from_row(row))
+            seen.add(food_id)
     return tuple(foods)
 
 
@@ -163,12 +356,12 @@ def curated_recipes():
     ingredients_by_recipe: dict[str, dict[str, float]] = {}
     for row in ingredients:
         recipe_id = row.get("recipe_id")
-        food_id = row.get("food_id")
         grams = row.get("grams")
-        if recipe_id not in ok_recipe_ids or not food_id or grams is None:
+        if recipe_id not in ok_recipe_ids or not row.get("food_id") or grams is None:
             continue
+        food_id, normalized_grams = _cis_friendly_ingredient(row)
         ingredients_by_recipe.setdefault(recipe_id, {})
-        ingredients_by_recipe[recipe_id][food_id] = ingredients_by_recipe[recipe_id].get(food_id, 0.0) + float(grams)
+        ingredients_by_recipe[recipe_id][food_id] = ingredients_by_recipe[recipe_id].get(food_id, 0.0) + normalized_grams
 
     templates = []
     for row in recipes:
@@ -185,7 +378,7 @@ def curated_recipes():
             RecipeTemplate(
                 id=recipe_id,
                 slot=str(row["slot"]),
-                title=str(row["title_ru"]),
+                title=_cis_friendly_text(str(row["title_ru"])),
                 ingredients_g={key: round(value, 2) for key, value in recipe_ingredients.items() if value > 0},
                 instructions=instructions,
                 time_text=str(row.get("time_text") or ""),

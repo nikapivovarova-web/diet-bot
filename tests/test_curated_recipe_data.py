@@ -15,6 +15,14 @@ from diet_bot.recipe_catalog import built_in_recipes
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 
 
+def _runtime_recipe_by_no() -> dict[int, object]:
+    return {
+        int(recipe.id[1:4]): recipe
+        for recipe in built_in_recipes()
+        if recipe.id.startswith("r") and recipe.id[1:4].isdigit()
+    }
+
+
 def test_curated_recipe_data_has_full_calculation_coverage() -> None:
     nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
     ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
@@ -123,6 +131,84 @@ def test_curated_recipe_source_json_has_no_truncated_instructions() -> None:
     ]
 
     assert truncated == []
+
+
+def test_curated_recipe_runtime_uses_cis_friendly_substitutions() -> None:
+    foods = {food.id: food for food in curated_foods()}
+    recipes = _runtime_recipe_by_no()
+    runtime_ingredient_ids = {
+        food_id
+        for recipe in recipes.values()
+        for food_id in recipe.ingredients_g
+    }
+    blocked_food_ids = {
+        "agave_syrup",
+        "almond_milk",
+        "garam_masala",
+        "kale",
+        "monterey_jack",
+        "sambal_olek",
+        "tamari",
+        "turkey_or_chicken_breast",
+        "tzatziki",
+        "wensleydale_cheese",
+    }
+
+    assert blocked_food_ids.isdisjoint(foods)
+    assert blocked_food_ids.isdisjoint(runtime_ingredient_ids)
+    assert foods["chicken_breast_cooked"].name == "готовая куриная грудка"
+    assert foods["turkey_breast_cooked"].name == "готовая грудка индейки"
+
+    assert recipes[43].title == "Тост с яйцом, курицей и овощами"
+    assert recipes[43].ingredients_g["chicken_breast_cooked"] == 80.0
+    assert recipes[85].ingredients_g["spinach"] == 50.0
+    assert recipes[117].ingredients_g["greek_yogurt"] == 35.0
+    assert recipes[159].ingredients_g["gouda"] == 40.0
+
+
+def test_curated_recipe_runtime_text_uses_accessible_ingredient_names() -> None:
+    recipes = _runtime_recipe_by_no()
+    runtime_text = "\n".join(
+        [
+            "\n".join(f"{recipe.title}\n{recipe.instructions}" for recipe in recipes.values()),
+            "\n".join(food.name for food in curated_foods()),
+        ]
+    ).lower()
+    blocked_terms = (
+        "кейл",
+        "шалот",
+        "монтерей",
+        "грюйер",
+        "венслидейл",
+        "кокосовый йогурт",
+        "миндальное молоко",
+        "сироп агавы",
+        "гарам масала",
+        "тандури масала",
+        "самбал",
+        "тамари",
+        "цацики",
+        "соевый соус или соевый соус",
+        "кинзой или тайским базиликом",
+        "хумус из эдамаме",
+        "черный или обычный кунжут",
+        "плоский хлеб или тонкий",
+    )
+
+    for term in blocked_terms:
+        assert term not in runtime_text
+
+
+def test_curated_recipe_runtime_preserves_normal_ingredient_mappings() -> None:
+    recipes = _runtime_recipe_by_no()
+
+    assert recipes[57].ingredients_g["acai_puree"] > 0
+    assert recipes[63].ingredients_g["banana"] > 0
+    assert recipes[209].ingredients_g["water"] >= 30.0
+    assert recipes[247].ingredients_g["peanut_oil"] > 0
+    assert recipes[247].ingredients_g["chili_oil"] > 0
+    assert recipes[287].ingredients_g["tomato"] == 130.0
+    assert recipes[306].ingredients_g["pecans"] == 5.0
 
 
 def test_curated_recipe_titles_match_corrected_main_ingredients() -> None:

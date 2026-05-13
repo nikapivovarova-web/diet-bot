@@ -419,7 +419,9 @@ def _build_recipe_plan(
         slot = energy_slot.slot
         slot_energy_target = total_energy * energy_slot.target_ratio
         current_total = NutrientVector.sum(meal.nutrients for meal in meals)
-        recipe = _select_recipe(
+        selected_recipe: RecipeTemplate | None = None
+        selected_portions: tuple[FoodPortion, ...] = tuple()
+        for recipe in _rank_recipes(
             recipes,
             slot,
             used_recipe_ids,
@@ -433,17 +435,22 @@ def _build_recipe_plan(
             total_energy * energy_slot.max_ratio,
             variety_seed,
             index,
-        )
-        if recipe is None:
+        ):
+            resolved = _resolve_recipe_ingredients(recipe, food_by_id)
+            if resolved is None:
+                continue
+            base_energy = NutrientVector.sum(food.portion(grams).nutrients for food, grams in resolved).get("energy_kcal")
+            scale = _recipe_scale(slot_energy_target, base_energy)
+            portions = _scaled_recipe_portions(resolved, scale, used_grams, current_total, target)
+            if not portions:
+                continue
+            selected_recipe = recipe
+            selected_portions = portions
+            break
+        if selected_recipe is None:
             continue
-        resolved = _resolve_recipe_ingredients(recipe, food_by_id)
-        if resolved is None:
-            continue
-        base_energy = NutrientVector.sum(food.portion(grams).nutrients for food, grams in resolved).get("energy_kcal")
-        scale = _recipe_scale(slot_energy_target, base_energy)
-        portions = _scaled_recipe_portions(resolved, scale, used_grams, current_total, target)
-        if not portions:
-            continue
+        recipe = selected_recipe
+        portions = selected_portions
         used_recipe_ids.add(recipe.id)
         used_formats[_recipe_format(recipe)] += 1
         for portion in portions:
@@ -782,9 +789,42 @@ def _select_recipe(
     variety_seed: int,
     index: int,
 ) -> RecipeTemplate | None:
+    ranked = _rank_recipes(
+        recipes,
+        slot,
+        used_recipe_ids,
+        used_food_ids,
+        used_formats,
+        food_by_id,
+        current_total,
+        target,
+        slot_energy_target,
+        slot_min_energy,
+        slot_max_energy,
+        variety_seed,
+        index,
+    )
+    return ranked[0] if ranked else None
+
+
+def _rank_recipes(
+    recipes: list[RecipeTemplate],
+    slot: str,
+    used_recipe_ids: set[str],
+    used_food_ids: Counter[str],
+    used_formats: Counter[str],
+    food_by_id: dict[str, Food],
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+    slot_min_energy: float,
+    slot_max_energy: float,
+    variety_seed: int,
+    index: int,
+) -> list[RecipeTemplate]:
     candidates = [recipe for recipe in recipes if recipe.slot == slot and recipe.id not in used_recipe_ids]
     if not candidates:
-        return None
+        return []
 
     def score(recipe: RecipeTemplate) -> float:
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
@@ -805,7 +845,7 @@ def _select_recipe(
         )
         return seed_score + nutrient_bonus + rotation_bonus + curated_bonus - overlap * 0.55 - format_penalty - macro_penalty - energy_penalty
 
-    return max(candidates, key=score)
+    return sorted(candidates, key=score, reverse=True)
 
 
 def _recipe_format(recipe: RecipeTemplate) -> str:
