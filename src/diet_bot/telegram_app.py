@@ -309,9 +309,12 @@ CALLBACK_BUY_EXTRA_WEEKLY_PDF = "diet:buy_extra_weekly_pdf"
 CALLBACK_FEATURES = "diet:features"
 CALLBACK_PROMO_CODE = "diet:promo_code"
 CALLBACK_SUPPORT = "diet:support"
+CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE = "diet:admin:create_monthly_access_code"
 CALLBACK_ONE_DAY_PLAN = "diet:one_day"
 CALLBACK_WEEK_PLAN_PDF = "diet:week_pdf"
 CALLBACK_ANSWER_PREFIX = "diet:answer:"
+ADMIN_CREATE_MONTHLY_ACCESS_CODE_TEXT = "🎟 Создать код на месяц"
+ADMIN_PROMO_PANEL_TEXT = "Админ-панель\n\nВыберите действие:"
 SELECTED_ANSWER_PREFIX = "✅ "
 PAYLOAD_SUBSCRIPTION_MONTH = "diet:stars:subscription_month"
 PAYLOAD_EXTRA_ONE_DAY = "diet:stars:extra_one_day"
@@ -476,6 +479,10 @@ async def secret_access_command(message: Message) -> None:
         await _admin_access_code_command(message)
         return
 
+    if _is_admin_panel_command_text(message.text or "") and _is_admin_message(message):
+        await _send_admin_promo_panel(message)
+        return
+
     action, target_chat_id = _parse_test_access_command(message.text or "")
     if target_chat_id is not None:
         if not _is_admin_message(message):
@@ -570,6 +577,14 @@ async def handle_callback(callback: CallbackQuery) -> None:
         SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     if data != CALLBACK_PROMO_CODE:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+
+    if data == CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        await _send_admin_monthly_access_code(message)
+        return
 
     if data == CALLBACK_SUPPORT:
         await callback.answer()
@@ -2412,6 +2427,11 @@ def _is_admin_message(message: Message) -> bool:
     return bool(user_id is not None and user_id in ADMIN_USER_IDS)
 
 
+def _is_admin_callback(callback: CallbackQuery) -> bool:
+    user_id = _callback_user_id(callback)
+    return bool(user_id is not None and user_id in ADMIN_USER_IDS)
+
+
 @dataclass(frozen=True)
 class _PaymentEventAdminCommand:
     mode: str
@@ -2702,11 +2722,39 @@ def _is_admin_access_code_command_text(text: str) -> bool:
     return len(args) == 1 and args[0].strip().lower() == "code"
 
 
+def _is_admin_panel_command_text(text: str) -> bool:
+    return _normalize_command_text(text) == "330366" and not text.split()[1:]
+
+
+def _admin_promo_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_CREATE_MONTHLY_ACCESS_CODE_TEXT,
+                    callback_data=CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE,
+                ),
+            ],
+        ],
+    )
+
+
+async def _send_admin_promo_panel(message: Message) -> None:
+    await message.answer(
+        ADMIN_PROMO_PANEL_TEXT,
+        reply_markup=_admin_promo_panel_keyboard(),
+    )
+
+
 async def _admin_access_code_command(message: Message) -> None:
     if not _is_admin_message(message):
         await message.answer("Command is available only to admins.")
         return
 
+    await _send_admin_monthly_access_code(message)
+
+
+async def _send_admin_monthly_access_code(message: Message) -> None:
     promo = _create_admin_monthly_access_promo_code()
     await message.answer(
         "\n".join(

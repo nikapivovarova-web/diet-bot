@@ -357,6 +357,103 @@ async def test_promo_code_activation_extends_existing_monthly_access(
 
 
 @pytest.mark.anyio
+async def test_admin_secret_command_shows_hidden_promo_panel(monkeypatch) -> None:
+    admin_id = 80_250
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        lambda count, *, existing_codes=None: pytest.fail("panel must not create codes"),
+        raising=False,
+    )
+
+    message = FakeMessage(admin_id, text="/330366", user_id=admin_id)
+    await secret_access_command(message)
+
+    sent_text, markup = message.texts[-1]
+    button = markup.inline_keyboard[0][0]
+
+    assert "Админ-панель" in sent_text
+    assert (button.text, button.callback_data) == (
+        "🎟 Создать код на месяц",
+        "diet:admin:create_monthly_access_code",
+    )
+
+
+@pytest.mark.anyio
+async def test_non_admin_secret_command_does_not_show_hidden_promo_panel(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {80_251})
+
+    message = FakeMessage(80_252, text="/330366", user_id=80_252)
+    await secret_access_command(message)
+
+    sent_text, markup = message.texts[-1]
+
+    assert "Админ-панель" not in sent_text
+    assert markup is None
+
+
+@pytest.mark.anyio
+async def test_admin_promo_panel_button_creates_monthly_access_code(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    admin_id = 80_253
+    code = "FB-PANL-MNTH-2026"
+    promo_path = tmp_path / "promo_codes.json"
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_id})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        lambda count, *, existing_codes=None: [code],
+        raising=False,
+    )
+
+    message = FakeMessage(admin_id, user_id=admin_id)
+    callback = FakeCallback("diet:admin:create_monthly_access_code", message)
+    await telegram_app.handle_callback(callback)
+
+    response = message.texts[-1][0]
+    created = load_promo_codes(promo_path)[code]
+
+    assert callback.answers == [None]
+    assert response.count(code) == 1
+    assert "1 month" in response
+    assert created.is_monthly_access()
+    assert created.max_redemptions == 1
+    assert created.per_user_limit == 1
+
+
+@pytest.mark.anyio
+async def test_non_admin_promo_panel_button_is_rejected_without_creating_code(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    promo_path = tmp_path / "promo_codes.json"
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {80_254})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(
+        telegram_app,
+        "generate_promo_codes",
+        lambda count, *, existing_codes=None: pytest.fail("non-admin callback must not generate codes"),
+        raising=False,
+    )
+
+    message = FakeMessage(80_255, user_id=80_255)
+    callback = FakeCallback("diet:admin:create_monthly_access_code", message)
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == ["Command is available only to admins."]
+    assert message.texts == []
+    assert load_promo_codes(promo_path) == {}
+
+
+@pytest.mark.anyio
 async def test_admin_code_command_creates_generated_monthly_access_code(
     monkeypatch,
     tmp_path,
@@ -2624,14 +2721,18 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
     await _set_bot_commands(bot)
 
     assert bot.commands == BOT_COMMANDS
-    assert "grant_test_access" not in [command.command for command in bot.commands]
-    assert "330366" not in [command.command for command in bot.commands]
+    command_names = [command.command for command in bot.commands]
+    assert "grant_test_access" not in command_names
+    assert "330366" not in command_names
+    assert "payment_event" not in command_names
+    assert "admin" not in command_names
+    assert "promo" not in command_names
     assert [(command.command, command.description) for command in bot.commands] == [
         ("start", "Открыть стартовое меню"),
         ("plan", "Показать мой расчет"),
         ("cancel", "Отменить текущее действие"),
     ]
-    assert "myid" not in [command.command for command in bot.commands]
+    assert "myid" not in command_names
 
 
 @pytest.mark.anyio
