@@ -6,7 +6,7 @@ import pytest
 
 from diet_bot.builder import _add_missing_garnishes
 from diet_bot.builder import build_one_day_plan
-from diet_bot.curated_data import _looks_incomplete_instruction, curated_foods, curated_recipes
+from diet_bot.curated_data import _looks_incomplete_instruction, _recipe_instruction, curated_foods, curated_recipes
 from diet_bot.domain import ActivityLevel, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, NutrientVector
 from diet_bot.recipe_catalog import built_in_recipes
@@ -97,13 +97,13 @@ def test_curated_recipe_fixes_cover_truncated_soup_and_rye_crackers() -> None:
     crackers = recipes["r331_rzhanye_krekery_s_tykvennymi_semechkami"]
 
     assert "овощной бульон и кокосовое молоко" in soup.instructions
-    assert soup.instructions.endswith("кокосовыми сливками.")
+    assert soup.instructions.endswith("кокосовых сливок.")
     assert crackers.ingredients_g["rye_flour"] == 8.0
     assert crackers.ingredients_g["wheat_flour"] == 9.0
     assert foods["rye_flour"].name == "ржаная мука"
     assert "ржаную муку" in crackers.instructions
-    assert "раскатайте очень тонким пластом" in crackers.instructions
-    assert "выпекайте 60-90 минут" in crackers.instructions
+    assert "Раскатайте как можно тоньше" in crackers.instructions
+    assert "пеките еще 45 минут" in crackers.instructions
 
 
 def test_curated_recipe_source_json_has_complete_soup_and_rye_crackers() -> None:
@@ -131,6 +131,25 @@ def test_curated_recipe_source_json_has_no_truncated_instructions() -> None:
     ]
 
     assert truncated == []
+
+
+def test_curated_recipe_runtime_keeps_complete_source_instruction_over_fallback() -> None:
+    source_text = "Сварите суп до мягкости. Добавьте лимонный сок и подайте с зеленью."
+    row = {
+        "recipe_id": "r215_zolotoy_karri_sup_iz_krasnoy_chechevitsy_s_kokosovym_m",
+        "instructions_ru": source_text,
+    }
+
+    assert _recipe_instruction(row) == source_text
+
+
+def test_curated_recipe_runtime_blocks_service_only_instruction_text() -> None:
+    row = {
+        "recipe_id": "test_service_text",
+        "instructions_ru": "Как AI-модель, я не могу приготовить это блюдо. Подпишитесь на наш канал.",
+    }
+
+    assert _recipe_instruction(row) is None
 
 
 def test_curated_recipe_runtime_uses_cis_friendly_substitutions() -> None:

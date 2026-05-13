@@ -5,9 +5,23 @@ import re
 from .domain import FoodPortion
 
 
-GRAM_OR_ML_RE = re.compile(r"(?P<number>\d+(?:[,.]\d+)?)\s*(?P<unit>г|мл)\b")
-SPOON_RE = re.compile(r"(?P<number>\d+(?:[,.]\d+)?)\s*(?P<unit>ч\. л\.|ст\. л\.)")
-CUP_RE = re.compile(r"(?P<number>\d+(?:[,.]\d+)?)\s*стакан(?:а|ов)?\b")
+AMOUNT_PATTERN = r"\d+\s+\d+/\d+|\d+/\d+|\d+(?:[,.]\d+)?"
+GRAM_OR_ML_RE = re.compile(fr"(?P<number>{AMOUNT_PATTERN})\s*(?P<unit>г|мл)\b")
+SPOON_RE = re.compile(fr"(?P<number>{AMOUNT_PATTERN})\s*(?P<unit>ч\. л\.|ст\. л\.)")
+CUP_RE = re.compile(fr"(?P<number>{AMOUNT_PATTERN})\s*стакан(?:а|ов)?\b")
+RECIPE_TEXT_LABEL_RE = re.compile(
+    r"^\s*(?:инструкци(?:я|и)|приготовление|способ приготовления|рецепт)\s*[:：-]\s*",
+    re.IGNORECASE,
+)
+STEP_MARKER_RE = re.compile(
+    r"(^|[\s.!?])(?:(?:шаг\s*)?\d+\s*\)\s*|шаг\s*\d+\s*[\.:]\s*|\d+\s*[\.:]\s+)",
+    re.IGNORECASE,
+)
+SERVICE_SENTENCE_RE = re.compile(
+    r"подпиш|подписыв|канал|https?://|www\.|telegram|@food|ai[-\s]?модель|как\s+ai|chatgpt|openai|"
+    r"искусственн\w+\s+интеллект|lorem|placeholder|todo",
+    re.IGNORECASE,
+)
 
 
 def recipe_for(meal_name: str, portions: tuple[FoodPortion, ...]) -> str:
@@ -100,12 +114,30 @@ def format_display_grams(grams: float) -> str:
 
 
 def clean_recipe_instruction_text(text: str) -> str:
+    text = _normalize_recipe_instruction_structure(text)
     text = SPOON_RE.sub(lambda match: _format_instruction_spoon(_parse_number(match["number"]), match["unit"]), text)
     text = CUP_RE.sub(lambda match: _format_instruction_cup(_parse_number(match["number"])), text)
-    return GRAM_OR_ML_RE.sub(
+    text = GRAM_OR_ML_RE.sub(
         lambda match: _format_instruction_weight_or_volume(_parse_number(match["number"]), match["unit"]),
         text,
     )
+    return _remove_service_sentences(text)
+
+
+def _normalize_recipe_instruction_structure(text: str) -> str:
+    text = RECIPE_TEXT_LABEL_RE.sub("", text.strip())
+    text = STEP_MARKER_RE.sub(lambda match: match.group(1), text)
+    return _normalize_recipe_text_spaces(text)
+
+
+def _remove_service_sentences(text: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", _normalize_recipe_text_spaces(text))
+    kept = [sentence for sentence in sentences if sentence and not SERVICE_SENTENCE_RE.search(sentence)]
+    return _normalize_recipe_text_spaces(" ".join(kept))
+
+
+def _normalize_recipe_text_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _format_egg_ingredient(portion: FoodPortion) -> str:
@@ -444,11 +476,28 @@ def _format_common_spoon_amount(value: float, unit: str) -> str:
         return f"1 {unit}"
     if value < 1.75:
         return f"1,5 {unit}"
-    return f"{round(value)} {unit}"
+    half_steps = round(value * 2) / 2
+    if abs(value - half_steps) < 0.05 and half_steps < 4:
+        return f"{_format_number(half_steps)} {unit}"
+    return f"{int(value + 0.5)} {unit}"
 
 
 def _parse_number(value: str) -> float:
-    return float(value.replace(",", "."))
+    normalized = value.strip().replace(",", ".")
+    if "/" not in normalized:
+        return float(normalized)
+    if " " in normalized:
+        whole, fraction = normalized.split(maxsplit=1)
+        return float(whole) + _parse_fraction(fraction)
+    return _parse_fraction(normalized)
+
+
+def _parse_fraction(value: str) -> float:
+    numerator, denominator = value.split("/", maxsplit=1)
+    denominator_value = float(denominator)
+    if denominator_value == 0:
+        return 0.0
+    return float(numerator) / denominator_value
 
 
 def _format_number(value: float) -> str:

@@ -413,6 +413,41 @@ def test_recipe_instruction_text_uses_kitchen_amounts() -> None:
     assert "2 ст. л." in cleaned
 
 
+def test_recipe_instruction_text_removes_service_labels_without_losing_steps() -> None:
+    text = (
+        "Инструкция: Шаг 1. Разогрейте духовку до 180 °C. "
+        "2) Смешайте творог с ягодами. Подписывайтесь на наш канал."
+    )
+
+    cleaned = clean_recipe_instruction_text(text)
+
+    assert "Инструкция" not in cleaned
+    assert "Шаг 1" not in cleaned
+    assert "2)" not in cleaned
+    assert "Подписывайтесь" not in cleaned
+    assert "Разогрейте духовку до 180 °C." in cleaned
+    assert "Смешайте творог с ягодами." in cleaned
+
+
+def test_recipe_instruction_text_keeps_normal_recipe_text_unchanged() -> None:
+    text = "Сварите овсянку до мягкости. Добавьте йогурт и ягоды."
+
+    assert clean_recipe_instruction_text(text) == text
+
+
+def test_recipe_instruction_text_normalizes_fractional_kitchen_units() -> None:
+    text = "Добавьте 2 1/2 ч. л. крахмала, 1/4 стакана воды и 0,33 г соли."
+
+    cleaned = clean_recipe_instruction_text(text)
+
+    assert "2 1/2 ч. л." not in cleaned
+    assert "1/4 стакана" not in cleaned
+    assert "0,33 г" not in cleaned
+    assert "2,5 ч. л." in cleaned
+    assert "несколько столовых ложек" in cleaned
+    assert "менее 1 г" in cleaned
+
+
 def test_meal_card_can_hide_photo_credit() -> None:
     session = start_session()
     for answer in [

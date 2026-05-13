@@ -213,7 +213,10 @@ def _load_json(name: str) -> Any:
 
 def _recipe_instruction(row: dict[str, Any]) -> str | None:
     recipe_id = str(row.get("recipe_id") or "")
-    raw_text = INSTRUCTION_FIXES_BY_RECIPE_ID.get(recipe_id, str(row.get("instructions_ru") or ""))
+    raw_text = str(row.get("instructions_ru") or "")
+    fixed_text = INSTRUCTION_FIXES_BY_RECIPE_ID.get(recipe_id)
+    if fixed_text and _looks_incomplete_instruction(clean_recipe_instruction_text(raw_text)):
+        raw_text = fixed_text
     text = _cis_friendly_text(clean_recipe_instruction_text(raw_text))
     if _looks_incomplete_instruction(text):
         return None

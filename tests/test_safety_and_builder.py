@@ -274,6 +274,24 @@ def test_generated_recipe_text_uses_natural_cases() -> None:
     assert "добавьте огурцом" not in text.lower()
 
 
+def test_recipe_catalog_text_has_no_service_labels_or_links() -> None:
+    text = "\n".join(f"{recipe.title}\n{recipe.instructions}" for recipe in built_in_recipes()).lower()
+    blocked_terms = (
+        "инструкция:",
+        "шаг 1",
+        "подпиш",
+        "http://",
+        "https://",
+        "www.",
+        "как ai",
+        "ai-модель",
+        "placeholder",
+    )
+
+    for term in blocked_terms:
+        assert term not in text
+
+
 @pytest.mark.slow_pdf_builder
 def test_recipe_plan_includes_usable_image_metadata() -> None:
     profile = profile_with(meal_count=5)
