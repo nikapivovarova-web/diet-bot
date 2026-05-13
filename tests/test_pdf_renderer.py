@@ -7,14 +7,17 @@ from pathlib import Path
 
 import pytest
 from pypdf import PdfReader
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate
 
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
-from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult
+from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult, ShoppingItem
 import diet_bot.pdf_renderer as pdf_renderer
 from diet_bot.pdf_renderer import _clean_text, _html, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
+from diet_bot.shopping import ShoppingGroup
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
 
 
@@ -60,7 +63,7 @@ def test_week_pdf_contains_full_week_content(tmp_path: Path, sample_week_plans, 
     assert "Как приготовить" in text
     assert "Итого за день" in text
     assert "●" in text
-    assert "Список покупок" in text
+    assert "Список продуктов" in text
     assert "ориентировочный расчёт" in text
 
 
@@ -84,6 +87,89 @@ def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
     assert qr is not None
     assert qr.drawWidth <= 34 * mm
     assert qr.drawHeight <= 34 * mm
+
+
+def test_week_pdf_renders_shopping_heading_categories_items(
+    monkeypatch,
+    tmp_path: Path,
+    sample_week_dates,
+) -> None:
+    groups = (
+        ShoppingGroup(
+            category="vegetable",
+            title="Vegetables and greens",
+            items=(
+                ShoppingItem(food_name="Tomatoes", category="vegetable", grams=300),
+                ShoppingItem(food_name="Cucumber", category="vegetable", grams=150),
+            ),
+        ),
+        ShoppingGroup(
+            category="protein",
+            title="Protein",
+            items=(ShoppingItem(food_name="Chicken breast", category="protein", grams=420),),
+        ),
+    )
+    monkeypatch.setattr(pdf_renderer, "build_week_shopping_groups", lambda _plans: groups)
+    plan = _plan_for_recipe(built_in_recipes()[0])
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "shopping-content.pdf")
+    text = _pdf_text(pdf_path)
+
+    assert pdf_path.exists()
+    assert "Список продуктов на неделю" in text
+    assert "Vegetables and greens" in text
+    assert "Tomatoes" in text
+    assert "300 г" in text
+    assert "Protein" in text
+    assert "Chicken breast" in text
+    assert "420 г" in text
+
+
+def test_week_pdf_handles_long_shopping_list_without_layout_error(
+    monkeypatch,
+    tmp_path: Path,
+    sample_week_dates,
+) -> None:
+    groups = _dense_shopping_groups()
+    monkeypatch.setattr(pdf_renderer, "build_week_shopping_groups", lambda _plans: groups)
+    plan = _plan_for_recipe(built_in_recipes()[0])
+
+    pdf_path = render_week_plan_pdf((plan,), (sample_week_dates[0],), tmp_path / "long-shopping.pdf")
+    reader = PdfReader(str(pdf_path))
+    text = _compact_text("\n".join(page.extract_text() or "" for page in reader.pages))
+
+    assert pdf_path.exists()
+    assert len(reader.pages) >= 2
+    assert "Список продуктов на неделю" in text
+    assert "Vegetables and greens ingredient 25" in text
+    assert "Other ingredient 1" in text
+
+
+def test_week_pdf_packs_dense_shopping_list_into_stable_pages(tmp_path: Path) -> None:
+    groups = _dense_shopping_groups()
+    base_font, bold_font, emoji_font = pdf_renderer._register_fonts()
+    styles = pdf_renderer._build_styles(base_font, bold_font, emoji_font)
+    doc = SimpleDocTemplate(
+        str(tmp_path / "shopping-probe.pdf"),
+        pagesize=A4,
+        leftMargin=pdf_renderer.PDF_MARGIN,
+        rightMargin=pdf_renderer.PDF_MARGIN,
+        topMargin=12 * mm,
+        bottomMargin=13 * mm,
+    )
+    title = pdf_renderer._emoji_title("🛒", "Shopping list for the week", styles)
+    first_page_height = pdf_renderer._shopping_first_page_available_height(title, doc.width)
+
+    pages = pdf_renderer._shopping_page_groups(groups, styles, doc.width, first_page_height)
+
+    assert len(pages) == 2
+    for page_index, page_groups in enumerate(pages):
+        available_height = first_page_height if page_index == 0 else pdf_renderer._shopping_frame_height()
+        _, page_height = pdf_renderer._shopping_columns(page_groups, styles, doc.width).wrap(
+            pdf_renderer._shopping_layout_width(doc.width),
+            available_height,
+        )
+        assert page_height <= available_height - 2
 
 
 def test_recipe_card_layout_helpers_split_meal_and_ingredient_text() -> None:
@@ -247,6 +333,38 @@ def _plan_for_recipe(recipe) -> MealPlan:
         macro_bounds={},
     )
     return MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+
+
+def _dense_shopping_groups() -> tuple[ShoppingGroup, ...]:
+    return (
+        _shopping_group("grains", "Grains, bread and side dishes", 11),
+        _shopping_group("vegetable", "Vegetables and greens", 25),
+        _shopping_group("fruit", "Fruit and berries", 11),
+        _shopping_group("protein", "Meat, fish, eggs and protein", 12),
+        _shopping_group("dairy", "Dairy products", 9),
+        _shopping_group("fat", "Oils and fats", 7),
+        _shopping_group("nuts", "Nuts and seeds", 8),
+        _shopping_group("spice", "Spices and herbs", 11),
+        _shopping_group("sauce", "Sauces and dressings", 13),
+        _shopping_group("sweet", "Sweeteners", 4),
+        _shopping_group("processed", "Processed meat", 2),
+        _shopping_group("other", "Other", 1),
+    )
+
+
+def _shopping_group(category: str, title: str, item_count: int) -> ShoppingGroup:
+    return ShoppingGroup(
+        category=category,
+        title=title,
+        items=tuple(
+            ShoppingItem(
+                food_name=f"{title} ingredient {index + 1}",
+                category=category,
+                grams=100 + index,
+            )
+            for index in range(item_count)
+        ),
+    )
 
 
 def _pdf_text(path: Path) -> str:

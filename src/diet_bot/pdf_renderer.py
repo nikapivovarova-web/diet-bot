@@ -975,15 +975,17 @@ def _daily_totals_subtable(
 
 
 def _shopping_section(plans: Sequence[MealPlan], styles: dict[str, ParagraphStyle], doc_width: float) -> list:
-    story: list = [_emoji_title("🛒", "Список покупок на неделю", styles), Spacer(1, 4 * mm)]
+    title = _emoji_title("🛒", "Список продуктов на неделю", styles)
+    story: list = [title, Spacer(1, 7 * mm)]
     groups = build_week_shopping_groups(plans)
     if not groups:
         story.append(_p("Список пуст.", styles["Body"]))
     else:
-        for group in groups:
-            story.append(KeepTogether([_p(group.title, styles["ShoppingGroupTitle"])]))
-            story.append(_shopping_items_table(group.items, styles, doc_width))
-            story.append(Spacer(1, 2 * mm))
+        first_page_available_height = _shopping_first_page_available_height(title, doc_width)
+        for page_index, page_groups in enumerate(_shopping_page_groups(groups, styles, doc_width, first_page_available_height)):
+            if page_index:
+                story.append(PageBreak())
+            story.append(_shopping_columns(page_groups, styles, doc_width))
 
     disclaimers = tuple(
         dict.fromkeys(disclaimer for plan in plans for disclaimer in plan.safety.disclaimers)
@@ -1004,6 +1006,272 @@ def _shopping_section(plans: Sequence[MealPlan], styles: dict[str, ParagraphStyl
     )
     story.append(_p(ORIENTATION_SENTENCE, styles["FinePrint"]))
     return story
+
+
+def _shopping_first_page_available_height(title, doc_width: float) -> float:
+    frame_height = _shopping_frame_height()
+    _, title_height = title.wrap(doc_width, frame_height)
+    return frame_height - title_height - 7 * mm
+
+
+def _shopping_page_groups(
+    groups: Sequence,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+    first_page_available_height: float,
+) -> list[list]:
+    pages: list[list] = []
+    start = 0
+    frame_height = _shopping_frame_height()
+    while start < len(groups):
+        available_height = first_page_available_height if not pages else frame_height
+        end = _shopping_page_end(groups, start, styles, doc_width, available_height)
+        pages.append(list(groups[start:end]))
+        start = end
+
+    if len(pages) > 2:
+        balanced_pages = _shopping_balanced_two_pages(
+            groups,
+            styles,
+            doc_width,
+            first_page_available_height,
+            frame_height,
+        )
+        if balanced_pages:
+            return balanced_pages
+    return pages
+
+
+def _shopping_page_end(
+    groups: Sequence,
+    start: int,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+    available_height: float,
+) -> int:
+    best_end = start + 1
+    for end in range(start + 1, len(groups) + 1):
+        table = _shopping_columns(groups[start:end], styles, doc_width)
+        _, height = table.wrap(_shopping_layout_width(doc_width), available_height)
+        if height <= available_height - 2:
+            best_end = end
+        else:
+            break
+    return best_end
+
+
+def _shopping_frame_height() -> float:
+    return PAGE_HEIGHT - 12 * mm - 13 * mm - 12
+
+
+def _shopping_layout_width(doc_width: float) -> float:
+    return max(1, doc_width - 12)
+
+
+def _shopping_columns(groups: Sequence, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    card_gap = 7 * mm
+    layout_width = _shopping_layout_width(doc_width)
+    col_width = (layout_width - card_gap) / 2
+    left_groups, right_groups = _split_shopping_columns(groups, styles, col_width)
+
+    left = _shopping_column_flowables(left_groups, styles, col_width)
+    right = _shopping_column_flowables(right_groups, styles, col_width)
+    table = Table([[left, "", right]], colWidths=[col_width, card_gap, col_width], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return table
+
+
+def _split_shopping_columns(
+    groups: Sequence,
+    styles: dict[str, ParagraphStyle],
+    col_width: float,
+) -> tuple[list, list]:
+    group_list = list(groups)
+    if len(group_list) <= 1:
+        return group_list, []
+
+    heights = [_shopping_group_height(group, styles, col_width) for group in group_list]
+    _, left_indexes, right_indexes = _best_shopping_column_indexes(range(len(group_list)), heights)
+    return (
+        [group_list[index] for index in left_indexes],
+        [group_list[index] for index in right_indexes],
+    )
+
+
+def _shopping_balanced_two_pages(
+    groups: Sequence,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+    first_page_available_height: float,
+    frame_height: float,
+) -> list[list] | None:
+    group_list = list(groups)
+    if len(group_list) <= 2 or len(group_list) > 16:
+        return None
+
+    layout_width = _shopping_layout_width(doc_width)
+    col_width = (layout_width - 7 * mm) / 2
+    heights = [_shopping_group_height(group, styles, col_width) for group in group_list]
+    full_mask = (1 << len(group_list)) - 1
+    height_cache: dict[int, float] = {}
+
+    def page_height(mask: int) -> float:
+        if mask not in height_cache:
+            indexes = [index for index in range(len(group_list)) if mask & (1 << index)]
+            height_cache[mask] = _best_shopping_column_indexes(indexes, heights)[0]
+        return height_cache[mask]
+
+    best_score: tuple[int, float, float, int] | None = None
+    best_pages: list[list] | None = None
+
+    for mask in range(1, full_mask):
+        if not mask & 1:
+            continue
+        other_mask = full_mask ^ mask
+        first_height = page_height(mask)
+        if first_height > first_page_available_height - 2:
+            continue
+        second_height = page_height(other_mask)
+        if second_height > frame_height - 2:
+            continue
+
+        prefix_count = _shopping_prefix_count(mask, len(group_list))
+        first_count = sum(1 for index in range(len(group_list)) if mask & (1 << index))
+        second_count = len(group_list) - first_count
+        score = (
+            -prefix_count,
+            max(first_height / first_page_available_height, second_height / frame_height),
+            abs(first_height - second_height),
+            abs(first_count - second_count),
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_pages = [
+                [
+                    group_list[index]
+                    for index in range(len(group_list))
+                    if mask & (1 << index)
+                ],
+                [
+                    group_list[index]
+                    for index in range(len(group_list))
+                    if other_mask & (1 << index)
+                ],
+            ]
+
+    return best_pages
+
+
+def _shopping_prefix_count(mask: int, group_count: int) -> int:
+    prefix_count = 0
+    for index in range(group_count):
+        if not mask & (1 << index):
+            break
+        prefix_count += 1
+    return prefix_count
+
+
+def _best_shopping_column_indexes(
+    indexes: Sequence[int],
+    group_heights: Sequence[float],
+) -> tuple[float, list[int], list[int]]:
+    index_list = list(indexes)
+    if not index_list:
+        return 1, [], []
+    if len(index_list) == 1:
+        return group_heights[index_list[0]], index_list, []
+
+    best_score: tuple[float, float, int] | None = None
+    best_columns: tuple[list[int], list[int]] = (index_list, [])
+
+    for mask in range(1, 1 << len(index_list)):
+        if not mask & 1:
+            continue
+        left_indexes = [
+            index_list[index]
+            for index in range(len(index_list))
+            if mask & (1 << index)
+        ]
+        if len(left_indexes) == len(index_list):
+            continue
+        right_indexes = [
+            index_list[index]
+            for index in range(len(index_list))
+            if not mask & (1 << index)
+        ]
+        left_height = _shopping_column_height(group_heights, left_indexes)
+        right_height = _shopping_column_height(group_heights, right_indexes)
+        score = (
+            max(left_height, right_height),
+            abs(left_height - right_height),
+            abs(len(left_indexes) - len(right_indexes)),
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_columns = (left_indexes, right_indexes)
+
+    return (
+        best_score[0] if best_score else _shopping_column_height(group_heights, index_list),
+        best_columns[0],
+        best_columns[1],
+    )
+
+
+def _shopping_group_height(group, styles: dict[str, ParagraphStyle], col_width: float) -> float:
+    _, height = _shopping_group_card(group, styles, col_width).wrap(col_width, PAGE_HEIGHT)
+    return height
+
+
+def _shopping_column_height(group_heights: Sequence[float], indexes: Sequence[int]) -> float:
+    if not indexes:
+        return 1
+    return sum(group_heights[index] for index in indexes) + (len(indexes) - 1) * 4 * mm
+
+
+def _shopping_column_flowables(groups: Sequence, styles: dict[str, ParagraphStyle], col_width: float) -> list:
+    flowables: list = []
+    for index, group in enumerate(groups):
+        if index:
+            flowables.append(Spacer(1, 4 * mm))
+        flowables.append(_shopping_group_card(group, styles, col_width))
+    return flowables or [Spacer(1, 1)]
+
+
+def _shopping_group_card(group, styles: dict[str, ParagraphStyle], col_width: float) -> Table:
+    items = [
+        _p(f"• {item.food_name}: {format_display_grams(item.grams)} г", styles["ShoppingItem"])
+        for item in group.items
+    ]
+    table = Table(
+        [[_p(group.title, styles["ShoppingGroupTitle"])], [items]],
+        colWidths=[col_width],
+        hAlign="LEFT",
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), SOFT_GREEN),
+                ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
+                ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return table
 
 
 def _shopping_items_table(items: Sequence, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
@@ -1438,8 +1706,6 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             fontSize=12.5,
             leading=15,
             textColor=BRAND_GREEN,
-            spaceBefore=1 * mm,
-            spaceAfter=0.5 * mm,
         ),
         "ShoppingItem": ParagraphStyle(
             "FoodBalanceShoppingItem",
