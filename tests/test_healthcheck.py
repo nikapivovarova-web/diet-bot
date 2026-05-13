@@ -6,12 +6,22 @@ from diet_bot import healthcheck
 from diet_bot.runtime_config import RuntimeConfigError
 
 
+PDF_BRANDING_ASSETS = {
+    "foodbalance_pdf_logo.png",
+    "foodbalance_pdf_qr.png",
+}
+
+
 def test_package_import_healthcheck_ok() -> None:
     assert healthcheck.check_package_import() == []
 
 
 def test_package_data_healthcheck_ok_without_external_services() -> None:
     assert healthcheck.check_package_data() == []
+
+
+def test_pdf_branding_assets_are_required_package_data() -> None:
+    assert PDF_BRANDING_ASSETS <= set(healthcheck.REQUIRED_DATA_FILES)
 
 
 def test_healthcheck_reports_missing_required_package_data() -> None:

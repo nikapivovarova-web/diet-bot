@@ -17,6 +17,8 @@ REQUIRED_DATA_FILES = (
     "curated_recipes.json",
     "curated_recipe_ingredients.json",
     "curated_recipe_nutrition.json",
+    "foodbalance_pdf_logo.png",
+    "foodbalance_pdf_qr.png",
     "welcome_foodbalance.png",
 )
 HEALTHCHECK_LOCAL_TOKEN = "healthcheck-local-token"
