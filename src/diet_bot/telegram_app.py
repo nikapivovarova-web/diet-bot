@@ -365,7 +365,7 @@ TRIAL_SUBSCRIPTION_TEXT = (
 )
 BOT_COMMANDS = (
     BotCommand(command="start", description="Открыть стартовое меню"),
-    BotCommand(command="plan", description="Заполнить анкету для рациона"),
+    BotCommand(command="plan", description="Показать мой расчет"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
 )
 
@@ -385,9 +385,11 @@ async def start(message: Message) -> None:
             reply_markup=_subscriber_cabinet_keyboard(message.chat.id),
         )
         return
-    if _profile_for_chat(message.chat.id) is not None:
+    profile = _profile_for_chat(message.chat.id)
+    if profile is not None:
         await message.answer(
-            "Анкета уже сохранена. Можно сразу составить рацион или изменить анкету.",
+            "Анкета уже сохранена. Ниже ваш актуальный расчет.\n\n"
+            f"{_format_profile_report(message.chat.id)}",
             reply_markup=_main_menu_keyboard(message.chat.id),
         )
         return

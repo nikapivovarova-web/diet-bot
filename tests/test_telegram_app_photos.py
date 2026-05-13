@@ -2058,6 +2058,47 @@ def test_saved_profile_maps_legacy_cooking_time_values_to_effort_modes() -> None
     assert telegram_app._profile_to_dict(long_profile)["cooking_time"] == "interesting"
 
 
+def _telegram_one_day_plan_fixture() -> MealPlan:
+    food = Food(
+        id="one_day_sentinel_food",
+        name="One Day Ingredient Sentinel",
+        category="test",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": 200,
+                "protein_g": 20,
+                "fat_g": 8,
+                "carbohydrate_g": 22,
+            }
+        ),
+    )
+    meal = Meal(
+        "One Day Text Sentinel",
+        (FoodPortion(food, 100),),
+        "Cook the one day text sentinel.",
+        recipe_id="one_day_sentinel_recipe",
+        recipe_key="one-day:sentinel",
+    )
+    targets = NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector(
+            {
+                "energy_kcal": 200,
+                "protein_g": 20,
+                "fat_g": 8,
+                "carbohydrate_g": 22,
+            }
+        ),
+        calorie_bounds=(100, 300),
+        macro_bounds={},
+    )
+    return MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+
+
 def _telegram_week_plan_fixture() -> tuple[MealPlan, ...]:
     food = Food(
         id="weekly_sentinel_food",
@@ -2174,10 +2215,65 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
     assert "330366" not in [command.command for command in bot.commands]
     assert [(command.command, command.description) for command in bot.commands] == [
         ("start", "Открыть стартовое меню"),
-        ("plan", "Заполнить анкету для рациона"),
+        ("plan", "Показать мой расчет"),
         ("cancel", "Отменить текущее действие"),
     ]
     assert "myid" not in [command.command for command in bot.commands]
+
+
+@pytest.mark.anyio
+async def test_start_with_saved_profile_shows_calculation_summary_and_plan_buttons(monkeypatch, tmp_path) -> None:
+    chat_id = 91_030
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    PROFILE_BY_CHAT_ID[chat_id] = profile_with()
+    message = FakeMessage(chat_id, text="/start")
+    try:
+        await telegram_app.start(message)
+
+        sent_text, markup = message.texts[-1]
+        buttons = [row[0] for row in markup.inline_keyboard]
+
+        assert sent_text.startswith("Анкета уже сохранена.")
+        assert "Ваш расчет" in sent_text
+        assert "ИМТ (индекс массы тела)" in sent_text
+        assert "Поддерживающая калорийность" in sent_text
+        assert "Питьевая вода" in sent_text
+        assert "БЖУ" in sent_text
+        assert [(button.text, button.callback_data) for button in buttons] == [
+            (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
+            (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
+            (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        ]
+    finally:
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_one_day_generation_still_sends_status_meal_and_final_keyboard(monkeypatch, tmp_path) -> None:
+    chat_id = 91_032
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: _telegram_one_day_plan_fixture())
+    message = FakeMessage(chat_id)
+    try:
+        sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+        sent_text = _sent_text(message)
+        final_text, final_markup = message.texts[-1]
+        final_buttons = [row[0] for row in final_markup.inline_keyboard]
+
+        assert sent is True
+        assert message.texts[0][0].startswith("Считаю рацион")
+        assert "One Day Text Sentinel" in sent_text
+        assert "Список покупок" in final_text
+        assert [(button.text, button.callback_data) for button in final_buttons] == [
+            (telegram_app.REPEAT_PLAN_TEXT, telegram_app.CALLBACK_REPEAT),
+            (telegram_app.NEW_PROFILE_TEXT, CALLBACK_NEW),
+            (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        ]
+    finally:
+        _clear_week_plan_state(chat_id)
 
 
 @pytest.mark.anyio
