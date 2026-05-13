@@ -53,6 +53,7 @@ DEEP_GREEN = colors.HexColor("#1F3A2A")
 SOFT_GREEN = colors.HexColor("#EAF4EA")
 PALE_GREEN = colors.HexColor("#F6FAF5")
 PAGE_BACKGROUND = colors.HexColor("#FBFAF4")
+CARD_BACKGROUND = colors.HexColor("#FFFFFF")
 TEXT_COLOR = colors.HexColor("#243126")
 MUTED_COLOR = colors.HexColor("#66736A")
 LINE_COLOR = colors.HexColor("#D8E2D3")
@@ -315,28 +316,391 @@ def _day_header(
 
 
 def _meal_card(meal: Meal, styles: dict[str, ParagraphStyle], doc_width: float) -> list:
-    image = _meal_image_flowables(meal, styles)
     flowables: list = [
-        _meal_title_table(meal.name, styles, doc_width),
-        Spacer(1, 1.5 * mm),
+        _meal_header_table(meal, styles, doc_width),
+        Spacer(1, 3 * mm),
     ]
-    if meal.batch:
-        flowables.extend(_meal_detail_flowables(meal, styles, doc_width))
-    else:
-        flowables.append(_meal_ingredients_media_table(meal, image, styles, doc_width))
+    if meal.batch and meal.batch.is_carryover:
+        flowables.append(
+            _soft_note(
+                f"Порция сегодня: {_counted(meal.batch.serving_units, meal.batch.unit_forms)} из приготовленной партии.",
+                styles,
+                doc_width,
+            )
+        )
+        flowables.extend(_ingredient_section("Ингредиенты порции", meal.portions, styles, doc_width))
         flowables.extend(
+            _recipe_section(
+                f"Съешьте {_counted(meal.batch.serving_units, meal.batch.unit_forms)} из приготовленной партии. "
+                "В расчет дня входит только сегодняшняя порция.",
+                styles,
+                doc_width,
+                meal,
+            )
+        )
+    elif meal.batch:
+        serving = _counted(meal.batch.serving_units, meal.batch.unit_forms)
+        total = _counted(meal.batch.total_units, meal.batch.unit_forms)
+        prep_count = _counted(meal.batch.serving_count, ("перекус", "перекуса", "перекусов"))
+        remaining_units = meal.batch.total_units - meal.batch.serving_units
+        remaining_servings = meal.batch.serving_count - 1
+        batch_note = (
+            f"Приготовьте {total} на {prep_count}. Сегодня съешьте {serving}; "
+            f"остальные {_counted(remaining_units, meal.batch.unit_forms)} уберите на "
+            f"следующие {_counted(remaining_servings, ('перекус', 'перекуса', 'перекусов'))}."
+        )
+        flowables.append(_soft_note(batch_note, styles, doc_width))
+        flowables.extend(_ingredient_section("Ингредиенты на партию", meal.batch.batch_portions, styles, doc_width))
+        flowables.extend(_recipe_section(format_batch_recipe_text(meal.recipe, meal.batch), styles, doc_width, meal))
+        flowables.append(_p("В расчет дня входит только сегодняшняя порция.", styles["FinePrint"]))
+    else:
+        flowables.extend(_ingredient_section("Ингредиенты", meal.portions, styles, doc_width))
+        flowables.extend(_recipe_section(meal.recipe, styles, doc_width, meal))
+    return flowables
+
+
+def _meal_header_table(meal: Meal, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    meal_type = _meal_type(meal)
+    recipe_title = _meal_recipe_title(meal)
+    badges = _meal_nutrition_badges(meal, styles, doc_width - 12 * mm)
+    table = Table(
+        [
+            [_meal_type_pill(meal_type, styles), _p(recipe_title, styles["MealTitle"])],
+            [badges, ""],
+        ],
+        colWidths=[38 * mm, doc_width - 38 * mm],
+        hAlign="LEFT",
+    )
+    table.setStyle(
+        TableStyle(
             [
-                _p("Как приготовить:", styles["Label"]),
-                _p(meal.recipe, styles["Body"]),
+                ("BACKGROUND", (0, 0), (-1, -1), SOFT_GREEN),
+                ("SPAN", (0, 1), (-1, 1)),
+                ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, 0), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                ("TOPPADDING", (0, 1), (-1, 1), 5),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 9),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
             ]
         )
-    flowables.extend(
-        [
-            Spacer(1, 0.5 * mm),
-            _p(_meal_nutrition_text(meal), styles["ChipText"]),
-        ]
     )
-    return flowables
+    return table
+
+
+def _meal_type_pill(meal_type: str, styles: dict[str, ParagraphStyle]) -> Table:
+    table = Table([[_p(meal_type, styles["MealType"])]], colWidths=[31 * mm], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), BRAND_GREEN),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    return table
+
+
+def _meal_nutrition_badges(meal: Meal, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    nutrients = meal.nutrients
+    badges = [
+        ("Калории", f"{nutrients.get('energy_kcal'):.0f} ккал"),
+        ("Белки", f"{nutrients.get('protein_g'):.0f} г"),
+        ("Жиры", f"{nutrients.get('fat_g'):.0f} г"),
+        ("Углеводы", f"{nutrients.get('carbohydrate_g'):.0f} г"),
+    ]
+    gap = 3 * mm
+    badge_width = (doc_width - gap * 3) / 4
+    badge_cells: list = []
+    badge_widths: list[float] = []
+    for index, (label, value) in enumerate(badges):
+        if index:
+            badge_cells.append("")
+            badge_widths.append(gap)
+        badge_cells.append(_nutrition_badge(label, value, styles, badge_width))
+        badge_widths.append(badge_width)
+    table = Table([badge_cells], colWidths=badge_widths, hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return table
+
+
+def _nutrition_badge(label: str, value: str, styles: dict[str, ParagraphStyle], width: float) -> Table:
+    table = Table(
+        [[_p(label, styles["BadgeLabel"])], [_p(value, styles["BadgeValue"])]],
+        colWidths=[width],
+        hAlign="LEFT",
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), CARD_BACKGROUND),
+                ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    return table
+
+
+def _ingredient_section(
+    title: str,
+    portions: Sequence,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+) -> list:
+    return [
+        _p(title, styles["Label"]),
+        _ingredient_table(portions, styles, doc_width),
+        Spacer(1, 3 * mm),
+    ]
+
+
+def _ingredient_table(portions: Sequence, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    rows = [
+        [
+            _p("Ингредиент", styles["TableHeaderWhiteCenter"]),
+            _p("Кол-во", styles["TableHeaderWhiteCenter"]),
+            _p("Примерная мера", styles["TableHeaderWhiteCenter"]),
+        ]
+    ]
+    if not portions:
+        rows.append([_p("Нет данных по ингредиентам", styles["TableCell"]), "", ""])
+    else:
+        for portion in portions:
+            product, amount, measure = _ingredient_cells(portion)
+            rows.append(
+                [
+                    _p(product, styles["TableCellCenter"]),
+                    _p(amount, styles["TableCellCenter"]),
+                    _p(measure or "-", styles["TableCellCenter"]),
+                ]
+            )
+
+    table = Table(rows, colWidths=[doc_width * 0.46, doc_width * 0.22, doc_width * 0.32], repeatRows=1)
+    row_styles = [
+        ("BACKGROUND", (0, row_index), (-1, row_index), PALE_GREEN if row_index % 2 else CARD_BACKGROUND)
+        for row_index in range(1, len(rows))
+    ]
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), BRAND_GREEN),
+                ("BOX", (0, 0), (-1, -1), 0.5, LINE_COLOR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, LINE_COLOR),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ]
+            + row_styles
+        )
+    )
+    return table
+
+
+def _ingredient_cells(portion) -> tuple[str, str, str]:
+    text = format_ingredient(portion)
+    if " - " not in text:
+        return text, "", ""
+    product, rest = text.split(" - ", 1)
+    measure = ""
+    amount = rest
+    if rest.endswith(")") and " (" in rest:
+        amount, measure = rest.rsplit(" (", 1)
+        measure = measure[:-1]
+    return product.strip(), amount.strip(), measure.strip()
+
+
+def _recipe_section(
+    recipe: str,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+    meal: Meal | None = None,
+) -> list:
+    return [
+        _p("Как приготовить", styles["Label"]),
+        *_recipe_media_flowables(recipe, meal, styles, doc_width),
+    ]
+
+
+def _recipe_media_flowables(
+    recipe: str,
+    meal: Meal | None,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+) -> list:
+    steps = _recipe_steps(recipe)
+    image = _meal_image_flowables(meal, styles) if meal is not None else None
+    if image and _recipe_fits_beside_image(steps):
+        return [_recipe_media_table(steps, image, styles, doc_width)]
+    return [_recipe_steps_table(steps, styles, doc_width)]
+
+
+def _recipe_media_table(
+    steps: Sequence[str],
+    image: list,
+    styles: dict[str, ParagraphStyle],
+    doc_width: float,
+) -> Table:
+    image_width = doc_width * 0.34
+    text_width = doc_width - image_width - 8 * mm
+    table = Table(
+        [[_recipe_steps_table(steps, styles, text_width), image]],
+        colWidths=[text_width, image_width],
+        hAlign="LEFT",
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (0, 0), 0),
+                ("RIGHTPADDING", (0, 0), (0, 0), 6),
+                ("LEFTPADDING", (1, 0), (1, 0), 6),
+                ("RIGHTPADDING", (1, 0), (1, 0), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return table
+
+
+def _recipe_steps_table(steps: Sequence[str], styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    rows = [
+        [
+            _p(f"{index}.", styles["StepNumber"]),
+            _p(step, styles["Body"]),
+        ]
+        for index, step in enumerate(steps, start=1)
+    ]
+    table = Table(rows, colWidths=[10 * mm, doc_width - 10 * mm], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return table
+
+
+def _recipe_steps(recipe: str) -> tuple[str, ...]:
+    text = _clean_text(recipe or "")
+    if not text:
+        return ("Инструкция приготовления не указана.",)
+
+    if "\n" in text:
+        chunks = [chunk.strip(" -0123456789.()") for chunk in text.splitlines()]
+        chunks = [chunk for chunk in chunks if chunk]
+        if chunks:
+            return tuple(chunks)
+
+    normalized = re.sub(r"\s+", " ", text).strip()
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", normalized) if sentence.strip()]
+    if len(sentences) <= 1:
+        return tuple(_chunk_long_text(normalized))
+
+    steps: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if len(sentence) > 260:
+            if current:
+                steps.append(current)
+                current = ""
+            steps.extend(_chunk_long_text(sentence))
+            continue
+        if current and len(current) + len(sentence) > 220:
+            steps.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        steps.append(current)
+    return tuple(steps)
+
+
+def _chunk_long_text(text: str, max_chars: int = 240) -> list[str]:
+    words = text.split()
+    chunks: list[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + len(word) + 1 > max_chars:
+            chunks.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        chunks.append(current)
+    return chunks or ["Инструкция приготовления не указана."]
+
+
+def _recipe_fits_beside_image(steps: Sequence[str]) -> bool:
+    return len(steps) <= 7 and sum(len(step) for step in steps) <= 1100
+
+
+def _soft_note(text: str, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    table = Table([[_p(text, styles["FinePrint"])]], colWidths=[doc_width], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), SOFT_GREEN),
+                ("BOX", (0, 0), (-1, -1), 0.35, LINE_COLOR),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return table
+
+
+def _meal_type(meal: Meal) -> str:
+    text = _clean_text(meal.name)
+    if ":" in text:
+        return text.split(":", 1)[0].strip() or "Прием пищи"
+    for slot in ("Завтрак", "Обед", "Перекус", "Ужин"):
+        if text.startswith(slot):
+            return slot
+    return "Прием пищи"
+
+
+def _meal_recipe_title(meal: Meal) -> str:
+    text = _clean_text(meal.name)
+    if ":" in text:
+        return text.split(":", 1)[1].strip() or text
+    for slot in ("Завтрак", "Обед", "Перекус", "Ужин"):
+        if text.startswith(slot):
+            return text.removeprefix(slot).strip(" :")
+    return text or "Блюдо"
 
 
 def _meal_title_table(title: str, styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
@@ -938,6 +1302,15 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             alignment=TA_RIGHT,
             textColor=colors.white,
         ),
+        "MealType": ParagraphStyle(
+            "FoodBalanceMealType",
+            parent=body,
+            fontName=bold_font,
+            fontSize=10.6,
+            leading=13,
+            alignment=TA_CENTER,
+            textColor=colors.white,
+        ),
         "MealTitle": ParagraphStyle(
             "FoodBalanceMealTitle",
             parent=body,
@@ -972,6 +1345,32 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             textColor=BRAND_GREEN,
             backColor=PALE_GREEN,
             borderPadding=(3, 4, 3),
+        ),
+        "BadgeLabel": ParagraphStyle(
+            "FoodBalanceBadgeLabel",
+            parent=body,
+            fontSize=8.5,
+            leading=10,
+            textColor=MUTED_COLOR,
+            alignment=TA_CENTER,
+        ),
+        "BadgeValue": ParagraphStyle(
+            "FoodBalanceBadgeValue",
+            parent=body,
+            fontName=bold_font,
+            fontSize=11.2,
+            leading=13.5,
+            textColor=BRAND_GREEN,
+            alignment=TA_CENTER,
+        ),
+        "StepNumber": ParagraphStyle(
+            "FoodBalanceStepNumber",
+            parent=body,
+            fontName=bold_font,
+            fontSize=10.5,
+            leading=14,
+            alignment=TA_CENTER,
+            textColor=BRAND_GREEN,
         ),
         "MetricLabel": ParagraphStyle(
             "FoodBalanceMetricLabel",
@@ -1008,11 +1407,28 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             leading=11.5,
             textColor=TEXT_COLOR,
         ),
+        "TableHeaderWhiteCenter": ParagraphStyle(
+            "FoodBalanceTableHeaderWhiteCenter",
+            parent=body,
+            fontName=bold_font,
+            fontSize=9.5,
+            leading=11.5,
+            alignment=TA_CENTER,
+            textColor=colors.white,
+        ),
         "TableCell": ParagraphStyle(
             "FoodBalanceTableCell",
             parent=body,
             fontSize=9.4,
             leading=12,
+            textColor=TEXT_COLOR,
+        ),
+        "TableCellCenter": ParagraphStyle(
+            "FoodBalanceTableCellCenter",
+            parent=body,
+            fontSize=9.4,
+            leading=12,
+            alignment=TA_CENTER,
             textColor=TEXT_COLOR,
         ),
         "ShoppingGroupTitle": ParagraphStyle(

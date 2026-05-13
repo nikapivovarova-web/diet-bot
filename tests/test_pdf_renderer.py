@@ -49,13 +49,15 @@ def test_week_pdf_contains_full_week_content(tmp_path: Path, sample_week_plans, 
 
     reader = PdfReader(str(pdf_path))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    first_meal_title = _clean_text(sample_week_plans[0].meals[0].name)
+    first_meal_title = _clean_text(sample_week_plans[0].meals[0].name).split(":", 1)[1].strip()
 
     assert "Рацион на неделю" in text
     assert "День 1" in text
     assert _compact_text(first_meal_title) in _compact_text(text)
-    assert "Ингредиенты:" in text
-    assert "Как приготовить:" in text
+    assert "Ингредиенты" in text
+    assert "Ингредиент" in text
+    assert "Примерная мера" in text
+    assert "Как приготовить" in text
     assert "Итого за день" in text
     assert "●" in text
     assert "Список покупок" in text
@@ -82,6 +84,39 @@ def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
     assert qr is not None
     assert qr.drawWidth <= 34 * mm
     assert qr.drawHeight <= 34 * mm
+
+
+def test_recipe_card_layout_helpers_split_meal_and_ingredient_text() -> None:
+    recipe = built_in_recipes()[0]
+    plan = _plan_for_recipe(recipe)
+    meal = plan.meals[0]
+
+    meal_type = getattr(pdf_renderer, "_meal_type", None)
+    meal_title = getattr(pdf_renderer, "_meal_recipe_title", None)
+    ingredient_cells = getattr(pdf_renderer, "_ingredient_cells", None)
+
+    assert meal_type is not None
+    assert meal_title is not None
+    assert ingredient_cells is not None
+    assert meal_type(meal) == "Ужин"
+    assert meal_title(meal) == recipe.title
+
+    product, amount, measure = ingredient_cells(meal.portions[0])
+
+    assert product
+    assert amount
+    assert measure
+
+
+def test_recipe_steps_are_numbered_chunks_for_readability() -> None:
+    recipe_steps = getattr(pdf_renderer, "_recipe_steps", None)
+
+    assert recipe_steps is not None
+
+    steps = recipe_steps("1. Обжарьте овощи.\n2. Добавьте крупу и воду.\n3. Подавайте теплым.")
+
+    assert len(steps) == 3
+    assert all(step for step in steps)
 
 
 def test_local_meal_photo_can_be_resolved(sample_week_plans) -> None:
@@ -121,6 +156,25 @@ def test_week_pdf_html_soft_wraps_long_unbroken_tokens() -> None:
     assert max(len(token) for token in html.split()) <= 48
 
 
+def test_week_pdf_handles_long_recipe_card_without_layout_error(tmp_path: Path, sample_week_dates) -> None:
+    recipe = built_in_recipes()[0]
+    plan = _plan_for_recipe(recipe)
+    long_recipe = " ".join(
+        f"Шаг {index}: добавьте ингредиенты, перемешайте и готовьте до мягкости."
+        for index in range(1, 28)
+    )
+    long_meal = replace(plan.meals[0], recipe=long_recipe, image_url=None)
+    long_plan = replace(plan, meals=(long_meal,))
+
+    pdf_path = render_week_plan_pdf((long_plan,), (sample_week_dates[0],), tmp_path / "long-recipe.pdf")
+    reader = PdfReader(str(pdf_path))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    assert pdf_path.exists()
+    assert len(reader.pages) >= 2
+    assert "Шаг 27" in text
+
+
 def test_week_pdf_removes_partial_output_when_render_fails(monkeypatch, tmp_path: Path, sample_week_dates) -> None:
     class FailingDoc:
         width = 120
@@ -152,7 +206,7 @@ def test_week_pdf_contains_fixed_soup_recipe_to_the_end(tmp_path: Path, sample_w
     text = _pdf_text(pdf_path)
 
     assert "овощной бульон и кокосовое молоко" in text
-    assert "подавайте с кинзой и кокосовыми сливками" in text
+    assert "посыпьте кинзой и добавьте по ложке кокосовых сливок" in text
 
 
 def test_week_pdf_uses_batch_adjusted_cracker_recipe(tmp_path: Path, sample_week_dates) -> None:
@@ -166,7 +220,8 @@ def test_week_pdf_uses_batch_adjusted_cracker_recipe(tmp_path: Path, sample_week
     assert "Приготовьте 6 крекеров на 3 перекуса" in text
     assert "ржаная мука" in text
     assert "пшеничная мука" in text
-    assert "выпекайте 60-90 минут" in text
+    assert "Выпекайте 45 минут" in text
+    assert "пеките еще 45 минут" in text
 
 
 def _plan_for_recipe(recipe) -> MealPlan:
