@@ -243,6 +243,27 @@ def apply_subscription_payment(
     return PaymentApplication(True, "subscription")
 
 
+def apply_monthly_access_promo_grant(
+    entitlement: Entitlement,
+    charge_id: str,
+    *,
+    now: datetime | None = None,
+    months: int = 1,
+) -> PaymentApplication:
+    current_time = _normalize_now(now)
+    current_end = entitlement.subscription_end_datetime()
+    extension_base = current_end if current_end and current_end > current_time else current_time
+    duration = max(1, int(months)) * SUBSCRIPTION_PERIOD_SECONDS
+    return apply_subscription_payment(
+        entitlement,
+        charge_id,
+        now=current_time,
+        subscription_expiration_timestamp=int(
+            (extension_base + timedelta(seconds=duration)).timestamp()
+        ),
+    )
+
+
 def apply_extra_one_day_payment(entitlement: Entitlement, charge_id: str) -> PaymentApplication:
     if _is_duplicate_charge(entitlement, charge_id):
         return PaymentApplication(False, "extra_one_day", duplicate=True)

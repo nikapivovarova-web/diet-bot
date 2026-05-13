@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -32,6 +33,7 @@ PromoCodeActivationStatus = Literal[
     "already_used",
     "disabled",
     "expired",
+    "not_access_code",
 ]
 
 
@@ -218,6 +220,25 @@ def normalize_promo_code(raw_code: str) -> str:
     return compact
 
 
+def promo_code_audit_hash(raw_code: str) -> str:
+    code = normalize_promo_code(raw_code)
+    payload = f"foodbalance:promo:{code}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def promo_code_audit_metadata(raw_code: str, **metadata: object) -> dict[str, object]:
+    code = normalize_promo_code(raw_code)
+    audit_metadata: dict[str, object] = {"code_hash": promo_code_audit_hash(code)}
+    if code:
+        audit_metadata["code_suffix"] = code[-4:]
+    audit_metadata.update({key: value for key, value in metadata.items() if value is not None})
+    return audit_metadata
+
+
+def promo_code_grant_charge_id(raw_code: str) -> str:
+    return f"promo:{promo_code_audit_hash(raw_code)[:24]}"
+
+
 def load_promo_codes(path: Path) -> dict[str, PromoCodeRecord]:
     if not path.exists():
         return {}
@@ -272,7 +293,7 @@ def activate_promo_code(
     if record is None:
         return PromoCodeActivation("not_found", code)
     if not record.is_monthly_access():
-        return PromoCodeActivation("not_found", code)
+        return PromoCodeActivation("not_access_code", code)
     if not record.active:
         return PromoCodeActivation("disabled", code)
     if not record.is_active_at(now):

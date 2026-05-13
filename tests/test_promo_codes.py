@@ -1,5 +1,5 @@
 import pytest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from diet_bot.promo_codes import (
     PromoCodeDefinition,
@@ -90,8 +90,31 @@ def test_json_discount_promo_is_not_activated_as_monthly_access(tmp_path) -> Non
     result = activate_promo_code(path, "FB-DISC-OUNT-2026", 123)
     loaded = load_promo_codes(path)
 
-    assert result.status == "not_found"
+    assert result.status == "not_access_code"
     assert loaded["FB-DISC-OUNT-2026"].used_by_chat_id is None
+
+
+def test_json_disabled_and_expired_monthly_access_promo_is_not_activated(tmp_path) -> None:
+    path = tmp_path / "promo_codes.json"
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    save_promo_codes(
+        path,
+        {
+            "FB-DISA-BLED-2026": PromoCodeRecord(active=False),
+            "FB-EXPI-REDX-2026": PromoCodeRecord(
+                expires_at=(now - timedelta(seconds=1)).isoformat()
+            ),
+        },
+    )
+
+    disabled = activate_promo_code(path, "FB-DISA-BLED-2026", 123, now=now)
+    expired = activate_promo_code(path, "FB-EXPI-REDX-2026", 123, now=now)
+    loaded = load_promo_codes(path)
+
+    assert disabled.status == "disabled"
+    assert expired.status == "expired"
+    assert loaded["FB-DISA-BLED-2026"].used_by_chat_id is None
+    assert loaded["FB-EXPI-REDX-2026"].used_by_chat_id is None
 
 
 def test_unknown_promo_code_is_not_found(tmp_path) -> None:

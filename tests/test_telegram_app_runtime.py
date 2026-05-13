@@ -118,6 +118,7 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_003,
         51_004,
         51_005,
+        51_006,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -224,6 +225,66 @@ async def test_foreign_private_callback_is_rejected_without_state_change() -> No
     assert callback.answers == [(PRIVATE_CHAT_CALLBACK_TEXT, True)]
     assert owner_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
     assert foreign_user_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_promo_code_runtime_store_activation_grants_access_and_rejects_replay(
+    monkeypatch,
+) -> None:
+    chat_id = 51_006
+
+    class FakePromoStore:
+        def __init__(self) -> None:
+            self.entitlements: dict[int, telegram_app.Entitlement] = {}
+            self.redeemed_codes: set[str] = set()
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return self.entitlements.get(user_id, telegram_app.Entitlement())
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            entitlement: telegram_app.Entitlement,
+        ) -> None:
+            self.entitlements[user_id] = entitlement
+
+        def activate_promo_code(
+            self,
+            user_id: int,
+            raw_code: str,
+        ) -> telegram_app.PromoCodeActivation:
+            if raw_code in self.redeemed_codes:
+                return telegram_app.PromoCodeActivation("already_used", raw_code, user_id)
+            entitlement = self.get_entitlement(user_id)
+            telegram_app.apply_monthly_access_promo_grant(
+                entitlement,
+                telegram_app.promo_code_grant_charge_id(raw_code),
+            )
+            self.save_entitlement(user_id, entitlement)
+            self.redeemed_codes.add(raw_code)
+            return telegram_app.PromoCodeActivation("activated", raw_code, user_id)
+
+    store = FakePromoStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+    first_message = FakeMessage(chat_id, text="FB-RUNT-IMEE-2026")
+    await telegram_app.handle_answer(first_message)
+    first_end = store.get_entitlement(chat_id).subscription_period_end
+
+    telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+    replay_message = FakeMessage(chat_id, text="FB-RUNT-IMEE-2026")
+    await telegram_app.handle_answer(replay_message)
+
+    entitlement = store.get_entitlement(chat_id)
+    assert entitlement.is_subscription_active()
+    assert entitlement.monthly_one_day_remaining == telegram_app.MONTHLY_ONE_DAY_LIMIT
+    assert entitlement.monthly_weekly_pdf_remaining == telegram_app.MONTHLY_WEEKLY_PDF_LIMIT
+    assert first_message.texts[-1][1].inline_keyboard[0][0].callback_data == (
+        telegram_app.CALLBACK_ONE_DAY_PLAN
+    )
+    assert replay_message.texts[-1] == (telegram_app.PROMO_CODE_ALREADY_USED_TEXT, None)
+    assert entitlement.subscription_period_end == first_end
 
 
 @pytest.mark.anyio

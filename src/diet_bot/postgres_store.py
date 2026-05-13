@@ -48,15 +48,16 @@ from .promo_codes import (
     PromoRedemptionResult,
     PromoRedemptionStatus,
     normalize_promo_code,
+    promo_code_audit_metadata,
+    promo_code_grant_charge_id,
 )
 from .subscriptions import (
     AttemptConsumption,
     Entitlement,
     RationKind,
-    SUBSCRIPTION_PERIOD_SECONDS,
     apply_extra_one_day_payment,
     apply_extra_weekly_pdf_payment,
-    apply_subscription_payment,
+    apply_monthly_access_promo_grant,
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
     grant_test_access,
@@ -552,11 +553,13 @@ class PostgresDietBotStore:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 row = self._upsert_promo_definition_cur(cur, definition)
+                metadata = definition.to_dict()
+                metadata.pop("code", None)
                 self._insert_promo_event_cur(
                     cur,
                     int(row["id"]),
                     "created",
-                    metadata=definition.to_dict(),
+                    metadata=promo_code_audit_metadata(definition.code, **metadata),
                 )
         return _row_to_promo_definition(row)
 
@@ -616,6 +619,13 @@ class PostgresDietBotStore:
                 self._remember_user_cur(cur, UserIdentity(user_id))
                 promo = self._select_promo_for_update_cur(cur, code)
                 if promo is None:
+                    self._insert_promo_event_cur(
+                        cur,
+                        None,
+                        "rejected",
+                        user_id=user_id,
+                        metadata=promo_code_audit_metadata(code, status="not_found"),
+                    )
                     return PromoRedemptionResult(PromoRedemptionStatus.NOT_FOUND, code)
 
                 try:
@@ -626,7 +636,7 @@ class PostgresDietBotStore:
                         int(promo["id"]),
                         "rejected",
                         user_id=user_id,
-                        metadata={"status": "not_found", "code": code},
+                        metadata=promo_code_audit_metadata(code, status="not_found"),
                     )
                     return PromoRedemptionResult(PromoRedemptionStatus.NOT_FOUND, code)
 
@@ -642,7 +652,10 @@ class PostgresDietBotStore:
                         int(promo["id"]),
                         "rejected",
                         user_id=user_id,
-                        metadata={"status": str(validation.status), "code": code},
+                        metadata=promo_code_audit_metadata(
+                            code,
+                            status=str(validation.status),
+                        ),
                     )
                     return validation
 
@@ -678,11 +691,11 @@ class PostgresDietBotStore:
                     "redeemed",
                     user_id=user_id,
                     redemption_id=redemption_id,
-                    metadata={
-                        "code": code,
-                        "kind": promo_kind.value,
-                        "entitlement_event_id": entitlement_event_id,
-                    },
+                    metadata=promo_code_audit_metadata(
+                        code,
+                        kind=promo_kind.value,
+                        entitlement_event_id=entitlement_event_id,
+                    ),
                 )
                 return PromoRedemptionResult(
                     PromoRedemptionStatus.REDEEMED,
@@ -703,10 +716,29 @@ class PostgresDietBotStore:
                 self._remember_user_cur(cur, UserIdentity(user_id))
                 promo = self._select_promo_for_update_cur(cur, code)
                 if promo is None:
+                    self._insert_promo_event_cur(
+                        cur,
+                        None,
+                        "rejected",
+                        user_id=user_id,
+                        metadata=promo_code_audit_metadata(code, status="not_found"),
+                    )
                     return PromoCodeActivation("not_found", code)
 
-                if _promo_kind_value(promo) == PromoCodeKind.DISCOUNT.value:
-                    return PromoCodeActivation("not_found", code)
+                promo_kind = _promo_kind_value(promo)
+                if promo_kind not in PROMO_ACCESS_KINDS:
+                    self._insert_promo_event_cur(
+                        cur,
+                        int(promo["id"]),
+                        "rejected",
+                        user_id=user_id,
+                        metadata=promo_code_audit_metadata(
+                            code,
+                            status="not_access_code",
+                            kind=promo_kind,
+                        ),
+                    )
+                    return PromoCodeActivation("not_access_code", code)
 
                 validation = self._validate_promo_redemption_cur(
                     cur,
@@ -720,13 +752,31 @@ class PostgresDietBotStore:
                         int(promo["id"]),
                         "rejected",
                         user_id=user_id,
-                        metadata={"status": str(validation.status), "code": code},
+                        metadata=promo_code_audit_metadata(
+                            code,
+                            status=str(validation.status),
+                        ),
                     )
                     return PromoCodeActivation(
                         str(validation.status),
                         code,
                         validation.used_by_chat_id,
                     )
+
+                existing_redeemer = self._first_promo_redeemer_cur(cur, int(promo["id"]))
+                already_redeemed = (
+                    existing_redeemer is not None
+                    or _non_negative_int(promo.get("used_count")) >= 1
+                )
+                if already_redeemed:
+                    self._insert_promo_event_cur(
+                        cur,
+                        int(promo["id"]),
+                        "rejected",
+                        user_id=user_id,
+                        metadata=promo_code_audit_metadata(code, status="already_used"),
+                    )
+                    return PromoCodeActivation("already_used", code, existing_redeemer)
 
                 entitlement = self._select_entitlement_for_update_cur(cur, user_id)
                 redemption_id = self._insert_promo_redemption_cur(
@@ -757,11 +807,11 @@ class PostgresDietBotStore:
                     "redeemed",
                     user_id=user_id,
                     redemption_id=redemption_id,
-                    metadata={
-                        "code": code,
-                        "kind": _promo_kind_value(promo),
-                        "entitlement_event_id": entitlement_event_id,
-                    },
+                    metadata=promo_code_audit_metadata(
+                        code,
+                        kind=promo_kind,
+                        entitlement_event_id=entitlement_event_id,
+                    ),
                 )
                 return PromoCodeActivation("activated", code, user_id)
 
@@ -2431,13 +2481,13 @@ class PostgresDietBotStore:
                     else None
                 ),
                 _jsonb(
-                    {
-                        "code": str(promo["code"]),
-                        "kind": kind,
-                        "discount_percent": promo.get("discount_percent"),
-                        "discount_amount": promo.get("discount_amount"),
-                        "monthly_duration_months": _promo_monthly_duration(promo),
-                    }
+                    promo_code_audit_metadata(
+                        str(promo["code"]),
+                        kind=kind,
+                        discount_percent=promo.get("discount_percent"),
+                        discount_amount=promo.get("discount_amount"),
+                        monthly_duration_months=_promo_monthly_duration(promo),
+                    )
                 ),
                 redeemed_at,
             ),
@@ -2477,7 +2527,7 @@ class PostgresDietBotStore:
     def _insert_promo_event_cur(
         self,
         cur: Any,
-        promo_id: int,
+        promo_id: int | None,
         event_type: str,
         *,
         user_id: int | None = None,
@@ -2526,16 +2576,14 @@ class PostgresDietBotStore:
             1,
             _non_negative_int(promo.get("value")),
         )
-        charge_id = f"promo:{code}"
+        charge_id = promo_code_grant_charge_id(code)
 
         if kind in PROMO_ACCESS_KINDS:
-            apply_subscription_payment(
+            apply_monthly_access_promo_grant(
                 entitlement,
                 charge_id,
                 now=now,
-                subscription_expiration_timestamp=int(
-                    (now + timedelta(seconds=SUBSCRIPTION_PERIOD_SECONDS * value)).timestamp()
-                ),
+                months=value,
             )
         elif kind == "extra_one_day":
             for index in range(value):
@@ -2553,12 +2601,12 @@ class PostgresDietBotStore:
             source="promo",
             amount=value,
             delta_generations=0,
-            metadata={
-                "promo_code_id": int(promo["id"]),
-                "promo_code": code,
-                "promo_kind": kind,
-                "monthly_duration_months": value if kind in PROMO_ACCESS_KINDS else None,
-            },
+            metadata=promo_code_audit_metadata(
+                code,
+                promo_code_id=int(promo["id"]),
+                promo_kind=kind,
+                monthly_duration_months=value if kind in PROMO_ACCESS_KINDS else None,
+            ),
         )
 
 

@@ -310,7 +310,7 @@ def test_postgres_completed_generation_is_not_refunded_by_late_failure() -> None
         _cleanup_users(store, user_id)
 
 
-def test_postgres_promo_redemption_is_one_per_user_and_respects_max_uses() -> None:
+def test_postgres_promo_activation_is_one_time_even_if_legacy_max_uses_is_higher() -> None:
     from diet_bot.promo_codes import PromoCodeRecord
     from diet_bot.subscriptions import MONTHLY_ONE_DAY_LIMIT, MONTHLY_WEEKLY_PDF_LIMIT
 
@@ -349,16 +349,16 @@ def test_postgres_promo_redemption_is_one_per_user_and_respects_max_uses() -> No
         assert first.used_by_chat_id == first_user_id
         assert duplicate.status == "already_used"
         assert duplicate.used_by_chat_id == first_user_id
-        assert second.activated
-        assert second.used_by_chat_id == second_user_id
+        assert second.status == "already_used"
+        assert second.used_by_chat_id == first_user_id
         assert exhausted.status == "already_used"
+        assert exhausted.used_by_chat_id == first_user_id
         assert not exhausted.activated
-        assert promo["used_count"] == 2
-        assert redeemed_user_ids == sorted([first_user_id, second_user_id])
+        assert promo["used_count"] == 1
+        assert redeemed_user_ids == [first_user_id]
         assert first_entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
         assert first_entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
-        assert second_entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
-        assert second_entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+        assert second_entitlement == second_entitlement.__class__()
         assert third_entitlement == store.get_entitlement(third_user_id) == third_entitlement.__class__()
     finally:
         _cleanup_users(store, first_user_id, second_user_id, third_user_id)
@@ -449,6 +449,135 @@ def test_postgres_one_time_monthly_promo_redeem_grants_once_and_is_audited() -> 
     finally:
         _cleanup_users(store, first_user_id, second_user_id)
         _cleanup_promo_code(store, code)
+
+
+def test_postgres_monthly_access_activation_extends_grants_once_and_redacts_audit() -> None:
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+    from diet_bot.subscriptions import (
+        MONTHLY_ONE_DAY_LIMIT,
+        MONTHLY_WEEKLY_PDF_LIMIT,
+        SUBSCRIPTION_PERIOD_SECONDS,
+        Entitlement,
+    )
+
+    store = _store()
+    first_user_id = _unique_user_id()
+    second_user_id = _unique_user_id()
+    code = _unique_promo_code()
+    now = datetime.now(UTC)
+    existing_end = now + timedelta(days=10)
+    try:
+        store.save_entitlement(
+            first_user_id,
+            Entitlement(
+                subscription_period_start=(now - timedelta(days=20)).isoformat(),
+                subscription_period_end=existing_end.isoformat(),
+                monthly_one_day_remaining=1,
+                monthly_weekly_pdf_remaining=1,
+            ),
+        )
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                max_redemptions=1,
+                per_user_limit=1,
+            )
+        )
+
+        first = store.activate_promo_code(first_user_id, code.lower().replace("-", " "))
+        replay = store.activate_promo_code(second_user_id, code)
+
+        first_entitlement = store.get_entitlement(first_user_id)
+        second_entitlement = store.get_entitlement(second_user_id)
+        redemptions = _promo_redemptions_for_code(store, code)
+        promo_events = _promo_events_for_code(store, code)
+        entitlement_events = _entitlement_events_for_user(store, first_user_id)
+        extended_end = datetime.fromisoformat(first_entitlement.subscription_period_end)
+
+        assert first.activated
+        assert replay.status == "already_used"
+        assert replay.used_by_chat_id == first_user_id
+        assert first_entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
+        assert first_entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
+        assert extended_end >= existing_end + timedelta(seconds=SUBSCRIPTION_PERIOD_SECONDS - 2)
+        assert second_entitlement == second_entitlement.__class__()
+        assert len(redemptions) == 1
+        assert [event["event_type"] for event in promo_events] == [
+            "created",
+            "redeemed",
+            "rejected",
+        ]
+        assert code not in str(redemptions[0]["metadata_json"])
+        assert code not in str(
+            [event["metadata_json"] for event in promo_events if event["event_type"] != "created"]
+        )
+        assert code not in str([event["metadata_json"] for event in entitlement_events])
+    finally:
+        _cleanup_users(store, first_user_id, second_user_id)
+        _cleanup_promo_code(store, code)
+
+
+def test_postgres_monthly_access_activation_rejects_invalid_access_codes() -> None:
+    from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
+
+    store = _store()
+    user_id = _unique_user_id()
+    expired_code = _unique_promo_code()
+    disabled_code = _unique_promo_code()
+    discount_code = _unique_promo_code()
+    try:
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=expired_code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                expires_at=datetime(2020, 1, 1, tzinfo=UTC),
+            )
+        )
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=disabled_code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                active=False,
+            )
+        )
+        store.create_promo_code(
+            PromoCodeDefinition(
+                code=discount_code,
+                kind=PromoCodeKind.DISCOUNT,
+                max_redemptions=5,
+                per_user_limit=1,
+                discount_percent=20,
+            )
+        )
+
+        expired = store.activate_promo_code(user_id, expired_code)
+        disabled = store.activate_promo_code(user_id, disabled_code)
+        discount = store.activate_promo_code(user_id, discount_code)
+
+        assert expired.status == "expired"
+        assert disabled.status == "disabled"
+        assert discount.status == "not_access_code"
+        assert _promo_redemptions_for_code(store, expired_code) == []
+        assert _promo_redemptions_for_code(store, disabled_code) == []
+        assert _promo_redemptions_for_code(store, discount_code) == []
+        assert [event["event_type"] for event in _promo_events_for_code(store, expired_code)] == [
+            "created",
+            "rejected",
+        ]
+        assert [event["event_type"] for event in _promo_events_for_code(store, disabled_code)] == [
+            "created",
+            "rejected",
+        ]
+        assert [event["event_type"] for event in _promo_events_for_code(store, discount_code)] == [
+            "created",
+            "rejected",
+        ]
+    finally:
+        _cleanup_users(store, user_id)
+        _cleanup_promo_code(store, expired_code)
+        _cleanup_promo_code(store, disabled_code)
+        _cleanup_promo_code(store, discount_code)
 
 
 def test_postgres_reusable_discount_promo_respects_global_and_per_user_limits() -> None:
@@ -1032,6 +1161,21 @@ def _entitlement_event_count(store: Any, user_id: int) -> int:
             )
             row = cur.fetchone()
     return int(row["event_count"])
+
+
+def _entitlement_events_for_user(store: Any, user_id: int) -> list[dict[str, Any]]:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT event_type, source, amount, delta_generations, metadata_json
+                FROM entitlement_events
+                WHERE user_id = %s
+                ORDER BY id
+                """,
+                (user_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
 
 
 def _latest_generation_for_user(store: Any, user_id: int) -> dict[str, Any]:

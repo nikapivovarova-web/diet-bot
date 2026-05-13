@@ -76,7 +76,7 @@ from .payments import (
     validate_payment_pre_checkout,
 )
 from .postgres_store import PostgresDietBotStore
-from .promo_codes import PromoCodeActivation, activate_promo_code
+from .promo_codes import PromoCodeActivation, activate_promo_code, promo_code_grant_charge_id
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import RuntimeConfig, is_production_environment, load_runtime_config
 from .safety import evaluate_safety
@@ -89,7 +89,7 @@ from .subscriptions import (
     Entitlement,
     PaymentApplication,
     RationKind,
-    apply_subscription_payment,
+    apply_monthly_access_promo_grant,
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
     grant_test_access,
@@ -223,6 +223,9 @@ PROMO_CODE_PROMPT_TEXT = "Введите промокод одним сообщ�
 PROMO_CODE_EMPTY_TEXT = "Пожалуйста, отправьте промокод текстом."
 PROMO_CODE_NOT_FOUND_TEXT = "Не нашел такой промокод. Проверьте написание и отправьте код еще раз."
 PROMO_CODE_ALREADY_USED_TEXT = "Этот промокод уже был активирован. Каждый промокод действует только один раз."
+PROMO_CODE_DISABLED_TEXT = "Этот промокод сейчас не активен. Если вы получили его от поддержки, напишите нам."
+PROMO_CODE_EXPIRED_TEXT = "Срок действия этого промокода закончился."
+PROMO_CODE_NOT_ACCESS_TEXT = "Этот промокод не активирует месячный доступ. Сейчас здесь можно применить только промокод на доступ."
 SUPPORT_TEXT = "🛟 Техподдержка"
 SUPPORT_PROMPT_TEXT = (
     "Опишите проблему одним сообщением.\n\n"
@@ -957,6 +960,15 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
         return
     if activation.status == "already_used":
         await message.answer(PROMO_CODE_ALREADY_USED_TEXT)
+        return
+    if activation.status == "disabled":
+        await message.answer(PROMO_CODE_DISABLED_TEXT)
+        return
+    if activation.status == "expired":
+        await message.answer(PROMO_CODE_EXPIRED_TEXT)
+        return
+    if activation.status == "not_access_code":
+        await message.answer(PROMO_CODE_NOT_ACCESS_TEXT)
         return
     await message.answer(PROMO_CODE_NOT_FOUND_TEXT)
 
@@ -2303,7 +2315,10 @@ def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeAct
             return activation
 
         entitlement = _load_entitlement_for_chat(chat_id)
-        apply_subscription_payment(entitlement, f"promo:{activation.code}")
+        apply_monthly_access_promo_grant(
+            entitlement,
+            promo_code_grant_charge_id(activation.code),
+        )
         _save_entitlement_for_chat(chat_id, entitlement)
         return activation
 

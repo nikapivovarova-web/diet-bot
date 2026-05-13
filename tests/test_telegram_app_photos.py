@@ -48,7 +48,13 @@ from diet_bot.payments import (
     is_active_pending_payment_order,
 )
 from diet_bot.presentation import format_meal_card, format_week_shopping_list
-from diet_bot.promo_codes import PromoCodeRecord, load_promo_codes, save_promo_codes
+from diet_bot.promo_codes import (
+    PromoCodeDefinition,
+    PromoCodeKind,
+    PromoCodeRecord,
+    load_promo_codes,
+    save_promo_codes,
+)
 from diet_bot.telegram_app import (
     BOT_COMMANDS,
     BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
@@ -222,6 +228,125 @@ async def test_promo_code_activation_grants_monthly_subscription(monkeypatch, tm
         assert entitlement.monthly_weekly_pdf_remaining == 4
         assert promo_codes["FB-ABCD-EFGH-2345"].used_by_chat_id == chat_id
         assert markup.inline_keyboard[0][0].callback_data == CALLBACK_ONE_DAY_PLAN
+    finally:
+        PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_promo_code_replay_is_rejected_without_extending(monkeypatch, tmp_path) -> None:
+    chat_id = 80_203
+    promo_path = tmp_path / "promo_codes.json"
+    subscriptions_path = tmp_path / "subscriptions.json"
+    save_promo_codes(promo_path, {"FB-ABCD-EFGH-2346": PromoCodeRecord()})
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    try:
+        await handle_answer(FakeMessage(chat_id, text=PROMO_CODE_TEXT))
+        first_message = FakeMessage(chat_id, text="FB-ABCD-EFGH-2346")
+        await handle_answer(first_message)
+        first_end = telegram_app.load_entitlements(subscriptions_path)[
+            chat_id
+        ].subscription_period_end
+
+        await handle_answer(FakeMessage(chat_id, text=PROMO_CODE_TEXT))
+        replay_message = FakeMessage(chat_id, text="FB-ABCD-EFGH-2346")
+        await handle_answer(replay_message)
+
+        entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert replay_message.texts[-1] == (telegram_app.PROMO_CODE_ALREADY_USED_TEXT, None)
+        assert entitlement.subscription_period_end == first_end
+    finally:
+        PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_promo_code_activation_rejects_non_redeemable_access_codes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 80_204
+    now = datetime.now(UTC)
+    promo_path = tmp_path / "promo_codes.json"
+    subscriptions_path = tmp_path / "subscriptions.json"
+    cases = [
+        (
+            "FB-DISA-BLED-2026",
+            PromoCodeRecord(active=False),
+            telegram_app.PROMO_CODE_DISABLED_TEXT,
+        ),
+        (
+            "FB-EXPI-REDX-2026",
+            PromoCodeRecord(expires_at=(now - timedelta(seconds=1)).isoformat()),
+            telegram_app.PROMO_CODE_EXPIRED_TEXT,
+        ),
+        (
+            "FB-DISC-OUNT-2026",
+            PromoCodeRecord.from_definition(
+                PromoCodeDefinition(
+                    code="FB-DISC-OUNT-2026",
+                    kind=PromoCodeKind.DISCOUNT,
+                    max_redemptions=5,
+                    discount_percent=15,
+                )
+            ),
+            telegram_app.PROMO_CODE_NOT_ACCESS_TEXT,
+        ),
+    ]
+    save_promo_codes(promo_path, {code: record for code, record, _expected in cases})
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    try:
+        for code, _record, expected_text in cases:
+            PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+            message = FakeMessage(chat_id, text=code)
+
+            await handle_answer(message)
+
+            assert message.texts[-1] == (expected_text, None)
+            assert chat_id not in telegram_app.load_entitlements(subscriptions_path)
+            assert load_promo_codes(promo_path)[code].used_by_chat_id is None
+    finally:
+        PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_promo_code_activation_extends_existing_monthly_access(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 80_205
+    promo_path = tmp_path / "promo_codes.json"
+    subscriptions_path = tmp_path / "subscriptions.json"
+    code = "FB-ABCD-EFGH-2347"
+    now = datetime.now(UTC)
+    existing_end = now + timedelta(days=10)
+    save_promo_codes(promo_path, {code: PromoCodeRecord()})
+    telegram_app.save_entitlements(
+        subscriptions_path,
+        {
+            chat_id: telegram_app.Entitlement(
+                subscription_period_start=(now - timedelta(days=20)).isoformat(),
+                subscription_period_end=existing_end.isoformat(),
+                monthly_one_day_remaining=1,
+                monthly_weekly_pdf_remaining=1,
+            )
+        },
+    )
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    try:
+        PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+        code_message = FakeMessage(chat_id, text=code)
+
+        await handle_answer(code_message)
+
+        entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        extended_end = datetime.fromisoformat(entitlement.subscription_period_end)
+        assert extended_end >= existing_end + timedelta(
+            seconds=telegram_app.SUBSCRIPTION_PERIOD_SECONDS - 2
+        )
+        assert entitlement.monthly_one_day_remaining == 5
+        assert entitlement.monthly_weekly_pdf_remaining == 4
     finally:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
 
