@@ -4,11 +4,33 @@ Scope: cleanup validation for `tmp/recipe_intake/cleaned_recipes.xlsx`. No produ
 
 ## Summary
 
-- Workbook rows after cleanup: 105 recipes, 844 ingredient rows, 462 step rows, 175 QA issue rows.
-- Status after cleanup: 86 recipes `ready`, 19 recipes `needs_review`.
+- Workbook rows after review-backlog triage: 105 recipes, 844 ingredient rows, 462 step rows, 175 QA issue rows.
+- Status after triage: 86 recipes `ready`, 19 recipes `needs_review`.
+- Review-backlog triage checked all 19 `needs_review` recipes. None could be safely promoted without a user nutrition-mapping or substitution decision.
 - All recipes still have `servings_cleaned = 1`.
 - Full import is still **not** recommended because 19 recipes retain product-ID/nutrition mapping blockers.
 - A subset import is now reasonable for the 86 `ready` recipes only, assuming the importer filters `status=ready` and excludes `needs_review`.
+- Detailed triage backlog: `docs/RECIPE_INTAKE_REVIEW_BACKLOG.md`.
+
+## Review Backlog Triage Counts
+
+| Check | Count | Result |
+|---|---:|---|
+| `needs_review` recipes before triage | 19 | PASS |
+| `needs_review` recipes examined | 19 | PASS |
+| Recipes promoted to `ready` | 0 | PASS |
+| Recipes still requiring user decision | 19 | PASS |
+| Existing `qa_issues` review rows rewritten with concrete user questions | 19 | PASS |
+
+## Post-Triage Validation Checks
+
+| Check | After triage | Result |
+|---|---:|---|
+| `ready` recipes missing ingredients, steps, or `photo_prompt_ru` | 0 | PASS |
+| Recipes with `servings_cleaned != 1` | 0 | PASS |
+| `ready` recipes with review/blocker QA rows | 0 | PASS |
+| Duplicate `recipe_key` values | 0 | PASS |
+| Ingredient-vs-steps mismatch count | 0 | PASS, ingredients and steps sheets unchanged from validated cleanup baseline |
 
 ## Before / After Counts
 
@@ -39,10 +61,12 @@ Scope: cleanup validation for `tmp/recipe_intake/cleaned_recipes.xlsx`. No produ
 - Rebuilt placeholder steps for recipes that still had generic instructions.
 - Cleaned protein anchors so `yes` remains only on clear protein products; missing anchors are now fixed.
 - Added `review` QA rows for recipes that still cannot be reliably mapped without a manual nutrition decision.
+- Re-triaged the 19 remaining `needs_review` recipes and rewrote their `qa_issues` review rows with concrete user decisions needed before any promotion to `ready`.
 
 ## Remaining Blockers
 
 The remaining blockers are explicit food-ID/nutrition mapping gaps, not structure, portion, gram/unit, anchor, or step-detail issues.
+The workbook `qa_issues` sheet now states the exact user decision needed for each blocker.
 
 | Recipe | Remaining blocker |
 |---|---|
