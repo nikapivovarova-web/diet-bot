@@ -17,8 +17,11 @@ from diet_bot.recipe_catalog import built_in_recipes
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LEGACY_CURATED_RECIPE_COUNT = 400
-INTAKE_RECIPE_COUNT = 105
+BATCH1_INTAKE_RECIPE_COUNT = 105
+BATCH2_INTAKE_RECIPE_COUNT = 105
+INTAKE_RECIPE_COUNT = BATCH1_INTAKE_RECIPE_COUNT + BATCH2_INTAKE_RECIPE_COUNT
 TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT
+INTAKE_RECIPE_KEY_PREFIXES = ("intake_", "batch2_")
 
 
 def _source_recipes() -> list[dict]:
@@ -43,7 +46,11 @@ def _rows_by_key(sheet, *, many: bool = False):
 
 
 def _imported_recipe_rows() -> list[dict]:
-    return [row for row in _source_recipes() if str(row.get("recipe_key", "")).startswith("intake_")]
+    return [
+        row
+        for row in _source_recipes()
+        if str(row.get("recipe_key", "")).startswith(INTAKE_RECIPE_KEY_PREFIXES)
+    ]
 
 
 def _imported_recipe_ids() -> set[str]:
@@ -192,7 +199,11 @@ def test_cleaned_intake_recipes_are_imported_with_required_metadata() -> None:
     assert len(imported) == INTAKE_RECIPE_COUNT
     assert len({row["recipe_key"] for row in imported}) == INTAKE_RECIPE_COUNT
     assert len({row["recipe_id"] for row in recipes}) == len(recipes)
-    assert all(row["recipe_key"].startswith("intake_") for row in imported)
+    assert Counter(row["recipe_key"].split("_", 1)[0] for row in imported) == {
+        "intake": BATCH1_INTAKE_RECIPE_COUNT,
+        "batch2": BATCH2_INTAKE_RECIPE_COUNT,
+    }
+    assert not any(row["recipe_key"] == "batch2_008" for row in imported)
     assert all(row["meal_slot"] in {"breakfast", "main", "snack"} for row in imported)
     assert all(row["slot"] == row["meal_slot"] for row in imported)
     assert all(row["cooking_effort"] in {"simple", "interesting"} for row in imported)

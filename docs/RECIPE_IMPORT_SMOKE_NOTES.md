@@ -17,6 +17,46 @@ Date: 2026-05-14
 
 ## Focused Verification
 
+### Batch2 Ready Import - 2026-05-14
+
+Imported the ready-only subset from `tmp/recipe_intake_batch2/cleaned_recipes_batch2.xlsx`.
+
+| Check | Result |
+| --- | --- |
+| Curated recipe count before / after | 505 -> 610 |
+| Imported batch2 recipes | 105 ready rows |
+| Excluded rows | `batch2_008` excluded as `needs_review` / exact production duplicate |
+| Imported ingredient rows | 680 |
+| New canonical food rows | `coconut_milk`, `rice_flour`, `rice_noodles`, `herring`, `sardines` |
+| Existing sprats mapping | Reused; `batch2_083`-`batch2_086` import as `sprats`, 70 g drained |
+| Empty image handling | 105/105 batch2 rows keep empty `image_url`; 105/105 keep `photo_prompt_ru` |
+
+Ready-only import integrity check:
+
+| Gate | Result |
+| --- | --- |
+| `batch2_008` absent from production | PASS |
+| No `needs_review` rows imported | PASS |
+| `recipe_key` unique | PASS |
+| `recipe_id` unique | PASS |
+| No exact title duplicates with preexisting curated recipes | PASS |
+| `servings_cleaned = 1` | 105/105 |
+| `allowed_meal_slots`, `slot_flex_type`, `coverage_priority` match workbook | 105/105 |
+| Ingredient mapping / nutrition readiness | 105 nutrition rows `ok`, 0 unmatched ingredients |
+
+Targeted tests and smokes:
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Curated recipe data tests | `python -m pytest tests/test_curated_recipe_data.py -q` | 25 passed |
+| Recipe effort / coverage tests | `python -m pytest tests/test_recipe_effort_slot_coverage.py -q` | 9 passed |
+| Weekly optimizer candidate tests | `python -m pytest tests/test_weekly_optimizer_candidates.py -q` | 7 passed |
+| Weekly / exclusion / builder targeted tests | `python -m pytest tests/test_safety_and_builder.py::test_weekly_recipe_plan_does_not_reuse_recipe_ids_across_days_or_slots tests/test_safety_and_builder.py::test_weekly_generation_with_enough_pool_has_no_repeated_recipe_id tests/test_safety_and_builder.py::test_weekly_generation_respects_food_exclusions_across_all_days tests/test_safety_and_builder.py::test_same_recipe_id_is_not_reused_across_week_slots_when_alternatives_exist tests/test_safety_and_builder.py::test_egg_allergy_excludes_recipes_with_egg_variants tests/test_safety_and_builder.py::test_broccoli_exclusion_excludes_broccoli_recipes -q` | 6 passed |
+| Generation smoke, simple 5 meals | Custom `_build_week_plans` probe, seed 101 | 7 days x 5 meals; 35/35 unique recipe IDs; 16 meals with empty `image_url`; no crash |
+| Generation smoke, gluten-free | Custom `_build_week_plans` probe with `ConditionCode.CELIAC`, seed 202 | 7 days x 5 meals; 35/35 unique recipe IDs; 0 gluten/oats violations; 20 meals with empty `image_url`; no crash |
+
+The post-import `tmp/recipe_intake_batch2/validate_batch2.py` mapping dry-run now reports 0 unmapped rows. Its duplicate counters are no longer meaningful after production import because the workbook rows now self-match the production rows; the ready-only import integrity check above is the post-import duplicate gate.
+
 | Check | Command | Result |
 | --- | --- | --- |
 | Curated recipe data tests | `.venv\Scripts\python.exe -m pytest tests\test_curated_recipe_data.py -q` | 23 passed |
