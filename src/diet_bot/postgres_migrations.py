@@ -783,12 +783,65 @@ PROMO_PAYMENT_DISCOUNT_MIGRATION = PostgresMigration(
 )
 
 
+RECIPE_HISTORY_MIGRATION = PostgresMigration(
+    version="202605140001",
+    description="Add per-user recipe history ledger",
+    statements=(
+        """
+        CREATE TABLE IF NOT EXISTS user_recipe_history (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+            generation_id BIGINT REFERENCES generation_records(id) ON DELETE SET NULL,
+            ration_kind TEXT NOT NULL,
+            generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            day_index INTEGER,
+            meal_index INTEGER NOT NULL,
+            meal_slot TEXT NOT NULL,
+            recipe_id TEXT NOT NULL,
+            recipe_key TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CHECK (ration_kind IN ('one_day', 'weekly_pdf')),
+            CHECK (meal_index >= 0),
+            CHECK (day_index IS NULL OR day_index >= 0)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_recipe_history_recent
+            ON user_recipe_history(user_id, generated_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_recipe_history_recipe_id
+            ON user_recipe_history(user_id, recipe_id, generated_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_recipe_history_recipe_key
+            ON user_recipe_history(user_id, recipe_key, generated_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_recipe_history_generation
+            ON user_recipe_history(generation_id)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_recipe_history_generation_slot
+            ON user_recipe_history(
+                generation_id,
+                COALESCE(day_index, -1),
+                meal_index,
+                recipe_id
+            )
+            WHERE generation_id IS NOT NULL
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
     PAYMENT_SUCCESS_LEDGER_MIGRATION,
     PROMO_STORAGE_FOUNDATION_MIGRATION,
     PROMO_PAYMENT_DISCOUNT_MIGRATION,
+    RECIPE_HISTORY_MIGRATION,
 )
 
 

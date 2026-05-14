@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -42,6 +43,19 @@ class SupportState:
     last_admin_message_id: int | None = None
 
 
+@dataclass(frozen=True)
+class RecipeHistoryItem:
+    recipe_id: str
+    recipe_key: str
+    meal_slot: str
+    ration_kind: RationKind
+    generation_id: int | None = None
+    generated_at: datetime | None = None
+    day_index: int | None = None
+    meal_index: int = 0
+    user_id: int | None = None
+
+
 class DietBotStore(Protocol):
     def initialize(self) -> None: ...
     def healthcheck(self) -> None: ...
@@ -72,6 +86,20 @@ class DietBotStore(Protocol):
         *,
         error_message: str | None = None,
     ) -> None: ...
+
+    def record_recipe_history(
+        self,
+        user_id: int,
+        entries: Sequence[RecipeHistoryItem],
+    ) -> None: ...
+
+    def load_recent_recipe_history(
+        self,
+        user_id: int,
+        *,
+        since: datetime | None = None,
+        limit: int = 400,
+    ) -> list[RecipeHistoryItem]: ...
 
     def cleanup_stale_generations(self, now: datetime | None = None) -> int: ...
     def upsert_promo_code(self, code: str, record: PromoCodeRecord) -> None: ...

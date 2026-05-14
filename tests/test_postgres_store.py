@@ -120,6 +120,79 @@ def test_postgres_chat_state_round_trips_recent_history() -> None:
         _cleanup_users(store, chat_id)
 
 
+def test_postgres_recipe_history_records_and_loads_recent_items_newest_first() -> None:
+    from diet_bot.storage import RecipeHistoryItem
+
+    store = _store()
+    user_id = _unique_user_id()
+    old_at = datetime(2026, 5, 1, 8, 0, tzinfo=UTC)
+    middle_at = datetime(2026, 5, 8, 8, 0, tzinfo=UTC)
+    new_at = datetime(2026, 5, 14, 8, 0, tzinfo=UTC)
+    try:
+        store.record_recipe_history(
+            user_id,
+            [
+                RecipeHistoryItem("old", "breakfast:old", "breakfast", "one_day", generated_at=old_at),
+                RecipeHistoryItem(
+                    "middle",
+                    "lunch:middle",
+                    "lunch",
+                    "weekly_pdf",
+                    generated_at=middle_at,
+                    day_index=1,
+                    meal_index=2,
+                ),
+                RecipeHistoryItem(
+                    "new",
+                    "dinner:new",
+                    "dinner",
+                    "weekly_pdf",
+                    generated_at=new_at,
+                    day_index=2,
+                    meal_index=3,
+                ),
+            ],
+        )
+
+        recent = store.load_recent_recipe_history(user_id, since=middle_at, limit=2)
+
+        assert [item.recipe_id for item in recent] == ["new", "middle"]
+        assert [item.meal_slot for item in recent] == ["dinner", "lunch"]
+        assert recent[0].generated_at == new_at
+    finally:
+        _cleanup_users(store, user_id)
+
+
+def test_postgres_recipe_history_deduplicates_generation_slot_entries() -> None:
+    from diet_bot.storage import RecipeHistoryItem
+
+    store = _store()
+    user_id = _unique_user_id()
+    generated_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    try:
+        generation_id = _insert_completed_generation(store, user_id, "weekly_pdf")
+        entry = RecipeHistoryItem(
+            "recipe-1",
+            "breakfast:recipe-1",
+            "breakfast",
+            "weekly_pdf",
+            generation_id=generation_id,
+            generated_at=generated_at,
+            day_index=0,
+            meal_index=0,
+        )
+
+        store.record_recipe_history(user_id, [entry])
+        store.record_recipe_history(user_id, [entry])
+
+        recent = store.load_recent_recipe_history(user_id, limit=10)
+
+        assert [item.recipe_id for item in recent] == ["recipe-1"]
+        assert recent[0].generation_id == generation_id
+    finally:
+        _cleanup_users(store, user_id)
+
+
 def test_postgres_entitlement_round_trips_existing_model() -> None:
     from diet_bot.subscriptions import Entitlement
 
@@ -1472,6 +1545,30 @@ def _latest_generation_for_user(store: Any, user_id: int) -> dict[str, Any]:
             row = cur.fetchone()
     assert row is not None
     return dict(row)
+
+
+def _insert_completed_generation(store: Any, user_id: int, ration_kind: str) -> int:
+    from diet_bot.storage import UserIdentity
+
+    store.remember_user(UserIdentity(user_id))
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO generation_records (
+                    user_id,
+                    ration_kind,
+                    status,
+                    finished_at
+                )
+                VALUES (%s, %s, 'completed', now())
+                RETURNING id
+                """,
+                (user_id, ration_kind),
+            )
+            row = cur.fetchone()
+    assert row is not None
+    return int(row["id"])
 
 
 def _events_for_generation(store: Any, generation_id: int) -> list[dict[str, Any]]:

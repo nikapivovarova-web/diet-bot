@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -64,7 +65,7 @@ from .subscriptions import (
     grant_test_access,
     refund_attempt,
 )
-from .storage import SupportState, UserIdentity
+from .storage import RecipeHistoryItem, SupportState, UserIdentity
 
 
 GENERATION_STALE_TIMEOUT = timedelta(minutes=30)
@@ -168,6 +169,83 @@ class PostgresDietBotStore:
                     """,
                     (chat_id, _jsonb(state)),
                 )
+
+    def record_recipe_history(
+        self,
+        user_id: int,
+        entries: Sequence[RecipeHistoryItem],
+    ) -> None:
+        if not entries:
+            return
+
+        current_time = datetime.now(UTC)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                self._remember_user_cur(cur, UserIdentity(user_id))
+                for entry in entries:
+                    generated_at = _normalize_datetime(entry.generated_at or current_time)
+                    cur.execute(
+                        """
+                        INSERT INTO user_recipe_history (
+                            user_id,
+                            generation_id,
+                            ration_kind,
+                            generated_at,
+                            day_index,
+                            meal_index,
+                            meal_slot,
+                            recipe_id,
+                            recipe_key
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (
+                            user_id,
+                            entry.generation_id,
+                            entry.ration_kind,
+                            generated_at,
+                            entry.day_index,
+                            max(0, int(entry.meal_index)),
+                            entry.meal_slot,
+                            entry.recipe_id,
+                            entry.recipe_key,
+                        ),
+                    )
+
+    def load_recent_recipe_history(
+        self,
+        user_id: int,
+        *,
+        since: datetime | None = None,
+        limit: int = 400,
+    ) -> list[RecipeHistoryItem]:
+        bounded_limit = max(0, int(limit))
+        if bounded_limit == 0:
+            return []
+
+        filters = ["user_id = %s"]
+        params: list[Any] = [user_id]
+        if since is not None:
+            filters.append("generated_at >= %s")
+            params.append(_normalize_datetime(since))
+        params.append(bounded_limit)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT user_id, generation_id, ration_kind, generated_at,
+                           day_index, meal_index, meal_slot, recipe_id, recipe_key
+                    FROM user_recipe_history
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY generated_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        return [_row_to_recipe_history_item(dict(row)) for row in rows]
 
     def get_entitlement(self, user_id: int) -> Entitlement:
         with self._connect() as conn:
@@ -3308,6 +3386,22 @@ def _row_to_payment_order(row: dict[str, Any]) -> PaymentOrder:
             _normalize_datetime(row["paid_at"]) if row["paid_at"] is not None else None
         ),
         updated_at=_normalize_datetime(row["updated_at"]),
+    )
+
+
+def _row_to_recipe_history_item(row: dict[str, Any]) -> RecipeHistoryItem:
+    return RecipeHistoryItem(
+        recipe_id=str(row["recipe_id"]),
+        recipe_key=str(row["recipe_key"]),
+        meal_slot=str(row["meal_slot"]),
+        ration_kind=str(row["ration_kind"]),  # type: ignore[arg-type]
+        generation_id=(
+            int(row["generation_id"]) if row.get("generation_id") is not None else None
+        ),
+        generated_at=_normalize_datetime(row["generated_at"]),
+        day_index=int(row["day_index"]) if row.get("day_index") is not None else None,
+        meal_index=_non_negative_int(row.get("meal_index")),
+        user_id=int(row["user_id"]) if row.get("user_id") is not None else None,
     )
 
 

@@ -16,6 +16,7 @@ REQUIRED_TABLES = {
     "payment_events",
     "processed_provider_charges",
     "generation_records",
+    "user_recipe_history",
     "promo_codes",
     "promo_redemptions",
     "promo_events",
@@ -29,6 +30,11 @@ REQUIRED_INDEXES = {
     "uniq_refund_per_related_event",
     "uniq_active_generation_per_user",
     "idx_generation_records_active_heartbeat",
+    "idx_user_recipe_history_recent",
+    "idx_user_recipe_history_recipe_id",
+    "idx_user_recipe_history_recipe_key",
+    "idx_user_recipe_history_generation",
+    "uniq_user_recipe_history_generation_slot",
     "idx_payment_orders_user_status",
     "idx_payment_events_order_created_at",
     "idx_payment_events_charge",
@@ -112,6 +118,11 @@ def test_migrations_include_required_paid_storage_tables() -> None:
         r"\bdiscount_amount\s+INTEGER\b",
         r"\bmonthly_duration_months\s+INTEGER\b",
         r"\bmetadata_json\s+JSONB\s+NOT\s+NULL\s+DEFAULT\s+'\{\}'::jsonb\b",
+        r"\bgeneration_id\s+BIGINT\s+REFERENCES\s+generation_records\(id\)\s+ON\s+DELETE\s+SET\s+NULL\b",
+        r"\bgenerated_at\s+TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+now\(\)",
+        r"\bmeal_slot\s+TEXT\s+NOT\s+NULL\b",
+        r"\brecipe_id\s+TEXT\s+NOT\s+NULL\b",
+        r"\brecipe_key\s+TEXT\s+NOT\s+NULL\b",
     ):
         assert re.search(column_pattern, sql, flags=re.IGNORECASE), column_pattern
 
