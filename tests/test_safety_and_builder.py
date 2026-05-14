@@ -732,6 +732,21 @@ def test_weekly_generation_with_enough_pool_has_no_repeated_recipe_id() -> None:
 
 
 @pytest.mark.slow_pdf_builder
+def test_interesting_weekly_seed_404_has_no_carryover_recipe_repeat() -> None:
+    profile = profile_with(goal=Goal.MAINTAIN, cooking_time=CookingTimePreference.INTERESTING, meal_count=5)
+
+    plans = _build_week_plans(profile, 404, set(), set())
+    recipe_ids = [meal.recipe_id for plan in plans for meal in plan.meals]
+    recipe_counts = Counter(recipe_ids)
+
+    assert len(plans) == 7
+    assert [len(plan.meals) for plan in plans] == [5, 5, 5, 5, 5, 5, 5]
+    assert len(recipe_ids) == 35
+    assert len(recipe_counts) == 35
+    assert recipe_counts["r020_domashnyaya_granola_s_gretskimi_orehami_i_klyukvoy"] <= 1
+
+
+@pytest.mark.slow_pdf_builder
 def test_weekly_partial_day_returns_controlled_failure(monkeypatch) -> None:
     profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=4)
     complete_day = build_one_day_plan(profile, variety_seed=101, recipe_source="curated_only")

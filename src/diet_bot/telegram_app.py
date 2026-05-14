@@ -1537,6 +1537,7 @@ def _build_week_plans(
             week_recipe_keys,
             week_food_ids,
             carryovers,
+            has_future_week_days=day_index < WEEK_PLAN_DAYS - 1,
         )
         if not _week_day_plan_is_complete(plan, profile):
             return ()
@@ -1555,10 +1556,13 @@ def _select_week_day_plan(
     avoided_recipe_keys: set[str],
     week_food_ids: set[str],
     carryovers: dict[str, "_BatchCarryover"],
+    *,
+    has_future_week_days: bool = True,
 ) -> tuple[MealPlan, dict[str, "_BatchCarryover"]]:
     best_plan: MealPlan | None = None
     best_carryovers: dict[str, _BatchCarryover] | None = None
     best_score: tuple[float, int] | None = None
+    rejected_plan: MealPlan | None = None
     for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
         plan = build_one_day_plan(
             profile,
@@ -1570,6 +1574,20 @@ def _select_week_day_plan(
         )
         candidate_carryovers = _copy_carryovers(carryovers)
         plan = _apply_batch_carryovers(plan, candidate_carryovers)
+        if _plan_uses_avoided_recipes(plan, avoided_recipe_ids, avoided_recipe_keys):
+            rejected_plan = rejected_plan or plan
+            continue
+        next_avoided_recipe_ids = set(avoided_recipe_ids)
+        next_avoided_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+        next_avoided_recipe_keys = set(avoided_recipe_keys)
+        next_avoided_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
+        if has_future_week_days and _carryovers_use_avoided_recipes(
+            candidate_carryovers,
+            next_avoided_recipe_ids,
+            next_avoided_recipe_keys,
+        ):
+            rejected_plan = rejected_plan or plan
+            continue
         score = (_ingredient_reuse_score(plan, week_food_ids), -candidate_index)
         if best_score is None or score > best_score:
             best_plan = plan
@@ -1577,6 +1595,8 @@ def _select_week_day_plan(
             best_score = score
 
     if best_plan is None or best_carryovers is None:
+        if rejected_plan is not None:
+            return replace(rejected_plan, meals=()), carryovers
         return (
             build_one_day_plan(
                 profile,
@@ -1597,6 +1617,30 @@ def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) ->
 
 def _week_day_plan_is_complete(plan: MealPlan, profile: UserProfile) -> bool:
     return plan.safety.can_generate_plan and len(plan.meals) == _expected_meal_count(profile)
+
+
+def _plan_uses_avoided_recipes(
+    plan: MealPlan,
+    avoided_recipe_ids: set[str],
+    avoided_recipe_keys: set[str],
+) -> bool:
+    return any(
+        (meal.recipe_id is not None and meal.recipe_id in avoided_recipe_ids)
+        or (meal.recipe_key is not None and meal.recipe_key in avoided_recipe_keys)
+        for meal in plan.meals
+    )
+
+
+def _carryovers_use_avoided_recipes(
+    carryovers: dict[str, "_BatchCarryover"],
+    avoided_recipe_ids: set[str],
+    avoided_recipe_keys: set[str],
+) -> bool:
+    return any(
+        (carryover.meal.recipe_id is not None and carryover.meal.recipe_id in avoided_recipe_ids)
+        or (carryover.meal.recipe_key is not None and carryover.meal.recipe_key in avoided_recipe_keys)
+        for carryover in carryovers.values()
+    )
 
 
 def _expected_meal_count(profile: UserProfile) -> int:
