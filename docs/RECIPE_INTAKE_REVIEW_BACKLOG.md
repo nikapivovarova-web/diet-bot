@@ -1,28 +1,43 @@
 # Recipe Intake Review Backlog
 
-Scope: final cleanup of the remaining `needs_review` recipes in `tmp/recipe_intake/cleaned_recipes.xlsx`, based on the user's decisions. This pass did not import recipes into production curated data, did not touch builder/PDF/Telegram/promo/payments/storage, did not change the source Excel, and did not generate photos.
+Date: 2026-05-14
+
+Scope: risky-recipe mapping-policy cleanup for `tmp/recipe_intake/cleaned_recipes.xlsx`. This pass did not import recipes into production curated data, did not touch builder/PDF/Telegram/promo/payments/storage, did not change the source Excel, and did not generate photos.
 
 ## Summary
 
 - Workbook total: 105 recipes.
-- Status before final pass: 102 `ready`, 3 `needs_review`.
-- Promoted to `ready`: 3 recipes.
+- Status before this policy pass: 105 `ready`, 0 `needs_review`.
+- Status after this policy pass: 105 `ready`, 0 `needs_review`.
 - Still `needs_review`: 0 recipes.
-- Status after final pass: 105 `ready`, 0 `needs_review`.
-- Workbook action taken: final user decisions were recorded in the staging workbook; no production nutrition mappings were added.
+- Workbook action taken: approved mapping/rewrite decisions were recorded in the staging workbook through recipe text updates and ingredient `issue_note` policy marks.
+- Production nutrition rows were not added.
 
-## Final Decisions Applied
+## Decisions Applied
 
-| Recipe | Title | Action |
-|---|---|---|
-| `intake_073` | Тилапия в духовке | Removed the alcohol cooking component, replaced the frozen vegetable mix with zucchini 40 g, bell pepper 30 g, carrot 20 g, and onion 10 g, added lemon juice 10 g, and updated ingredients, steps, and photo prompt. |
-| `intake_078` | Яйца по-флорентийски | Replaced prepared sauce 20 g with milk 15 g, butter 3 g, and flour 2 g; merged the added milk and butter into existing ingredient rows, added flour, and updated steps. |
-| `intake_093` | Шаурма с фалафелем | Kept frozen/prepared falafel as a semi-prepared ingredient for staging readiness and marked falafel as the plant protein anchor. |
+| Recipe | Action |
+|---|---|
+| `intake_032` | Dressing ambiguity resolved to Greek yogurt; crab sticks kept as an approved generic product. |
+| `intake_053` | Protein ambiguity resolved to tofu only; recipe text, steps, tags, and photo prompt updated. |
+| `intake_080` | Udon ingredient normalized to generic udon noodles. |
+| `intake_084` | Brand-specific pumpkin wording replaced with generic pumpkin cubes. |
+| `intake_089` | Re-slotted to snack/light meal; hummus marked as weak plant-protein anchor. |
+| `intake_095` | Asparagus restored; only the pak-choi replacement remains as a future import note. |
+| `intake_098` | Tomato variants normalized and vinegar wording cleaned. |
+| `intake_100` | Prepared tomato sauce normalized to passata plus spices policy. |
+| `intake_101` | Processed poultry product replaced with chicken fillet; spicy tomato sauce normalized to passata plus spices. |
+| `intake_062`, `intake_086`, `intake_096`, `intake_104` | Seasoning, pork-chop, egg-yolk, and chopped-tomato mapping policies recorded. |
+
+## Mapping Policy Recorded
+
+- Cod liver: keep recipes; use drained/no-extra-jar-oil policy unless a recipe explicitly uses oil; cod liver can be an anchor but is not a future scalable anchor.
+- Simple mappings marked ready: dry buckwheat, grapes/kishmish, cornmeal/polenta, chicken liver, split peas, trout, basmati rice, pumpkin, asparagus, egg yolk, pork chop, tomato variants, and sun-dried tomatoes.
+- Condiment/product policy marked ready: soy sauce, explicit-gram mayo, crab sticks, prepared falafel, explicit-gram pesto, and modest explicit-gram teriyaki.
+- Tomato sauces are normalized toward passata plus spices where the recipe wording allowed it.
+- Low-impact seasoning is normalized to mixed spices or 0 g seasoning policy.
 
 ## Remaining Needs Review
 
-None.
+None for the staging workbook.
 
-## Import Recommendation
-
-All 105 recipes are `ready` in the staging workbook. Production import remains a separate task and was not performed here.
+For a future all-105 production import, `intake_093` still needs a final import policy for the large prepared mayo-soy sauce and Korean-carrot component. Frozen/prepared falafel itself is already accepted as a generic prepared product in staging.
