@@ -17,14 +17,14 @@ Scope: validation/dry-run slice for `tmp/recipe_intake_batch2/cleaned_recipes_ba
 ## Summary
 
 - Workbook shape is valid: sheets `recipes`, `ingredients`, `steps`, `qa_issues` are present.
-- After the workbook-fix pass, batch2 has 106 recipes: 93 `ready`, 13 `needs_review`.
+- After the rescue-fix pass, batch2 has 106 recipes: 100 `ready`, 6 `needs_review`.
 - `recipe_key` values are unique.
 - Required recipe fields are filled: title, slots, effort, time, equipment, tags, coverage priority, photo prompt, ingredients, and steps.
 - `allowed_meal_slots`, `slot_flex_type`, `coverage_priority`, and `cooking_effort` values are from the expected enum sets.
 - `servings_cleaned = 1` for all 106 recipes.
 - Text cleanliness passes for banned promo/service/link phrases: no `приятного аппетита`, links, channel/site/promo, or AI/service phrases found.
-- Ready-only hard blockers are cleared: no invalid ingredient names, no 500-600 g one-portion ingredient rows, no production duplicate in `ready`, no prepared-product policy rows in `ready`, and no fish/vegetarian/fish_free conflicts in `ready`.
-- Import-all is still not ready because 13 rows are intentionally quarantined as `needs_review`, including the exact production duplicate and prepared-product rows that need policy decisions.
+- Ready-only hard blockers are cleared: no invalid ingredient names, no 500-600 g one-portion ingredient rows, no production duplicate in `ready`, no disallowed prepared-product policy rows in `ready`, and no fish/vegetarian/fish_free conflicts in `ready`.
+- Import-all is still not ready because 6 rows are intentionally quarantined as `needs_review`: the exact production duplicate, four sprats recipes without supported mapping, and `batch2_106` with source-restored quantities that still require manual confirmation.
 
 Recommendation: import only `ready` rows after the normal importer dry-run. Do not import `needs_review` rows until the duplicate/prepared-product issues are explicitly resolved.
 
@@ -32,26 +32,26 @@ Recommendation: import only `ready` rows after the normal importer dry-run. Do n
 
 | Status | Count |
 |---|---:|
-| ready | 93 |
-| needs_review | 13 |
+| ready | 100 |
+| needs_review | 6 |
 
 Needs review rows from the workbook:
 
 | recipe_key | title | reason |
 |---|---|---|
-| `batch2_002` | Онигири | Crab sticks are a prepared product; kept out of ready import pending policy decision. |
-| `batch2_005` | Рулет из лаваша с крабовыми палочками | Crab sticks and processed cheese are prepared products; kept out of ready import pending policy decision. |
 | `batch2_008` | Яичные маффины с овощами | Exact production duplicate of `r007_yaichnye_maffiny_s_ovoschami`; do not import as a new recipe. |
-| `batch2_052` | Картофельные ньокки | Source had no meal slot or effort; slot, effort, and 6 quantities were restored editorially. |
-| `batch2_053` | Пицца на основе из цветной капусты | Prepared tomato sauce row remains; needs decomposition or explicit approval. |
-| `batch2_055` | Рулетики из баклажанов с мясом и сыром | Prepared tomato sauce row remains; needs decomposition or explicit approval. |
-| `batch2_060` | Энчилада в кукурузных тортильях | Prepared tomato sauce row remains; needs decomposition or explicit approval. |
-| `batch2_083` | Тосты со шпротами, огурцом и горчицей | Prepared canned sprats row remains; needs policy decision. |
-| `batch2_084` | Брускетты со шпротами и маринованным луком | Prepared canned sprats row remains; needs policy decision. |
-| `batch2_085` | Яйца, фаршированные шпротами | Prepared canned sprats row remains; needs policy decision. |
-| `batch2_086` | Рисовые хлебцы со шпротным паштетом | Prepared canned sprats row remains; needs policy decision. |
-| `batch2_102` | Ленивая пицца на лаваше | Prepared tomato sauce row remains; needs decomposition or explicit approval. |
-| `batch2_106` | Быстрая пицца на хлебе | Source had no meal slot, effort, or exact quantities; 5 quantities were restored editorially. |
+| `batch2_083` | Тосты со шпротами, огурцом и горчицей | Sprats normalized to drained weight, but no supported canonical sprats or close canned fish mapping exists. |
+| `batch2_084` | Брускетты со шпротами и маринованным луком | Sprats normalized to drained weight; lemon juice row normalized; no supported sprats mapping exists. |
+| `batch2_085` | Яйца, фаршированные шпротами | Sprats normalized to drained weight, but no supported canonical sprats or close canned fish mapping exists. |
+| `batch2_086` | Рисовые хлебцы со шпротным паштетом | Sprats normalized to drained weight, but no supported canonical sprats or close canned fish mapping exists. |
+| `batch2_106` | Быстрая пицца на хлебе | Tomato sauce was normalized, but source had no meal slot, effort, or exact quantities; keep excluded pending manual quantity confirmation. |
+
+Moved from `needs_review` to `ready` in the rescue pass:
+
+- `batch2_002`: crab sticks kept as canonical `crab_sticks`; no artificial decomposition.
+- `batch2_005`: crab sticks kept as canonical `crab_sticks`; `плавленый сыр` replaced with `творожный сыр`.
+- `batch2_052`: source-restored slot/effort/one-portion quantities accepted as conservative; tomato sauce replaced with `томаты в собственном соку`.
+- `batch2_053`, `batch2_055`, `batch2_060`, `batch2_102`: tomato sauce replaced with `томаты в собственном соку` at the same grams.
 
 ## Validation Matrix
 
@@ -70,13 +70,13 @@ Needs review rows from the workbook:
 | Weird decimals | PASS | No weird decimal gram estimates found. |
 | Text cleanliness | PASS | No banned phrases or links. Short steps exist, but no obvious truncated comma/ellipsis endings. |
 | Nutrition/import mapping | WARNING | Heuristic dry-run maps 664/686 ingredient rows, 178/188 unique names. 22 rows remain unmapped against current production foods/aliases. |
-| Prepared-product policy in ready rows | PASS | 13 prepared-product policy rows remain in the workbook, but all are now on `needs_review` recipes. |
+| Prepared-product policy in ready rows | PASS | No disallowed prepared rows remain in `ready`: crab sticks are allowed by canonical `crab_sticks`; tomato sauce and processed cheese were normalized; sprats remain `needs_review`. |
 | Fish/vegetarian/fish_free conflicts in ready rows | PASS | Targeted ready-only check found no fish-containing ready recipe with `vegetarian` tag or `fish_free` restriction. |
 | Protein anchor | PASS | `batch2_036`, `batch2_006`, and `batch2_010` fish/tuna anchors were corrected where needed. |
 
 ## Original Blockers Fixed Or Quarantined
 
-The following findings were the hard blockers from the initial validation. In the current workbook, parser defects and tag conflicts are fixed directly; duplicate/prepared-product rows that could not be safely decomposed are kept out of ready import with `status = needs_review`.
+The following findings were the hard blockers from the initial validation. In the current workbook, parser defects and tag conflicts are fixed directly; exact duplicate and unresolved sprats/source-quantity rows are kept out of ready import with `status = needs_review`.
 
 1. Production duplicate:
 
@@ -141,27 +141,26 @@ Unmapped or risky unique ingredients:
 - `сардины` - 1 row, no current production food id.
 - `варёная свёкла` / `Варёная свёкла` - 2 rows total, casing duplicate plus missing direct food id.
 
-Prepared product or sauce policy issues, 13 rows after the workbook-fix pass; all are quarantined on `needs_review` recipes:
+Prepared product or sauce policy choices after the rescue pass:
 
-- Crab sticks: `batch2_002`, `batch2_005`.
-- Processed cheese: `batch2_005`.
-- Tomato sauce: `batch2_052`, `batch2_053`, `batch2_055`, `batch2_060`, `batch2_102`, `batch2_106`.
-- Sprats: `batch2_083`, `batch2_084`, `batch2_085`, `batch2_086`.
+- Crab sticks: `batch2_002`, `batch2_005` are `ready` because `crab_sticks` exists as a canonical ingredient; no decomposition was applied.
+- Processed cheese: `batch2_005` now uses `творожный сыр`; the recipe remains culinary-coherent as a lavash roll.
+- Tomato sauce: `batch2_052`, `batch2_053`, `batch2_055`, `batch2_060`, `batch2_102`, and `batch2_106` now use `томаты в собственном соку` with the same gram estimates. No prepared tomato sauce row remains.
+- Sprats: `batch2_083`, `batch2_084`, `batch2_085`, `batch2_086` remain `needs_review`; drained-weight notes were added, but no canonical sprats or close canned fish mapping exists.
 
 Prepared rows fixed directly in ready recipes:
 
 - `batch2_057`: `Куриная котлета` -> `куриный фарш`; `йогуртовый соус` -> `йогурт`.
 - `batch2_088`: `постный майонез или масло` -> `растительное масло`.
 - `batch2_092`: `соус из авокадо` -> `авокадо`.
+- `batch2_084`: `уксус/лимонный сок` -> `лимонный сок`, matching the step text.
 
 ## Slot-Flex Issues
 
-Slot-flex enum consistency passes, but 3 recipes should be manually reviewed for `snack_light_main` quality:
+Slot-flex enum consistency passes, with 1 remaining `snack_light_main` quality warning:
 
 | recipe_key | title | issue |
 |---|---|---|
-| `batch2_006` | Сэндвич с тунцом | `snack_light_main` but no protein anchor and no `high_protein` tag. |
-| `batch2_010` | Рулет из лаваша с тунцом | `snack_light_main`; strongest marked anchor is only 45 g творожный сыр while tuna is not marked as anchor. |
 | `batch2_011` | Салат с гречкой, овощами и фетой | `snack_light_main`; strongest marked anchor is 50 g feta, likely weak for main fallback. |
 
 `breakfast_snack` rows look broadly reasonable: they are mostly rolls, sandwiches, toast, lavash, muffins, or quick pizza/flatbread formats rather than hot porridge/omelet plates. No porridge/omelet snack-flex blocker found.
@@ -215,8 +214,8 @@ If imported on top of the current 505 production recipes:
 | Scenario | Production total |
 |---|---:|
 | Import all 106 raw batch2 recipes | 611 |
-| Import only 104 `ready` rows | 609 |
-| Import after excluding blockers | Needs a rerun after workbook fixes; current workbook is not subset-ready without manual exclusions. |
+| Import only 100 `ready` rows | 605 |
+| Import after excluding blockers | 605; exclude 6 `needs_review` rows. |
 
 Estimated 4-week gap closure using `docs/RECIPE_4_WEEK_COVERAGE_AUDIT.md` baseline:
 
@@ -228,19 +227,17 @@ Estimated 4-week gap closure using `docs/RECIPE_4_WEEK_COVERAGE_AUDIT.md` baseli
 | Egg-free breakfasts | 30 | 28 hard minimum, HP proxy still thin | +16 | 46 raw egg-free breakfasts; high-protein quality still needs QA |
 | Native SIMPLE mains | 55 | 56 hard minimum, 70 for 1.25x buffer | +45 | 100 raw native simple mains |
 
-Coverage value is high, especially for dairy-free snacks/mains and simple native mains, but the current blocker rows can inflate or misclassify those counts. In particular, `fish_free`/`vegetarian` conflicts and unmapped dairy/gluten substitute ingredients must be fixed before treating coverage closure as production-ready.
+Coverage value is high, especially for dairy-free snacks/mains and simple native mains. Treat coverage counts as ready-subset estimates only; unresolved sprats rows remain excluded, and unrelated mapping gaps for coconut milk, rice flour/noodles, herring, sardines, beetroot, and split spice rows still need normal importer policy review.
 
 ## Recommendation
 
-Fix workbook first.
-
-Do not import all from the current workbook. The workbook-fix pass completed the minimum blocker handling:
+Do not import all from the current workbook. Import readiness applies to the 100-row `ready` subset only; keep the 6 `needs_review` rows excluded.
 
 1. `batch2_008` is marked `needs_review` and must not be imported as a new recipe.
 2. All `ingredient_name_ru = 0` rows and embedded quantities in ingredient names are fixed.
 3. The 500-600 g one-portion ingredient rows in `batch2_003`, `batch2_005`, and `batch2_006` are corrected.
-4. Prepared rows that could be normalized without guessing were decomposed; the rest are marked `needs_review`.
+4. Tomato sauce rows were normalized to `томаты в собственном соку`; processed cheese was normalized to `творожный сыр`; canonical crab sticks were allowed without decomposition.
 5. Fish/vegetarian/fish_free conflicts are fixed for ready rows.
-6. Duplicate, mapping, slot-flex, and ready-only blocker checks were rerun locally after the workbook fix.
+6. Duplicate, mapping, slot-flex, and ready-only blocker checks were rerun locally after the rescue fix.
 
-Remaining before any production promotion: resolve the 13 `needs_review` rows, confirm mapping policy for coconut milk, rice flour, rice noodles, sprats, herring, sardines, beetroot, and split spice rows, then run the normal importer dry-run for the final ready subset.
+Remaining before any production promotion: resolve the 6 `needs_review` rows, confirm mapping policy for coconut milk, rice flour, rice noodles, sprats, herring, sardines, beetroot, and split spice rows, then run the normal importer dry-run for the final ready subset.

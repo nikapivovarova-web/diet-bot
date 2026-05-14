@@ -17,8 +17,8 @@ Scope: preprocessing/cleanup slice for the second recipe batch only. Production 
 ## Counts
 
 - Total recipes: 106
-- Ready after workbook-fix pass: 93
-- Needs review after workbook-fix pass: 13
+- Ready after rescue-fix pass: 100
+- Needs review after rescue-fix pass: 6
 
 ### Primary Meal Slot
 
@@ -40,7 +40,7 @@ Scope: preprocessing/cleanup slice for the second recipe batch only. Production 
 
 ## Gap-Oriented Counts
 
-These are raw workbook counts retained from cleanup; production coverage should be recomputed on the ready-only import subset after the 13 `needs_review` rows are resolved or excluded.
+These are raw workbook counts retained from cleanup; production coverage should be recomputed on the ready-only import subset after the 6 `needs_review` rows are resolved or excluded.
 
 - Dairy-free snacks: 30
 - Dairy-free mains: 49
@@ -67,21 +67,30 @@ These are raw workbook counts retained from cleanup; production coverage should 
 - Several original recipes used multi-serving quantities; all cleaned rows were normalized to `servings_cleaned = 1` with rounded amounts.
 - Optional alternatives were resolved to one concrete ingredient where needed, e.g. water instead of milk, rice flour instead of wheat/oats, avocado or hummus instead of optional mayo.
 
-## Needs Review
+## Rescue Review Outcome
 
-- `batch2_002` Онигири: крабовые палочки требуют policy decision; строка выведена из ready import.
-- `batch2_005` Рулет из лаваша с крабовыми палочками: крабовые палочки и плавленый сыр требуют policy decision; строка выведена из ready import.
-- `batch2_008` Яичные маффины с овощами: точный production duplicate `r007_yaichnye_maffiny_s_ovoschami`; не импортировать как новый рецепт.
-- `batch2_052` Картофельные ньокки: В исходнике нет приема пищи и сложности; основной слот и effort восстановлены редакционно.
-- `batch2_053` Пицца на основе из цветной капусты: томатный соус требует разложения или явного approval.
-- `batch2_055` Рулетики из баклажанов с мясом и сыром: томатный соус требует разложения или явного approval.
-- `batch2_060` Энчилада в кукурузных тортильях: томатный соус требует разложения или явного approval.
-- `batch2_083` Тосты со шпротами, огурцом и горчицей: шпроты требуют policy decision.
-- `batch2_084` Брускетты со шпротами и маринованным луком: шпроты требуют policy decision.
-- `batch2_085` Яйца, фаршированные шпротами: шпроты требуют policy decision.
-- `batch2_086` Рисовые хлебцы со шпротным паштетом: шпроты требуют policy decision.
-- `batch2_102` Ленивая пицца на лаваше: томатный соус требует разложения или явного approval.
-- `batch2_106` Быстрая пицца на хлебе: В исходнике нет приема пищи, сложности и точных количеств; нужна ручная проверка перед production-import.
+Moved from `needs_review` to `ready`:
+
+- `batch2_002`: crab sticks are supported by canonical `crab_sticks`; no artificial decomposition.
+- `batch2_005`: crab sticks are supported by canonical `crab_sticks`; `плавленый сыр` was replaced with `творожный сыр`.
+- `batch2_052`: slot/effort/one-portion quantities accepted as conservative editorial correction; tomato sauce replaced with `томаты в собственном соку`.
+- `batch2_053`, `batch2_055`, `batch2_060`, `batch2_102`: tomato sauce replaced with `томаты в собственном соку` using the same gram estimate.
+
+Still `needs_review`:
+
+- `batch2_008` Яичные маффины с овощами: exact production duplicate `r007_yaichnye_maffiny_s_ovoschami`; do not import as a new recipe.
+- `batch2_083` Тосты со шпротами, огурцом и горчицей: sprats normalized to drained weight, but mapping is unsupported.
+- `batch2_084` Брускетты со шпротами и маринованным луком: sprats normalized to drained weight and lemon juice normalized; mapping is unsupported.
+- `batch2_085` Яйца, фаршированные шпротами: sprats normalized to drained weight, but mapping is unsupported.
+- `batch2_086` Рисовые хлебцы со шпротным паштетом: sprats normalized to drained weight, but mapping is unsupported.
+- `batch2_106` Быстрая пицца на хлебе: tomato sauce normalized, but source meal slot/effort/exact quantities still require manual confirmation before import.
+
+Policy choices:
+
+- Tomato sauce: replaced with `томаты в собственном соку`; no alternate prepared-sauce wording is used in batch2 workbook edits.
+- Sprats: kept excluded because no canonical sprats or close canned fish mapping exists; drained-weight notes were added.
+- Crab sticks: allowed only where canonical `crab_sticks` mapping exists; no decomposition.
+- Processed cheese: replaced with `творожный сыр` in `batch2_005`.
 
 ## Coverage Impact vs. 4-Week Audit
 
@@ -92,7 +101,7 @@ The audit in `docs/RECIPE_4_WEEK_COVERAGE_AUDIT.md` identified the largest stric
 - It adds 16 egg-free breakfast-capable recipes, though not all are high-protein; protein QA is still needed before production import.
 - It adds 45 simple native mains, increasing buffer for unrestricted SIMPLE plans.
 
-Conclusion: batch2 is useful for the documented gaps, especially dairy-free snacks and simple mains, but should remain staging until nutrition/protein checks and manual review of the 13 `needs_review` rows are complete. Only `ready` rows should be considered for the next importer dry-run.
+Conclusion: batch2 is useful for the documented gaps, especially dairy-free snacks and simple mains, but should remain staging until nutrition/protein checks and manual review of the 6 `needs_review` rows are complete. Only the 100 `ready` rows should be considered for the next importer dry-run.
 
 ## Validation
 
@@ -103,4 +112,4 @@ Conclusion: batch2 is useful for the documented gaps, especially dairy-free snac
 - workbook opens with sheets `recipes`, `ingredients`, `steps`, `qa_issues`: yes
 - all workbook sheets rendered to PNG preview: yes
 - formula/error scan: 0 matches
-- workbook-fix targeted validation: invalid ingredient names 0; 500-600 g one-portion rows 0; production duplicates in ready rows 0; prepared-product policy rows in ready rows 0; fish/vegetarian/fish_free conflicts in ready rows 0
+- rescue-fix targeted validation: invalid ingredient names 0; 500-600 g one-portion rows 0; production duplicates in ready rows 0; disallowed prepared-product policy rows in ready rows 0; fish/vegetarian/fish_free conflicts in ready rows 0
