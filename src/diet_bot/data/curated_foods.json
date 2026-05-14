@@ -15824,6 +15824,57 @@
     }
   },
   {
+    "food_id": "sprats",
+    "name_ru": "шпроты",
+    "name_en": "fish sardine Atlantic canned in oil drained solids with bone",
+    "category": "protein",
+    "tags": [
+      "high_sodium"
+    ],
+    "roles": [
+      "protein",
+      "fat"
+    ],
+    "default_state": "drained",
+    "source": "USDA FoodData Central + NIH ODS iodine table",
+    "fdc_id": "175139",
+    "source_description": "Fish, sardine, Atlantic, canned in oil, drained solids with bone; close proxy for canned sprats with oil drained",
+    "match_confidence": "close",
+    "max_per_meal_g": 120,
+    "max_per_day_g": 180,
+    "nutrients_per_100g": {
+      "energy_kcal": 208.0,
+      "protein_g": 24.62,
+      "fat_g": 11.45,
+      "saturated_fat_g": 1.528,
+      "carbohydrate_g": 0.0,
+      "fiber_g": 0.0,
+      "sugar_g": 0.0,
+      "added_sugar_g": 0.0,
+      "sodium_mg": 307.0,
+      "potassium_mg": 397.0,
+      "calcium_mg": 382.0,
+      "magnesium_mg": 39.0,
+      "iron_mg": 2.92,
+      "zinc_mg": 1.31,
+      "iodine_mcg": 25.0,
+      "selenium_mcg": 52.7,
+      "phosphorus_mg": 490.0,
+      "vitamin_c_mg": 0.0,
+      "vitamin_d_mcg": 4.8,
+      "vitamin_b12_mcg": 8.94,
+      "folate_mcg_dfe": 10.0,
+      "vitamin_b1_mg": 0.08,
+      "vitamin_b2_mg": 0.227,
+      "vitamin_b3_mg": 5.245,
+      "vitamin_b6_mg": 0.167,
+      "vitamin_a_mcg_rae": 32.0,
+      "vitamin_e_mg": 2.04,
+      "vitamin_k_mcg": 2.6,
+      "omega_3_mg": 1480.0
+    }
+  },
+  {
     "food_id": "tuna_steak",
     "name_ru": "стейк тунца",
     "name_en": "fish tuna fresh raw",

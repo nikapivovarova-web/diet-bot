@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from diet_bot.builder import _add_missing_garnishes
 from diet_bot.builder import build_one_day_plan
@@ -14,6 +15,7 @@ from diet_bot.recipe_catalog import built_in_recipes
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
+ROOT_DIR = Path(__file__).resolve().parents[1]
 LEGACY_CURATED_RECIPE_COUNT = 400
 INTAKE_RECIPE_COUNT = 105
 TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT
@@ -25,6 +27,19 @@ def _source_recipes() -> list[dict]:
 
 def _source_ingredients() -> list[dict]:
     return json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+
+
+def _rows_by_key(sheet, *, many: bool = False):
+    headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    key_index = headers.index("recipe_key")
+    rows = {}
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        item = dict(zip(headers, row))
+        if many:
+            rows.setdefault(row[key_index], []).append(item)
+        else:
+            rows[row[key_index]] = item
+    return rows
 
 
 def _imported_recipe_rows() -> list[dict]:
@@ -97,6 +112,52 @@ def test_gnocchi_recipe_uses_gnocchi_ingredient_name() -> None:
     assert gnocchi_rows[0]["ingredient_name_ru"] == "ньокки"
     assert gnocchi_rows[0]["food_id"] == "gnocchi"
     assert any(food["food_id"] == "gnocchi" and food["name_ru"] == "ньокки" for food in foods)
+
+
+def test_sprats_supported_as_drained_canned_fish_policy() -> None:
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    sprats = next((food for food in foods if food["food_id"] == "sprats"), None)
+
+    assert sprats is not None
+    assert sprats["name_ru"] == "шпроты"
+    assert "canned" in sprats["name_en"]
+    assert "drained solids" in sprats["name_en"]
+    assert sprats["default_state"] == "drained"
+    assert "protein" in sprats["roles"]
+    assert sprats["nutrients_per_100g"]["protein_g"] > 0
+    assert sprats["nutrients_per_100g"]["fat_g"] > 0
+
+
+def test_batch2_sprats_rows_are_ready_with_drained_weight_mapping() -> None:
+    workbook_path = ROOT_DIR / "tmp" / "recipe_intake_batch2" / "cleaned_recipes_batch2.xlsx"
+    sprats_keys = {"batch2_083", "batch2_084", "batch2_085", "batch2_086"}
+    wb = load_workbook(workbook_path, read_only=True, data_only=True)
+
+    recipes = _rows_by_key(wb["recipes"])
+    ingredients = _rows_by_key(wb["ingredients"], many=True)
+    qa_issues = _rows_by_key(wb["qa_issues"], many=True)
+    wb.close()
+
+    assert {key: recipes[key]["status"] for key in sprats_keys} == {
+        key: "ready"
+        for key in sprats_keys
+    }
+    for key in sprats_keys:
+        sprats_rows = [
+            row
+            for row in ingredients[key]
+            if str(row["ingredient_name_ru"]).lower() == "шпроты"
+        ]
+        assert len(sprats_rows) == 1
+        assert sprats_rows[0]["grams_estimate"] == 70
+        assert sprats_rows[0]["preparation_note"] == "масло слить, вес без масла"
+        assert "unsupported" not in str(sprats_rows[0].get("issue_note") or "").lower()
+        assert "needs_review" not in str(sprats_rows[0].get("issue_note") or "").lower()
+        assert not [
+            row
+            for row in qa_issues.get(key, [])
+            if row["severity"] == "warning" and "Sprats remain needs_review" in row["issue"]
+        ]
 
 
 def test_curated_recipe_data_has_local_photos() -> None:

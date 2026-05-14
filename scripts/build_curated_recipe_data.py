@@ -141,6 +141,7 @@ MANUAL_NUTRIENT_OVERRIDES = {
     "seafood_mix": {"iodine_mcg": 15},
     "shrimp": {"iodine_mcg": 15},
     "smoked_white_fish": {"iodine_mcg": 172},
+    "sprats": {"iodine_mcg": 25},
     "swiss_cheese": {"iodine_mcg": 50},
     "tuna": {"iodine_mcg": 8},
     "tuna_steak": {"iodine_mcg": 8},
@@ -218,6 +219,44 @@ FOOD_DEFS: tuple[FoodDef, ...] = (
     fd("turkey", "индейка", "turkey breast meat raw", "protein", ("филе индейки готовое", "эскалопы индейки", "индейка", "филе индейки"), roles=("protein",), max_per_meal_g=250, max_per_day_g=420),
     fd("salmon", "лосось", "salmon Atlantic raw", "protein", ("филе лосося", "лосось"), roles=("protein", "fat"), max_per_meal_g=220, max_per_day_g=320),
     fd("tuna", "тунец консервированный", "tuna light canned in water drained solids", "protein", ("тунец консервированный в собственном соку", "консервированный тунец", "тунец"), roles=("protein",), default_state="drained", max_per_meal_g=220, max_per_day_g=320),
+    fd(
+        "sprats",
+        "шпроты",
+        "fish sardine Atlantic canned in oil drained solids with bone",
+        "protein",
+        ("шпроты в масле", "консервированные шпроты", "шпроты"),
+        tags=("high_sodium",),
+        roles=("protein", "fat"),
+        default_state="drained",
+        max_per_meal_g=120,
+        max_per_day_g=180,
+        prefer=("Fish, sardine, Atlantic, canned in oil, drained solids with bone",),
+        fallback={
+            "energy_kcal": 208,
+            "protein_g": 24.62,
+            "fat_g": 11.45,
+            "saturated_fat_g": 1.528,
+            "sodium_mg": 307,
+            "potassium_mg": 397,
+            "calcium_mg": 382,
+            "magnesium_mg": 39,
+            "iron_mg": 2.92,
+            "zinc_mg": 1.31,
+            "selenium_mcg": 52.7,
+            "phosphorus_mg": 490,
+            "vitamin_d_mcg": 4.8,
+            "vitamin_b12_mcg": 8.94,
+            "folate_mcg_dfe": 10,
+            "vitamin_b1_mg": 0.08,
+            "vitamin_b2_mg": 0.227,
+            "vitamin_b3_mg": 5.245,
+            "vitamin_b6_mg": 0.167,
+            "vitamin_a_mcg_rae": 32,
+            "vitamin_e_mg": 2.04,
+            "vitamin_k_mcg": 2.6,
+            "omega_3_mg": 1480,
+        },
+    ),
     fd("white_fish", "белая рыба", "fish cod Atlantic raw", "protein", ("филе белой рыбы", "белая рыба", "треска"), roles=("protein",), max_per_meal_g=240, max_per_day_g=420),
     fd("shrimp", "креветки", "crustaceans shrimp raw", "protein", ("креветки очищенные", "креветки"), roles=("protein",), max_per_meal_g=240, max_per_day_g=360),
     fd("crab_sticks", "крабовые палочки", "surimi imitation crab", "protein", ("крабовые палочки",), tags=("high_sodium",), roles=("protein",), max_per_meal_g=180, max_per_day_g=240),
@@ -500,6 +539,7 @@ FOOD_DEFS: tuple[FoodDef, ...] = (
     fd("pepperoncini", "пеперончини", "peppers pickled canned", "vegetable", ("пеперончини",), tags=("high_sodium",), garnish_g=10, max_per_meal_g=60, max_per_day_g=100),
     fd("ranch", "соус ранч", "salad dressing ranch dressing commercial regular", "sauce", ("соус ранч",), density_g_per_ml=1.0, max_per_meal_g=60, max_per_day_g=100),
 )
+EXTRA_CANONICAL_FOOD_IDS = {"sprats"}
 
 
 EXTRA_FOOD_DEFS: tuple[FoodDef, ...] = (
@@ -1099,7 +1139,7 @@ def build_foods(
     api_key: str,
     sr_foods: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    used_ids = sorted({item["food_id"] for item in ingredients if item.get("food_id")})
+    used_ids = sorted({item["food_id"] for item in ingredients if item.get("food_id")} | EXTRA_CANONICAL_FOOD_IDS)
     defs_by_id = {food_def.id: food_def for food_def in FOOD_DEFS}
     cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
     foods: list[dict[str, Any]] = []

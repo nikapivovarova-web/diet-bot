@@ -17,8 +17,8 @@ Scope: preprocessing/cleanup slice for the second recipe batch only. Production 
 ## Counts
 
 - Total recipes: 106
-- Ready after rescue-fix pass: 100
-- Needs review after rescue-fix pass: 6
+- Ready after sprats mapping pass: 104
+- Needs review after sprats mapping pass: 2
 
 ### Primary Meal Slot
 
@@ -40,7 +40,7 @@ Scope: preprocessing/cleanup slice for the second recipe batch only. Production 
 
 ## Gap-Oriented Counts
 
-These are raw workbook counts retained from cleanup; production coverage should be recomputed on the ready-only import subset after the 6 `needs_review` rows are resolved or excluded.
+These are raw workbook counts retained from cleanup; production coverage should be recomputed on the ready-only import subset after the 2 `needs_review` rows are resolved or excluded.
 
 - Dairy-free snacks: 30
 - Dairy-free mains: 49
@@ -75,20 +75,17 @@ Moved from `needs_review` to `ready`:
 - `batch2_005`: crab sticks are supported by canonical `crab_sticks`; `плавленый сыр` was replaced with `творожный сыр`.
 - `batch2_052`: slot/effort/one-portion quantities accepted as conservative editorial correction; tomato sauce replaced with `томаты в собственном соку`.
 - `batch2_053`, `batch2_055`, `batch2_060`, `batch2_102`: tomato sauce replaced with `томаты в собственном соку` using the same gram estimate.
+- `batch2_083`, `batch2_084`, `batch2_085`, `batch2_086`: sprats are supported by canonical `sprats`, following the existing canned fish pattern. Oil is discarded and the recipe grams are drained fish weight.
 
 Still `needs_review`:
 
 - `batch2_008` Яичные маффины с овощами: exact production duplicate `r007_yaichnye_maffiny_s_ovoschami`; do not import as a new recipe.
-- `batch2_083` Тосты со шпротами, огурцом и горчицей: sprats normalized to drained weight, but mapping is unsupported.
-- `batch2_084` Брускетты со шпротами и маринованным луком: sprats normalized to drained weight and lemon juice normalized; mapping is unsupported.
-- `batch2_085` Яйца, фаршированные шпротами: sprats normalized to drained weight, but mapping is unsupported.
-- `batch2_086` Рисовые хлебцы со шпротным паштетом: sprats normalized to drained weight, but mapping is unsupported.
 - `batch2_106` Быстрая пицца на хлебе: tomato sauce normalized, but source meal slot/effort/exact quantities still require manual confirmation before import.
 
 Policy choices:
 
 - Tomato sauce: replaced with `томаты в собственном соку`; no alternate prepared-sauce wording is used in batch2 workbook edits.
-- Sprats: kept excluded because no canonical sprats or close canned fish mapping exists; drained-weight notes were added.
+- Sprats: allowed only through canonical `sprats`; the mapping uses a close canned-in-oil/drained-solids fish proxy, and workbook grams are drained fish weight with oil discarded.
 - Crab sticks: allowed only where canonical `crab_sticks` mapping exists; no decomposition.
 - Processed cheese: replaced with `творожный сыр` in `batch2_005`.
 
@@ -101,7 +98,7 @@ The audit in `docs/RECIPE_4_WEEK_COVERAGE_AUDIT.md` identified the largest stric
 - It adds 16 egg-free breakfast-capable recipes, though not all are high-protein; protein QA is still needed before production import.
 - It adds 45 simple native mains, increasing buffer for unrestricted SIMPLE plans.
 
-Conclusion: batch2 is useful for the documented gaps, especially dairy-free snacks and simple mains, but should remain staging until nutrition/protein checks and manual review of the 6 `needs_review` rows are complete. Only the 100 `ready` rows should be considered for the next importer dry-run.
+Conclusion: batch2 is useful for the documented gaps, especially dairy-free snacks and simple mains, but should remain staging until nutrition/protein checks and manual review of the 2 `needs_review` rows are complete. Only the 104 `ready` rows should be considered for the next importer dry-run.
 
 ## Validation
 
