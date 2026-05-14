@@ -17,7 +17,8 @@ Scope: user-facing question status for `tmp/recipe_intake/cleaned_recipes.xlsx` 
 |---|---|
 | Cod liver recipes | Kept; drained/no-extra-jar-oil policy recorded unless a recipe explicitly uses oil. |
 | Normal product mappings | Buckwheat, grapes/kishmish, cornmeal/polenta, chicken liver, split peas, trout, basmati rice, tomato variants, sun-dried tomatoes, pumpkin, asparagus, egg yolk, pork chop, and mixed-spice seasoning policies recorded. |
-| Standard condiments/products | Soy sauce, explicit-gram mayo, crab sticks, prepared falafel, pesto with grams, and modest teriyaki with grams marked as staging-approved policy. |
+| Standard condiments/products | Soy sauce, explicit-gram mayo, crab sticks, prepared falafel, Korean carrot, pesto with grams, and modest teriyaki with grams marked as staging-approved policy. |
+| `intake_093` | Falafel and Korean carrot kept as accepted prepared products; prepared mayo-soy sauce replaced with Greek yogurt 30 g, soy sauce 5 g, and lemon juice 5 g. |
 | `intake_032` | Dressing ambiguity resolved to yogurt. |
 | `intake_053` | Protein ambiguity resolved to tofu only. |
 | `intake_080` | Udon wording normalized to generic udon noodles. |
@@ -28,4 +29,4 @@ Scope: user-facing question status for `tmp/recipe_intake/cleaned_recipes.xlsx` 
 
 ## Future Import Question
 
-Not blocking this staging cleanup: `intake_093` still needs an import-time decision for the large prepared mayo-soy sauce and Korean-carrot component if the goal is to import all 105 recipes at once.
+No recipe-specific user questions remain for this staging cleanup. Production import remains a separate task and should consume the staging workbook policy notes before promoting all 105 recipes.

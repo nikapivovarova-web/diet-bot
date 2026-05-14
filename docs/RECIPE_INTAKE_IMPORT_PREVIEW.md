@@ -17,7 +17,7 @@ Temporary dry-run artifacts were written under ignored `tmp/recipe_intake/` and 
 - Total recipes: 105
 - Status: 105 `ready`, 0 `needs_review`
 - `servings_cleaned = 1`: 105/105
-- Ingredient rows: 845
+- Ingredient rows: 847
 - Step rows: 462
 - QA rows retained in workbook: 188, with 103 notes and 85 warnings
 - Meal slots: 52 main, 22 breakfast, 31 snack
@@ -35,7 +35,7 @@ Passes:
 - Duplicate check against existing curated recipes by normalized repaired title: 0 matches
 - Valid `meal_slot`: 105/105
 - Valid `cooking_effort`: 105/105
-- Ingredient parseability: 845/845 parseable for dry-run purposes
+- Ingredient parseability: 847/847 parseable for dry-run purposes
 - Step parseability: 462/462 parseable, step numbering sequential per recipe
 - `photo_prompt_ru`: present for 105/105
 - Cooking-beverage ingredient terms: 0 exact hits in recipe content
@@ -55,8 +55,8 @@ Protein anchor warnings where the unchanged preview expects an anchor but none i
 
 Current unchanged dry-run logic:
 
-- Mapped ingredient rows: 824/845, 97.5%
-- Mapped unique ingredient names: 316/331, 95.5%
+- Mapped ingredient rows: 826/847, 97.5%
+- Mapped unique ingredient names: 315/330, 95.5%
 - Preview mapped food IDs used: 138
 - Full mapped recipes: 75
 - Near-full mapped recipes: 2
@@ -64,17 +64,17 @@ Current unchanged dry-run logic:
 
 Policy-adjusted readiness after applying workbook `issue_note` decisions:
 
-- Full mapped recipes: 102
+- Full mapped recipes: 103
 - Near-full mapped recipes: 2
-- Risky for nutrition readiness: 1
+- Risky for nutrition readiness: 0
 
-The difference exists because this cleanup intentionally did not add production nutrition rows or import aliases. The unchanged preview still flags approved staging policies such as cod liver, grapes/kishmish, buckwheat, chicken liver, split peas, trout, generic udon, canned/chopped tomatoes, sun-dried tomatoes, soy sauce, explicit-gram mayo, crab sticks, pesto, falafel, and teriyaki.
+The difference exists because this cleanup intentionally did not add production nutrition rows or import aliases. The unchanged preview still flags approved staging policies such as cod liver, grapes/kishmish, buckwheat, chicken liver, split peas, trout, generic udon, canned/chopped tomatoes, sun-dried tomatoes, soy sauce, explicit-gram mayo, crab sticks, pesto, falafel, Korean carrot, and teriyaki.
 
 ## Remaining Risk
 
-Policy-adjusted remaining risky recipe:
+Policy-adjusted remaining risky recipes: none.
 
-- `intake_093` - falafel itself is approved, but the large prepared mayo-soy sauce and Korean-carrot component still need either decomposition or explicit generic-product acceptance before all-105 production import.
+`intake_093` is resolved in staging: falafel and Korean carrot remain accepted prepared products, and the prepared mayo-soy sauce was replaced with Greek yogurt 30 g, soy sauce 5 g, and lemon juice 5 g.
 
 Near-full but not risky:
 
@@ -100,9 +100,9 @@ Do not import in this task.
 For the next import-preview task:
 
 1. Teach the preview/import process to consume the staging workbook policy notes, or add production nutrition aliases in a separate mapping-only change.
-2. Keep `intake_093` out of an all-105 import until its prepared sauce/vegetable product policy is resolved.
+2. Treat `intake_093` as policy-ready only when the preview/import process consumes the staging workbook policy notes.
 3. Generate no photos until the separate media/import slice.
 
 ## Conclusion
 
-The intake workbook remains structurally clean and has 105 ready recipes. The approved risky-recipe policies are now represented in staging, moving the policy-adjusted readiness from 68/3/34 to 102/2/1. Production import remains intentionally deferred.
+The intake workbook remains structurally clean and has 105 ready recipes. The approved risky-recipe policies are now represented in staging, moving the policy-adjusted readiness from 68/3/34 to 103/2/0. Production import remains intentionally deferred.

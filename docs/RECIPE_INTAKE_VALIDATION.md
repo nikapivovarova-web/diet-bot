@@ -9,7 +9,7 @@ Scope: validation for `tmp/recipe_intake/cleaned_recipes.xlsx` after the risky-r
 - Workbook recipes: 105.
 - Status before this policy pass: 105 `ready`, 0 `needs_review`.
 - Status after this policy pass: 105 `ready`, 0 `needs_review`.
-- Recipe-specific rewrites and mapping-policy notes were applied in the staging workbook only.
+- Final `intake_093` rewrite and mapping-policy notes were applied in the staging workbook only.
 - Production import was not run.
 
 ## Workbook Counts
@@ -17,14 +17,14 @@ Scope: validation for `tmp/recipe_intake/cleaned_recipes.xlsx` after the risky-r
 | Check | Before policy pass | After policy pass | Result |
 |---|---:|---:|---|
 | Workbook recipes | 105 | 105 | PASS |
-| Ingredient rows | 845 | 845 | PASS |
+| Ingredient rows | 845 | 847 | PASS |
 | Step rows | 462 | 462 | PASS |
-| QA issue rows | 175 | 188 | PASS |
+| QA issue rows | 188 | 188 | PASS |
 | Workbook status: `ready` | 105 | 105 | PASS |
 | Workbook status: `needs_review` | 0 | 0 | PASS |
 | `servings_cleaned = 1` | 105/105 | 105/105 | PASS |
 
-QA rows increased by 13 because this pass recorded explicit staging-only policy notes for the approved ambiguous-ingredient, generic-product, tomato, seasoning, and protein-anchor decisions.
+Ingredient rows increased by 2 because `intake_093` now uses a controlled yogurt-soy-lemon sauce: Greek yogurt 30 g, soy sauce 5 g, and lemon juice 5 g.
 
 ## Cleanup Applied
 
@@ -40,6 +40,7 @@ QA rows increased by 13 because this pass recorded explicit staging-only policy 
 | `intake_100` | Prepared tomato sauce normalized to passata plus spices policy. |
 | `intake_101` | Processed poultry product replaced with chicken fillet; prepared spicy tomato sauce normalized to passata plus spices. |
 | `intake_062`, `intake_086`, `intake_096`, `intake_104` | Seasoning, pork-chop, egg-yolk, and chopped-tomato mapping policies recorded/normalized. |
+| `intake_093` | Frozen/prepared falafel kept as an accepted prepared product; Korean carrot kept as an accepted household prepared product; prepared mayo-soy sauce replaced with controlled yogurt-soy-lemon sauce. |
 
 ## Validation Checks
 
@@ -60,6 +61,9 @@ QA rows increased by 13 because this pass recorded explicit staging-only policy 
 | No brand-specific pumpkin wording remains | PASS |
 | No product-specific udon wording remains | PASS |
 | Processed poultry product in `intake_101` is replaced with chicken fillet | PASS |
+| `intake_093` no longer contains the prepared mayo-soy sauce ingredient | PASS |
+| `intake_093` keeps frozen/prepared falafel as accepted | PASS |
+| `intake_093` keeps Korean carrot as an accepted prepared product with mapping readiness note | PASS |
 
 ## Dry-Run Preview Snapshot
 
@@ -69,9 +73,9 @@ The same existing dry-run preview script was rerun after the workbook cleanup. B
 |---|---:|---:|---:|
 | Before this policy pass | 68 | 3 | 34 |
 | After workbook rewrites, unchanged dry-run logic | 75 | 2 | 28 |
-| Policy-adjusted readiness from workbook notes | 102 | 2 | 1 |
+| Policy-adjusted readiness from workbook notes | 103 | 2 | 0 |
 
-Remaining policy-adjusted risky recipe: `intake_093`, because the large prepared mayo-soy sauce and Korean-carrot component still need either decomposition or explicit generic-product acceptance before an all-105 import.
+Policy-adjusted risky recipes remaining: none. `intake_093` is now importable under staging policy notes: falafel and Korean carrot are accepted prepared products, and the former prepared mayo-soy sauce was replaced by Greek yogurt, soy sauce, and lemon juice.
 
 ## Import Recommendation
 

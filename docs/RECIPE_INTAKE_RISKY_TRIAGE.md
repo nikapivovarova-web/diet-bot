@@ -7,10 +7,10 @@ Scope: mapping-policy triage for the 34 recipes previously marked risky in `docs
 ## Summary
 
 - Starting preview state: 105 structurally ready recipes, with 68 full-mapped, 3 near-full, and 34 risky for nutrition readiness.
-- Workbook cleanup applied approved user decisions for normal-food mappings, generic condiment/product policies, tomato normalization, ambiguous ingredients, asparagus restoration, pumpkin wording, udon wording, and the processed-poultry replacement.
+- Workbook cleanup applied approved user decisions for normal-food mappings, generic condiment/product policies, tomato normalization, ambiguous ingredients, asparagus restoration, pumpkin wording, udon wording, the processed-poultry replacement, and the final `intake_093` sauce cleanup.
 - The unchanged dry-run preview now reports 75 full-mapped, 2 near-full, and 28 risky.
 - The unchanged dry-run still flags approved items because it does not yet consume workbook `issue_note` policy marks.
-- Policy-adjusted readiness from workbook notes is 102 full-mapped, 2 near-full, and 1 risky.
+- Policy-adjusted readiness from workbook notes is 103 full-mapped, 2 near-full, and 0 risky.
 
 ## Before / After Counts
 
@@ -18,7 +18,7 @@ Scope: mapping-policy triage for the 34 recipes previously marked risky in `docs
 |---|---:|---:|---:|
 | Original dry-run before this pass | 68 | 3 | 34 |
 | Current unchanged dry-run after workbook rewrites | 75 | 2 | 28 |
-| Policy-adjusted readiness after user-approved decisions | 102 | 2 | 1 |
+| Policy-adjusted readiness after user-approved decisions | 103 | 2 | 0 |
 
 ## Resolved By This Pass
 
@@ -29,7 +29,8 @@ Scope: mapping-policy triage for the 34 recipes previously marked risky in `docs
 - Asparagus restored: `intake_095` uses asparagus in title, ingredients, steps, and photo prompt.
 - Tomato policy recorded: cherry tomatoes, passata/pureed tomatoes, canned/chopped tomatoes, tomato sauce, and spicy tomato sauce have staging policy notes.
 - Alias/seasoning policy recorded: pork chop, egg yolk, basmati rice, khmeli-suneli, and universal seasoning.
-- Generic product policy recorded: soy sauce, explicit-gram mayo, crab sticks, falafel, pesto, and modest teriyaki.
+- Generic product policy recorded: soy sauce, explicit-gram mayo, crab sticks, falafel, Korean carrot, pesto, and modest teriyaki.
+- `intake_093` final risk resolved: falafel and Korean carrot remain accepted prepared products, and the prepared mayo-soy sauce was replaced with Greek yogurt 30 g, soy sauce 5 g, and lemon juice 5 g.
 
 ## Current Dry-Run Caveat
 
@@ -39,9 +40,7 @@ This is expected for this cleanup slice. The next preview/import task should eit
 
 ## Remaining Policy-Adjusted Risk
 
-| recipe_key | Reason |
-|---|---|
-| `intake_093` | Frozen/prepared falafel is accepted, but the large prepared mayo-soy sauce and Korean-carrot component still need either decomposition or explicit generic-product acceptance before an all-105 import. |
+None. The policy-adjusted view is now 105 importable recipes: 103 full-mapped and 2 near-full.
 
 ## Near-Full Items Still Not Risky
 
@@ -52,4 +51,4 @@ This is expected for this cleanup slice. The next preview/import task should eit
 
 ## Recommendation
 
-Do not import from this triage report directly. Re-run the import preview in a separate task with the workbook policy marks accounted for. A production import can then promote the policy-ready slice while either deferring or decomposing `intake_093`.
+Do not import from this triage report directly. Re-run the import preview in a separate task with the workbook policy marks accounted for. A production import can then promote the policy-ready 105 recipes in a controlled import slice.

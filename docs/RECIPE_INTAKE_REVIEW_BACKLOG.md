@@ -27,12 +27,13 @@ Scope: risky-recipe mapping-policy cleanup for `tmp/recipe_intake/cleaned_recipe
 | `intake_100` | Prepared tomato sauce normalized to passata plus spices policy. |
 | `intake_101` | Processed poultry product replaced with chicken fillet; spicy tomato sauce normalized to passata plus spices. |
 | `intake_062`, `intake_086`, `intake_096`, `intake_104` | Seasoning, pork-chop, egg-yolk, and chopped-tomato mapping policies recorded. |
+| `intake_093` | Falafel and Korean carrot kept as accepted prepared products; prepared mayo-soy sauce replaced with Greek yogurt 30 g, soy sauce 5 g, and lemon juice 5 g. |
 
 ## Mapping Policy Recorded
 
 - Cod liver: keep recipes; use drained/no-extra-jar-oil policy unless a recipe explicitly uses oil; cod liver can be an anchor but is not a future scalable anchor.
 - Simple mappings marked ready: dry buckwheat, grapes/kishmish, cornmeal/polenta, chicken liver, split peas, trout, basmati rice, pumpkin, asparagus, egg yolk, pork chop, tomato variants, and sun-dried tomatoes.
-- Condiment/product policy marked ready: soy sauce, explicit-gram mayo, crab sticks, prepared falafel, explicit-gram pesto, and modest explicit-gram teriyaki.
+- Condiment/product policy marked ready: soy sauce, explicit-gram mayo, crab sticks, prepared falafel, Korean carrot, explicit-gram pesto, and modest explicit-gram teriyaki.
 - Tomato sauces are normalized toward passata plus spices where the recipe wording allowed it.
 - Low-impact seasoning is normalized to mixed spices or 0 g seasoning policy.
 
@@ -40,4 +41,4 @@ Scope: risky-recipe mapping-policy cleanup for `tmp/recipe_intake/cleaned_recipe
 
 None for the staging workbook.
 
-For a future all-105 production import, `intake_093` still needs a final import policy for the large prepared mayo-soy sauce and Korean-carrot component. Frozen/prepared falafel itself is already accepted as a generic prepared product in staging.
+No policy-adjusted risky recipes remain. For a future all-105 production import, `intake_093` should be promoted only through the staging policy notes that accept falafel and Korean carrot as prepared products and use the controlled yogurt-soy-lemon sauce.
