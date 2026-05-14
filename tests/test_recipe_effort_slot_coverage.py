@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections import Counter
 
+from diet_bot import builder as builder_module
 from diet_bot.builder import (
     _build_recipe_plan_for_time,
     _cooking_effort_constraints,
     _meal_energy_slots,
     _rank_recipes,
     _recipe_matches_cooking_effort,
+    filter_foods,
 )
 from diet_bot.calculator import calculate_targets
 from diet_bot.catalog import built_in_foods
@@ -267,6 +269,120 @@ def _snack_dessert(recipe_id: str = "snack_yogurt_berry_parfait") -> RecipeTempl
     )
 
 
+def _slot_recipe(
+    recipe_id: str,
+    *,
+    slot: str,
+    ingredients_g: dict[str, float] | None = None,
+    allowed_meal_slots: tuple[str, ...] = (),
+    slot_flex_type: str | None = None,
+) -> RecipeTemplate:
+    return RecipeTemplate(
+        id=recipe_id,
+        slot=slot,
+        title=recipe_id.replace("_", " ").title(),
+        ingredients_g=ingredients_g or {"chicken_breast": 180, "pita": 70, "cucumber": 100},
+        instructions="Assemble the test recipe.",
+        tags=frozenset({"curated"}),
+        time_text="10 minutes",
+        allowed_meal_slots=allowed_meal_slots,
+        slot_flex_type=slot_flex_type,
+    )
+
+
+def _slot_eligibility(recipe: RecipeTemplate, slot: str):
+    helper = getattr(builder_module, "_recipe_slot_eligibility", None)
+    assert helper is not None
+    return helper(
+        recipe,
+        slot,
+        {food.id: food for food in _fallback_foods()},
+        600,
+        NutrientVector({"energy_kcal": 1900, "protein_g": 80, "fat_g": 55, "carbohydrate_g": 220}),
+    )
+
+
+def test_native_slot_recipe_is_eligible_without_flex_penalty() -> None:
+    recipe = _slot_recipe("native_main", slot="main", allowed_meal_slots=("main",), slot_flex_type="main_only")
+
+    result = _slot_eligibility(recipe, "main")
+
+    assert result.eligible
+    assert result.penalty == 0.0
+
+
+def test_breakfast_snack_metadata_flexes_between_breakfast_and_snack_with_penalty() -> None:
+    breakfast = _slot_recipe(
+        "breakfast_snack_flex",
+        slot="breakfast",
+        ingredients_g={"egg": 120, "pita": 60},
+        allowed_meal_slots=("breakfast", "snack"),
+        slot_flex_type="breakfast_snack",
+    )
+    snack = _slot_recipe(
+        "snack_breakfast_flex",
+        slot="snack",
+        ingredients_g={"egg": 120, "pita": 60},
+        allowed_meal_slots=("breakfast", "snack"),
+        slot_flex_type="breakfast_snack",
+    )
+
+    snack_result = _slot_eligibility(breakfast, "snack")
+    breakfast_result = _slot_eligibility(snack, "breakfast")
+    main_result = _slot_eligibility(breakfast, "main")
+
+    assert snack_result.eligible
+    assert snack_result.penalty > 0
+    assert breakfast_result.eligible
+    assert breakfast_result.penalty > 0
+    assert not main_result.eligible
+
+
+def test_main_only_metadata_does_not_flex_even_when_allowed_slots_claim_main() -> None:
+    recipe = _slot_recipe(
+        "metadata_main_only_snack",
+        slot="snack",
+        allowed_meal_slots=("snack", "main"),
+        slot_flex_type="main_only",
+    )
+
+    result = _slot_eligibility(recipe, "main")
+
+    assert not result.eligible
+
+
+def test_snack_light_main_metadata_uses_existing_main_like_gates() -> None:
+    structured = _slot_recipe(
+        "metadata_light_main",
+        slot="snack",
+        allowed_meal_slots=("snack", "main"),
+        slot_flex_type="snack_light_main",
+    )
+    dessert = _slot_recipe(
+        "metadata_light_main_dessert",
+        slot="snack",
+        ingredients_g={"greek_yogurt": 350, "berries": 120},
+        allowed_meal_slots=("snack", "main"),
+        slot_flex_type="snack_light_main",
+    )
+
+    structured_result = _slot_eligibility(structured, "main")
+    dessert_result = _slot_eligibility(dessert, "main")
+
+    assert structured_result.eligible
+    assert structured_result.penalty > 0
+    assert not dessert_result.eligible
+
+
+def test_legacy_snack_as_main_fallback_still_applies_without_explicit_metadata() -> None:
+    legacy_snack = _slot_recipe("legacy_light_main", slot="snack")
+
+    result = _slot_eligibility(legacy_snack, "main")
+
+    assert result.eligible
+    assert result.penalty > 0
+
+
 def test_main_builder_can_use_high_protein_main_like_snack_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         "diet_bot.builder.built_in_recipes",
@@ -308,6 +424,51 @@ def test_snack_dessert_does_not_fill_main_slot(monkeypatch) -> None:
     )
 
     assert meals == []
+
+
+def test_slot_flex_does_not_relax_forbidden_ingredients(monkeypatch) -> None:
+    egg = _food("egg", category="protein", energy=150, protein=13, fat=10, roles=frozenset({MealRole.PROTEIN}))
+    safe = _food(
+        "safe_high_protein",
+        category="protein",
+        energy=120,
+        protein=24,
+        fat=2,
+        roles=frozenset({MealRole.PROTEIN}),
+    )
+    recipes = (
+        _slot_recipe("safe_breakfast", slot="breakfast", ingredients_g={"safe_high_protein": 420}),
+        _slot_recipe("safe_lunch", slot="main", ingredients_g={"safe_high_protein": 500}),
+        _slot_recipe("safe_dinner", slot="main", ingredients_g={"safe_high_protein": 460}),
+        _slot_recipe("safe_snack", slot="snack", ingredients_g={"safe_high_protein": 200}),
+        _slot_recipe(
+            "egg_flex_snack",
+            slot="breakfast",
+            ingredients_g={"egg": 250},
+            allowed_meal_slots=("breakfast", "snack"),
+            slot_flex_type="breakfast_snack",
+        ),
+    )
+    safety = evaluate_safety(
+        profile_with(restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "egg"),))
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        filter_foods([egg, safe], safety),
+        NutrientVector({"energy_kcal": 1600, "protein_g": 300, "fat_g": 45, "carbohydrate_g": 180}),
+        4,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+        excluded_food_names=safety.excluded_food_names,
+    )
+
+    assert len(meals) == 4
+    assert "egg_flex_snack" not in {meal.recipe_id for meal in meals}
+    assert "egg" not in {portion.food.id for meal in meals for portion in meal.portions}
 
 
 def test_simple_main_eligible_coverage_exceeds_audit_baseline() -> None:

@@ -56,6 +56,7 @@ PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.95
 PROTEIN_REASONABLE_CEILING_MULTIPLIER = 1.30
 PROTEIN_EXCESSIVE_CEILING_MULTIPLIER = 1.50
 RECIPE_PLAN_CANDIDATE_COUNT = 1
+SLOT_FLEX_PENALTY = 5.0
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
@@ -98,6 +99,12 @@ class CookingEffortConstraints:
     max_ingredients: int
     max_instruction_sentences: int
     allow_oven_or_sauces: bool
+
+
+@dataclass(frozen=True)
+class RecipeSlotEligibility:
+    eligible: bool
+    penalty: float = 0.0
 
 
 MEAL_ENERGY_PROFILES: dict[int, tuple[MealEnergySlot, ...]] = {
@@ -1029,11 +1036,76 @@ def _recipe_is_eligible_for_slot(
     slot_energy_target: float,
     target: NutrientVector,
 ) -> bool:
-    if recipe.slot == slot:
-        return True
-    if slot == "main":
-        return _snack_recipe_can_fill_main_slot(recipe, food_by_id, slot_energy_target, target)
-    return False
+    return _recipe_slot_eligibility(recipe, slot, food_by_id, slot_energy_target, target).eligible
+
+
+def _recipe_slot_eligibility(
+    recipe: RecipeTemplate,
+    slot: str,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    target: NutrientVector,
+) -> RecipeSlotEligibility:
+    requested_slot = slot.strip().lower()
+    native_slot = recipe.slot.strip().lower()
+    if native_slot == requested_slot:
+        return RecipeSlotEligibility(True)
+
+    flex_type = _recipe_slot_flex_type(recipe)
+    allowed_slots = _recipe_allowed_meal_slots(recipe)
+    has_explicit_flex_metadata = _recipe_has_explicit_slot_flex_metadata(recipe)
+
+    if flex_type.endswith("_only") or flex_type == "main_only":
+        return RecipeSlotEligibility(False)
+
+    if flex_type == "breakfast_snack":
+        if requested_slot in allowed_slots and {native_slot, requested_slot} <= {"breakfast", "snack"}:
+            return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
+        return RecipeSlotEligibility(False)
+
+    if flex_type == "snack_light_main":
+        if (
+            native_slot == "snack"
+            and requested_slot == "main"
+            and requested_slot in allowed_slots
+            and _snack_recipe_can_fill_main_slot(recipe, food_by_id, slot_energy_target, target)
+        ):
+            return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
+        return RecipeSlotEligibility(False)
+
+    if (
+        flex_type in {"", "native", "none", "default"}
+        and _allowed_meal_slots_declare_flex(recipe)
+        and requested_slot in allowed_slots
+    ):
+        return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
+
+    if (
+        not has_explicit_flex_metadata
+        and requested_slot == "main"
+        and _snack_recipe_can_fill_main_slot(recipe, food_by_id, slot_energy_target, target)
+    ):
+        return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
+
+    return RecipeSlotEligibility(False)
+
+
+def _recipe_slot_flex_type(recipe: RecipeTemplate) -> str:
+    return (recipe.slot_flex_type or "").strip().lower()
+
+
+def _recipe_allowed_meal_slots(recipe: RecipeTemplate) -> frozenset[str]:
+    return frozenset(slot.strip().lower() for slot in recipe.allowed_meal_slots if slot.strip())
+
+
+def _allowed_meal_slots_declare_flex(recipe: RecipeTemplate) -> bool:
+    allowed_slots = _recipe_allowed_meal_slots(recipe)
+    native_slot = recipe.slot.strip().lower()
+    return bool(allowed_slots and allowed_slots != {native_slot})
+
+
+def _recipe_has_explicit_slot_flex_metadata(recipe: RecipeTemplate) -> bool:
+    return bool(_recipe_slot_flex_type(recipe) or _allowed_meal_slots_declare_flex(recipe))
 
 
 def _snack_recipe_can_fill_main_slot(
@@ -1079,14 +1151,17 @@ def _rank_recipes(
     index: int,
     ranking_mode: RecipeRankingMode = "balanced",
 ) -> list[RecipeTemplate]:
-    candidates = [
-        recipe
-        for recipe in recipes
-        if recipe.id not in used_recipe_ids
-        and _recipe_is_eligible_for_slot(recipe, slot, food_by_id, slot_energy_target, target)
-    ]
+    eligible_candidates: list[tuple[RecipeTemplate, RecipeSlotEligibility]] = []
+    for recipe in recipes:
+        if recipe.id in used_recipe_ids:
+            continue
+        eligibility = _recipe_slot_eligibility(recipe, slot, food_by_id, slot_energy_target, target)
+        if eligibility.eligible:
+            eligible_candidates.append((recipe, eligibility))
+    candidates = [recipe for recipe, _ in eligible_candidates]
     if not candidates:
         return []
+    eligibility_by_recipe_id = {recipe.id: eligibility for recipe, eligibility in eligible_candidates}
 
     def score(recipe: RecipeTemplate) -> float:
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
@@ -1104,7 +1179,7 @@ def _rank_recipes(
             )
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
-        slot_mismatch_penalty = 5.0 if recipe.slot != slot else 0.0
+        slot_flex_penalty = eligibility_by_recipe_id[recipe.id].penalty
         format_penalty = used_formats[_recipe_format(recipe)] * 0.85
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
@@ -1124,7 +1199,7 @@ def _rank_recipes(
             + rotation_bonus
             + curated_bonus
             - overlap * 0.55
-            - slot_mismatch_penalty
+            - slot_flex_penalty
             - format_penalty
             - macro_penalty
             - energy_penalty
