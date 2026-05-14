@@ -1,38 +1,22 @@
 # Recipe Intake User Questions
 
-Scope: remaining user-facing questions for `tmp/recipe_intake/cleaned_recipes.xlsx` after applying the user's latest decisions. This file does not approve production imports, change production nutrition data, edit the source Excel, or generate photos.
+Scope: user-facing question status for `tmp/recipe_intake/cleaned_recipes.xlsx` after applying all provided decisions. This file does not approve production imports, change production nutrition data, edit the source Excel, or generate photos.
 
 ## Current Status
 
 - Workbook total: 105 recipes.
-- Ready after this pass: 102 recipes.
-- Still `needs_review`: 3 recipes.
-- Decisions applied: cod liver, dry buckwheat, fresh grape/kishmish, cornmeal/polenta, turkey-liver replacement, chicken liver, split pea soup turnip replacement, trout, and blue-cheese replacement.
+- Ready after final pass: 105 recipes.
+- Still `needs_review`: 0 recipes.
+- Remaining user questions: none.
 
-## Remaining Questions
+## Resolved Final Questions
 
-| recipe_key | Title | Question | Options |
-|---|---|---|---|
-| `intake_073` | Тилапия в духовке | How should the frozen vegetable mix and white wine be handled? | 1. Break `Овощи по-деревенски` into exact mapped vegetables and count wine. 2. Break the mix into exact mapped vegetables and omit wine as a cooking component. 3. Exclude the recipe. |
-| `intake_078` | Яйца по-флорентийски | How should prepared bechamel be counted? | 1. Add/confirm prepared bechamel mapping. 2. Decompose into milk/butter/flour/cheese with exact grams. 3. Exclude the recipe. |
-| `intake_093` | Шаурма с фалафелем | How should frozen falafel be counted? | 1. Add/confirm frozen falafel mapping. 2. Rewrite/decompose as chickpea falafel with exact grams. 3. Exclude the recipe. |
+| recipe_key | Title | Resolution |
+|---|---|---|
+| `intake_073` | Тилапия в духовке | Frozen vegetable mix was replaced with zucchini 40 g, bell pepper 30 g, carrot 20 g, and onion 10 g; the alcohol cooking component was removed; lemon juice 10 g was added. |
+| `intake_078` | Яйца по-флорентийски | Prepared sauce 20 g was decomposed into milk 15 g, butter 3 g, and flour 2 g. |
+| `intake_093` | Шаурма с фалафелем | Frozen/prepared falafel was kept as a semi-prepared ingredient for staging readiness and marked as the plant protein anchor. |
 
-## Resolved Decisions
+## Next Step
 
-- Cod liver recipes were kept; cod liver mapping is recorded as confirmed in the staging workbook.
-- Dry buckwheat was kept in `intake_021` and `intake_049`.
-- Fresh grapes and kishmish were kept; neither was replaced with raisins.
-- Cornmeal/polenta was kept in `intake_035`.
-- Turkey liver in `intake_048` was replaced with chicken liver, and cognac was removed completely.
-- Chicken liver was kept in `intake_054`.
-- `intake_071` was kept; turnip was replaced with carrot.
-- Trout was kept in `intake_077` and marked as the protein anchor.
-- Blue cheese in `intake_094` was replaced with regular cheese.
-
-## Compact Answer Template
-
-```text
-intake_073 vegetable mix: [exact vegetables + grams]; wine: count/omit
-intake_078 bechamel: map prepared sauce / decompose into [exact grams] / exclude
-intake_093 falafel: map frozen falafel / decompose-rewrite / exclude
-```
+No intake review questions remain. Any production import should be handled as a separate task.
