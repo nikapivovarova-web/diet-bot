@@ -276,17 +276,22 @@ def _slot_recipe(
     ingredients_g: dict[str, float] | None = None,
     allowed_meal_slots: tuple[str, ...] = (),
     slot_flex_type: str | None = None,
+    cooking_effort: str | None = None,
+    time_text: str = "10 minutes",
+    title: str | None = None,
+    instructions: str = "Assemble the test recipe.",
 ) -> RecipeTemplate:
     return RecipeTemplate(
         id=recipe_id,
         slot=slot,
-        title=recipe_id.replace("_", " ").title(),
+        title=title or recipe_id.replace("_", " ").title(),
         ingredients_g=ingredients_g or {"chicken_breast": 180, "pita": 70, "cucumber": 100},
-        instructions="Assemble the test recipe.",
+        instructions=instructions,
         tags=frozenset({"curated"}),
-        time_text="10 minutes",
+        time_text=time_text,
         allowed_meal_slots=allowed_meal_slots,
         slot_flex_type=slot_flex_type,
+        cooking_effort=cooking_effort,
     )
 
 
@@ -468,6 +473,218 @@ def test_slot_flex_does_not_relax_forbidden_ingredients(monkeypatch) -> None:
 
     assert len(meals) == 4
     assert "egg_flex_snack" not in {meal.recipe_id for meal in meals}
+    assert "egg" not in {portion.food.id for meal in meals for portion in meal.portions}
+
+
+def test_requested_simple_uses_simple_recipes_when_available(monkeypatch) -> None:
+    recipes = (
+        _slot_recipe(
+            "simple_breakfast",
+            slot="breakfast",
+            ingredients_g={"egg": 200, "pita": 60},
+            cooking_effort="simple",
+        ),
+        _slot_recipe("fallback_simple_main_one", slot="main", cooking_effort="simple"),
+        _slot_recipe("fallback_simple_main_two", slot="main", cooking_effort="simple"),
+        _slot_recipe(
+            "fallback_interesting_breakfast",
+            slot="breakfast",
+            ingredients_g={"egg": 200, "pita": 60},
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the batter in a waffle iron. Serve warm.",
+        ),
+        _slot_recipe(
+            "fallback_interesting_main",
+            slot="main",
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the chicken on a grill. Serve with rice.",
+        ),
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        _fallback_foods(),
+        NutrientVector({"energy_kcal": 1900, "protein_g": 80, "fat_g": 55, "carbohydrate_g": 220}),
+        3,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
+
+    assert {meal.recipe_id for meal in meals} == {
+        "simple_breakfast",
+        "fallback_simple_main_one",
+        "fallback_simple_main_two",
+    }
+
+
+def test_requested_simple_can_complete_with_interesting_fallback_when_simple_pool_is_short(monkeypatch) -> None:
+    recipes = (
+        _slot_recipe(
+            "fallback_interesting_breakfast",
+            slot="breakfast",
+            ingredients_g={"egg": 200, "pita": 60},
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the batter in a waffle iron. Serve warm.",
+        ),
+        _slot_recipe("fallback_simple_main_one", slot="main", cooking_effort="simple"),
+        _slot_recipe("fallback_simple_main_two", slot="main", cooking_effort="simple"),
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        _fallback_foods(),
+        NutrientVector({"energy_kcal": 1900, "protein_g": 80, "fat_g": 55, "carbohydrate_g": 220}),
+        3,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
+
+    assert len(meals) == 3
+    assert {meal.recipe_id for meal in meals} == {
+        "fallback_interesting_breakfast",
+        "fallback_simple_main_one",
+        "fallback_simple_main_two",
+    }
+
+
+def test_simple_effort_fallback_penalty_keeps_good_simple_recipe_ahead(monkeypatch) -> None:
+    recipes = (
+        _slot_recipe(
+            "fallback_interesting_breakfast",
+            slot="breakfast",
+            ingredients_g={"egg": 200, "pita": 60},
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the batter in a waffle iron. Serve warm.",
+        ),
+        _slot_recipe("fallback_simple_main_one", slot="main", cooking_effort="simple"),
+        _slot_recipe("fallback_simple_main_two", slot="main", cooking_effort="simple"),
+        _slot_recipe(
+            "fallback_interesting_main",
+            slot="main",
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the chicken on a grill. Serve with rice.",
+        ),
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        _fallback_foods(),
+        NutrientVector({"energy_kcal": 1900, "protein_g": 80, "fat_g": 55, "carbohydrate_g": 220}),
+        3,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
+
+    assert len(meals) == 3
+    assert "fallback_interesting_breakfast" in {meal.recipe_id for meal in meals}
+    assert "fallback_interesting_main" not in {meal.recipe_id for meal in meals}
+
+
+def test_requested_interesting_can_build_from_simple_recipes(monkeypatch) -> None:
+    recipes = (
+        _slot_recipe(
+            "simple_breakfast",
+            slot="breakfast",
+            ingredients_g={"egg": 200, "pita": 60},
+            cooking_effort="simple",
+        ),
+        _slot_recipe("fallback_simple_main_one", slot="main", cooking_effort="simple"),
+        _slot_recipe("fallback_simple_main_two", slot="main", cooking_effort="simple"),
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        _fallback_foods(),
+        NutrientVector({"energy_kcal": 1900, "protein_g": 80, "fat_g": 55, "carbohydrate_g": 220}),
+        3,
+        CookingTimePreference.INTERESTING,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+    )
+
+    assert len(meals) == 3
+    assert {meal.recipe_id for meal in meals} == {
+        "simple_breakfast",
+        "fallback_simple_main_one",
+        "fallback_simple_main_two",
+    }
+
+
+def test_effort_fallback_does_not_relax_allergy_filtered_foods(monkeypatch) -> None:
+    egg = _food("egg", category="protein", energy=150, protein=13, fat=10, roles=frozenset({MealRole.PROTEIN}))
+    safe = _food(
+        "safe_high_protein",
+        category="protein",
+        energy=120,
+        protein=24,
+        fat=2,
+        roles=frozenset({MealRole.PROTEIN}),
+    )
+    recipes = (
+        _slot_recipe(
+            "safe_interesting_breakfast",
+            slot="breakfast",
+            ingredients_g={"safe_high_protein": 420},
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the safe protein on a grill. Serve warm.",
+        ),
+        _slot_recipe(
+            "safe_main_one",
+            slot="main",
+            ingredients_g={"safe_high_protein": 500},
+            cooking_effort="simple",
+        ),
+        _slot_recipe(
+            "safe_main_two",
+            slot="main",
+            ingredients_g={"safe_high_protein": 460},
+            cooking_effort="simple",
+        ),
+        _slot_recipe(
+            "egg_interesting_breakfast",
+            slot="breakfast",
+            ingredients_g={"egg": 300},
+            cooking_effort="interesting",
+            time_text="40 minutes",
+            instructions="Cook the eggs in a waffle iron. Serve warm.",
+        ),
+    )
+    safety = evaluate_safety(
+        profile_with(restrictions=(Restriction(RestrictionType.ALLERGY, "egg"),))
+    )
+    monkeypatch.setattr("diet_bot.builder.built_in_recipes", lambda: recipes)
+
+    meals = _build_recipe_plan_for_time(
+        filter_foods([egg, safe], safety),
+        NutrientVector({"energy_kcal": 1600, "protein_g": 300, "fat_g": 45, "carbohydrate_g": 180}),
+        3,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+        excluded_food_names=safety.excluded_food_names,
+    )
+
+    assert len(meals) == 3
+    assert "egg_interesting_breakfast" not in {meal.recipe_id for meal in meals}
     assert "egg" not in {portion.food.id for meal in meals for portion in meal.portions}
 
 

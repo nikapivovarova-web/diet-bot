@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from .safety import evaluate_safety, is_food_excluded, is_name_excluded
 RecipeSource = Literal["all", "curated_only"]
 TimeBucket = Literal["quick", "medium", "long"]
 RecipeRankingMode = Literal["balanced", "protein_floor"]
+logger = logging.getLogger(__name__)
 
 PRIORITY_NUTRIENTS = {
     "energy_kcal": 1.0,
@@ -57,6 +59,7 @@ PROTEIN_REASONABLE_CEILING_MULTIPLIER = 1.30
 PROTEIN_EXCESSIVE_CEILING_MULTIPLIER = 1.50
 RECIPE_PLAN_CANDIDATE_COUNT = 1
 SLOT_FLEX_PENALTY = 5.0
+EFFORT_FALLBACK_PENALTY = 7.0
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
@@ -99,6 +102,15 @@ class CookingEffortConstraints:
     max_ingredients: int
     max_instruction_sentences: int
     allow_oven_or_sauces: bool
+
+
+@dataclass(frozen=True)
+class CookingEffortPhase:
+    name: str
+    time_preference: CookingTimePreference
+    constraints: CookingEffortConstraints | None
+    penalty_base_constraints: CookingEffortConstraints | None = None
+    fallback_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -413,8 +425,31 @@ def _build_recipe_plan_for_time(
     recipe_source: RecipeSource,
     excluded_food_names: frozenset[str] = frozenset(),
 ) -> list[Meal]:
-    effort_constraints = _cooking_effort_constraints(cooking_time)
-    for allowed_time_buckets in _time_filter_attempts(cooking_time):
+    preference = normalize_cooking_time_preference(cooking_time)
+    for effort_phase in _cooking_effort_phases(preference):
+        for allowed_time_buckets in _time_filter_attempts(effort_phase.time_preference):
+            meals = _build_recipe_plan_candidates_for_attempt(
+                candidates,
+                target,
+                meal_count,
+                variety_seed,
+                avoided_recipe_ids,
+                avoided_recipe_keys,
+                recipe_source,
+                allowed_time_buckets,
+                effort_phase,
+                excluded_food_names,
+            )
+            if meals:
+                if effort_phase.fallback_penalty > 0:
+                    logger.info(
+                        "Recipe plan relaxed cooking effort preference: requested=%s phase=%s meal_count=%s",
+                        preference.value,
+                        effort_phase.name,
+                        len(meals),
+                    )
+                return meals
+
         meals = _build_recipe_plan_candidates_for_attempt(
             candidates,
             target,
@@ -423,25 +458,21 @@ def _build_recipe_plan_for_time(
             avoided_recipe_ids,
             avoided_recipe_keys,
             recipe_source,
-            allowed_time_buckets,
-            effort_constraints,
+            None,
+            effort_phase,
             excluded_food_names,
         )
         if meals:
+            if effort_phase.fallback_penalty > 0:
+                logger.info(
+                    "Recipe plan relaxed cooking effort preference: requested=%s phase=%s meal_count=%s",
+                    preference.value,
+                    effort_phase.name,
+                    len(meals),
+                )
             return meals
 
-    return _build_recipe_plan_candidates_for_attempt(
-        candidates,
-        target,
-        meal_count,
-        variety_seed,
-        avoided_recipe_ids,
-        avoided_recipe_keys,
-        recipe_source,
-        None,
-        effort_constraints,
-        excluded_food_names,
-    )
+    return []
 
 
 def _build_recipe_plan_candidates_for_attempt(
@@ -453,7 +484,7 @@ def _build_recipe_plan_candidates_for_attempt(
     avoided_recipe_keys: set[str] | frozenset[str],
     recipe_source: RecipeSource,
     allowed_time_buckets: frozenset[TimeBucket] | None,
-    effort_constraints: CookingEffortConstraints,
+    effort_phase: CookingEffortPhase,
     excluded_food_names: frozenset[str] = frozenset(),
 ) -> list[Meal]:
     meal_candidates: list[list[Meal]] = []
@@ -470,7 +501,7 @@ def _build_recipe_plan_candidates_for_attempt(
                 avoided_recipe_keys,
                 recipe_source,
                 allowed_time_buckets,
-                effort_constraints,
+                effort_phase,
                 ranking_mode,
                 excluded_food_names,
             )
@@ -496,7 +527,7 @@ def _build_recipe_plan(
     avoided_recipe_keys: set[str] | frozenset[str],
     recipe_source: RecipeSource,
     allowed_time_buckets: frozenset[TimeBucket] | None = None,
-    effort_constraints: CookingEffortConstraints | None = None,
+    effort_phase: CookingEffortPhase | None = None,
     ranking_mode: RecipeRankingMode = "balanced",
     excluded_food_names: frozenset[str] = frozenset(),
 ) -> list[Meal]:
@@ -509,7 +540,11 @@ def _build_recipe_plan(
         and _recipe_memory_key(recipe) not in avoided_recipe_keys
         and (recipe_source != "curated_only" or "curated" in recipe.tags)
         and (allowed_time_buckets is None or _recipe_time_bucket(recipe) in allowed_time_buckets)
-        and (effort_constraints is None or _recipe_matches_cooking_effort(recipe, effort_constraints))
+        and (
+            effort_phase is None
+            or effort_phase.constraints is None
+            or _recipe_matches_cooking_effort(recipe, effort_phase.constraints)
+        )
         and not _recipe_title_uses_excluded_food(recipe, excluded_food_names)
     ]
     if not recipes:
@@ -544,6 +579,7 @@ def _build_recipe_plan(
             variety_seed,
             index,
             ranking_mode,
+            effort_phase,
         ):
             resolved = _resolve_recipe_ingredients(recipe, food_by_id)
             if resolved is None:
@@ -696,6 +732,33 @@ def _cooking_effort_constraints(cooking_time: CookingTimePreference) -> CookingE
     )
 
 
+def _cooking_effort_phases(cooking_time: CookingTimePreference) -> tuple[CookingEffortPhase, ...]:
+    preference = normalize_cooking_time_preference(cooking_time)
+    if preference == CookingTimePreference.SIMPLE:
+        simple = _cooking_effort_constraints(CookingTimePreference.SIMPLE)
+        return (
+            CookingEffortPhase(
+                name="strict_simple",
+                time_preference=CookingTimePreference.SIMPLE,
+                constraints=simple,
+            ),
+            CookingEffortPhase(
+                name="simple_effort_fallback",
+                time_preference=CookingTimePreference.INTERESTING,
+                constraints=_cooking_effort_constraints(CookingTimePreference.INTERESTING),
+                penalty_base_constraints=simple,
+                fallback_penalty=EFFORT_FALLBACK_PENALTY,
+            ),
+        )
+    return (
+        CookingEffortPhase(
+            name="interesting",
+            time_preference=CookingTimePreference.INTERESTING,
+            constraints=None,
+        ),
+    )
+
+
 def _recipe_matches_cooking_effort(
     recipe: RecipeTemplate,
     cooking_time: CookingTimePreference | CookingEffortConstraints,
@@ -715,6 +778,32 @@ def _recipe_matches_cooking_effort(
     if not constraints.allow_oven_or_sauces and _has_complex_cooking_technique(recipe):
         return False
     return True
+
+
+def _recipe_effort_fallback_penalty(
+    recipe: RecipeTemplate,
+    effort_phase: CookingEffortPhase | None,
+) -> float:
+    if effort_phase is None or effort_phase.fallback_penalty <= 0:
+        return 0.0
+    strict_constraints = effort_phase.penalty_base_constraints
+    if strict_constraints is None:
+        return 0.0
+    declared_effort = _declared_recipe_cooking_effort(recipe)
+    if declared_effort == "simple":
+        return 0.0
+    if declared_effort == "interesting":
+        return effort_phase.fallback_penalty
+    if _recipe_matches_cooking_effort(recipe, strict_constraints):
+        return 0.0
+    return effort_phase.fallback_penalty
+
+
+def _declared_recipe_cooking_effort(recipe: RecipeTemplate) -> str | None:
+    value = (recipe.cooking_effort or "").strip().lower()
+    if value in {"simple", "interesting"}:
+        return value
+    return None
 
 
 def _recipe_title_uses_excluded_food(
@@ -1150,6 +1239,7 @@ def _rank_recipes(
     variety_seed: int,
     index: int,
     ranking_mode: RecipeRankingMode = "balanced",
+    effort_phase: CookingEffortPhase | None = None,
 ) -> list[RecipeTemplate]:
     eligible_candidates: list[tuple[RecipeTemplate, RecipeSlotEligibility]] = []
     for recipe in recipes:
@@ -1180,6 +1270,7 @@ def _rank_recipes(
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
         slot_flex_penalty = eligibility_by_recipe_id[recipe.id].penalty
+        effort_penalty = _recipe_effort_fallback_penalty(recipe, effort_phase)
         format_penalty = used_formats[_recipe_format(recipe)] * 0.85
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(recipe, food_by_id, slot_energy_target, current_total, target)
@@ -1200,6 +1291,7 @@ def _rank_recipes(
             + curated_bonus
             - overlap * 0.55
             - slot_flex_penalty
+            - effort_penalty
             - format_penalty
             - macro_penalty
             - energy_penalty
