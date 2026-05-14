@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,7 @@ class FakeGenerationStore:
         self.completed: list[tuple[int, str, str | None, int | None]] = []
         self.refunded: list[tuple[int, str, str | None]] = []
         self.recorded: list[tuple[int, tuple[RecipeHistoryItem, ...]]] = []
+        self.recent_history: list[RecipeHistoryItem] = []
         self.chat_states: dict[int, dict[str, object]] = {}
         self.events: list[str] = []
 
@@ -123,6 +125,21 @@ class FakeGenerationStore:
         self.recorded.append((user_id, tuple(entries)))
         ration_kind = entries[0].ration_kind if entries else "empty"
         self.events.append(f"record:{ration_kind}:{len(entries)}")
+
+    def load_recent_recipe_history(
+        self,
+        user_id: int,
+        *,
+        since: datetime | None = None,
+        limit: int = 400,
+    ) -> list[RecipeHistoryItem]:
+        self.events.append(f"load_history:{user_id}:{limit}")
+        items = [
+            item
+            for item in self.recent_history
+            if since is None or (item.generated_at is not None and item.generated_at >= since)
+        ]
+        return items[:limit]
 
 
 class FakePromoAdminStore:
@@ -717,6 +734,27 @@ def _history_item(
     )
 
 
+def _fake_week_plans(profile: telegram_app.UserProfile) -> tuple[telegram_app.MealPlan, ...]:
+    targets = telegram_app.calculate_targets(profile)
+    safety = telegram_app.evaluate_safety(profile)
+    meal_count = max(3, min(5, profile.meal_count))
+    slots = ["breakfast", "snack_1", "lunch", "snack_2", "dinner"]
+    plans = []
+    for day_index in range(7):
+        meals = tuple(
+            telegram_app.Meal(
+                name=f"Meal {day_index}-{meal_index}",
+                portions=(),
+                recipe="Test recipe",
+                recipe_id=f"week-{day_index}-{meal_index}",
+                recipe_key=f"{slots[meal_index]}:curated:week-{day_index}-{meal_index}",
+            )
+            for meal_index in range(meal_count)
+        )
+        plans.append(telegram_app.MealPlan(meals, targets, safety))
+    return tuple(plans)
+
+
 @pytest.mark.anyio
 async def test_successful_one_day_access_generation_completes_postgres_lock(monkeypatch) -> None:
     chat_id = 52_001
@@ -828,6 +866,112 @@ async def test_successful_weekly_pdf_access_generation_records_35_recipe_history
     assert {entry.generation_id for entry in entries} == {1}
     assert [entry.day_index for entry in entries[:5]] == [0, 0, 0, 0, 0]
     assert [entry.meal_index for entry in entries[:5]] == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_generation_uses_structured_recent_history_from_runtime_store(
+    monkeypatch,
+) -> None:
+    chat_id = 52_202
+    store = FakeGenerationStore()
+    store.recent_history = [
+        RecipeHistoryItem(
+            recipe_id="recent-breakfast",
+            recipe_key="breakfast:curated:recent-breakfast",
+            meal_slot="breakfast",
+            ration_kind="weekly_pdf",
+            generated_at=datetime.now(UTC),
+        )
+    ]
+    message = FakeMessage(chat_id)
+    profile = profile_with(meal_count=3)
+    captured_avoids: list[tuple[set[str], set[str]]] = []
+
+    def fake_build_week_plans(
+        _profile,
+        _seed,
+        avoided_recipe_ids,
+        avoided_recipe_keys,
+    ):
+        captured_avoids.append((set(avoided_recipe_ids), set(avoided_recipe_keys)))
+        return _fake_week_plans(profile)
+
+    async def fake_animate_week_pdf_status(*_args, **_kwargs) -> None:
+        return None
+
+    async def fake_send_week_pdf_document(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", fake_build_week_plans)
+    monkeypatch.setattr(telegram_app, "_animate_week_pdf_status", fake_animate_week_pdf_status)
+    monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", lambda *_args: (b"%PDF", "week.pdf"))
+    monkeypatch.setattr(telegram_app, "_send_week_pdf_document", fake_send_week_pdf_document)
+
+    sent = await telegram_app._send_week_plan(message, profile, recipe_history_entries=[])
+
+    assert sent is True
+    assert captured_avoids[0] == (
+        {"recent-breakfast"},
+        {"breakfast:curated:recent-breakfast"},
+    )
+
+
+@pytest.mark.anyio
+async def test_one_day_generation_uses_structured_recent_history_from_runtime_store(
+    monkeypatch,
+) -> None:
+    chat_id = 52_201
+    store = FakeGenerationStore()
+    store.recent_history = [
+        RecipeHistoryItem(
+            recipe_id="recent-lunch",
+            recipe_key="lunch:curated:recent-lunch",
+            meal_slot="lunch",
+            ration_kind="one_day",
+            generated_at=datetime.now(UTC),
+        )
+    ]
+    message = FakeMessage(chat_id)
+    profile = profile_with(meal_count=3)
+    captured_avoids: list[tuple[set[str], set[str]]] = []
+
+    def fake_build_one_day_plan(
+        _profile,
+        *,
+        avoided_recipe_ids,
+        avoided_recipe_keys,
+        **_kwargs,
+    ):
+        captured_avoids.append((set(avoided_recipe_ids), set(avoided_recipe_keys)))
+        return telegram_app.MealPlan(
+            (),
+            telegram_app.calculate_targets(profile),
+            telegram_app.evaluate_safety(profile),
+        )
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", fake_build_one_day_plan)
+
+    sent = await telegram_app._send_plan(message, profile)
+
+    assert sent is False
+    assert captured_avoids == [
+        ({"recent-lunch"}, {"lunch:curated:recent-lunch"}),
+    ]
+
+
+def test_recent_recipe_avoidance_without_store_or_history_is_empty(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+
+    avoidance = telegram_app._load_recent_recipe_avoidance(52_203)
+
+    assert avoidance.full_recipe_ids == frozenset()
+    assert avoidance.full_recipe_keys == frozenset()
 
 
 @pytest.mark.anyio

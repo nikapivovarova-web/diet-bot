@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import random
@@ -9,7 +10,7 @@ import re
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -56,6 +57,7 @@ from .pdf_renderer import build_week_plan_pdf
 from .json_storage import (
     atomic_write_json,
     json_storage_transaction,
+    load_recent_recipe_history_from_json,
     record_recipe_history_in_json,
 )
 from .payments import (
@@ -135,6 +137,25 @@ _RUNTIME_STORE: DietBotStore | None = None
 ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT = 20
 ADMIN_PROMO_ACTION_CREATE_DISCOUNT = "create_discount"
 ADMIN_PROMO_ACTION_DISABLE_DISCOUNT = "disable_discount"
+RECENT_RECIPE_HISTORY_DAYS = 28
+RECENT_RECIPE_HISTORY_LIMIT = 140
+RECENT_RECIPE_REDUCED_DAYS = 14
+RECENT_RECIPE_REDUCED_LIMIT = 70
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RecentRecipeAvoidance:
+    full_recipe_ids: frozenset[str]
+    full_recipe_keys: frozenset[str]
+    reduced_recipe_ids: frozenset[str]
+    reduced_recipe_keys: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _WeekPlanBuildResult:
+    plans: tuple[MealPlan, ...]
+    avoidance_phase: str
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
@@ -1363,16 +1384,23 @@ async def _send_plan(
     seed = seed_offset + count
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + 1
     await message.answer("Считаю рацион и проверяю ограничения... 🧮", reply_markup=ReplyKeyboardRemove())
-    _load_chat_history(chat_id)
-    recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
-    recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
+    recent_avoidance = _load_recent_recipe_avoidance(chat_id)
     plan_result = build_one_day_plan(
         profile,
         variety_seed=seed,
-        avoided_recipe_ids=recent_recipe_ids,
-        avoided_recipe_keys=recent_recipe_keys,
+        avoided_recipe_ids=recent_avoidance.full_recipe_ids,
+        avoided_recipe_keys=recent_avoidance.full_recipe_keys,
         recipe_source="curated_only",
     )
+    if _plan_uses_avoided_recipes(
+        plan_result,
+        set(recent_avoidance.full_recipe_ids),
+        set(recent_avoidance.full_recipe_keys),
+    ):
+        logger.info(
+            "One-day generation relaxed recent recipe avoidance for chat_id=%s",
+            chat_id,
+        )
     plan_result = _annotate_batch_prep(plan_result)
     if not plan_result.safety.can_generate_plan:
         messages = format_plan_messages(plan_result, validate_plan(plan_result))
@@ -1423,17 +1451,15 @@ async def _send_week_plan(
         reply_markup=ReplyKeyboardRemove(),
     )
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
-    _load_chat_history(chat_id)
-    recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
-    recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
+    recent_avoidance = _load_recent_recipe_avoidance(chat_id)
     try:
-        plans = await asyncio.to_thread(
-            _build_week_plans,
+        build_result = await asyncio.to_thread(
+            _build_week_plans_with_recent_fallback,
             profile,
             seed,
-            recent_recipe_ids,
-            recent_recipe_keys,
+            recent_avoidance,
         )
+        plans = build_result.plans
         plan_dates = _week_plan_dates()
 
         if not _week_plans_are_complete(plans, profile):
@@ -1526,6 +1552,197 @@ def _validate_week_pdf_payload_size(pdf_data: bytes, pdf_filename: str) -> None:
         f"Weekly PDF {pdf_filename!r} is {len(pdf_data)} bytes; "
         f"Telegram document limit is {TELEGRAM_DOCUMENT_MAX_BYTES} bytes."
     )
+
+
+def _build_week_plans_with_recent_fallback(
+    profile: UserProfile,
+    seed: int,
+    recent_avoidance: _RecentRecipeAvoidance,
+) -> _WeekPlanBuildResult:
+    for phase, avoided_recipe_ids, avoided_recipe_keys in _weekly_recent_avoidance_phases(
+        recent_avoidance
+    ):
+        plans = _build_week_plans(
+            profile,
+            seed,
+            set(avoided_recipe_ids),
+            set(avoided_recipe_keys),
+        )
+        if _week_plans_are_complete(plans, profile):
+            if phase != "full_recent" and (
+                recent_avoidance.full_recipe_ids or recent_avoidance.full_recipe_keys
+            ):
+                logger.info(
+                    "Weekly generation relaxed recent recipe avoidance: "
+                    "phase=%s full_ids=%s full_keys=%s kept_ids=%s kept_keys=%s",
+                    phase,
+                    len(recent_avoidance.full_recipe_ids),
+                    len(recent_avoidance.full_recipe_keys),
+                    len(avoided_recipe_ids),
+                    len(avoided_recipe_keys),
+                )
+            return _WeekPlanBuildResult(plans=plans, avoidance_phase=phase)
+
+        if avoided_recipe_ids or avoided_recipe_keys:
+            logger.info(
+                "Weekly generation could not satisfy recent recipe avoidance: "
+                "phase=%s avoided_ids=%s avoided_keys=%s",
+                phase,
+                len(avoided_recipe_ids),
+                len(avoided_recipe_keys),
+            )
+
+    return _WeekPlanBuildResult(plans=(), avoidance_phase="failed")
+
+
+def _weekly_recent_avoidance_phases(
+    recent_avoidance: _RecentRecipeAvoidance,
+) -> tuple[tuple[str, frozenset[str], frozenset[str]], ...]:
+    full = (recent_avoidance.full_recipe_ids, recent_avoidance.full_recipe_keys)
+    reduced = (
+        recent_avoidance.reduced_recipe_ids,
+        recent_avoidance.reduced_recipe_keys,
+    )
+    empty = (frozenset(), frozenset())
+    if not (full[0] or full[1]):
+        return (("no_recent", empty[0], empty[1]),)
+
+    phases: list[tuple[str, frozenset[str], frozenset[str]]] = [
+        ("full_recent", full[0], full[1])
+    ]
+    if (reduced[0] or reduced[1]) and reduced != full:
+        phases.append(("reduced_recent", reduced[0], reduced[1]))
+    phases.append(("no_recent", empty[0], empty[1]))
+    return tuple(phases)
+
+
+def _load_recent_recipe_avoidance(
+    chat_id: int,
+    *,
+    now: datetime | None = None,
+) -> _RecentRecipeAvoidance:
+    current_time = _recent_history_now(now)
+    since = current_time - timedelta(days=RECENT_RECIPE_HISTORY_DAYS)
+    history_items = _load_structured_recent_recipe_history(chat_id, since=since)
+    if history_items:
+        return _recent_recipe_avoidance_from_history(history_items, now=current_time)
+
+    _load_chat_history(chat_id)
+    return _recent_recipe_avoidance_from_legacy_chat_history(chat_id)
+
+
+def _load_structured_recent_recipe_history(
+    chat_id: int,
+    *,
+    since: datetime,
+) -> list[RecipeHistoryItem]:
+    store = _runtime_store()
+    if store is not None:
+        loader = getattr(store, "load_recent_recipe_history", None)
+        if loader is None:
+            return []
+        try:
+            return list(
+                loader(
+                    chat_id,
+                    since=since,
+                    limit=RECENT_RECIPE_HISTORY_LIMIT,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Recipe history load failed for chat_id=%s; continuing without "
+                "structured recent avoidance",
+                chat_id,
+                exc_info=True,
+            )
+            return []
+
+    return load_recent_recipe_history_from_json(
+        STATE_FILE,
+        chat_id,
+        since=since,
+        limit=RECENT_RECIPE_HISTORY_LIMIT,
+    )
+
+
+def _recent_recipe_avoidance_from_history(
+    history_items: Sequence[RecipeHistoryItem],
+    *,
+    now: datetime,
+) -> _RecentRecipeAvoidance:
+    sorted_items = sorted(
+        history_items,
+        key=lambda item: _recipe_history_generated_at(item)
+        or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )[:RECENT_RECIPE_HISTORY_LIMIT]
+    reduced_since = now - timedelta(days=RECENT_RECIPE_REDUCED_DAYS)
+    reduced_items = [
+        item
+        for item in sorted_items
+        if (
+            generated_at := _recipe_history_generated_at(item)
+        ) is not None
+        and generated_at >= reduced_since
+    ][:RECENT_RECIPE_REDUCED_LIMIT]
+    return _RecentRecipeAvoidance(
+        full_recipe_ids=_recipe_history_ids(sorted_items),
+        full_recipe_keys=_recipe_history_keys(sorted_items),
+        reduced_recipe_ids=_recipe_history_ids(reduced_items),
+        reduced_recipe_keys=_recipe_history_keys(reduced_items),
+    )
+
+
+def _recent_recipe_avoidance_from_legacy_chat_history(chat_id: int) -> _RecentRecipeAvoidance:
+    recent_ids = _bounded_recent_strings(
+        RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []),
+        RECENT_RECIPE_HISTORY_LIMIT,
+    )
+    recent_keys = _bounded_recent_strings(
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []),
+        RECENT_RECIPE_HISTORY_LIMIT,
+    )
+    reduced_ids = _bounded_recent_strings(recent_ids, RECENT_RECIPE_REDUCED_LIMIT)
+    reduced_keys = _bounded_recent_strings(recent_keys, RECENT_RECIPE_REDUCED_LIMIT)
+    return _RecentRecipeAvoidance(
+        full_recipe_ids=frozenset(recent_ids),
+        full_recipe_keys=frozenset(recent_keys),
+        reduced_recipe_ids=frozenset(reduced_ids),
+        reduced_recipe_keys=frozenset(reduced_keys),
+    )
+
+
+def _recipe_history_ids(items: Sequence[RecipeHistoryItem]) -> frozenset[str]:
+    return frozenset(item.recipe_id for item in items if item.recipe_id)
+
+
+def _recipe_history_keys(items: Sequence[RecipeHistoryItem]) -> frozenset[str]:
+    return frozenset(item.recipe_key for item in items if item.recipe_key)
+
+
+def _recipe_history_generated_at(item: RecipeHistoryItem) -> datetime | None:
+    generated_at = item.generated_at
+    if generated_at is None:
+        return None
+    if generated_at.tzinfo is None:
+        return generated_at.replace(tzinfo=UTC)
+    return generated_at.astimezone(UTC)
+
+
+def _bounded_recent_strings(values: Sequence[object], limit: int) -> tuple[str, ...]:
+    bounded_limit = max(0, int(limit))
+    if bounded_limit == 0:
+        return ()
+    return tuple(str(value) for value in values if value)[-bounded_limit:]
+
+
+def _recent_history_now(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(UTC)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=UTC)
+    return now.astimezone(UTC)
 
 
 async def _animate_week_pdf_status(message: Message, status_message: Message) -> None:

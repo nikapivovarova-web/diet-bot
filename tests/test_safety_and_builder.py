@@ -33,7 +33,13 @@ from diet_bot.domain import (
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.recipe_catalog import RecipeTemplate
 from diet_bot.safety import evaluate_safety, is_food_excluded, is_name_excluded
-from diet_bot.telegram_app import _build_week_plans
+from diet_bot.telegram_app import (
+    WEEK_PLAN_CANDIDATE_COUNT,
+    WEEK_PLAN_DAYS,
+    _RecentRecipeAvoidance,
+    _build_week_plans,
+    _build_week_plans_with_recent_fallback,
+)
 from diet_bot.validation import validate_plan
 
 
@@ -70,6 +76,33 @@ def recipe_ingredient_ids(plan) -> set[str]:
         if meal.recipe_id and meal.recipe_id in recipes_by_id
         for food_id in recipes_by_id[meal.recipe_id].ingredients_g
     }
+
+
+def recipe_ids(plans: tuple[MealPlan, ...]) -> list[str]:
+    return [
+        meal.recipe_id
+        for plan in plans
+        for meal in plan.meals
+        if meal.recipe_id is not None
+    ]
+
+
+def recipe_keys(plans: tuple[MealPlan, ...]) -> list[str]:
+    return [
+        meal.recipe_key
+        for plan in plans
+        for meal in plan.meals
+        if meal.recipe_key is not None
+    ]
+
+
+def recent_avoidance_from_plans(plans: tuple[MealPlan, ...]) -> _RecentRecipeAvoidance:
+    return _RecentRecipeAvoidance(
+        full_recipe_ids=frozenset(recipe_ids(plans)),
+        full_recipe_keys=frozenset(recipe_keys(plans)),
+        reduced_recipe_ids=frozenset(recipe_ids(plans)),
+        reduced_recipe_keys=frozenset(recipe_keys(plans)),
+    )
 
 
 def assert_meal_energy_distribution(plan) -> None:
@@ -732,6 +765,71 @@ def test_weekly_generation_with_enough_pool_has_no_repeated_recipe_id() -> None:
 
 
 @pytest.mark.slow_pdf_builder
+def test_second_weekly_generation_avoids_first_week_recent_history_when_feasible() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    first_week = _build_week_plans(profile, 101, set(), set())
+    second_seed = 101 + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
+
+    result = _build_week_plans_with_recent_fallback(
+        profile,
+        second_seed,
+        recent_avoidance_from_plans(first_week),
+    )
+    second_week_ids = set(recipe_ids(result.plans))
+
+    assert result.avoidance_phase == "full_recent"
+    assert len(second_week_ids) == 35
+    assert second_week_ids.isdisjoint(set(recipe_ids(first_week)))
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_recent_history_decreases_overlap_compared_to_no_history_baseline() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    first_week = _build_week_plans(profile, 101, set(), set())
+    second_seed = 101 + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
+    baseline_second_week = _build_week_plans(profile, second_seed, set(), set())
+
+    avoided_result = _build_week_plans_with_recent_fallback(
+        profile,
+        second_seed,
+        recent_avoidance_from_plans(first_week),
+    )
+
+    first_ids = set(recipe_ids(first_week))
+    baseline_overlap = len(first_ids & set(recipe_ids(baseline_second_week)))
+    avoided_overlap = len(first_ids & set(recipe_ids(avoided_result.plans)))
+
+    assert baseline_overlap > 0
+    assert avoided_overlap < baseline_overlap
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_recent_history_fallback_still_returns_complete_unique_week_when_recent_blocks_pool() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE, meal_count=5)
+    all_curated_recipe_ids = frozenset(
+        recipe.id for recipe in built_in_recipes() if "curated" in recipe.tags
+    )
+    all_curated_recipe_keys = frozenset(
+        f"{recipe.slot}:curated:{recipe.id}"
+        for recipe in built_in_recipes()
+        if "curated" in recipe.tags
+    )
+    avoidance = _RecentRecipeAvoidance(
+        full_recipe_ids=all_curated_recipe_ids,
+        full_recipe_keys=all_curated_recipe_keys,
+        reduced_recipe_ids=frozenset(),
+        reduced_recipe_keys=frozenset(),
+    )
+
+    result = _build_week_plans_with_recent_fallback(profile, 101, avoidance)
+    planned_recipe_ids = recipe_ids(result.plans)
+
+    assert result.avoidance_phase == "no_recent"
+    assert len(planned_recipe_ids) == 35
+    assert len(set(planned_recipe_ids)) == 35
+
+
+@pytest.mark.slow_pdf_builder
 def test_interesting_weekly_seed_404_has_no_carryover_recipe_repeat() -> None:
     profile = profile_with(goal=Goal.MAINTAIN, cooking_time=CookingTimePreference.INTERESTING, meal_count=5)
 
@@ -804,6 +902,31 @@ def test_weekly_generation_respects_food_exclusions_across_all_days() -> None:
 
     assert len(plans) == 7
     for plan in plans:
+        assert len(plan.meals) == 5
+        assert forbidden_ids.isdisjoint(food_ids(plan))
+        assert forbidden_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+
+@pytest.mark.slow_pdf_builder
+def test_weekly_generation_respects_food_exclusions_when_recent_history_is_applied() -> None:
+    profile = profile_with(
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438"),
+        ),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    first_week = _build_week_plans(profile, 101, set(), set())
+
+    result = _build_week_plans_with_recent_fallback(
+        profile,
+        101 + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT,
+        recent_avoidance_from_plans(first_week),
+    )
+    forbidden_ids = {"broccoli"}
+
+    assert len(result.plans) == 7
+    for plan in result.plans:
         assert len(plan.meals) == 5
         assert forbidden_ids.isdisjoint(food_ids(plan))
         assert forbidden_ids.isdisjoint(recipe_ingredient_ids(plan))
