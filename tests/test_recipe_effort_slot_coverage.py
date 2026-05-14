@@ -321,20 +321,31 @@ def test_simple_main_eligible_coverage_exceeds_audit_baseline() -> None:
         if "curated" in recipe.tags and _recipe_matches_cooking_effort(recipe, _cooking_effort_constraints(CookingTimePreference.SIMPLE))
     ]
 
-    eligible = _rank_recipes(
-        simple_curated,
-        "main",
-        set(),
-        Counter(),
-        Counter(),
-        food_by_id,
-        NutrientVector(),
-        target,
-        target.get("energy_kcal") * lunch_slot.target_ratio,
-        target.get("energy_kcal") * lunch_slot.min_ratio,
-        target.get("energy_kcal") * lunch_slot.max_ratio,
-        0,
-        1,
-    )
+    def is_imported_intake(recipe) -> bool:
+        return recipe.id.startswith("r") and recipe.id[1:4].isdigit() and int(recipe.id[1:4]) >= 401
 
-    assert len(eligible) > 30
+    def ranked_main_count(recipes) -> int:
+        return len(
+            _rank_recipes(
+                recipes,
+                "main",
+                set(),
+                Counter(),
+                Counter(),
+                food_by_id,
+                NutrientVector(),
+                target,
+                target.get("energy_kcal") * lunch_slot.target_ratio,
+                target.get("energy_kcal") * lunch_slot.min_ratio,
+                target.get("energy_kcal") * lunch_slot.max_ratio,
+                0,
+                1,
+            )
+        )
+
+    legacy_eligible = ranked_main_count([recipe for recipe in simple_curated if not is_imported_intake(recipe)])
+    eligible = ranked_main_count(simple_curated)
+
+    assert legacy_eligible >= 55
+    assert eligible >= 86
+    assert eligible - legacy_eligible >= 26

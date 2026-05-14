@@ -1034,5 +1034,17 @@ def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:
 
     assert len(plan.meals) == 5
     assert all(meal.recipe_id and meal.recipe_id.startswith("r") for meal in plan.meals)
-    assert all(meal.image_url and meal.image_url.startswith("recipe_photos/") for meal in plan.meals)
+    assert all(
+        meal.image_url
+        or (
+            meal.recipe_id
+            and meal.recipe_id[1:4].isdigit()
+            and int(meal.recipe_id[1:4]) > 400
+        )
+        for meal in plan.meals
+    )
+    assert all(
+        not meal.image_url or meal.image_url.startswith("recipe_photos/")
+        for meal in plan.meals
+    )
     assert plan.totals.get("protein_g") <= plan.targets.targets.get("protein_g") * 1.50

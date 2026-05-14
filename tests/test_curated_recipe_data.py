@@ -1,4 +1,5 @@
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -13,6 +14,34 @@ from diet_bot.recipe_catalog import built_in_recipes
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
+LEGACY_CURATED_RECIPE_COUNT = 400
+INTAKE_RECIPE_COUNT = 105
+TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT
+
+
+def _source_recipes() -> list[dict]:
+    return json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+
+
+def _source_ingredients() -> list[dict]:
+    return json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+
+
+def _imported_recipe_rows() -> list[dict]:
+    return [row for row in _source_recipes() if str(row.get("recipe_key", "")).startswith("intake_")]
+
+
+def _imported_recipe_ids() -> set[str]:
+    return {row["recipe_id"] for row in _imported_recipe_rows()}
+
+
+def _is_imported_intake_recipe_id(recipe_id: str | None) -> bool:
+    return bool(
+        recipe_id
+        and recipe_id.startswith("r")
+        and recipe_id[1:4].isdigit()
+        and int(recipe_id[1:4]) > LEGACY_CURATED_RECIPE_COUNT
+    )
 
 
 def _runtime_recipe_by_no() -> dict[int, object]:
@@ -28,8 +57,8 @@ def test_curated_recipe_data_has_full_calculation_coverage() -> None:
     ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
 
     curated = curated_recipes()
-    assert len(curated) == 400
-    assert len(curated_foods()) >= 330
+    assert len(curated) == TOTAL_CURATED_RECIPE_COUNT
+    assert len(curated_foods()) >= 340
     assert all(recipe.instructions.rstrip().endswith(".") for recipe in curated)
     assert {row["calculation_status"] for row in nutrition} == {"ok"}
     assert all(row["unmatched_ingredient_count"] == 0 for row in nutrition)
@@ -71,16 +100,120 @@ def test_gnocchi_recipe_uses_gnocchi_ingredient_name() -> None:
 
 
 def test_curated_recipe_data_has_local_photos() -> None:
-    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    recipes = _source_recipes()
 
-    assert len(recipes) == 400
-    assert all(recipe.get("image_url") for recipe in recipes)
+    assert len(recipes) == TOTAL_CURATED_RECIPE_COUNT
     missing = [
         recipe["recipe_id"]
         for recipe in recipes
-        if not (DATA_DIR / recipe["image_url"]).exists()
+        if recipe["recipe_no"] <= LEGACY_CURATED_RECIPE_COUNT
+        and not (DATA_DIR / recipe["image_url"]).exists()
     ]
     assert missing == []
+
+    imported = _imported_recipe_rows()
+    assert len(imported) == INTAKE_RECIPE_COUNT
+    assert all(not recipe.get("image_url") for recipe in imported)
+    assert all(recipe.get("photo_prompt_ru") for recipe in imported)
+
+
+def test_cleaned_intake_recipes_are_imported_with_required_metadata() -> None:
+    recipes = _source_recipes()
+    ingredients = _source_ingredients()
+    imported = _imported_recipe_rows()
+    imported_ids = {row["recipe_id"] for row in imported}
+    ingredients_by_recipe = Counter(
+        row["recipe_id"]
+        for row in ingredients
+        if row["recipe_id"] in imported_ids
+    )
+
+    assert len(imported) == INTAKE_RECIPE_COUNT
+    assert len({row["recipe_key"] for row in imported}) == INTAKE_RECIPE_COUNT
+    assert len({row["recipe_id"] for row in recipes}) == len(recipes)
+    assert all(row["recipe_key"].startswith("intake_") for row in imported)
+    assert all(row["meal_slot"] in {"breakfast", "main", "snack"} for row in imported)
+    assert all(row["slot"] == row["meal_slot"] for row in imported)
+    assert all(row["cooking_effort"] in {"simple", "interesting"} for row in imported)
+    assert all(row["instructions_ru"].strip().endswith(".") for row in imported)
+    assert all(ingredients_by_recipe[row["recipe_id"]] > 0 for row in imported)
+
+
+def test_cleaned_intake_required_policy_mappings_resolve() -> None:
+    imported_ids = _imported_recipe_ids()
+    imported_ingredients = [
+        row
+        for row in _source_ingredients()
+        if row["recipe_id"] in imported_ids
+    ]
+    food_ids = {row["food_id"] for row in imported_ingredients}
+    required_food_ids = {
+        "cod_liver_canned_drained",
+        "buckwheat",
+        "grapes",
+        "cornmeal",
+        "chicken_liver",
+        "split_peas",
+        "trout",
+        "rice",
+        "tomato",
+        "passata",
+        "pumpkin",
+        "asparagus",
+        "falafel_prepared",
+        "korean_carrot",
+        "soy_sauce",
+        "mayonnaise",
+        "crab_sticks",
+        "pesto",
+        "teriyaki_sauce",
+        "mixed_spices",
+    }
+
+    assert required_food_ids <= food_ids
+    assert "басмати" in "\n".join(
+        row["raw_text"]
+        for row in imported_ingredients
+        if row["food_id"] == "rice"
+    )
+    assert any(
+        row["food_id"] == "cod_liver_canned_drained" and "без лишнего масла" in row["raw_text"]
+        for row in imported_ingredients
+    )
+    assert any(
+        row["food_id"] == "mixed_spices" and row["grams"] == 0
+        for row in imported_ingredients
+    )
+
+
+def test_cleaned_intake_policy_rejected_terms_are_absent() -> None:
+    imported = _imported_recipe_rows()
+    imported_ids = {row["recipe_id"] for row in imported}
+    ingredients = [
+        row
+        for row in _source_ingredients()
+        if row["recipe_id"] in imported_ids
+    ]
+    text = "\n".join(
+        [
+            json.dumps(imported, ensure_ascii=False),
+            json.dumps(ingredients, ensure_ascii=False),
+        ]
+    ).lower()
+    blocked_patterns = (
+        r"(?<![а-яa-z])вино(?![а-яa-z])",
+        r"(?<![а-яa-z])wine(?![а-яa-z])",
+        r"коньяк",
+        r"cognac",
+        r"голубой сыр",
+        r"blue cheese",
+        r"дор блю",
+        r"рокфор",
+        r"горгонзола",
+    )
+
+    for pattern in blocked_patterns:
+        assert re.search(pattern, text) is None, pattern
 
 
 def test_curated_recipe_instructions_use_regular_salt_wording() -> None:
@@ -293,7 +426,7 @@ def test_bare_animal_main_gets_deficit_based_garnish() -> None:
     lunch_ids = {portion.food.id for portion in meals[1].portions}
 
     assert any(portion.food.category == "vegetable" and portion.grams >= 80 for portion in meals[1].portions)
-    assert lunch_ids & {"potato", "sweet_potato", "rice", "bulgur", "quinoa", "whole_wheat_pasta", "orzo"}
+    assert lunch_ids & {"buckwheat", "potato", "sweet_potato", "rice", "bulgur", "quinoa", "whole_wheat_pasta", "orzo"}
     assert "Гарнир:" in meals[1].recipe
 
 
@@ -340,7 +473,14 @@ def test_curated_only_plan_uses_only_table_recipes_and_local_photos() -> None:
         assert not legacy_ids & {meal.recipe_id for meal in plan.meals}
         assert all(meal.recipe_id and meal.recipe_id.startswith("r") for meal in plan.meals)
         assert all(meal.recipe_key and ":curated:" in meal.recipe_key for meal in plan.meals)
-        assert all(meal.image_url and meal.image_url.startswith("recipe_photos/") for meal in plan.meals)
+        assert all(
+            meal.image_url or _is_imported_intake_recipe_id(meal.recipe_id)
+            for meal in plan.meals
+        )
+        assert all(
+            not meal.image_url or meal.image_url.startswith("recipe_photos/")
+            for meal in plan.meals
+        )
         assert all((DATA_DIR / meal.image_url).exists() for meal in plan.meals if meal.image_url)
 
 
