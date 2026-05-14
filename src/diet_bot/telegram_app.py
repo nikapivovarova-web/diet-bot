@@ -53,7 +53,11 @@ from .presentation import (
     format_plan_messages,
 )
 from .pdf_renderer import build_week_plan_pdf
-from .json_storage import atomic_write_json, json_storage_transaction
+from .json_storage import (
+    atomic_write_json,
+    json_storage_transaction,
+    record_recipe_history_in_json,
+)
 from .payments import (
     PaymentOrder,
     PaymentOrderCreationCode,
@@ -91,7 +95,7 @@ from .promo_codes import (
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import RuntimeConfig, is_production_environment, load_runtime_config
 from .safety import evaluate_safety
-from .storage import DietBotStore, SupportState
+from .storage import DietBotStore, RecipeHistoryItem, SupportState
 from .subscriptions import (
     MONTHLY_ONE_DAY_LIMIT,
     MONTHLY_WEEKLY_PDF_LIMIT,
@@ -1251,9 +1255,15 @@ async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
         await _send_limit_paywall(message, "one_day")
         return
 
+    recipe_history_entries: list[RecipeHistoryItem] = []
     try:
         await _send_calculation_report(message, profile)
-        sent = await _send_plan(message, profile, include_default_after_plan_keyboard=False)
+        sent = await _send_plan(
+            message,
+            profile,
+            include_default_after_plan_keyboard=False,
+            recipe_history_entries=recipe_history_entries,
+        )
     except Exception:
         _refund_generation_attempt(message.chat.id, consumption)
         raise
@@ -1264,6 +1274,11 @@ async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
 
     if sent:
         _complete_generation_attempt(message.chat.id, consumption)
+        _record_successful_generation_history(
+            message.chat.id,
+            consumption,
+            recipe_history_entries,
+        )
         await message.answer(
             TRIAL_SUBSCRIPTION_TEXT + "\n\n" + _format_entitlement_status(message.chat.id),
             reply_markup=_trial_subscription_keyboard(),
@@ -1276,11 +1291,13 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
         await _send_limit_paywall(message, "one_day")
         return False
 
+    recipe_history_entries: list[RecipeHistoryItem] = []
     try:
         sent = await _send_plan(
             message,
             profile,
             status_text=_format_entitlement_status(message.chat.id),
+            recipe_history_entries=recipe_history_entries,
         )
     except Exception:
         _refund_generation_attempt(message.chat.id, consumption)
@@ -1290,6 +1307,11 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
         _refund_generation_attempt(message.chat.id, consumption)
     else:
         _complete_generation_attempt(message.chat.id, consumption)
+        _record_successful_generation_history(
+            message.chat.id,
+            consumption,
+            recipe_history_entries,
+        )
     return sent
 
 
@@ -1299,11 +1321,13 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
         await _send_limit_paywall(message, "weekly_pdf")
         return False
 
+    recipe_history_entries: list[RecipeHistoryItem] = []
     try:
         sent = await _send_week_plan(
             message,
             profile,
             status_text=_format_entitlement_status(message.chat.id),
+            recipe_history_entries=recipe_history_entries,
         )
     except Exception:
         _refund_generation_attempt(message.chat.id, consumption)
@@ -1313,6 +1337,11 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
         _refund_generation_attempt(message.chat.id, consumption)
     else:
         _complete_generation_attempt(message.chat.id, consumption)
+        _record_successful_generation_history(
+            message.chat.id,
+            consumption,
+            recipe_history_entries,
+        )
     return sent
 
 
@@ -1323,6 +1352,7 @@ async def _send_plan(
     final_reply_markup: InlineKeyboardMarkup | None = None,
     include_default_after_plan_keyboard: bool = True,
     status_text: str | None = None,
+    recipe_history_entries: list[RecipeHistoryItem] | None = None,
 ) -> bool:
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
@@ -1362,13 +1392,14 @@ async def _send_plan(
         messages[-1] = f"{messages[-1]}\n\n{status_text}"
     for meal in plan_result.meals:
         await _send_meal_card(message, meal)
-    _remember_recipes(chat_id, plan_result)
     plan_reply_markup = final_reply_markup
     if plan_reply_markup is None and include_default_after_plan_keyboard:
         plan_reply_markup = _after_plan_keyboard(message.chat.id)
     for index, response in enumerate(messages[2:]):
         markup = plan_reply_markup if index == len(messages[2:]) - 1 else None
         await _send_text_chunks(message, response, markup)
+    if recipe_history_entries is not None:
+        recipe_history_entries.extend(_recipe_history_items_from_plan(plan_result, "one_day"))
     return True
 
 
@@ -1377,6 +1408,7 @@ async def _send_week_plan(
     profile: UserProfile,
     *,
     status_text: str | None = None,
+    recipe_history_entries: list[RecipeHistoryItem] | None = None,
 ) -> bool:
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
@@ -1444,8 +1476,15 @@ async def _send_week_plan(
 
         await _edit_week_pdf_status(status_message, WEEK_PDF_DONE_TEXT)
 
-        for plan_result in plans:
-            _remember_recipes(chat_id, plan_result)
+        if recipe_history_entries is not None:
+            for day_index, plan_result in enumerate(plans):
+                recipe_history_entries.extend(
+                    _recipe_history_items_from_plan(
+                        plan_result,
+                        "weekly_pdf",
+                        day_index=day_index,
+                    )
+                )
         return True
     finally:
         await _stop_week_pdf_status(status_task)
@@ -1810,16 +1849,88 @@ def _format_week_day_header(day_index: int, plan_date: date) -> str:
     return f"📅 День {day_index} — {plan_date:%d.%m.%Y}"
 
 
+def _recipe_history_items_from_plan(
+    plan_result: MealPlan,
+    ration_kind: RationKind,
+    *,
+    day_index: int | None = None,
+) -> list[RecipeHistoryItem]:
+    return [
+        RecipeHistoryItem(
+            recipe_id=meal.recipe_id,
+            recipe_key=meal.recipe_key,
+            meal_slot=_meal_slot(meal),
+            ration_kind=ration_kind,
+            day_index=day_index,
+            meal_index=meal_index,
+        )
+        for meal_index, meal in enumerate(plan_result.meals)
+        if meal.recipe_id and meal.recipe_key
+    ]
+
+
 def _remember_recipes(chat_id: int, plan_result) -> None:
+    _remember_recipe_history_items(
+        chat_id,
+        _recipe_history_items_from_plan(plan_result, "one_day"),
+    )
+
+
+def _remember_recipe_history_items(
+    chat_id: int,
+    entries: Sequence[RecipeHistoryItem],
+) -> None:
+    if not entries:
+        return
     id_history = RECENT_RECIPE_IDS_BY_CHAT_ID.setdefault(chat_id, [])
     key_history = RECENT_RECIPE_KEYS_BY_CHAT_ID.setdefault(chat_id, [])
-    id_history.extend(meal.recipe_id for meal in plan_result.meals if meal.recipe_id)
-    key_history.extend(meal.recipe_key for meal in plan_result.meals if meal.recipe_key)
+    id_history.extend(entry.recipe_id for entry in entries if entry.recipe_id)
+    key_history.extend(entry.recipe_key for entry in entries if entry.recipe_key)
     if len(id_history) > RECENT_RECIPE_LIMIT:
         del id_history[:-RECENT_RECIPE_LIMIT]
     if len(key_history) > RECENT_RECIPE_LIMIT:
         del key_history[:-RECENT_RECIPE_LIMIT]
     _save_chat_history(chat_id)
+
+
+def _record_successful_generation_history(
+    chat_id: int,
+    consumption: AttemptConsumption,
+    entries: Sequence[RecipeHistoryItem],
+) -> None:
+    if not consumption.allowed or not entries:
+        return
+
+    generation_id = _history_generation_id(consumption)
+    entries_with_context = [
+        replace(
+            entry,
+            user_id=chat_id,
+            ration_kind=consumption.ration_kind,
+            generation_id=entry.generation_id
+            if entry.generation_id is not None
+            else generation_id,
+        )
+        for entry in entries
+    ]
+    store = _runtime_store()
+    if store is not None:
+        store.record_recipe_history(chat_id, entries_with_context)
+        _remember_recipe_history_items(chat_id, entries_with_context)
+        return
+
+    record_recipe_history_in_json(STATE_FILE, chat_id, entries_with_context)
+    _load_chat_history(chat_id)
+
+
+def _history_generation_id(consumption: AttemptConsumption) -> int | None:
+    raw_generation_id = getattr(consumption, "_postgres_generation_id", None)
+    if raw_generation_id is None:
+        return None
+    try:
+        return int(raw_generation_id)
+    except (TypeError, ValueError):
+        return None
 
 
 def _runtime_store() -> DietBotStore | None:
@@ -1912,6 +2023,8 @@ def _load_state() -> dict[str, dict[str, object]]:
             "recipe_ids": list(value.get("recipe_ids", [])) if isinstance(value, dict) else [],
             "recipe_keys": list(value.get("recipe_keys", [])) if isinstance(value, dict) else [],
         }
+        if isinstance(value, dict) and isinstance(value.get("recipe_history"), list):
+            chat_state["recipe_history"] = list(value["recipe_history"])
         if isinstance(value, dict) and isinstance(value.get("profile"), dict):
             chat_state["profile"] = value["profile"]
         state[str(chat_id)] = chat_state

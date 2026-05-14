@@ -2616,12 +2616,15 @@ def _telegram_week_plan_fixture() -> tuple[MealPlan, ...]:
         category="test",
         nutrients_per_100g=NutrientVector({"energy_kcal": 100}),
     )
-    meal = Meal(
-        "Weekly Plan Text Sentinel",
-        (FoodPortion(food, 100),),
-        "Cook the weekly text sentinel.",
-        recipe_id="weekly_sentinel_recipe",
-        recipe_key="weekly:sentinel",
+    meals = tuple(
+        Meal(
+            f"Weekly Plan Text Sentinel {index}",
+            (FoodPortion(food, 100),),
+            "Cook the weekly text sentinel.",
+            recipe_id=f"weekly_sentinel_recipe_{index}",
+            recipe_key=f"weekly:sentinel:{index}",
+        )
+        for index in range(3)
     )
     targets = NutritionTargets(
         bmi=22,
@@ -2633,7 +2636,7 @@ def _telegram_week_plan_fixture() -> tuple[MealPlan, ...]:
         calorie_bounds=(1800, 2200),
         macro_bounds={},
     )
-    plan = MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+    plan = MealPlan(meals, targets, SafetyResult(can_generate_plan=True))
     return (plan,) * 7
 
 
@@ -2962,8 +2965,13 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
     chat_id = 92_001
     pdf_path = _patch_fast_week_plan(monkeypatch, tmp_path)
     message = FakeMessage(chat_id)
+    history_entries = []
     try:
-        sent = await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(
+            message,
+            profile_with(meal_count=3),
+            recipe_history_entries=history_entries,
+        )
 
         assert sent is True
         assert len(message.documents) == 1
@@ -2977,6 +2985,17 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
         assert message.edits
         assert message.edits[-1][0] == "Готово. PDF отправлен ниже."
         assert message.bot.chat_actions
+        assert len(history_entries) == 21
+        assert {entry.recipe_id for entry in history_entries} == {
+            "weekly_sentinel_recipe_0",
+            "weekly_sentinel_recipe_1",
+            "weekly_sentinel_recipe_2",
+        }
+        assert {entry.ration_kind for entry in history_entries} == {"weekly_pdf"}
+        assert [entry.day_index for entry in history_entries] == [
+            day_index for day_index in range(7) for _ in range(3)
+        ]
+        assert [entry.meal_index for entry in history_entries] == [0, 1, 2] * 7
         _assert_weekly_text_fallback_not_sent(message)
     finally:
         _clear_week_plan_state(chat_id)
@@ -2987,13 +3006,19 @@ async def test_week_plan_render_failure_does_not_send_text_fallback(monkeypatch,
     chat_id = 92_002
     _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes=None)
     message = FakeMessage(chat_id)
+    history_entries = []
     try:
-        sent = await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(
+            message,
+            profile_with(meal_count=3),
+            recipe_history_entries=history_entries,
+        )
 
         assert sent is False
         assert message.documents == []
         assert message.edits
         assert "PDF" in message.edits[-1][0]
+        assert history_entries == []
         _assert_weekly_text_fallback_not_sent(message)
     finally:
         _clear_week_plan_state(chat_id)
@@ -3005,13 +3030,19 @@ async def test_week_plan_oversize_pdf_does_not_send_text_fallback(monkeypatch, t
     _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes=b"oversized pdf payload")
     monkeypatch.setattr(telegram_app, "TELEGRAM_DOCUMENT_MAX_BYTES", 5)
     message = FakeMessage(chat_id)
+    history_entries = []
     try:
-        sent = await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(
+            message,
+            profile_with(meal_count=3),
+            recipe_history_entries=history_entries,
+        )
 
         assert sent is False
         assert message.documents == []
         assert message.edits
         assert "PDF" in message.edits[-1][0]
+        assert history_entries == []
         _assert_weekly_text_fallback_not_sent(message)
     finally:
         _clear_week_plan_state(chat_id)
@@ -3022,14 +3053,20 @@ async def test_week_plan_document_send_failure_does_not_send_text_fallback(monke
     chat_id = 92_004
     _patch_fast_week_plan(monkeypatch, tmp_path)
     message = FailingDocumentMessage(chat_id)
+    history_entries = []
     try:
-        sent = await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(
+            message,
+            profile_with(meal_count=3),
+            recipe_history_entries=history_entries,
+        )
 
         assert sent is False
         assert len(message.document_attempts) == 1
         assert message.documents == []
         assert message.edits
         assert "PDF" in message.edits[-1][0]
+        assert history_entries == []
         _assert_weekly_text_fallback_not_sent(message)
     finally:
         _clear_week_plan_state(chat_id)

@@ -6,6 +6,7 @@ import pytest
 
 import diet_bot.telegram_app as telegram_app
 from diet_bot.questionnaire import start_session
+from diet_bot.storage import RecipeHistoryItem
 
 
 PRIVATE_CHAT_REQUIRED_TEXT = "Пожалуйста, откройте бота в личном чате, чтобы продолжить."
@@ -70,6 +71,15 @@ class FakeGenerationStore:
         self.consumed: list[tuple[int, str]] = []
         self.completed: list[tuple[int, str, str | None, int | None]] = []
         self.refunded: list[tuple[int, str, str | None]] = []
+        self.recorded: list[tuple[int, tuple[RecipeHistoryItem, ...]]] = []
+        self.chat_states: dict[int, dict[str, object]] = {}
+        self.events: list[str] = []
+
+    def load_chat_state(self, chat_id: int) -> dict[str, object]:
+        return dict(self.chat_states.get(chat_id, {}))
+
+    def save_chat_state(self, chat_id: int, state: dict[str, object]) -> None:
+        self.chat_states[chat_id] = dict(state)
 
     def get_entitlement(self, user_id: int) -> object:
         return self.entitlement
@@ -79,6 +89,7 @@ class FakeGenerationStore:
 
     def consume_generation_attempt(self, user_id: int, ration_kind: str) -> object:
         self.consumed.append((user_id, ration_kind))
+        self.events.append(f"consume:{ration_kind}")
         consumption = telegram_app.AttemptConsumption(True, ration_kind, "test_access")
         object.__setattr__(consumption, "_postgres_generation_id", len(self.consumed))
         return consumption
@@ -92,6 +103,7 @@ class FakeGenerationStore:
         telegram_message_id: int | None = None,
     ) -> None:
         self.completed.append((user_id, consumption.ration_kind, pdf_path, telegram_message_id))
+        self.events.append(f"complete:{consumption.ration_kind}")
 
     def refund_generation_attempt(
         self,
@@ -101,6 +113,16 @@ class FakeGenerationStore:
         error_message: str | None = None,
     ) -> None:
         self.refunded.append((user_id, consumption.ration_kind, error_message))
+        self.events.append(f"refund:{consumption.ration_kind}")
+
+    def record_recipe_history(
+        self,
+        user_id: int,
+        entries: list[RecipeHistoryItem] | tuple[RecipeHistoryItem, ...],
+    ) -> None:
+        self.recorded.append((user_id, tuple(entries)))
+        ration_kind = entries[0].ration_kind if entries else "empty"
+        self.events.append(f"record:{ration_kind}:{len(entries)}")
 
 
 class FakePromoAdminStore:
@@ -676,6 +698,25 @@ def profile_with(**kwargs) -> object:
     return telegram_app.UserProfile(**data)
 
 
+def _history_item(
+    index: int,
+    *,
+    ration_kind: str,
+    day_index: int | None = None,
+    meal_index: int | None = None,
+) -> RecipeHistoryItem:
+    slot_index = index if meal_index is None else meal_index
+    meal_slot = ["breakfast", "snack_1", "lunch", "snack_2", "dinner"][slot_index % 5]
+    return RecipeHistoryItem(
+        recipe_id=f"recipe-{index}",
+        recipe_key=f"{meal_slot}:curated:recipe-{index}",
+        meal_slot=meal_slot,
+        ration_kind=ration_kind,  # type: ignore[arg-type]
+        day_index=day_index,
+        meal_index=slot_index,
+    )
+
+
 @pytest.mark.anyio
 async def test_successful_one_day_access_generation_completes_postgres_lock(monkeypatch) -> None:
     chat_id = 52_001
@@ -697,6 +738,39 @@ async def test_successful_one_day_access_generation_completes_postgres_lock(monk
 
 
 @pytest.mark.anyio
+async def test_successful_one_day_access_generation_records_recipe_history(monkeypatch) -> None:
+    chat_id = 52_101
+    store = FakeGenerationStore()
+    message = FakeMessage(chat_id)
+
+    async def fake_send_plan(*_args, recipe_history_entries=None, **_kwargs) -> bool:
+        assert recipe_history_entries is not None
+        recipe_history_entries.extend(
+            [
+                _history_item(0, ration_kind="one_day", meal_index=0),
+                _history_item(1, ration_kind="one_day", meal_index=1),
+            ]
+        )
+        return True
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+
+    sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+    assert sent is True
+    assert store.completed == [(chat_id, "one_day", None, None)]
+    assert store.refunded == []
+    assert len(store.recorded) == 1
+    recorded_user_id, entries = store.recorded[0]
+    assert recorded_user_id == chat_id
+    assert [entry.recipe_id for entry in entries] == ["recipe-0", "recipe-1"]
+    assert {entry.ration_kind for entry in entries} == {"one_day"}
+    assert {entry.generation_id for entry in entries} == {1}
+    assert store.events == ["consume:one_day", "complete:one_day", "record:one_day:2"]
+
+
+@pytest.mark.anyio
 async def test_successful_weekly_pdf_access_generation_completes_postgres_lock(monkeypatch) -> None:
     chat_id = 52_002
     store = FakeGenerationStore()
@@ -714,6 +788,112 @@ async def test_successful_weekly_pdf_access_generation_completes_postgres_lock(m
     assert store.consumed == [(chat_id, "weekly_pdf")]
     assert store.completed == [(chat_id, "weekly_pdf", None, None)]
     assert store.refunded == []
+
+
+@pytest.mark.anyio
+async def test_successful_weekly_pdf_access_generation_records_35_recipe_history_entries(
+    monkeypatch,
+) -> None:
+    chat_id = 52_102
+    store = FakeGenerationStore()
+    message = FakeMessage(chat_id)
+
+    async def fake_send_week_plan(*_args, recipe_history_entries=None, **_kwargs) -> bool:
+        assert recipe_history_entries is not None
+        for day_index in range(7):
+            for meal_index in range(5):
+                recipe_history_entries.append(
+                    _history_item(
+                        day_index * 5 + meal_index,
+                        ration_kind="weekly_pdf",
+                        day_index=day_index,
+                        meal_index=meal_index,
+                    )
+                )
+        return True
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with(meal_count=5))
+
+    assert sent is True
+    assert store.completed == [(chat_id, "weekly_pdf", None, None)]
+    assert store.refunded == []
+    assert len(store.recorded) == 1
+    recorded_user_id, entries = store.recorded[0]
+    assert recorded_user_id == chat_id
+    assert len(entries) == 35
+    assert {entry.ration_kind for entry in entries} == {"weekly_pdf"}
+    assert {entry.generation_id for entry in entries} == {1}
+    assert [entry.day_index for entry in entries[:5]] == [0, 0, 0, 0, 0]
+    assert [entry.meal_index for entry in entries[:5]] == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.anyio
+async def test_failed_one_day_access_generation_does_not_record_recipe_history(monkeypatch) -> None:
+    chat_id = 52_103
+    store = FakeGenerationStore()
+    message = FakeMessage(chat_id)
+
+    async def fake_send_plan(*_args, recipe_history_entries=None, **_kwargs) -> bool:
+        if recipe_history_entries is not None:
+            recipe_history_entries.append(_history_item(0, ration_kind="one_day"))
+        return False
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+
+    sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+    assert sent is False
+    assert store.completed == []
+    assert store.refunded == [(chat_id, "one_day", None)]
+    assert store.recorded == []
+
+
+@pytest.mark.anyio
+async def test_failed_weekly_pdf_access_generation_does_not_record_recipe_history(monkeypatch) -> None:
+    chat_id = 52_104
+    store = FakeGenerationStore()
+    message = FakeMessage(chat_id)
+
+    async def fake_send_week_plan(*_args, recipe_history_entries=None, **_kwargs) -> bool:
+        if recipe_history_entries is not None:
+            recipe_history_entries.append(_history_item(0, ration_kind="weekly_pdf"))
+        return False
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with(meal_count=5))
+
+    assert sent is False
+    assert store.completed == []
+    assert store.refunded == [(chat_id, "weekly_pdf", None)]
+    assert store.recorded == []
+
+
+def test_successful_generation_history_json_recording_is_idempotent(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 52_105
+    state_path = tmp_path / "history.json"
+    consumption = telegram_app.AttemptConsumption(True, "one_day", "subscription")
+    object.__setattr__(consumption, "_postgres_generation_id", 777)
+    entry = _history_item(0, ration_kind="one_day")
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", state_path)
+
+    telegram_app._record_successful_generation_history(chat_id, consumption, [entry])
+    telegram_app._record_successful_generation_history(chat_id, consumption, [entry])
+
+    stored = __import__("json").loads(state_path.read_text(encoding="utf-8"))
+    chat_state = stored[str(chat_id)]
+    assert len(chat_state["recipe_history"]) == 1
+    assert chat_state["recipe_ids"] == ["recipe-0"]
 
 
 @pytest.mark.anyio
