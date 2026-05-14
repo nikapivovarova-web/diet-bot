@@ -211,6 +211,33 @@ def test_cleaned_intake_recipes_are_imported_with_required_metadata() -> None:
     assert all(ingredients_by_recipe[row["recipe_id"]] > 0 for row in imported)
 
 
+def test_batch2_curated_recipe_runtime_loads_metadata_fields() -> None:
+    source = next(row for row in _source_recipes() if row.get("recipe_key") == "batch2_001")
+    recipe = {recipe.id: recipe for recipe in curated_recipes()}[source["recipe_id"]]
+
+    assert recipe.allowed_meal_slots == ("breakfast", "snack")
+    assert recipe.slot_flex_type == source["slot_flex_type"]
+    assert recipe.cooking_effort == source["cooking_effort"]
+    assert recipe.active_time_min == source["active_time_min"]
+    assert recipe.coverage_priority == source["coverage_priority"]
+
+
+def test_legacy_curated_recipe_runtime_uses_metadata_defaults() -> None:
+    source = next(row for row in _source_recipes() if row["recipe_no"] == 1)
+    recipe = {recipe.id: recipe for recipe in curated_recipes()}[source["recipe_id"]]
+
+    assert "allowed_meal_slots" not in source
+    assert "slot_flex_type" not in source
+    assert "cooking_effort" not in source
+    assert "active_time_min" not in source
+    assert "coverage_priority" not in source
+    assert recipe.allowed_meal_slots == (recipe.slot,)
+    assert recipe.slot_flex_type is None
+    assert recipe.cooking_effort is None
+    assert recipe.active_time_min is None
+    assert recipe.coverage_priority is None
+
+
 def test_cleaned_intake_required_policy_mappings_resolve() -> None:
     imported_ids = _imported_recipe_ids()
     imported_ingredients = [

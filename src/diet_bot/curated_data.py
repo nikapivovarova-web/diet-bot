@@ -237,6 +237,42 @@ def _role(value: str) -> MealRole | None:
         return None
 
 
+def _allowed_meal_slots(row: dict[str, Any]) -> tuple[str, ...]:
+    raw_slots = row.get("allowed_meal_slots")
+    slots: tuple[str, ...]
+    if isinstance(raw_slots, str):
+        slots = tuple(slot.strip() for slot in raw_slots.split(",") if slot.strip())
+    elif isinstance(raw_slots, (list, tuple)):
+        slots = tuple(str(slot).strip() for slot in raw_slots if str(slot).strip())
+    elif raw_slots is None:
+        slots = ()
+    else:
+        slot_text = str(raw_slots).strip()
+        slots = (slot_text,) if slot_text else ()
+    if slots:
+        return slots
+    slot = str(row.get("slot") or "").strip()
+    return (slot,) if slot else ()
+
+
+def _optional_text(row: dict[str, Any], key: str) -> str | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_int(row: dict[str, Any], key: str) -> int | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return int(text)
+
+
 def _preserve_initial_case(replacement: str, matched: str) -> str:
     if matched[:1].isupper():
         return replacement[:1].upper() + replacement[1:]
@@ -389,6 +425,11 @@ def curated_recipes():
                 image_url=str(row.get("image_url") or "") or None,
                 image_attribution=str(row.get("image_attribution") or "") or None,
                 source_url=str(row.get("source_url") or "") or None,
+                allowed_meal_slots=_allowed_meal_slots(row),
+                slot_flex_type=_optional_text(row, "slot_flex_type"),
+                cooking_effort=_optional_text(row, "cooking_effort"),
+                active_time_min=_optional_int(row, "active_time_min"),
+                coverage_priority=_optional_text(row, "coverage_priority"),
             )
         )
     return tuple(templates)
