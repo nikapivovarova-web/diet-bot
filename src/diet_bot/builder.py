@@ -1939,6 +1939,15 @@ def _has_meal_below_min_energy(meals: list[Meal], target: NutrientVector) -> boo
     return any(_meal_min_energy_gap(meal, target, slot) > 10 for meal, slot in zip(meals, slots))
 
 
+def _is_calorie_recovery_context(
+    meal: Meal,
+    total: NutrientVector,
+    target: NutrientVector,
+    slot: MealEnergySlot,
+) -> bool:
+    return total.get("energy_kcal") < target.get("energy_kcal") * 0.96 or _meal_energy_gap(meal, target, slot) > 10
+
+
 def _meal_indices_by_energy_gap(meals: list[Meal], target: NutrientVector) -> list[int]:
     slots = _meal_energy_slots(len(meals))
     return sorted(
@@ -1957,6 +1966,50 @@ def _top_up_roles_for_slot(slot: str) -> tuple[MealRole, ...]:
     if slot == "snack":
         return (MealRole.CALCIUM, MealRole.FRUIT, MealRole.PROTEIN, MealRole.CARB)
     return (MealRole.CARB, MealRole.VEGETABLE, MealRole.PROTEIN, MealRole.FAT)
+
+
+def _is_calorie_recovery_base(food: Food) -> bool:
+    food_id = food.id.lower()
+    if food.category in {
+        "protein",
+        "dairy",
+        "fat",
+        "nuts_seeds",
+        "sauce",
+        "sweetener",
+        "spice",
+        "other",
+        "processed_meat",
+    }:
+        return False
+    if food_id in {"lemon_juice", "lime_juice"} or food_id.endswith("_juice") or "sauce" in food_id:
+        return False
+    if food.category in {"grains", "fruit"}:
+        return True
+    if food_id in STARCHY_GARNISH_IDS:
+        return True
+    if any(
+        token in food_id
+        for token in ("bread", "lavash", "tortilla", "bagel", "pita", "flatbread", "potato", "yam", "flour")
+    ):
+        return True
+    if food.category == "vegetable":
+        return (
+            food.nutrients_per_100g.get("energy_kcal") >= 45
+            and food.nutrients_per_100g.get("carbohydrate_g") >= 10
+            and food.nutrients_per_100g.get("protein_g") <= 5
+        )
+    return False
+
+
+def _relaxes_protein_ceiling_for_calorie_recovery(
+    food: Food,
+    meal: Meal,
+    total: NutrientVector,
+    target: NutrientVector,
+    slot: MealEnergySlot,
+) -> bool:
+    return _is_calorie_recovery_base(food) and _is_calorie_recovery_context(meal, total, target, slot)
 
 
 def _top_up_if_needed(
@@ -2005,7 +2058,14 @@ def _top_up_if_needed(
                     continue
                 grams = min(grams, room_energy / energy_per_g)
                 grams = round(max(0.0, grams), 1)
-                grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
+                if not _relaxes_protein_ceiling_for_calorie_recovery(
+                    food,
+                    meal,
+                    total,
+                    target,
+                    slots[meal_index],
+                ):
+                    grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_fat_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_excessive_protein(food, grams, total, target)
@@ -2084,7 +2144,14 @@ def _increase_existing_portions(
                         grams = max(0.0, room_energy_for_meal / energy_per_g)
                     if grams <= 0:
                         continue
-                    grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
+                    if not _relaxes_protein_ceiling_for_calorie_recovery(
+                        food,
+                        meal,
+                        total,
+                        target,
+                        slots[meal_index],
+                    ):
+                        grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
                     grams = _limit_grams_for_fat_ceiling(food, grams, total, target)
                     grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
                     if grams <= 0:
