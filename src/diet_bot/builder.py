@@ -75,6 +75,11 @@ FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
 CARBOHYDRATE_TOP_UP_CEILING_MULTIPLIER = 1.18
 CARBOHYDRATE_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.08
 CARBOHYDRATE_RECIPE_HARD_LIMIT_MULTIPLIER = 1.24
+COLLAPSED_MEAL_MIN_KCAL = 40.0
+COLLAPSED_MEAL_CORE_MIN_KCAL = 25.0
+TINY_GARNISH_MAX_GRAMS = 75.0
+LOW_PROTEIN_CALORIE_RECOVERY_MAX_PROTEIN_G = 85.0
+LOW_PROTEIN_CALORIE_RECOVERY_MIN_KCAL_PER_PROTEIN = 30.0
 SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
     "несколько этап",
     "ваф",
@@ -313,6 +318,23 @@ MAIN_LIKE_SNACK_BLOCKED_FORMAT_KEYWORDS = (
     "parfait",
     "smoothie",
     "syrniki",
+)
+NON_CORE_MEAL_COMPONENT_IDS = frozenset(
+    {
+        "basil",
+        "cilantro",
+        "dill",
+        "greens",
+        "lemon_juice",
+        "lime_juice",
+        "mint",
+        "parsley",
+        "rosemary",
+        "sage",
+        "salt",
+        "thyme",
+        "water",
+    }
 )
 
 
@@ -664,6 +686,8 @@ def _select_best_hard_valid_meals(
 
 def _passes_hard_nutrition_gates(meals: list[Meal], target: NutrientVector) -> bool:
     if not meals:
+        return False
+    if any(_meal_is_collapsed(meal) for meal in meals):
         return False
     total = NutrientVector.sum(meal.nutrients for meal in meals)
     return total.get("protein_g") + 0.01 >= _protein_hard_floor(target)
@@ -1274,6 +1298,14 @@ def _rank_recipes(
             target,
             meal_slot=slot,
         )
+        calorie_recovery_bonus = _recipe_low_protein_calorie_recovery_bonus(
+            recipe,
+            food_by_id,
+            slot_energy_target,
+            current_total,
+            target,
+            meal_slot=slot,
+        )
         if ranking_mode == "protein_floor":
             seed_score = _seeded_score(recipe.id, variety_seed, index) * 0.25
             macro_bonus += _recipe_projected_protein_floor_bonus(
@@ -1326,6 +1358,7 @@ def _rank_recipes(
             seed_score
             + nutrient_bonus
             + macro_bonus
+            + calorie_recovery_bonus
             + rotation_bonus
             + curated_bonus
             - overlap * 0.55
@@ -1512,6 +1545,66 @@ def _recipe_projected_macro_gap_bonus(
         if gap > nutrient_target * 0.15:
             bonus += min(estimated.get(nutrient), gap) / nutrient_target * weight
     return bonus
+
+
+def _recipe_low_protein_calorie_recovery_bonus(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    meal_slot: str | None = None,
+) -> float:
+    if not _is_low_protein_calorie_recovery_target(target):
+        return 0.0
+
+    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
+    if estimated is None:
+        return 0.0
+
+    energy = estimated.get("energy_kcal")
+    protein = estimated.get("protein_g")
+    if energy < max(COLLAPSED_MEAL_MIN_KCAL, slot_energy_target * 0.45):
+        return -2.0
+
+    target_protein = max(1.0, target.get("protein_g"))
+    target_kcal_per_protein = target.get("energy_kcal") / target_protein
+    kcal_per_protein = energy / max(1.0, protein)
+    bonus = min(1.8, kcal_per_protein / max(1.0, target_kcal_per_protein)) * 2.8
+
+    resolved_foods = [
+        food
+        for food_id in recipe.ingredients_g
+        if (food := _resolve_recipe_food(food_id, food_by_id)) is not None
+    ]
+    if any(_is_calorie_recovery_base(food) for food in resolved_foods):
+        bonus += 1.2
+    if any(food.category in {"protein", "dairy", "nuts_seeds"} for food in resolved_foods):
+        bonus -= 0.8
+
+    protein_floor = _protein_hard_floor(target)
+    projected_protein = current_total.get("protein_g") + protein
+    if projected_protein < protein_floor:
+        bonus -= min(3.0, (protein_floor - projected_protein) / target_protein * 10.0)
+
+    protein_ratio = projected_protein / target_protein
+    if protein_ratio > 1.0:
+        bonus -= (protein_ratio - 1.0) * 2.0
+    if protein_ratio > _protein_ceiling_multiplier(target):
+        bonus -= (protein_ratio - _protein_ceiling_multiplier(target)) * 8.0
+
+    return bonus
+
+
+def _is_low_protein_calorie_recovery_target(target: NutrientVector) -> bool:
+    protein = target.get("protein_g")
+    energy = target.get("energy_kcal")
+    if protein <= 0:
+        return False
+    return (
+        protein <= LOW_PROTEIN_CALORIE_RECOVERY_MAX_PROTEIN_G
+        and energy / protein >= LOW_PROTEIN_CALORIE_RECOVERY_MIN_KCAL_PER_PROTEIN
+    )
 
 
 def _recipe_projected_protein_floor_bonus(
@@ -1736,18 +1829,116 @@ def _scaled_recipe_portions(
     target: NutrientVector,
     meal_slot: str | None = None,
 ) -> tuple[FoodPortion, ...]:
+    scaled = _scaled_recipe_portions_with_limits(
+        resolved,
+        scale,
+        used_grams,
+        current_total,
+        target,
+        meal_slot=meal_slot,
+        enforce_protein_ceiling=True,
+    )
+    if _scaled_portions_are_meaningful(scaled, target=target, meal_slot=meal_slot):
+        return scaled
+    if not _is_low_protein_calorie_recovery_target(target):
+        scaled = _scaled_recipe_portions_with_limits(
+            resolved,
+            scale,
+            used_grams,
+            current_total,
+            target,
+            meal_slot=meal_slot,
+            enforce_protein_ceiling=False,
+        )
+        if _scaled_portions_are_meaningful(scaled, target=target, meal_slot=meal_slot):
+            return scaled
+    return tuple()
+
+
+def _scaled_recipe_portions_with_limits(
+    resolved: tuple[tuple[Food, float], ...],
+    scale: float,
+    used_grams: dict[str, float],
+    current_total: NutrientVector,
+    target: NutrientVector,
+    *,
+    meal_slot: str | None,
+    enforce_protein_ceiling: bool,
+) -> tuple[FoodPortion, ...]:
     portions: list[FoodPortion] = []
     for food, base_grams in resolved:
         max_available = min(food.max_per_meal_g, max(0.0, food.max_per_day_g - used_grams[food.id]))
         grams = scaled_recipe_grams(food, base_grams, scale, meal_slot=meal_slot, max_grams=max_available)
-        grams = _limit_grams_for_protein_ceiling(food, grams, current_total, target, portions)
+        if enforce_protein_ceiling and not _relaxes_recipe_protein_ceiling_for_calorie_recovery(
+            food,
+            current_total,
+            target,
+        ):
+            grams = _limit_grams_for_protein_ceiling(food, grams, current_total, target, portions)
         grams = practical_grams(food, grams, meal_slot=meal_slot, max_grams=grams, prefer_floor=True)
         if grams <= 0:
-            if food.category in {"protein", "dairy"}:
+            if enforce_protein_ceiling and food.category in {"protein", "dairy"}:
                 return tuple()
             continue
         portions.append(food.portion(grams))
     return tuple(portions)
+
+
+def _meal_is_collapsed(meal: Meal) -> bool:
+    return not _scaled_portions_are_meaningful(meal.portions)
+
+
+def _scaled_portions_are_meaningful(
+    portions: tuple[FoodPortion, ...],
+    *,
+    target: NutrientVector | None = None,
+    meal_slot: str | None = None,
+) -> bool:
+    if not portions:
+        return False
+    total_energy = sum(portion.nutrients.get("energy_kcal") for portion in portions)
+    if total_energy < _minimum_meaningful_meal_energy(target, meal_slot):
+        return False
+    core_energy = sum(
+        portion.nutrients.get("energy_kcal")
+        for portion in portions
+        if _portion_counts_as_core_meal_component(portion)
+    )
+    return core_energy >= COLLAPSED_MEAL_CORE_MIN_KCAL
+
+
+def _minimum_meaningful_meal_energy(target: NutrientVector | None, meal_slot: str | None) -> float:
+    del target, meal_slot
+    return COLLAPSED_MEAL_MIN_KCAL
+
+
+def _portion_counts_as_core_meal_component(portion: FoodPortion) -> bool:
+    food = portion.food
+    food_id = food.id.lower()
+    energy = portion.nutrients.get("energy_kcal")
+    if food.category in {"spice", "sweetener", "other"}:
+        return False
+    if food_id in NON_CORE_MEAL_COMPONENT_IDS or food_id.endswith("_salt") or food_id.endswith("_juice"):
+        return False
+    if food.category == "fat" and ("oil" in food_id or "butter" in food_id):
+        return False
+    if food.category == "sauce" and (energy < 40 or portion.grams < 30):
+        return False
+    if energy < COLLAPSED_MEAL_CORE_MIN_KCAL and portion.grams < TINY_GARNISH_MAX_GRAMS:
+        return False
+    return True
+
+
+def _relaxes_recipe_protein_ceiling_for_calorie_recovery(
+    food: Food,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> bool:
+    return (
+        _is_low_protein_calorie_recovery_target(target)
+        and _is_calorie_recovery_base(food)
+        and current_total.get("energy_kcal") < target.get("energy_kcal") * 0.98
+    )
 
 
 def _scale_for_food(food: Food, recipe_scale: float) -> float:
@@ -2068,7 +2259,14 @@ def _top_up_if_needed(
                     grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_fat_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target, portions)
-                grams = _limit_grams_for_excessive_protein(food, grams, total, target)
+                if not _relaxes_protein_ceiling_for_calorie_recovery(
+                    food,
+                    meal,
+                    total,
+                    target,
+                    slots[meal_index],
+                ):
+                    grams = _limit_grams_for_excessive_protein(food, grams, total, target)
                 grams = practical_grams(
                     food,
                     grams,
@@ -2158,7 +2356,13 @@ def _increase_existing_portions(
                         continue
                     max_total_for_rounding = min(food.max_per_meal_g, portion.grams + max(0.0, room_day))
                     protein_per_g = food.nutrients_per_100g.get("protein_g") / 100
-                    if protein_per_g > 0:
+                    if protein_per_g > 0 and not _relaxes_protein_ceiling_for_calorie_recovery(
+                        food,
+                        meal,
+                        total,
+                        target,
+                        slots[meal_index],
+                    ):
                         protein_room = target.get("protein_g") * PROTEIN_EXCESSIVE_CEILING_MULTIPLIER
                         protein_room -= total.get("protein_g")
                         protein_room -= PROTEIN_TOP_UP_CEILING_BUFFER_G

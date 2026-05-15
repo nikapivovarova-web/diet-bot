@@ -114,6 +114,41 @@ def assert_meal_energy_distribution(plan) -> None:
         assert meal_energy <= target_energy * slot.max_ratio + 10
 
 
+def collapsed_meal_names(plan) -> list[str]:
+    non_core_ids = {
+        "salt",
+        "lemon_juice",
+        "lime_juice",
+        "water",
+        "basil",
+        "cilantro",
+        "dill",
+        "greens",
+        "mint",
+        "parsley",
+        "rosemary",
+        "sage",
+        "thyme",
+    }
+    collapsed: list[str] = []
+    for meal in plan.meals:
+        core_energy = 0.0
+        for portion in meal.portions:
+            food_id = portion.food.id.lower()
+            is_non_core = (
+                portion.food.category in {"spice", "sweetener", "other"}
+                or food_id in non_core_ids
+                or food_id.endswith("_salt")
+                or food_id.endswith("_juice")
+                or (portion.nutrients.get("energy_kcal") < 25 and portion.grams < 75)
+            )
+            if not is_non_core:
+                core_energy += portion.nutrients.get("energy_kcal")
+        if meal.nutrients.get("energy_kcal") < 40 or core_energy < 25:
+            collapsed.append(meal.name)
+    return collapsed
+
+
 def _strict_floor_target() -> NutrientVector:
     return NutrientVector(
         {
@@ -873,6 +908,27 @@ def test_weekly_plan_success_contains_no_empty_days() -> None:
 
 
 @pytest.mark.slow_pdf_builder
+def test_low_weight_simple_weekly_seed101_has_no_collapsed_meals_and_keeps_protein_floor() -> None:
+    profile = profile_with(
+        goal=Goal.MAINTAIN,
+        weight_kg=45,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    plans = _build_week_plans(profile, 101, set(), set())
+
+    assert len(plans) == 7
+    assert sum(len(plan.meals) for plan in plans) == 35
+    for plan in plans:
+        validation = validate_plan(plan)
+        assert all("excluded" not in error and "is excluded" not in error for error in validation.errors)
+        assert plan.totals.get("energy_kcal") + 0.01 >= plan.targets.calorie_bounds[0]
+        assert plan.totals.get("protein_g") + 0.01 >= plan.targets.targets.get("protein_g") * 0.95
+        assert collapsed_meal_names(plan) == []
+
+
+@pytest.mark.slow_pdf_builder
 def test_weekly_infeasible_pool_returns_controlled_failure_not_partial_success(monkeypatch) -> None:
     low_protein, hard_valid_protein = _strict_floor_foods()
     monkeypatch.setattr("diet_bot.builder.built_in_foods", lambda: [low_protein, hard_valid_protein])
@@ -1113,6 +1169,71 @@ def test_recipe_ranking_prefers_130_percent_protein_candidate_over_150_plus_cand
     )
 
     assert ranked[0].id == "moderate_recipe"
+
+
+def test_low_protein_calorie_ranking_prefers_better_kcal_per_protein_candidate() -> None:
+    target = NutrientVector({"energy_kcal": 2200, "protein_g": 50, "fat_g": 70, "carbohydrate_g": 330})
+    current_total = NutrientVector({"energy_kcal": 1200, "protein_g": 44, "fat_g": 40, "carbohydrate_g": 150})
+    starch_food = Food(
+        id="rice_lowp",
+        name="Rice low protein",
+        category="grains",
+        nutrients_per_100g=NutrientVector(
+            {"energy_kcal": 220, "protein_g": 4, "fat_g": 1, "carbohydrate_g": 50}
+        ),
+        roles=frozenset({MealRole.CARB}),
+        max_per_meal_g=1000,
+        max_per_day_g=2000,
+    )
+    protein_food = Food(
+        id="turkey_highp",
+        name="Turkey high protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector(
+            {"energy_kcal": 220, "protein_g": 12, "fat_g": 4, "carbohydrate_g": 0}
+        ),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=2000,
+    )
+    recipes = [
+        RecipeTemplate(
+            id="protein_heavy_0_0",
+            slot="snack",
+            title="Protein heavy",
+            ingredients_g={"turkey_highp": 100},
+            instructions="Assemble.",
+            tags=frozenset({"curated"}),
+            time_text="10 minutes",
+        ),
+        RecipeTemplate(
+            id="starch_recovery_0_0",
+            slot="snack",
+            title="Starch recovery",
+            ingredients_g={"rice_lowp": 100},
+            instructions="Assemble.",
+            tags=frozenset({"curated"}),
+            time_text="10 minutes",
+        ),
+    ]
+
+    ranked = _rank_recipes(
+        recipes,
+        "snack",
+        set(),
+        Counter(),
+        Counter(),
+        {food.id: food for food in (starch_food, protein_food)},
+        current_total,
+        target,
+        220,
+        130,
+        330,
+        0,
+        0,
+    )
+
+    assert ranked[0].id == "starch_recovery_0_0"
 
 
 def test_exclusion_infeasible_case_returns_controlled_empty_plan_not_unsafe_ration(monkeypatch) -> None:

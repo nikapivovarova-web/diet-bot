@@ -255,3 +255,23 @@ def test_oil_salt_and_lemon_are_not_used_for_calorie_recovery() -> None:
     assert grams["olive_oil"] == 10
     assert grams["salt"] == 3
     assert grams["lemon_juice"] == 30
+
+
+def test_scaled_recipe_portions_reject_tiny_garnish_only_remnant() -> None:
+    food_by_id = _foods_by_id()
+    resolved = (
+        (food_by_id["tomato"], 50.0),
+        (food_by_id["salt"], 1.0),
+        (food_by_id["lemon_juice"], 10.0),
+    )
+
+    portions = _scaled_recipe_portions(
+        resolved,
+        1.0,
+        defaultdict(float),
+        NutrientVector({"protein_g": 75}),
+        NutrientVector({"energy_kcal": 2182, "protein_g": 50, "fat_g": 73, "carbohydrate_g": 332}),
+        meal_slot="snack",
+    )
+
+    assert portions == ()
