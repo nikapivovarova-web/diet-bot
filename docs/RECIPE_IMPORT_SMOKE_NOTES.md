@@ -17,6 +17,54 @@ Date: 2026-05-14
 
 ## Focused Verification
 
+### Post-Scaling Smoke - 2026-05-15
+
+Scope: docs-only smoke/report slice after:
+
+- `d668b73` recipes: soften cooking effort preference
+- `9bc199c` recipes: make portion scaling practical
+
+No code, recipe data, runtime state, or push was changed in this slice.
+
+Probe: inline `.venv\Scripts\python.exe` smoke using existing `_build_week_plans`, `build_week_shopping_groups`, and `render_week_plan_pdf` helpers. Weekly profiles used male, age 32, height 178 cm, moderate activity, maintain goal, 5 meals.
+
+| Profile | Seed | Generation | Meals | Unique recipes | Protein floor | Calories vs +/-8% bounds | Effort fallback | Weird quantities |
+| --- | ---: | --- | ---: | ---: | --- | --- | --- | --- |
+| 45kg simple | 101 | PASS | 35/35 | 35 | PASS; 1.480-1.501x target | FAIL low all 7 days; 1542-1865 kcal vs 2007-2356 bound | No | None |
+| 75kg simple | 101 | PASS | 35/35 | 35 | PASS; 1.470-1.495x target | FAIL low days 1,2,6,7; 2230-2597 kcal vs 2435-2858 bound | No | None |
+| 86kg simple | 101 | PASS | 35/35 | 35 | PASS; 1.277-1.490x target | FAIL low days 1,3; 2347-2931 kcal vs 2592-3042 bound | Yes; 3 relaxation logs, `r459_pisto` once | 1 strange carrier: `corn_tortilla` 55 g in `r572_tykvennoe_karri_s_kuritsey` |
+| 120kg simple | 101 | PASS | 35/35 | 35 | PASS; 1.335-1.490x target | FAIL low days 2-6; 2852-3263 kcal vs 3077-3612 bound | Yes; 3 relaxation logs, `r459_pisto` once | None |
+| 120kg interesting | 404 | PASS | 35/35 | 35 | PASS; 1.328-1.490x target | FAIL low days 4,7; 2932-3492 kcal vs 3077-3612 bound | n/a | None |
+| 86kg simple, egg allergy + celiac | 202 | PASS | 35/35 | 35 | PASS; 1.291-1.484x target | FAIL low day 1; 2539-2817 kcal vs 2592-3042 bound | Yes; 2 relaxation logs, selected recipes still matched strict-simple heuristic | 1 strange carrier: `corn_tortilla` 55 g in `r558_krevetki_v_kokosovom_karri_s_risom` |
+
+Quantity heuristics checked in every generated week:
+
+- Fractional whole eggs: none found.
+- Strange bread/lavash/tortilla grams: 2 total `corn_tortilla` 55 g findings, listed above.
+- Salt over 3 g per meal: none found.
+- Lemon/lime over 35 g: none found.
+- Oil/butter over 20 g: none found.
+- Snack over 650 kcal: none found.
+
+Restrictive profile check:
+
+- Egg allergy + celiac generated a complete week.
+- No egg, egg part, gluten-tagged, or celiac-excluded food violations were found in final scaled portions.
+- Dairy-free was not separately run because the existing fast celiac helper path covered the requested restrictive smoke shape.
+
+Shopping/PDF quick smoke:
+
+- Shopping totals matched final scaled `FoodPortion` totals for all 6 generated weeks after batch carryover handling; `diff_count=0` in each case.
+- Representative PDF render for `120kg interesting`, seed 404, completed without crashing; output size in the temporary render was 2,054,426 bytes.
+
+Known limitations / failures to fix later:
+
+- Weekly generation completeness passed for every requested profile, but calorie lower-bound tolerance failed in every sample. All calorie failures were below the lower bound; no sampled day exceeded the upper calorie bound.
+- Protein floor passed everywhere, but protein remains high in all samples: observed ratios were 1.277-1.501x target.
+- Simple effort fallback is still used for 86kg/120kg simple and the restrictive simple run. In unrestricted 86kg/120kg simple weeks, `r459_pisto` surfaced as a non-simple recipe once.
+- Carrier rounding still has at least one practical-portion edge: `corn_tortilla` can appear at 55 g as a garnish/carrier.
+- This smoke did not fix any of the above by request; it only records the post-scaling behavior.
+
 ### Batch2 Ready Import - 2026-05-14
 
 Imported the ready-only subset from `tmp/recipe_intake_batch2/cleaned_recipes_batch2.xlsx`.
