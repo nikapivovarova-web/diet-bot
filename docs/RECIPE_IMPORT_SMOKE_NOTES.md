@@ -17,6 +17,109 @@ Date: 2026-05-14
 
 ## Focused Verification
 
+### Post-Planner Stabilization Smoke - 2026-05-15
+
+Scope: post-planner stabilization smoke/report slice after:
+
+- `1a0e848` recipes: use slot flex metadata in builder
+- `d668b73` recipes: soften cooking effort preference
+- `9bc199c` recipes: make portion scaling practical
+- `7fc52b7` recipes: prefer calorie-fit weekly candidates
+- `559b5b7` recipes: recover calories with carb top ups
+- `a77d7d9` recipes: avoid collapsed low-calorie meals
+
+No code, recipe data, runtime state, validation bounds, or push was changed in this slice. The only intended repository change is this smoke note.
+
+Probe: inline `.venv\Scripts\python.exe` smoke using existing `_build_week_plans`, `build_week_shopping_groups`, and `render_week_plan_pdf` helpers. Weekly profiles used male, age 32, height 178 cm, moderate activity, maintain goal, 5 meals.
+
+Summary:
+
+- All 9 planner smoke profiles generated complete weeks.
+- Every generated week had `35/35` meals and `35` unique recipe IDs inside the week.
+- Calorie lower-bound failures: none in the smoke matrix.
+- Protein floor failures: none in the smoke matrix.
+- Collapsed meals: none in the smoke matrix.
+- Exclusion/allergy violations: none in the restrictive profiles.
+- Downstream shopping totals matched generated `FoodPortion` totals after batch carryover handling for every generated week.
+- One representative weekly PDF render completed with a forced empty `image_url`; output size was 1,900,925 bytes in a temporary directory.
+- Existing validation errors/warnings remain, mostly sodium over 2300 mg/day and macro upper/lower bounds. They were recorded only and not fixed.
+
+| Profile | Seed | Generation | Meals | Unique recipes | Calorie lower-bound failures | Protein floor failures | Collapsed meals | Weird quantities | Exclusion/allergy violations | Effort fallback |
+| --- | ---: | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- |
+| 45kg simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 7 relaxation logs; 0 selected non-simple recipes |
+| 75kg simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 0 logs; 0 selected non-simple recipes |
+| 86kg simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 0 logs; 0 selected non-simple recipes |
+| 120kg simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 0 logs; 0 selected non-simple recipes |
+| 120kg interesting | 404 | PASS | 35/35 | 35 | None | None | 0 | None | None | n/a |
+| Dairy-free simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 0 logs; 0 selected non-simple recipes |
+| Gluten/celiac simple | 202 | PASS | 35/35 | 35 | None | None | 0 | `corn_tortilla` 55 g in day 3 main `r211_govyadina_s_fasolyu_i_risom_na_skovorode` | None | 0 logs; 0 selected non-simple recipes |
+| Egg allergy simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 0 logs; 0 selected non-simple recipes |
+| Fish+nuts excluded simple | 101 | PASS | 35/35 | 35 | None | None | 0 | None | None | 0 logs; 0 selected non-simple recipes |
+
+Quantity heuristics checked in every generated week:
+
+- Fractional whole eggs: none found.
+- Strange bread/lavash/tortilla grams: 1 total `corn_tortilla` 55 g finding in the celiac run, listed above.
+- Salt over 3 g per meal: none found.
+- Lemon/lime over 35 g: none found.
+- Oil/butter over 20 g: none found.
+- Snack over 650 kcal: none found.
+
+Observed energy and protein ranges:
+
+| Profile | Energy range | Protein ratio range |
+| --- | --- | --- |
+| 45kg simple | 2110-2207 kcal | 1.587-1.890x target |
+| 75kg simple | 2598-2672 kcal | 1.312-1.506x target |
+| 86kg simple | 2753-2920 kcal | 1.352-1.614x target |
+| 120kg simple | 3253-3418 kcal | 1.433-1.682x target |
+| 120kg interesting | 3244-3374 kcal | 1.322-1.600x target |
+| Dairy-free simple | 2727-2820 kcal | 1.289-1.542x target |
+| Gluten/celiac simple | 2756-2812 kcal | 1.355-1.587x target |
+| Egg allergy simple | 2771-2928 kcal | 1.455-1.583x target |
+| Fish+nuts excluded simple | 2772-2845 kcal | 1.445-1.573x target |
+
+Downstream quick smoke:
+
+| Check | Result |
+| --- | --- |
+| Shopping totals vs final generated portions with batch carryover handling | PASS; `diff_count=0` for all 9 generated weeks |
+| Representative PDF render | PASS; `120kg interesting`, seed 404, 1,900,925 bytes in temp output |
+| Empty `image_url` handling | PASS; first meal image URL forced to empty string before the representative PDF render |
+
+Validation warnings/errors recorded, not fixed:
+
+| Profile | Sodium over target | Protein upper-bound errors | Other macro warnings/errors |
+| --- | ---: | ---: | --- |
+| 45kg simple | 5/7 days | 7/7 days | fat upper day 3; fat below day 1; carb below days 2-3 |
+| 75kg simple | 4/7 days | 0/7 days | fat upper day 7; carb below day 7 |
+| 86kg simple | 5/7 days | 4/7 days | carb below day 4 |
+| 120kg simple | 7/7 days | 5/7 days | None |
+| 120kg interesting | 6/7 days | 4/7 days | fat below days 2-3 |
+| Dairy-free simple | 5/7 days | 1/7 day | fat below day 7 |
+| Gluten/celiac simple | 1/7 day | 4/7 days | carb below day 7 |
+| Egg allergy simple | 4/7 days | 4/7 days | fat below day 2 |
+| Fish+nuts excluded simple | 7/7 days | 4/7 days | fat below days 1 and 7 |
+
+Additional validation warnings observed: repeated-food warnings for salt, egg, onion, and vegetable oil in a few days. These were not treated as generation failures in this smoke.
+
+Tests run:
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Recipe portion scaling | `python -m pytest tests/test_recipe_portion_scaling.py -q` | 7 passed |
+| Recipe effort / slot coverage | `python -m pytest tests/test_recipe_effort_slot_coverage.py -q` | 20 passed |
+| Curated recipe data | `python -m pytest tests/test_curated_recipe_data.py -q` | 27 passed |
+| Weekly selector and optimizer candidates | `python -m pytest tests/test_weekly_selector_scoring.py tests/test_weekly_optimizer_candidates.py -q` | 10 passed |
+| Targeted builder tests from previous slices | `python -m pytest` with 10 selected `tests/test_safety_and_builder.py` node IDs covering egg/broccoli exclusions, simple effort, weekly uniqueness, weekly completeness, seed 404 carryover, low-weight floor/collapse, and exclusion propagation | 10 passed |
+
+Recommendation for next slice:
+
+1. Tune sodium and macro upper-bound quality without relaxing validation bounds.
+2. Investigate high protein ratios, especially 45kg simple where the ratio reached 1.890x target.
+3. Fix the remaining carrier rounding edge that can leave `corn_tortilla` at 55 g.
+4. Keep the restrictive-profile matrix as a regression smoke after any planner tuning.
+
 ### Post-Scaling Smoke - 2026-05-15
 
 Scope: docs-only smoke/report slice after:
