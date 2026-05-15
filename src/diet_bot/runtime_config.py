@@ -42,6 +42,7 @@ class RuntimeConfig:
     local_json_storage_allowed: bool
     postgres_statement_timeout_ms: int
     postgres_lock_timeout_ms: int
+    public_payments_enabled: bool
 
 
 def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -80,6 +81,11 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         default=1000,
         name="DIET_BOT_POSTGRES_LOCK_TIMEOUT_MS",
     )
+    public_payments_enabled = _parse_bool_flag(
+        _env_value(env, "DIET_BOT_PUBLIC_PAYMENTS_ENABLED"),
+        default=False,
+        name="DIET_BOT_PUBLIC_PAYMENTS_ENABLED",
+    )
 
     default_state_file = Path(__file__).resolve().parents[2] / ".diet_bot_state" / "history.json"
     state_file = _path_from_env(env, "DIET_BOT_STATE_FILE", default_state_file)
@@ -108,6 +114,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         local_json_storage_allowed=local_json_storage_allowed,
         postgres_statement_timeout_ms=postgres_statement_timeout_ms,
         postgres_lock_timeout_ms=postgres_lock_timeout_ms,
+        public_payments_enabled=public_payments_enabled,
     )
 
 
@@ -171,6 +178,19 @@ def _parse_positive_int(raw: str, *, default: int, name: str) -> int:
     if value <= 0:
         raise RuntimeConfigError(f"{name} must be a positive integer.")
     return value
+
+
+def _parse_bool_flag(raw: str, *, default: bool, name: str) -> bool:
+    if not raw:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeConfigError(
+        f"{name} must be one of: 1, 0, true, false, yes, no, on, off."
+    )
 
 
 def _parse_id_set(raw: str) -> frozenset[int]:

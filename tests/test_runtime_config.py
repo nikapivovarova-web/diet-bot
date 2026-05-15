@@ -188,6 +188,43 @@ def test_runtime_config_optional_provider_token_defaults_to_empty_string() -> No
     assert config.telegram_provider_token == ""
 
 
+def test_runtime_config_disables_public_payments_by_default() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+            "TELEGRAM_PROVIDER_TOKEN": "provider-token",
+        },
+    )
+
+    assert config.public_payments_enabled is False
+
+
+def test_runtime_config_enables_public_payments_only_with_explicit_flag() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+            "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "1",
+        },
+    )
+
+    assert config.public_payments_enabled is True
+
+
+def test_runtime_config_rejects_invalid_public_payments_flag() -> None:
+    with pytest.raises(RuntimeConfigError, match="DIET_BOT_PUBLIC_PAYMENTS_ENABLED"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "local-token",
+                "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+                "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "maybe",
+            },
+        )
+
+
 def test_runtime_config_uses_provided_mapping_instead_of_process_environment(monkeypatch) -> None:
     monkeypatch.setenv("DIET_BOT_TOKEN", "process-env-token")
 

@@ -7,6 +7,7 @@ The current clean release state focuses on:
 - deterministic nutrition planning for one-day rations;
 - Telegram polling with `/start`, `/plan`, and `/cancel`;
 - explicit local/dev JSON state files for history, subscriptions, and promo codes;
+- pilot access with public YooKassa/Stars payment buttons disabled by default;
 - a fast local healthcheck for package data and runtime config;
 - weekly ration delivery as a PDF document only.
 
@@ -27,6 +28,7 @@ Optional local settings:
 
 - `TELEGRAM_BOT_TOKEN`: legacy alias used only when `DIET_BOT_TOKEN` is empty.
 - `TELEGRAM_PROVIDER_TOKEN`: Telegram/YooKassa provider token for card payments; leave empty for local smoke if card payments are not being tested.
+- `DIET_BOT_PUBLIC_PAYMENTS_ENABLED`: `0` by default for pilot mode. Public YooKassa/Stars invoice buttons stay hidden while promo-code entry and admin monthly-access promo grants remain available. Set `1` only for paid-mode smoke/release after real YooKassa and Telegram Stars provider smoke is approved and recorded.
 - `DIET_BOT_SUPPORT_CHAT_ID`: support chat target.
 - `DIET_BOT_ADMIN_USER_IDS`: comma/space/semicolon separated Telegram user IDs.
 - `DIET_BOT_TESTER_CHAT_IDS`: comma/space/semicolon separated tester chat IDs.
@@ -49,6 +51,7 @@ $env:DIET_BOT_ENV = "development"
 $env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 $env:DIET_BOT_TOKEN = "replace-with-telegram-bot-token"
 $env:TELEGRAM_PROVIDER_TOKEN = ""
+$env:DIET_BOT_PUBLIC_PAYMENTS_ENABLED = "0"
 
 & $py -m diet_bot.telegram_app
 ```
@@ -102,3 +105,5 @@ Weekly rations are delivered only as a Telegram PDF document. The bot must not s
 ## Release Smoke
 
 Before a release, run the manual Telegram smoke checklist in `docs/RELEASE_SMOKE_CHECKLIST.md`.
+
+Pilot releases should keep `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`: users get access by promo code or admin-created monthly access code, and public card/Stars invoices stay hidden. Paid mode requires `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` plus recorded real-provider smoke for both YooKassa and Telegram Stars before public launch.

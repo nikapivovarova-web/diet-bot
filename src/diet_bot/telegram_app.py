@@ -275,6 +275,11 @@ SUPPORT_PROMPT_TEXT = (
     "Если вопрос по оплате, напишите способ оплаты: карта/SberPay или Telegram Stars, "
     "и что именно произошло."
 )
+PUBLIC_PAYMENTS_PILOT_TEXT = (
+    "Доступ по промокоду на этапе пилота.\n\n"
+    "Публичная оплата картой, SberPay и Telegram Stars пока выключена. "
+    "Введите промокод или обратитесь к администратору, если доступ уже согласован."
+)
 SUPPORT_SENT_TEXT = "Обращение отправлено в техподдержку. Мы проверим и свяжемся с вами, если потребуется."
 SUPPORT_UNAVAILABLE_TEXT = "Техподдержка временно не настроена. Попробуйте, пожалуйста, позже."
 SUPPORT_TEXT_REQUIRED = "Пожалуйста, опишите проблему текстом одним сообщением."
@@ -323,6 +328,7 @@ PROMO_CODES_STATE_FILE = Path(os.getenv("DIET_BOT_PROMO_CODES_STATE_FILE", str(D
 ADMIN_USER_IDS = _parse_id_set(os.getenv("DIET_BOT_ADMIN_USER_IDS"))
 TESTER_CHAT_IDS = _parse_id_set(os.getenv("DIET_BOT_TESTER_CHAT_IDS"))
 TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "").strip()
+PUBLIC_PAYMENTS_ENABLED = os.getenv("DIET_BOT_PUBLIC_PAYMENTS_ENABLED", "").strip() == "1"
 SUPPORT_CHAT_ID = _parse_optional_int(os.getenv("DIET_BOT_SUPPORT_CHAT_ID")) or DEFAULT_SUPPORT_CHAT_ID
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
@@ -999,6 +1005,7 @@ def _initialize_runtime_store(config: RuntimeConfig) -> DietBotStore | None:
 def _apply_runtime_config(config: RuntimeConfig) -> None:
     global ADMIN_USER_IDS
     global PROMO_CODES_STATE_FILE
+    global PUBLIC_PAYMENTS_ENABLED
     global STATE_FILE
     global SUBSCRIPTIONS_STATE_FILE
     global SUPPORT_CHAT_ID
@@ -1011,6 +1018,7 @@ def _apply_runtime_config(config: RuntimeConfig) -> None:
     ADMIN_USER_IDS = set(config.admin_user_ids)
     TESTER_CHAT_IDS = set(config.tester_chat_ids)
     TELEGRAM_PROVIDER_TOKEN = config.telegram_provider_token
+    PUBLIC_PAYMENTS_ENABLED = config.public_payments_enabled
     SUPPORT_CHAT_ID = config.support_chat_id or DEFAULT_SUPPORT_CHAT_ID
 
 
@@ -2344,14 +2352,27 @@ def _profile_from_dict(raw: dict[str, object]) -> UserProfile | None:
 
 
 def _start_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=TRY_FREE_TEXT, callback_data=CALLBACK_START)],
-            [InlineKeyboardButton(text=SUBSCRIBE_MONTH_TEXT, callback_data=CALLBACK_SUBSCRIBE)],
+    buttons = [
+        [InlineKeyboardButton(text=TRY_FREE_TEXT, callback_data=CALLBACK_START)],
+    ]
+    if _public_payments_enabled():
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=SUBSCRIBE_MONTH_TEXT,
+                    callback_data=CALLBACK_SUBSCRIBE,
+                ),
+            ]
+        )
+    buttons.extend(
+        [
             [InlineKeyboardButton(text=FEATURES_TEXT, callback_data=CALLBACK_FEATURES)],
             [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons,
     )
 
 
@@ -2442,10 +2463,42 @@ def _payment_result_keyboard(chat_id: int, result: PaymentApplication) -> Inline
     return _subscription_payment_keyboard()
 
 
+def _public_payments_enabled() -> bool:
+    return PUBLIC_PAYMENTS_ENABLED
+
+
+def _public_payments_disabled_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
+        ],
+    )
+
+
+def _subscription_payment_text() -> str:
+    if _public_payments_enabled():
+        return SUBSCRIPTION_PAYMENT_TEXT
+    return (
+        "FoodBalance - цифровой сервис персональных рационов питания.\n\n"
+        f"{PUBLIC_PAYMENTS_PILOT_TEXT}\n\n"
+        "В месячный доступ входит:\n"
+        f"• {MONTHLY_WEEKLY_PDF_LIMIT} недельных PDF-рациона\n"
+        f"• {MONTHLY_ONE_DAY_LIMIT} рационов на 1 день\n"
+        "• рецепты и список продуктов по анкете"
+    )
+
+
+async def _send_public_payments_disabled_notice(message: Message) -> None:
+    await message.answer(
+        PUBLIC_PAYMENTS_PILOT_TEXT,
+        reply_markup=_public_payments_disabled_keyboard(),
+    )
+
+
 async def _send_subscription_payment_options(message: Message) -> None:
     if await _send_active_subscription_notice_if_needed(message):
         return
-    await message.answer(SUBSCRIPTION_PAYMENT_TEXT, reply_markup=_subscription_payment_keyboard())
+    await message.answer(_subscription_payment_text(), reply_markup=_subscription_payment_keyboard())
 
 
 async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
@@ -2468,6 +2521,13 @@ async def _send_extra_purchase_subscription_notice_if_needed(message: Message) -
 
 
 async def _send_extra_purchase_subscription_required_message(message: Message) -> None:
+    if not _public_payments_enabled():
+        await message.answer(
+            "Разовые покупки доступны только при активном месячном доступе.\n\n"
+            f"{PUBLIC_PAYMENTS_PILOT_TEXT}",
+            reply_markup=_public_payments_disabled_keyboard(),
+        )
+        return
     await message.answer(
         "Разовые покупки доступны только при активной подписке.\n\n"
         "Чтобы продолжить, оформите месячный доступ.",
@@ -2562,6 +2622,9 @@ def _mark_payment_order_invoice_creation_failed(order: PaymentOrder) -> None:
 
 
 async def _send_stars_invoice_link(message: Message, payload: str) -> None:
+    if not _public_payments_enabled():
+        await _send_public_payments_disabled_notice(message)
+        return
     provider = _payment_provider_for_payload(payload)
     product = _payment_product_for_payload(payload)
     if provider != PaymentProvider.TELEGRAM_STARS or product is None:
@@ -2608,6 +2671,9 @@ async def _send_stars_invoice_link(message: Message, payload: str) -> None:
 
 
 async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
+    if not _public_payments_enabled():
+        await _send_public_payments_disabled_notice(message)
+        return
     provider_token = TELEGRAM_PROVIDER_TOKEN.strip()
     if not provider_token:
         await message.answer(_ru_card_payment_unavailable_text(payload))
@@ -3734,20 +3800,27 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
     if next_renewal:
         lines.extend(["", next_renewal])
     if has_active_subscription:
-        lines.extend(
-            [
-                "",
-                "Можно дождаться следующего обновления подписки или купить разовую попытку.",
-            ],
-        )
-        reply_markup = _paywall_keyboard(preferred=ration_kind)
+        if _public_payments_enabled():
+            lines.extend(
+                [
+                    "",
+                    "Можно дождаться следующего обновления подписки или купить разовую попытку.",
+                ],
+            )
+            reply_markup = _paywall_keyboard(preferred=ration_kind)
+        else:
+            lines.extend(["", PUBLIC_PAYMENTS_PILOT_TEXT])
+            reply_markup = _public_payments_disabled_keyboard()
     else:
-        lines.extend(
-            [
-                "",
-                "Чтобы продолжить, оформите месячный доступ.",
-            ],
-        )
+        if _public_payments_enabled():
+            lines.extend(
+                [
+                    "",
+                    "Чтобы продолжить, оформите месячный доступ.",
+                ],
+            )
+        else:
+            lines.extend(["", PUBLIC_PAYMENTS_PILOT_TEXT])
         reply_markup = _subscription_payment_keyboard()
     await message.answer(
         "\n".join(lines),
@@ -3756,6 +3829,8 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
 
 
 def _subscription_payment_keyboard() -> InlineKeyboardMarkup:
+    if not _public_payments_enabled():
+        return _public_payments_disabled_keyboard()
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=PAY_WITH_RU_CARD_TEXT, callback_data=CALLBACK_PAY_RU_CARD)],
@@ -3766,6 +3841,8 @@ def _subscription_payment_keyboard() -> InlineKeyboardMarkup:
 
 
 def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:
+    if not _public_payments_enabled():
+        return _public_payments_disabled_keyboard()
     extra_one_day_stars_button = InlineKeyboardButton(
         text=BUY_EXTRA_ONE_DAY_TEXT,
         callback_data=CALLBACK_BUY_EXTRA_ONE_DAY,
@@ -3808,6 +3885,8 @@ def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:
 
 
 def _trial_subscription_keyboard() -> InlineKeyboardMarkup:
+    if not _public_payments_enabled():
+        return _public_payments_disabled_keyboard()
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=SUBSCRIBE_CTA_TEXT, callback_data=CALLBACK_SUBSCRIBE)],

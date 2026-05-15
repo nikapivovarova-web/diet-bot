@@ -13,6 +13,8 @@ Use this checklist from the clean worktree before publishing a Telegram bot rele
 - For local/dev JSON smoke, confirm `DIET_BOT_ALLOW_JSON_STORAGE=1` is set.
 - For production-like smoke, confirm `DIET_BOT_DATABASE_URL` is set and local JSON fallback is not the active storage path.
 - Leave `TELEGRAM_PROVIDER_TOKEN` empty unless card-payment smoke is explicitly being tested with a Telegram/YooKassa test provider token.
+- For pilot releases, confirm `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`; public YooKassa/Stars payment buttons must stay hidden and access must be via promo code or admin monthly-access code.
+- For paid-mode releases, set `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` only after real YooKassa and Telegram Stars provider smoke is explicitly approved, run, and recorded.
 
 ## 2. Healthcheck
 
@@ -59,6 +61,7 @@ $env:DIET_BOT_ENV = "development"
 $env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 $env:DIET_BOT_TOKEN = "replace-with-telegram-bot-token"
 $env:TELEGRAM_PROVIDER_TOKEN = ""
+$env:DIET_BOT_PUBLIC_PAYMENTS_ENABLED = "0"
 
 & $py -m diet_bot.telegram_app
 ```
@@ -77,17 +80,23 @@ Expected: the process starts polling without a startup config error.
 - If `DIET_BOT_TESTER_CHAT_IDS` or an active subscription is configured, request the weekly PDF ration; confirm Telegram receives a document attachment with a PDF file.
 - For weekly PDF failures, confirm the bot shows a PDF failure/status message and does not send a text weekly-menu fallback.
 - Confirm weekly PDF success sends only the PDF document plus its caption; no text fallback menu should appear before or after the document.
-- If `TELEGRAM_PROVIDER_TOKEN` is empty, confirm card payment attempts do not create a broken invoice and the user receives a configuration message.
-- If `TELEGRAM_PROVIDER_TOKEN` is set to a test provider token, smoke one card invoice link with test credentials only.
+- In pilot mode with `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`, open the subscription/paywall path and confirm no YooKassa/card or Telegram Stars invoice buttons are visible.
+- In pilot mode, confirm the user sees clear promo access text and the `Ввести промокод` button remains available.
+- In pilot mode, confirm admin-created monthly access promo codes still grant access.
+- If `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` and `TELEGRAM_PROVIDER_TOKEN` is empty, confirm card payment attempts do not create a broken invoice and the user receives a configuration message.
+- If `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` and `TELEGRAM_PROVIDER_TOKEN` is set to a test provider token, smoke one card invoice link with test credentials only.
 
 ## 6. Payment Happy Path Smoke
 
 Run this only against a staging/prod-like deployment after durable payment order/event storage and payment handler wiring are present. This is a happy-path and safety smoke before refund/admin reconciliation wiring; it is not production launch approval.
 
+Paid public release remains blocked while `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`. Enabling it for public users requires this smoke to pass with recorded YooKassa and Telegram Stars evidence.
+
 ### Preflight Production-Like Config
 
 - Confirm the bot build, branch, commit, deployment target, and `DIET_BOT_ENV` value.
 - Confirm `DIET_BOT_DATABASE_URL` is configured for the production-like environment.
+- Confirm `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` only for this paid-mode smoke and that the pilot-mode disabling evidence is already recorded for any pilot release.
 - Confirm the deployment uses durable DB-backed storage for payment orders, payment events, processed provider charges, entitlements, promo/test grants, and generation state.
 - Confirm production-like startup rejects JSON paid-state fallback and the active environment is not writing payment state to local JSON files.
 - Run strict healthcheck and save the exact redacted output.
@@ -147,4 +156,5 @@ Run this only against a staging/prod-like deployment after durable payment order
 - Record the fast-test command and result.
 - Record the full-test command and result if it was run for the release.
 - Record manual Telegram smoke results, including the weekly PDF-only check.
+- Record whether the release is pilot mode (`DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`, promo/admin access only) or paid mode (`DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1`).
 - Record payment happy-path smoke evidence only after the production-like payment stack exists and the smoke is actually run.

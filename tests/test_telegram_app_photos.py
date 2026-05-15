@@ -146,6 +146,11 @@ from diet_bot.telegram_app import (
 from diet_bot.questionnaire import start_session
 
 
+@pytest.fixture(autouse=True)
+def enabled_public_payment_buttons_for_legacy_telegram_tests(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+
 def test_photo_input_resolves_curated_local_photo() -> None:
     photo_path = next((DATA_DIR / "recipe_photos").glob("*.jpg"))
     meal = Meal(

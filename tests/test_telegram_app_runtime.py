@@ -212,6 +212,7 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
     touched_ids = {
         -100_510_001,
         -100_510_002,
@@ -701,6 +702,109 @@ def test_subscription_payment_keyboard_offers_promo_code_entry() -> None:
 
     assert len(promo_buttons) == 1
     assert promo_buttons[0].callback_data == telegram_app.CALLBACK_PROMO_CODE
+
+
+def test_subscription_payment_keyboard_hides_paid_buttons_when_public_payments_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", False, raising=False)
+
+    keyboard = telegram_app._subscription_payment_keyboard()
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert buttons == [
+        (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE),
+    ]
+    assert all(
+        callback
+        not in {
+            telegram_app.CALLBACK_PAY_RU_CARD,
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+        }
+        for _, callback in buttons
+    )
+
+
+def test_subscription_payment_keyboard_shows_paid_buttons_when_public_payments_enabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    keyboard = telegram_app._subscription_payment_keyboard()
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert buttons == [
+        (telegram_app.PAY_WITH_RU_CARD_TEXT, telegram_app.CALLBACK_PAY_RU_CARD),
+        (
+            telegram_app.PAY_WITH_TELEGRAM_STARS_TEXT,
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+        ),
+        (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "callback_data",
+    [
+        telegram_app.CALLBACK_PAY_RU_CARD,
+        telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+        telegram_app.CALLBACK_PAY_RU_EXTRA_ONE_DAY,
+        telegram_app.CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF,
+        telegram_app.CALLBACK_BUY_EXTRA_ONE_DAY,
+        telegram_app.CALLBACK_BUY_EXTRA_WEEKLY_PDF,
+    ],
+)
+async def test_public_payment_callbacks_show_pilot_promo_text_when_disabled(
+    monkeypatch,
+    callback_data: str,
+) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", False, raising=False)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    message = FakeMessage(51_021)
+
+    await telegram_app.handle_callback(FakeCallback(callback_data, message))
+
+    sent_text, markup = message.texts[-1]
+    buttons = [
+        (button.text, button.callback_data)
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+    assert "промокод" in sent_text.lower()
+    assert "пилот" in sent_text.lower()
+    assert buttons == [
+        (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE),
+    ]
+
+
+@pytest.mark.anyio
+async def test_public_payment_flag_does_not_expose_admin_payment_commands(
+    monkeypatch,
+) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.commands: tuple[object, ...] = ()
+
+        async def set_my_commands(self, commands) -> None:
+            self.commands = tuple(commands)
+
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", False, raising=False)
+    bot = FakeBot()
+
+    await telegram_app._set_bot_commands(bot)
+
+    command_names = [command.command for command in bot.commands]
+    assert "payment_event" not in command_names
+    assert "330366" not in command_names
 
 
 @pytest.mark.anyio
