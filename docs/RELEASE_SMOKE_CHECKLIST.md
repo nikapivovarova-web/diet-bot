@@ -10,6 +10,8 @@ Use this checklist from the clean worktree before publishing a Telegram bot rele
 - Confirm local `.env` exists only on the machine or deployment host and is not staged.
 - Confirm `DIET_BOT_ENV` is `development` or another non-production value for this clean runtime phase.
 - Confirm `DIET_BOT_TOKEN` is set to a test or release Telegram bot token.
+- For local/dev JSON smoke, confirm `DIET_BOT_ALLOW_JSON_STORAGE=1` is set.
+- For production-like smoke, confirm `DIET_BOT_DATABASE_URL` is set and local JSON fallback is not the active storage path.
 - Leave `TELEGRAM_PROVIDER_TOKEN` empty unless card-payment smoke is explicitly being tested with a Telegram/YooKassa test provider token.
 
 ## 2. Healthcheck
@@ -20,6 +22,7 @@ From `C:\Users\adck8\Documents\New project 2 CLEAN`:
 $py = "C:\Users\adck8\Documents\New project 2\.venv\Scripts\python.exe"
 $env:PYTHONPATH = "src"
 $env:DIET_BOT_ENV = "development"
+$env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 
 & $py -m diet_bot.healthcheck --package-data-only
 & $py -m diet_bot.healthcheck
@@ -53,6 +56,7 @@ Set-Location "C:\Users\adck8\Documents\New project 2 CLEAN"
 $py = "C:\Users\adck8\Documents\New project 2\.venv\Scripts\python.exe"
 $env:PYTHONPATH = "src"
 $env:DIET_BOT_ENV = "development"
+$env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 $env:DIET_BOT_TOKEN = "replace-with-telegram-bot-token"
 $env:TELEGRAM_PROVIDER_TOKEN = ""
 
@@ -83,6 +87,7 @@ Run this only against a staging/prod-like deployment after durable payment order
 ### Preflight Production-Like Config
 
 - Confirm the bot build, branch, commit, deployment target, and `DIET_BOT_ENV` value.
+- Confirm `DIET_BOT_DATABASE_URL` is configured for the production-like environment.
 - Confirm the deployment uses durable DB-backed storage for payment orders, payment events, processed provider charges, entitlements, promo/test grants, and generation state.
 - Confirm production-like startup rejects JSON paid-state fallback and the active environment is not writing payment state to local JSON files.
 - Run strict healthcheck and save the exact redacted output.

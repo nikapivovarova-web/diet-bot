@@ -41,7 +41,11 @@ async def test_weekly_pdf_limit_is_consumed_after_successful_delivery(monkeypatc
     _save_active_subscription(chat_id, weekly_pdf_remaining=1)
     plans = tuple(sample_meal_plan() for _ in range(7))
 
-    monkeypatch.setattr(telegram_app, "_build_week_plans", lambda *_args: plans)
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
     monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", lambda *_args: (b"%PDF-1.4\n%test", "week.pdf"))
 
     sent = await telegram_app._send_week_plan_with_access(message, profile_with())
@@ -59,7 +63,11 @@ async def test_weekly_pdf_render_failure_does_not_consume_limit_or_send_text_fal
     _save_active_subscription(chat_id, weekly_pdf_remaining=1)
     plans = tuple(sample_meal_plan() for _ in range(7))
 
-    monkeypatch.setattr(telegram_app, "_build_week_plans", lambda *_args: plans)
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
     monkeypatch.setattr(
         telegram_app,
         "_build_week_pdf_payload",
@@ -87,7 +95,11 @@ async def test_weekly_pdf_size_guard_does_not_consume_limit_or_send_text_fallbac
     _save_active_subscription(chat_id, weekly_pdf_remaining=1)
     plans = tuple(sample_meal_plan() for _ in range(7))
 
-    monkeypatch.setattr(telegram_app, "_build_week_plans", lambda *_args: plans)
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
     monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", lambda *_args: (b"%PDF-1.4\n" + b"x" * 32, "large.pdf"))
     monkeypatch.setattr(telegram_app, "TELEGRAM_DOCUMENT_MAX_BYTES", 16, raising=False)
 
@@ -170,18 +182,22 @@ def _save_active_subscription(chat_id: int, *, weekly_pdf_remaining: int) -> Ent
 
 
 def sample_meal_plan() -> MealPlan:
-    meal = sample_meal()
+    meals = tuple(sample_meal() for _ in range(4))
     targets = NutritionTargets(
         bmi=22.0,
         bmi_category="normal",
         bmr_kcal=1500,
         tdee_kcal=2000,
         water_l=2.0,
-        targets=meal.nutrients,
+        targets=meals[0].nutrients,
         calorie_bounds=(1400, 2200),
         macro_bounds={},
     )
-    return MealPlan((meal,), targets, SafetyResult(can_generate_plan=True))
+    return MealPlan(meals, targets, SafetyResult(can_generate_plan=True))
+
+
+def _week_plan_build_result(plans: tuple[MealPlan, ...]) -> telegram_app._WeekPlanBuildResult:
+    return telegram_app._WeekPlanBuildResult(plans=plans, avoidance_phase="full_recent")
 
 
 def sample_meal() -> Meal:

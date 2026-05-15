@@ -876,6 +876,7 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
     ]
 
 
@@ -957,6 +958,7 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
     ]
 
 
@@ -2653,8 +2655,11 @@ def _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes: bytes | None = b"%PD
     pdf_path = tmp_path / "week.pdf"
     plans = _telegram_week_plan_fixture()
 
-    def fake_build_week_plans(*_args, **_kwargs):
-        return plans
+    def fake_build_week_plans_with_recent_fallback(*_args, **_kwargs):
+        return telegram_app._WeekPlanBuildResult(
+            plans=plans,
+            avoidance_phase="full_recent",
+        )
 
     def fake_build_week_plan_pdf(_plans, _plan_dates):
         if pdf_bytes is None:
@@ -2664,7 +2669,11 @@ def _patch_fast_week_plan(monkeypatch, tmp_path, pdf_bytes: bytes | None = b"%PD
 
     monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
-    monkeypatch.setattr(telegram_app, "_build_week_plans", fake_build_week_plans)
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        fake_build_week_plans_with_recent_fallback,
+    )
     monkeypatch.setattr(telegram_app, "build_week_plan_pdf", fake_build_week_plan_pdf)
     monkeypatch.setattr(
         telegram_app,

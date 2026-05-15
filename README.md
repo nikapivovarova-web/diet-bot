@@ -6,11 +6,11 @@ The current clean release state focuses on:
 
 - deterministic nutrition planning for one-day rations;
 - Telegram polling with `/start`, `/plan`, and `/cancel`;
-- local JSON state files for history, subscriptions, and promo codes;
+- explicit local/dev JSON state files for history, subscriptions, and promo codes;
 - a fast local healthcheck for package data and runtime config;
 - weekly ration delivery as a PDF document only.
 
-Postgres/durable production storage is not part of this clean runtime phase. Do not run this branch with `DIET_BOT_ENV=production`; the runtime guard rejects production mode until durable storage is implemented.
+Runtime storage must be selected explicitly. Local/dev JSON storage requires `DIET_BOT_ALLOW_JSON_STORAGE=1`; production-like or durable runs require `DIET_BOT_DATABASE_URL`.
 
 ## Local Environment
 
@@ -21,6 +21,7 @@ Required for local bot polling:
 - `PYTHONPATH=src` when running from source without installing the package.
 - `DIET_BOT_ENV=development` or another non-production value.
 - `DIET_BOT_TOKEN=<telegram bot token>` from BotFather.
+- Storage choice: set `DIET_BOT_ALLOW_JSON_STORAGE=1` for local/dev JSON, or set `DIET_BOT_DATABASE_URL=<postgresql://...>` for production-like durable storage.
 
 Optional local settings:
 
@@ -33,7 +34,7 @@ Optional local settings:
 - `DIET_BOT_SUBSCRIPTIONS_STATE_FILE`: default `.diet_bot_state/subscriptions.json`.
 - `DIET_BOT_PROMO_CODES_STATE_FILE`: default `.diet_bot_state/promo_codes.json`.
 
-No Postgres, database URL, payment webhook, or PDF service env is required in this clean state.
+No payment webhook or external PDF service env is required in this clean state. Do not rely on implicit JSON fallback; set either `DIET_BOT_ALLOW_JSON_STORAGE=1` for local/dev JSON or `DIET_BOT_DATABASE_URL` for production-like storage.
 
 ## Run Telegram Bot Locally
 
@@ -45,6 +46,7 @@ Set-Location "C:\Users\adck8\Documents\New project 2 CLEAN"
 $py = "C:\Users\adck8\Documents\New project 2\.venv\Scripts\python.exe"
 $env:PYTHONPATH = "src"
 $env:DIET_BOT_ENV = "development"
+$env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 $env:DIET_BOT_TOKEN = "replace-with-telegram-bot-token"
 $env:TELEGRAM_PROVIDER_TOKEN = ""
 
@@ -69,6 +71,7 @@ Default local runtime healthcheck:
 $py = "C:\Users\adck8\Documents\New project 2\.venv\Scripts\python.exe"
 $env:PYTHONPATH = "src"
 $env:DIET_BOT_ENV = "development"
+$env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 & $py -m diet_bot.healthcheck
 ```
 
