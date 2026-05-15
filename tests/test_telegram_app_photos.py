@@ -199,7 +199,10 @@ async def test_promo_code_button_asks_for_code(monkeypatch, tmp_path) -> None:
 
         assert callback.answers == [None]
         assert chat_id in PROMO_CODE_REQUEST_CHAT_IDS
-        assert message.texts[-1] == (PROMO_CODE_PROMPT_TEXT, None)
+        assert message.texts[-1] == (
+            telegram_app._promo_code_retry_text(PROMO_CODE_PROMPT_TEXT),
+            None,
+        )
     finally:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
 
@@ -258,7 +261,10 @@ async def test_promo_code_replay_is_rejected_without_extending(monkeypatch, tmp_
         await handle_answer(replay_message)
 
         entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
-        assert replay_message.texts[-1] == (telegram_app.PROMO_CODE_ALREADY_USED_TEXT, None)
+        assert replay_message.texts[-1] == (
+            telegram_app._promo_code_retry_text(telegram_app.PROMO_CODE_ALREADY_USED_TEXT),
+            None,
+        )
         assert entitlement.subscription_period_end == first_end
     finally:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
@@ -307,7 +313,10 @@ async def test_promo_code_activation_rejects_non_redeemable_access_codes(
 
             await handle_answer(message)
 
-            assert message.texts[-1] == (expected_text, None)
+            assert message.texts[-1] == (
+                telegram_app._promo_code_retry_text(expected_text),
+                None,
+            )
             assert chat_id not in telegram_app.load_entitlements(subscriptions_path)
             assert load_promo_codes(promo_path)[code].used_by_chat_id is None
     finally:

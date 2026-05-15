@@ -72,6 +72,34 @@ Scope: focused local smoke/check slice for promocode recovery commits. No runtim
   - Fake invoice links created: `2`.
   - Real payments performed: `false`.
 
+## 2026-05-15 User-Facing Flow Follow-up
+
+Scope: Telegram user-facing promo code entry for payment/subscription UX only. No planner, recipes, PDF, payment core, storage migrations, admin promo panel changes, push, or real YooKassa/Telegram Stars payments were performed.
+
+Checked:
+
+- subscription/payment keyboard now exposes the existing `Ввести промокод` entry point;
+- promo prompt and retryable errors mention `/cancel`;
+- monthly access code redemption through the user flow grants active monthly access;
+- invalid code keeps the input state so the user can retry or cancel;
+- discount code entered by the user is remembered and passed to the next fake YooKassa subscription invoice/order;
+- `/cancel` exits promo input without deleting the saved profile.
+
+Commands run:
+
+- `.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider --basetemp .pytest_tmp_telegram_runtime tests/test_telegram_app_runtime.py`
+- `.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider --basetemp .pytest_tmp_telegram_photos_promo tests/test_telegram_app_photos.py -k "promo or discount"`
+- `.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider --basetemp .pytest_tmp_promo_codes tests/test_promo_codes.py`
+- `.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider --basetemp .pytest_tmp_payment_promo tests/test_payments_model.py -k "promo or discount"`
+
+Results:
+
+- Telegram runtime handler tests: `40 passed`.
+- Telegram promo/photo subset: `10 passed, 86 deselected`.
+- Promo model tests: `9 passed`.
+- Payment promo subset: `2 passed, 96 deselected`.
+- Real payments performed: `false`.
+
 ## Postgres Lane
 
 Local Postgres lane was not available in this shell:

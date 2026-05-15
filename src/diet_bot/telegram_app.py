@@ -1062,12 +1062,16 @@ async def _start_promo_code_request(message: Message) -> None:
     SESSION_BY_CHAT_ID.pop(message.chat.id, None)
     TRIAL_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.add(message.chat.id)
-    await message.answer(PROMO_CODE_PROMPT_TEXT)
+    await message.answer(_promo_code_retry_text(PROMO_CODE_PROMPT_TEXT))
+
+
+def _promo_code_retry_text(text: str) -> str:
+    return f"{text}\n\nДля отмены отправьте /cancel."
 
 
 async def _handle_promo_code_request(message: Message, text: str) -> None:
     if not text:
-        await message.answer(PROMO_CODE_EMPTY_TEXT)
+        await message.answer(_promo_code_retry_text(PROMO_CODE_EMPTY_TEXT))
         return
 
     activation = _activate_promo_code_for_chat(message.chat.id, text)
@@ -1079,13 +1083,13 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
         )
         return
     if activation.status == "already_used":
-        await message.answer(PROMO_CODE_ALREADY_USED_TEXT)
+        await message.answer(_promo_code_retry_text(PROMO_CODE_ALREADY_USED_TEXT))
         return
     if activation.status == "disabled":
-        await message.answer(PROMO_CODE_DISABLED_TEXT)
+        await message.answer(_promo_code_retry_text(PROMO_CODE_DISABLED_TEXT))
         return
     if activation.status == "expired":
-        await message.answer(PROMO_CODE_EXPIRED_TEXT)
+        await message.answer(_promo_code_retry_text(PROMO_CODE_EXPIRED_TEXT))
         return
     if activation.status == "not_access_code":
         if _remember_discount_promo_code_for_chat(message.chat.id, text):
@@ -1095,9 +1099,9 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
                 reply_markup=_subscription_payment_keyboard(),
             )
             return
-        await message.answer(PROMO_CODE_NOT_ACCESS_TEXT)
+        await message.answer(_promo_code_retry_text(PROMO_CODE_NOT_ACCESS_TEXT))
         return
-    await message.answer(PROMO_CODE_NOT_FOUND_TEXT)
+    await message.answer(_promo_code_retry_text(PROMO_CODE_NOT_FOUND_TEXT))
 
 
 async def _handle_support_request(message: Message, text: str) -> None:
@@ -3756,6 +3760,7 @@ def _subscription_payment_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=PAY_WITH_RU_CARD_TEXT, callback_data=CALLBACK_PAY_RU_CARD)],
             [InlineKeyboardButton(text=PAY_WITH_TELEGRAM_STARS_TEXT, callback_data=CALLBACK_PAY_TELEGRAM_STARS)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
         ],
     )
 

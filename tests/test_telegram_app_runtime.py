@@ -233,6 +233,11 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_014,
         51_015,
         51_016,
+        51_017,
+        51_018,
+        51_019,
+        51_020,
+        51_021,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -673,8 +678,249 @@ async def test_promo_code_runtime_store_activation_grants_access_and_rejects_rep
     assert first_message.texts[-1][1].inline_keyboard[0][0].callback_data == (
         telegram_app.CALLBACK_ONE_DAY_PLAN
     )
-    assert replay_message.texts[-1] == (telegram_app.PROMO_CODE_ALREADY_USED_TEXT, None)
+    assert replay_message.texts[-1] == (
+        telegram_app._promo_code_retry_text(telegram_app.PROMO_CODE_ALREADY_USED_TEXT),
+        None,
+    )
     assert entitlement.subscription_period_end == first_end
+
+
+def test_subscription_payment_keyboard_offers_promo_code_entry() -> None:
+    keyboard = telegram_app._subscription_payment_keyboard()
+    buttons = [
+        button
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    promo_buttons = [
+        button
+        for button in buttons
+        if button.text == telegram_app.PROMO_CODE_TEXT
+    ]
+
+    assert len(promo_buttons) == 1
+    assert promo_buttons[0].callback_data == telegram_app.CALLBACK_PROMO_CODE
+
+
+@pytest.mark.anyio
+async def test_promo_code_button_monthly_access_flow_grants_access(
+    monkeypatch,
+) -> None:
+    chat_id = 51_017
+
+    class FakeMonthlyPromoStore:
+        def __init__(self) -> None:
+            self.entitlements: dict[int, telegram_app.Entitlement] = {}
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return self.entitlements.get(user_id, telegram_app.Entitlement())
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            entitlement: telegram_app.Entitlement,
+        ) -> None:
+            self.entitlements[user_id] = entitlement
+
+        def activate_promo_code(
+            self,
+            user_id: int,
+            raw_code: str,
+        ) -> telegram_app.PromoCodeActivation:
+            entitlement = self.get_entitlement(user_id)
+            telegram_app.apply_monthly_access_promo_grant(
+                entitlement,
+                telegram_app.promo_code_grant_charge_id(raw_code),
+            )
+            self.save_entitlement(user_id, entitlement)
+            return telegram_app.PromoCodeActivation("activated", raw_code, user_id)
+
+    store = FakeMonthlyPromoStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    start_message = FakeMessage(chat_id)
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PROMO_CODE, start_message)
+    )
+    input_message = FakeMessage(chat_id, text="FB-USER-FLOW-2026")
+    await telegram_app.handle_answer(input_message)
+
+    entitlement = store.get_entitlement(chat_id)
+    assert entitlement.is_subscription_active()
+    assert entitlement.monthly_one_day_remaining == telegram_app.MONTHLY_ONE_DAY_LIMIT
+    assert entitlement.monthly_weekly_pdf_remaining == telegram_app.MONTHLY_WEEKLY_PDF_LIMIT
+    assert chat_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+    assert input_message.texts[-1][1].inline_keyboard[0][0].callback_data == (
+        telegram_app.CALLBACK_ONE_DAY_PLAN
+    )
+
+
+@pytest.mark.anyio
+async def test_invalid_promo_code_message_keeps_retry_state_and_mentions_cancel(
+    monkeypatch,
+) -> None:
+    chat_id = 51_018
+
+    def fake_activation(
+        _chat_id: int,
+        _promo_code: str,
+    ) -> telegram_app.PromoCodeActivation:
+        return telegram_app.PromoCodeActivation("not_found", "UNKNOWN")
+
+    monkeypatch.setattr(telegram_app, "_activate_promo_code_for_chat", fake_activation)
+    telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+
+    message = FakeMessage(chat_id, text="wrong-code")
+    await telegram_app.handle_answer(message)
+
+    assert chat_id in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+    assert "/cancel" in message.texts[-1][0]
+
+
+@pytest.mark.anyio
+async def test_discount_promo_code_applies_to_next_yookassa_invoice(
+    monkeypatch,
+) -> None:
+    chat_id = 51_019
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/discounted"
+
+    class FakeDiscountPaymentStore:
+        def __init__(self) -> None:
+            self.entitlements: dict[int, telegram_app.Entitlement] = {}
+            self.created_orders: list[dict[str, object]] = []
+            self.invoice_links: list[tuple[str, str]] = []
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return self.entitlements.get(user_id, telegram_app.Entitlement())
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            entitlement: telegram_app.Entitlement,
+        ) -> None:
+            self.entitlements[user_id] = entitlement
+
+        def activate_promo_code(
+            self,
+            user_id: int,
+            raw_code: str,
+        ) -> telegram_app.PromoCodeActivation:
+            return telegram_app.PromoCodeActivation(
+                "not_access_code",
+                telegram_app.normalize_promo_code(raw_code),
+                user_id,
+            )
+
+        def get_promo_code(
+            self,
+            raw_code: str,
+            *,
+            active_only: bool = False,
+            now=None,
+        ) -> telegram_app.PromoCodeDefinition | None:
+            code = telegram_app.normalize_promo_code(raw_code)
+            if code != "ANNA20":
+                return None
+            promo = telegram_app.PromoCodeDefinition(
+                code="ANNA20",
+                kind=telegram_app.PromoCodeKind.DISCOUNT,
+                max_redemptions=10,
+                discount_percent=20,
+            )
+            return promo if not active_only or promo.is_active_at(now) else None
+
+        def create_or_reuse_pending_payment_order(
+            self,
+            *,
+            user_id: int,
+            delivery_chat_id: int | None,
+            provider: telegram_app.PaymentProvider,
+            product: telegram_app.PaymentProduct,
+            amount: int,
+            currency,
+            promo_code: str | None = None,
+        ):
+            discount_amount = 11_980
+            self.created_orders.append(
+                {
+                    "user_id": user_id,
+                    "delivery_chat_id": delivery_chat_id,
+                    "provider": provider,
+                    "product": product,
+                    "amount": amount,
+                    "currency": currency,
+                    "promo_code": promo_code,
+                }
+            )
+            order = telegram_app.PaymentOrder(
+                order_id="order_discounted",
+                nonce="nonce_discounted",
+                user_id=user_id,
+                delivery_chat_id=delivery_chat_id,
+                provider=provider,
+                product=product,
+                amount=amount - discount_amount,
+                currency=currency,
+                list_amount=amount,
+                discount_amount=discount_amount,
+                promo_code_id=7,
+                promo_code_hash="c" * 64,
+                promo_code_suffix="NA20",
+            )
+            return SimpleNamespace(
+                accepted=True,
+                code=telegram_app.PaymentOrderCreationCode.CREATED,
+                order=order,
+            )
+
+        def mark_payment_order_invoice_link(
+            self,
+            order_id: str,
+            invoice_link: str,
+        ) -> None:
+            self.invoice_links.append((order_id, invoice_link))
+
+    store = FakeDiscountPaymentStore()
+    bot = FakeInvoiceBot()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PROMO_CODE, FakeMessage(chat_id))
+    )
+    await telegram_app.handle_answer(FakeMessage(chat_id, text="anna20"))
+
+    payment_message = FakeMessage(chat_id)
+    payment_message.bot = bot
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PAY_RU_CARD, payment_message)
+    )
+
+    assert store.created_orders[0]["promo_code"] == "ANNA20"
+    assert bot.calls[0]["prices"][0].amount == 47_920
+    assert store.invoice_links == [("order_discounted", "https://invoice.test/discounted")]
+    assert chat_id not in telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID
+
+
+@pytest.mark.anyio
+async def test_cancel_exits_promo_input_without_deleting_saved_profile() -> None:
+    chat_id = 51_020
+    profile = profile_with()
+    telegram_app.PROFILE_BY_CHAT_ID[chat_id] = profile
+    telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+
+    await telegram_app.cancel(FakeMessage(chat_id, text="/cancel"))
+
+    assert chat_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+    assert telegram_app.PROFILE_BY_CHAT_ID[chat_id] is profile
 
 
 @pytest.mark.anyio
