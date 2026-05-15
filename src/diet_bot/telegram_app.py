@@ -1817,7 +1817,7 @@ def _select_week_day_plan(
 ) -> tuple[MealPlan, dict[str, "_BatchCarryover"]]:
     best_plan: MealPlan | None = None
     best_carryovers: dict[str, _BatchCarryover] | None = None
-    best_score: tuple[float, int] | None = None
+    best_score: tuple[float, float, float, int] | None = None
     rejected_plan: MealPlan | None = None
     for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
         plan = build_one_day_plan(
@@ -1844,7 +1844,7 @@ def _select_week_day_plan(
         ):
             rejected_plan = rejected_plan or plan
             continue
-        score = (_ingredient_reuse_score(plan, week_food_ids), -candidate_index)
+        score = _weekly_day_selection_score(plan, week_food_ids, candidate_index)
         if best_score is None or score > best_score:
             best_plan = plan
             best_carryovers = candidate_carryovers
@@ -1929,6 +1929,33 @@ def _ingredient_reuse_score(plan: MealPlan, week_food_ids: set[str]) -> float:
         if portion.food.id in week_food_ids
     )
     return len(reused) * 2.0 + shared_grams / 200.0 - len(new_items) * 4.0
+
+
+def _weekly_day_selection_score(
+    plan: MealPlan,
+    week_food_ids: set[str],
+    candidate_index: int,
+) -> tuple[float, float, float, int]:
+    in_calorie_band, calorie_gap = _calorie_fit(plan)
+    return (
+        1.0 if in_calorie_band else 0.0,
+        -calorie_gap,
+        _ingredient_reuse_score(plan, week_food_ids),
+        -candidate_index,
+    )
+
+
+def _calorie_fit(plan: MealPlan) -> tuple[bool, float]:
+    energy = plan.totals.get("energy_kcal")
+    target = plan.targets.targets.get("energy_kcal")
+    lower, upper = plan.targets.calorie_bounds
+    denominator = max(target, 1.0)
+
+    if lower <= energy <= upper:
+        return True, abs(energy - target) / denominator
+    if energy < lower:
+        return False, (lower - energy) / denominator
+    return False, (energy - upper) / denominator
 
 
 @dataclass
