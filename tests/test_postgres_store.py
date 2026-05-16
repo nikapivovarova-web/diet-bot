@@ -1128,12 +1128,25 @@ def test_postgres_payment_order_pre_checkout_approval_round_trips_without_entitl
 
 
 def test_postgres_successful_payment_applies_order_and_records_charge_aliases() -> None:
-    from diet_bot.payments import PaymentSuccessfulPaymentCode, PaymentSuccessfulPaymentInput
+    from diet_bot.payments import (
+        PaymentProduct,
+        PaymentProvider,
+        PaymentSuccessfulPaymentCode,
+        PaymentSuccessfulPaymentInput,
+        get_payment_product_invoice_metadata,
+    )
     from diet_bot.subscriptions import MONTHLY_ONE_DAY_LIMIT, MONTHLY_WEEKLY_PDF_LIMIT
 
     store = _store()
     user_id = _unique_user_id()
     order_id = f"order-{uuid.uuid4().hex}"
+    charge_suffix = uuid.uuid4().hex
+    telegram_charge_id = f"tg-charge-ru1-{charge_suffix}"
+    provider_charge_id = f"provider-charge-ru1-{charge_suffix}"
+    product_metadata = get_payment_product_invoice_metadata(
+        PaymentProvider.YOOKASSA,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+    )
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
     try:
         store.create_payment_order(
@@ -1141,23 +1154,23 @@ def test_postgres_successful_payment_applies_order_and_records_charge_aliases() 
             nonce="nonce-ok1",
             user_id=user_id,
             delivery_chat_id=user_id + 10,
-            product="subscription_month",
-            provider="yookassa",
-            amount=59_900,
-            currency="RUB",
+            product=product_metadata.product.value,
+            provider=product_metadata.provider.value,
+            amount=product_metadata.amount,
+            currency=product_metadata.currency.value,
             expires_at=now + timedelta(minutes=5),
         )
         order = store.load_payment_order(order_id)
         assert order is not None
         payment = PaymentSuccessfulPaymentInput(
             payload=order.payload,
-            provider="yookassa",
-            telegram_charge_id="tg-charge-ru1",
-            provider_charge_id="provider-charge-ru1",
+            provider=product_metadata.provider,
+            telegram_charge_id=telegram_charge_id,
+            provider_charge_id=provider_charge_id,
             user_id=user_id,
             delivery_chat_id=user_id + 10,
-            currency="RUB",
-            total_amount=59_900,
+            currency=product_metadata.currency,
+            total_amount=product_metadata.amount,
             raw_payload={"email": "buyer@example.com", "invoice_payload": order.payload},
         )
 
@@ -1197,7 +1210,7 @@ def test_postgres_successful_payment_applies_order_and_records_charge_aliases() 
         assert paid_order.status == "paid"
         assert entitlement.monthly_one_day_remaining == MONTHLY_ONE_DAY_LIMIT
         assert entitlement.monthly_weekly_pdf_remaining == MONTHLY_WEEKLY_PDF_LIMIT
-        assert charge_ids == ["provider-charge-ru1", "tg-charge-ru1"]
+        assert charge_ids == [provider_charge_id, telegram_charge_id]
         assert [event["status"] for event in events] == ["processed", "duplicate"]
         assert events[0]["reason"] is None
         assert "buyer@example.com" not in str(events[0]["raw_payload_redacted"])
@@ -1214,6 +1227,7 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
         PaymentProvider,
         PaymentSuccessfulPaymentCode,
         PaymentSuccessfulPaymentInput,
+        get_payment_product_invoice_metadata,
         validate_payment_pre_checkout,
     )
     from diet_bot.promo_codes import PromoCodeDefinition, PromoCodeKind
@@ -1222,6 +1236,15 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
     user_id = _unique_user_id()
     second_user_id = _unique_user_id()
     code = _unique_promo_code()
+    charge_suffix = uuid.uuid4().hex
+    telegram_charge_id = f"tg-charge-discount1-{charge_suffix}"
+    provider_charge_id = f"provider-charge-discount1-{charge_suffix}"
+    product_metadata = get_payment_product_invoice_metadata(
+        PaymentProvider.YOOKASSA,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+    )
+    discount_amount = product_metadata.amount * 20 // 100
+    final_amount = product_metadata.amount - discount_amount
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
     try:
         store.create_promo_code(
@@ -1239,8 +1262,8 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
             delivery_chat_id=user_id + 10,
             provider=PaymentProvider.YOOKASSA,
             product=PaymentProduct.SUBSCRIPTION_MONTH,
-            amount=59_900,
-            currency=PaymentCurrency.RUB,
+            amount=product_metadata.amount,
+            currency=product_metadata.currency,
             promo_code=code,
             now=now,
         )
@@ -1249,8 +1272,8 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
             delivery_chat_id=user_id + 10,
             provider=PaymentProvider.YOOKASSA,
             product=PaymentProduct.SUBSCRIPTION_MONTH,
-            amount=59_900,
-            currency=PaymentCurrency.RUB,
+            amount=product_metadata.amount,
+            currency=product_metadata.currency,
             promo_code=code,
             now=now + timedelta(minutes=1),
         )
@@ -1259,8 +1282,8 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
             delivery_chat_id=second_user_id + 10,
             provider=PaymentProvider.YOOKASSA,
             product=PaymentProduct.SUBSCRIPTION_MONTH,
-            amount=59_900,
-            currency=PaymentCurrency.RUB,
+            amount=product_metadata.amount,
+            currency=product_metadata.currency,
             promo_code=code,
             now=now,
         )
@@ -1272,9 +1295,9 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
         assert exhausted.code == PaymentOrderCreationCode.PROMO_ALREADY_USED
         order = first.order
         assert order is not None
-        assert order.amount == 47_920
-        assert order.list_amount == 59_900
-        assert order.discount_amount == 11_980
+        assert order.amount == final_amount
+        assert order.list_amount == product_metadata.amount
+        assert order.discount_amount == discount_amount
         assert order.promo_code_id is not None
         assert order.promo_redemption_id is not None
         assert order.promo_code_suffix == code[-4:]
@@ -1284,15 +1307,15 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
         assert len(redemptions) == 1
         assert redemptions[0]["status"] == "reserved"
         assert redemptions[0]["order_id"] == order.order_id
-        assert redemptions[0]["discount_amount"] == 11_980
+        assert redemptions[0]["discount_amount"] == discount_amount
         assert code not in str(redemptions[0]["metadata_json"])
 
         pre_checkout = validate_payment_pre_checkout(
             store,
             payload=order.payload,
             user_id=user_id,
-            currency=PaymentCurrency.RUB,
-            total_amount=47_920,
+            currency=product_metadata.currency,
+            total_amount=final_amount,
             expected_provider=PaymentProvider.YOOKASSA,
             expected_product=PaymentProduct.SUBSCRIPTION_MONTH,
             now=now,
@@ -1300,12 +1323,12 @@ def test_postgres_discount_promo_reserves_order_and_redeems_on_successful_paymen
         payment = PaymentSuccessfulPaymentInput(
             payload=order.payload,
             provider=PaymentProvider.YOOKASSA,
-            telegram_charge_id="tg-charge-discount1",
-            provider_charge_id="provider-charge-discount1",
+            telegram_charge_id=telegram_charge_id,
+            provider_charge_id=provider_charge_id,
             user_id=user_id,
             delivery_chat_id=user_id + 10,
-            currency=PaymentCurrency.RUB,
-            total_amount=47_920,
+            currency=product_metadata.currency,
+            total_amount=final_amount,
         )
         success = store.apply_successful_payment(payment, now=now)
         duplicate = store.apply_successful_payment(payment, now=now + timedelta(seconds=10))

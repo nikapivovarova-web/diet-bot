@@ -1056,6 +1056,53 @@ MANAGED_SUBSCRIPTION_STATE_MIGRATION = PostgresMigration(
 )
 
 
+PROMO_KIND_CONSTRAINT_COMPATIBILITY_MIGRATION = PostgresMigration(
+    version="202605170001",
+    description="Replace legacy promo kind constraint",
+    statements=(
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE promo_codes
+            DROP CONSTRAINT IF EXISTS chk_promo_codes_kind_allowed;
+
+            ALTER TABLE promo_codes
+            DROP CONSTRAINT IF EXISTS promo_codes_kind_check;
+
+            ALTER TABLE promo_codes
+            DROP CONSTRAINT IF EXISTS promo_codes_kind_supported_check;
+
+            ALTER TABLE promo_codes
+            ADD CONSTRAINT promo_codes_kind_supported_check
+            CHECK (kind IN (
+                'monthly_access',
+                'discount',
+                'subscription_month',
+                'extra_one_day',
+                'extra_weekly_pdf',
+                'test_access_days'
+            ));
+        END $$;
+        """,
+    ),
+)
+
+
+POSTGRES_LEGACY_LEDGER_COMPATIBILITY_MIGRATION = PostgresMigration(
+    version="202605170002",
+    description="Drop legacy ledger constraints",
+    statements=(
+        """
+        ALTER TABLE entitlement_events
+        DROP CONSTRAINT IF EXISTS chk_entitlement_events_source_allowed
+        """,
+        """
+        DROP INDEX IF EXISTS uniq_payment_events_provider_charge_type
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
@@ -1064,6 +1111,8 @@ POSTGRES_MIGRATIONS = (
     PROMO_PAYMENT_DISCOUNT_MIGRATION,
     RECIPE_HISTORY_MIGRATION,
     MANAGED_SUBSCRIPTION_STATE_MIGRATION,
+    PROMO_KIND_CONSTRAINT_COMPATIBILITY_MIGRATION,
+    POSTGRES_LEGACY_LEDGER_COMPATIBILITY_MIGRATION,
 )
 
 

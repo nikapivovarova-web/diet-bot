@@ -157,7 +157,11 @@ def test_migrations_use_idempotent_sql_shapes() -> None:
     for statement in _all_statement_texts(postgres_migrations):
         normalized = _normalize_sql(statement)
         upper = normalized.upper()
-        assert not re.search(r"\bDROP\s+(TABLE|INDEX|SCHEMA|DATABASE)\b", upper)
+        assert not re.search(r"\bDROP\s+(TABLE|SCHEMA|DATABASE)\b", upper)
+        assert not re.search(
+            r"\bDROP\s+INDEX\b(?!\s+IF\s+EXISTS\s+UNIQ_PAYMENT_EVENTS_PROVIDER_CHARGE_TYPE\b)",
+            upper,
+        )
         assert not re.search(r"\bCREATE\s+TABLE\b(?!\s+IF\s+NOT\s+EXISTS)", upper)
         assert not re.search(r"\bCREATE\s+INDEX\b(?!\s+IF\s+NOT\s+EXISTS)", upper)
         assert not re.search(r"\bCREATE\s+UNIQUE\s+INDEX\b(?!\s+IF\s+NOT\s+EXISTS)", upper)
@@ -167,9 +171,23 @@ def test_migrations_use_idempotent_sql_shapes() -> None:
                 "CREATE INDEX IF NOT EXISTS",
                 "CREATE UNIQUE INDEX IF NOT EXISTS",
                 "ALTER TABLE",
+                "DROP INDEX IF EXISTS UNIQ_PAYMENT_EVENTS_PROVIDER_CHARGE_TYPE",
                 "DO $$",
             )
         ), normalized
+
+
+def test_migrations_replace_legacy_promo_kind_constraint() -> None:
+    from diet_bot import postgres_migrations
+
+    sql = "\n".join(_migration_statement_texts(postgres_migrations))
+
+    assert "DROP CONSTRAINT IF EXISTS chk_promo_codes_kind_allowed" in sql
+    assert "DROP CONSTRAINT IF EXISTS chk_entitlement_events_source_allowed" in sql
+    assert "DROP INDEX IF EXISTS uniq_payment_events_provider_charge_type" in sql
+    assert "DROP CONSTRAINT IF EXISTS promo_codes_kind_supported_check" in sql
+    assert "ADD CONSTRAINT promo_codes_kind_supported_check" in sql
+    assert "kind IN (\n                    'monthly_access',\n                    'discount'," in sql
 
 
 def test_run_postgres_migrations_records_each_version_once() -> None:
