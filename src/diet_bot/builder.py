@@ -376,6 +376,7 @@ def build_one_day_plan(
         avoided_recipe_keys or frozenset(),
         recipe_source,
         excluded_food_names=safety.excluded_food_names,
+        manage_sodium=bool(safety.excluded_food_names),
     )
     if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
         recipe_meals = _build_recipe_plan_for_time(
@@ -388,6 +389,7 @@ def build_one_day_plan(
             frozenset(),
             recipe_source,
             excluded_food_names=safety.excluded_food_names,
+            manage_sodium=bool(safety.excluded_food_names),
         )
     if not recipe_meals and allow_avoided_recipe_relaxation and (avoided_recipe_ids or avoided_recipe_keys):
         recipe_meals = _build_recipe_plan_for_time(
@@ -400,6 +402,7 @@ def build_one_day_plan(
             frozenset(),
             recipe_source,
             excluded_food_names=safety.excluded_food_names,
+            manage_sodium=bool(safety.excluded_food_names),
         )
     if recipe_meals:
         return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
@@ -455,6 +458,7 @@ def _build_recipe_plan_for_time(
     avoided_recipe_keys: set[str] | frozenset[str],
     recipe_source: RecipeSource,
     excluded_food_names: frozenset[str] = frozenset(),
+    manage_sodium: bool = False,
 ) -> list[Meal]:
     preference = normalize_cooking_time_preference(cooking_time)
     for effort_phase in _cooking_effort_phases(preference):
@@ -470,6 +474,7 @@ def _build_recipe_plan_for_time(
                 allowed_time_buckets,
                 effort_phase,
                 excluded_food_names,
+                manage_sodium,
             )
             if meals:
                 if effort_phase.fallback_penalty > 0:
@@ -492,6 +497,7 @@ def _build_recipe_plan_for_time(
             None,
             effort_phase,
             excluded_food_names,
+            manage_sodium,
         )
         if meals:
             if effort_phase.fallback_penalty > 0:
@@ -517,6 +523,7 @@ def _build_recipe_plan_candidates_for_attempt(
     allowed_time_buckets: frozenset[TimeBucket] | None,
     effort_phase: CookingEffortPhase,
     excluded_food_names: frozenset[str] = frozenset(),
+    manage_sodium: bool = False,
 ) -> list[Meal]:
     meal_candidates: list[list[Meal]] = []
     seen_signatures: set[tuple[str | None, ...]] = set()
@@ -535,6 +542,7 @@ def _build_recipe_plan_candidates_for_attempt(
                 effort_phase,
                 ranking_mode,
                 excluded_food_names,
+                manage_sodium,
             )
             if not meals:
                 continue
@@ -544,9 +552,13 @@ def _build_recipe_plan_candidates_for_attempt(
                 continue
             seen_signatures.add(signature)
             meal_candidates.append(meals)
-            if ranking_mode == "balanced" and _passes_hard_nutrition_gates(meals, target):
-                return _select_best_hard_valid_meals(meal_candidates, target)
-    return _select_best_hard_valid_meals(meal_candidates, target)
+            if ranking_mode == "balanced" and _passes_hard_nutrition_gates(
+                meals,
+                target,
+                enforce_sodium=manage_sodium,
+            ):
+                return _select_best_hard_valid_meals(meal_candidates, target, enforce_sodium=manage_sodium)
+    return _select_best_hard_valid_meals(meal_candidates, target, enforce_sodium=manage_sodium)
 
 
 def _build_recipe_plan(
@@ -561,6 +573,7 @@ def _build_recipe_plan(
     effort_phase: CookingEffortPhase | None = None,
     ranking_mode: RecipeRankingMode = "balanced",
     excluded_food_names: frozenset[str] = frozenset(),
+    manage_sodium: bool = False,
 ) -> list[Meal]:
     food_by_id = {food.id: food for food in candidates}
     recipes = [
@@ -611,6 +624,7 @@ def _build_recipe_plan(
             index,
             ranking_mode,
             effort_phase,
+            manage_sodium,
         ):
             resolved = _resolve_recipe_ingredients(recipe, food_by_id)
             if resolved is None:
@@ -669,11 +683,13 @@ def _finalize_recipe_meals(
 def _select_best_hard_valid_meals(
     meal_candidates: list[list[Meal]],
     target: NutrientVector,
+    *,
+    enforce_sodium: bool = False,
 ) -> list[Meal]:
     hard_valid = [
         (candidate_index, meals)
         for candidate_index, meals in enumerate(meal_candidates)
-        if _passes_hard_nutrition_gates(meals, target)
+        if _passes_hard_nutrition_gates(meals, target, enforce_sodium=enforce_sodium)
     ]
     if not hard_valid:
         return []
@@ -684,12 +700,21 @@ def _select_best_hard_valid_meals(
     return selected
 
 
-def _passes_hard_nutrition_gates(meals: list[Meal], target: NutrientVector) -> bool:
+def _passes_hard_nutrition_gates(
+    meals: list[Meal],
+    target: NutrientVector,
+    *,
+    enforce_sodium: bool = False,
+) -> bool:
     if not meals:
         return False
     if any(_meal_is_collapsed(meal) for meal in meals):
         return False
     total = NutrientVector.sum(meal.nutrients for meal in meals)
+    if enforce_sodium:
+        sodium_limit = target.get("sodium_mg")
+        if sodium_limit > 0 and total.get("sodium_mg") > sodium_limit + 0.01:
+            return False
     return total.get("protein_g") + 0.01 >= _protein_hard_floor(target)
 
 
@@ -1273,6 +1298,7 @@ def _rank_recipes(
     index: int,
     ranking_mode: RecipeRankingMode = "balanced",
     effort_phase: CookingEffortPhase | None = None,
+    manage_sodium: bool = False,
 ) -> list[RecipeTemplate]:
     eligible_candidates: list[tuple[RecipeTemplate, RecipeSlotEligibility]] = []
     for recipe in recipes:
@@ -1346,6 +1372,15 @@ def _rank_recipes(
             target,
             meal_slot=slot,
         )
+        if manage_sodium:
+            macro_penalty += _recipe_projected_sodium_penalty(
+                recipe,
+                food_by_id,
+                slot_energy_target,
+                current_total,
+                target,
+                meal_slot=slot,
+            )
         energy_penalty = _recipe_projected_energy_penalty(
             recipe,
             food_by_id,
@@ -1731,6 +1766,35 @@ def _recipe_projected_carbohydrate_penalty(
         penalty += (projected_carbohydrate - soft_limit) / max(1.0, carbohydrate_target) * 8.0
     if projected_carbohydrate > hard_limit:
         penalty += (projected_carbohydrate - hard_limit) / max(1.0, carbohydrate_target) * 24.0
+    return penalty
+
+
+def _recipe_projected_sodium_penalty(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    meal_slot: str | None = None,
+) -> float:
+    sodium_limit = target.get("sodium_mg")
+    if sodium_limit <= 0:
+        return 0.0
+
+    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
+    if estimated is None:
+        return 0.0
+
+    estimated_sodium = estimated.get("sodium_mg")
+    target_energy = max(1.0, target.get("energy_kcal"))
+    slot_sodium_budget = sodium_limit * min(1.0, max(0.05, slot_energy_target / target_energy))
+    projected_sodium = current_total.get("sodium_mg") + estimated_sodium
+
+    penalty = 0.0
+    if estimated_sodium > slot_sodium_budget:
+        penalty += (estimated_sodium - slot_sodium_budget) / sodium_limit * 14.0
+    if projected_sodium > sodium_limit:
+        penalty += (projected_sodium - sodium_limit) / sodium_limit * 20.0
     return penalty
 
 

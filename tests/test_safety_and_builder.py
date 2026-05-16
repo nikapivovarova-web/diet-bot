@@ -603,6 +603,73 @@ def test_mushroom_exclusion_filters_champignon_recipes_from_curated_plan() -> No
     assert mushroom_ids.isdisjoint(recipe_ingredient_ids(plan))
 
 
+def _sodium_debug(plan) -> str:
+    lines = [
+        f"total_sodium_mg={plan.totals.get('sodium_mg'):.0f} "
+        f"limit={plan.targets.targets.get('sodium_mg'):.0f}"
+    ]
+    for index, meal in enumerate(plan.meals, 1):
+        contributors = sorted(
+            (
+                (portion.nutrients.get("sodium_mg"), portion.food.id, portion.grams)
+                for portion in meal.portions
+            ),
+            reverse=True,
+        )[:5]
+        contributor_text = ", ".join(
+            f"{food_id}:{sodium:.0f}mg/{grams:.0f}g"
+            for sodium, food_id, grams in contributors
+        )
+        lines.append(
+            f"{index}. recipe_id={meal.recipe_id} sodium_mg={meal.nutrients.get('sodium_mg'):.0f} "
+            f"contributors=[{contributor_text}]"
+        )
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize("seed", (0, 2, 3, 4))
+def test_combined_exclusions_do_not_deliver_sodium_invalid_curated_plan(seed: int) -> None:
+    profile = profile_with(
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u043a\u0430\u0448\u0430"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u043c\u043e\u043b\u043e\u0447\u043a\u0430"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u043c\u043e\u043b\u043e\u043a\u043e"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u0433\u0440\u0438\u0431\u044b"),
+        ),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+
+    plan = build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only")
+    validation = validate_plan(plan)
+
+    if plan.meals:
+        dairy_ids = {
+            "milk",
+            "buttermilk",
+            "greek_yogurt",
+            "lactose_free_yogurt",
+            "cottage_cheese",
+            "lactose_free_cottage_cheese",
+            "cream_cheese",
+            "cheddar",
+            "feta",
+            "mozzarella",
+            "parmesan",
+            "ricotta",
+        }
+        mushroom_ids = {"mushrooms", "shiitake"}
+        plan_food_ids = food_ids(plan)
+        assert dairy_ids.isdisjoint(plan_food_ids)
+        assert mushroom_ids.isdisjoint(plan_food_ids)
+        assert dairy_ids.isdisjoint(recipe_ingredient_ids(plan))
+        assert mushroom_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+    assert not plan.meals or validation.ok, (
+        f"seed={seed} errors={validation.errors}\n{_sodium_debug(plan)}"
+    )
+
+
 def test_celiac_excludes_gluten_foods_and_oats_by_default() -> None:
     profile = profile_with(conditions=(ConditionCode.CELIAC,))
     safety = evaluate_safety(profile)
