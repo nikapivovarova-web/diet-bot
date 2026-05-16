@@ -2200,7 +2200,11 @@ def _relaxes_protein_ceiling_for_calorie_recovery(
     target: NutrientVector,
     slot: MealEnergySlot,
 ) -> bool:
-    return _is_calorie_recovery_base(food) and _is_calorie_recovery_context(meal, total, target, slot)
+    return (
+        food.nutrients_per_100g.get("protein_g") <= 5.0
+        and _is_calorie_recovery_base(food)
+        and _is_calorie_recovery_context(meal, total, target, slot)
+    )
 
 
 def _top_up_if_needed(

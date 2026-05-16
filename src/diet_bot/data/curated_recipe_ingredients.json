@@ -62831,6 +62831,21 @@
     "parse_method": "garnish_default"
   },
   {
+    "recipe_id": "r444_tvorog_s_ukropom_s_tselnozernovym_hlebom",
+    "recipe_no": 444,
+    "recipe_key": "intake_044",
+    "line_index": 8,
+    "raw_text": "\u0446\u0435\u043b\u044c\u043d\u043e\u0437\u0435\u0440\u043d\u043e\u0432\u043e\u0439 \u0445\u043b\u0435\u0431 \u2014 1 \u043b\u043e\u043c\u0442\u0438\u043a",
+    "ingredient_name_ru": "\u0446\u0435\u043b\u044c\u043d\u043e\u0437\u0435\u0440\u043d\u043e\u0432\u043e\u0439 \u0445\u043b\u0435\u0431",
+    "food_id": "whole_grain_bread",
+    "grams": 40.0,
+    "quantity_text": "1 \u043b\u043e\u043c\u0442\u0438\u043a",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "added from title after duplicate-signature cleanup",
+    "parse_method": "title_recovery"
+  },
+  {
     "recipe_id": "r445_tvorog_s_ukropom_i_hlebtsami",
     "recipe_no": 445,
     "recipe_key": "intake_045",
@@ -62936,6 +62951,21 @@
     "parse_method": "garnish_default"
   },
   {
+    "recipe_id": "r445_tvorog_s_ukropom_i_hlebtsami",
+    "recipe_no": 445,
+    "recipe_key": "intake_045",
+    "line_index": 8,
+    "raw_text": "\u0445\u043b\u0435\u0431\u0446\u044b \u2014 3 \u0448\u0442.",
+    "ingredient_name_ru": "\u0445\u043b\u0435\u0431\u0446\u044b",
+    "food_id": "crackers",
+    "grams": 30.0,
+    "quantity_text": "3 \u0448\u0442.",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "added from title after duplicate-signature cleanup",
+    "parse_method": "title_recovery"
+  },
+  {
     "recipe_id": "r446_tvorog_s_ukropom_i_morkovnymi_palochkami",
     "recipe_no": 446,
     "recipe_key": "intake_046",
@@ -63039,6 +63069,21 @@
     "is_optional": false,
     "conversion_note": "amount missing in source; small garnish default",
     "parse_method": "garnish_default"
+  },
+  {
+    "recipe_id": "r446_tvorog_s_ukropom_i_morkovnymi_palochkami",
+    "recipe_no": 446,
+    "recipe_key": "intake_046",
+    "line_index": 8,
+    "raw_text": "\u043c\u043e\u0440\u043a\u043e\u0432\u044c \u2014 80 \u0433",
+    "ingredient_name_ru": "\u043c\u043e\u0440\u043a\u043e\u0432\u044c",
+    "food_id": "carrot",
+    "grams": 80.0,
+    "quantity_text": "80 \u0433",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "added from title after duplicate-signature cleanup",
+    "parse_method": "title_recovery"
   },
   {
     "recipe_id": "r447_skrembl_iz_tofu",
