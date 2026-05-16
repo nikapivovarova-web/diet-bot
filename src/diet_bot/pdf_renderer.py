@@ -1234,10 +1234,12 @@ def _daily_totals_subtable(
             _p("%", styles["TableHeaderCenter"]),
         ]
     ]
-    for key in nutrient_keys:
+    percent_backgrounds = []
+    for row_index, key in enumerate(nutrient_keys, start=1):
         value = plan.totals.get(key)
         target = plan.targets.targets.get(key)
         percent_style = styles[_coverage_percent_style(value, target)]
+        percent_backgrounds.append(("BACKGROUND", (2, row_index), (2, row_index), _coverage_percent_color(value, target)))
         rows.append(
             [
                 _p(NUTRIENT_LABELS[key], styles["TableCell"]),
@@ -1259,6 +1261,7 @@ def _daily_totals_subtable(
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("TOPPADDING", (0, 0), (-1, -1), 4),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                *percent_backgrounds,
             ]
         )
     )
@@ -2062,7 +2065,7 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             fontSize=9.4,
             leading=12,
             alignment=TA_CENTER,
-            textColor=colors.HexColor("#4F9E5D"),
+            textColor=colors.black,
         ),
         "PercentYellow": ParagraphStyle(
             "FoodBalancePercentYellow",
@@ -2071,7 +2074,7 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             fontSize=9.4,
             leading=12,
             alignment=TA_CENTER,
-            textColor=colors.HexColor("#D8A23A"),
+            textColor=colors.black,
         ),
         "PercentRed": ParagraphStyle(
             "FoodBalancePercentRed",
@@ -2080,7 +2083,7 @@ def _build_styles(base_font: str, bold_font: str, emoji_font: str) -> dict[str, 
             fontSize=9.4,
             leading=12,
             alignment=TA_CENTER,
-            textColor=colors.HexColor("#C95B4A"),
+            textColor=colors.black,
         ),
     }
 

@@ -184,7 +184,7 @@ def test_nutrient_percent_thresholds_for_pdf_display() -> None:
     ]
 
 
-def test_daily_totals_table_uses_colored_percent_cells_without_dots() -> None:
+def test_daily_totals_table_fills_percent_cells_with_status_color_without_dots() -> None:
     base_font, bold_font, emoji_font = pdf_renderer._register_fonts()
     styles = pdf_renderer._build_styles(base_font, bold_font, emoji_font)
     plan = _plan_with_daily_percentages(
@@ -207,10 +207,14 @@ def test_daily_totals_table_uses_colored_percent_cells_without_dots() -> None:
     assert cell_text[0] == ["Нутриент", "Факт / цель", "%"]
     assert all("●" not in "".join(row) for row in cell_text)
     assert [row[2] for row in cell_text[1:]] == ["100%", "94%", "45%", "44%"]
-    assert table._cellvalues[1][2].style.textColor == pdf_renderer.colors.HexColor("#4F9E5D")
-    assert table._cellvalues[2][2].style.textColor == pdf_renderer.colors.HexColor("#D8A23A")
-    assert table._cellvalues[3][2].style.textColor == pdf_renderer.colors.HexColor("#D8A23A")
-    assert table._cellvalues[4][2].style.textColor == pdf_renderer.colors.HexColor("#C95B4A")
+    assert table._cellvalues[1][2].style.textColor == pdf_renderer.colors.black
+    assert table._cellvalues[2][2].style.textColor == pdf_renderer.colors.black
+    assert table._cellvalues[3][2].style.textColor == pdf_renderer.colors.black
+    assert table._cellvalues[4][2].style.textColor == pdf_renderer.colors.black
+    assert ("BACKGROUND", (2, 1), (2, 1), pdf_renderer.colors.HexColor("#4F9E5D")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 2), (2, 2), pdf_renderer.colors.HexColor("#D8A23A")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 3), (2, 3), pdf_renderer.colors.HexColor("#D8A23A")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 4), (2, 4), pdf_renderer.colors.HexColor("#C95B4A")) in table._bkgrndcmds
 
 
 def test_week_pdf_daily_totals_text_contains_percentages(tmp_path: Path, sample_week_dates) -> None:
