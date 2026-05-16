@@ -442,6 +442,10 @@ PAYMENT_PAYLOAD_PROVIDERS = {
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: PaymentProvider.YOOKASSA,
 }
 PAYMENT_INVOICE_CREATION_FAILED_TEXT = "Не удалось создать счет для оплаты. Попробуйте позже."
+PAYMENT_DURABLE_STORE_REQUIRED_TEXT = (
+    "Payment invoice creation is unavailable: durable payment storage is required. "
+    "Set DIET_BOT_DATABASE_URL/Postgres for payment smoke; JSON storage is not valid for invoice smoke."
+)
 WELCOME_TEXT = (
     "Привет! Я FoodBalance — ваш персональный помощник по сбалансированному питанию 🥗\n\n"
     "Я подберу рецепты под ваши цели, рассчитаю КБЖУ, витамины и минералы, помогу собрать рацион так, "
@@ -702,49 +706,73 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
     if data == CALLBACK_SUBSCRIBE:
         await callback.answer()
-        await _send_subscription_payment_options(message)
+        await _send_subscription_payment_options(message, user_id=callback_user_id)
         return
 
     if data == CALLBACK_PAY_TELEGRAM_STARS:
         await callback.answer()
         if await _send_active_subscription_notice_if_needed(message):
             return
-        await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+        await _send_stars_invoice_link(
+            message,
+            PAYLOAD_SUBSCRIPTION_MONTH,
+            buyer_user_id=callback_user_id,
+        )
         return
 
     if data == CALLBACK_PAY_RU_CARD:
         await callback.answer()
         if await _send_active_subscription_notice_if_needed(message):
             return
-        await _send_yookassa_invoice_link(message, PAYLOAD_RU_SUBSCRIPTION_MONTH)
+        await _send_yookassa_invoice_link(
+            message,
+            PAYLOAD_RU_SUBSCRIPTION_MONTH,
+            buyer_user_id=callback_user_id,
+        )
         return
 
     if data == CALLBACK_PAY_RU_EXTRA_ONE_DAY:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_yookassa_invoice_link(message, PAYLOAD_RU_EXTRA_ONE_DAY)
+        await _send_yookassa_invoice_link(
+            message,
+            PAYLOAD_RU_EXTRA_ONE_DAY,
+            buyer_user_id=callback_user_id,
+        )
         return
 
     if data == CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_yookassa_invoice_link(message, PAYLOAD_RU_EXTRA_WEEKLY_PDF)
+        await _send_yookassa_invoice_link(
+            message,
+            PAYLOAD_RU_EXTRA_WEEKLY_PDF,
+            buyer_user_id=callback_user_id,
+        )
         return
 
     if data == CALLBACK_BUY_EXTRA_ONE_DAY:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+        await _send_stars_invoice_link(
+            message,
+            PAYLOAD_EXTRA_ONE_DAY,
+            buyer_user_id=callback_user_id,
+        )
         return
 
     if data == CALLBACK_BUY_EXTRA_WEEKLY_PDF:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_stars_invoice_link(message, PAYLOAD_EXTRA_WEEKLY_PDF)
+        await _send_stars_invoice_link(
+            message,
+            PAYLOAD_EXTRA_WEEKLY_PDF,
+            buyer_user_id=callback_user_id,
+        )
         return
 
     if data == CALLBACK_FEATURES:
@@ -2556,13 +2584,22 @@ async def _send_public_payments_disabled_notice(message: Message) -> None:
     )
 
 
-async def _send_subscription_payment_options(message: Message) -> None:
+async def _send_subscription_payment_options(
+    message: Message,
+    *,
+    user_id: int | None = None,
+) -> None:
     if await _send_active_subscription_notice_if_needed(message):
         return
-    user_id = _payment_user_id_for_message(message)
+    payment_user_id = (
+        user_id if isinstance(user_id, int) else _payment_user_id_for_message(message)
+    )
     await message.answer(
-        _subscription_payment_text(chat_id=message.chat.id, user_id=user_id),
-        reply_markup=_subscription_payment_keyboard(chat_id=message.chat.id, user_id=user_id),
+        _subscription_payment_text(chat_id=message.chat.id, user_id=payment_user_id),
+        reply_markup=_subscription_payment_keyboard(
+            chat_id=message.chat.id,
+            user_id=payment_user_id,
+        ),
     )
 
 
@@ -2643,18 +2680,27 @@ async def _create_or_reuse_invoice_payment_order(
     *,
     provider: PaymentProvider,
     product: PaymentProduct,
+    buyer_user_id: int | None = None,
 ) -> PaymentOrder | None:
     store = _runtime_store()
     if store is None:
-        await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
+        await message.answer(PAYMENT_DURABLE_STORE_REQUIRED_TEXT)
         return None
 
-    buyer_id = _payment_user_id_for_message(message)
+    buyer_id = (
+        buyer_user_id
+        if isinstance(buyer_user_id, int)
+        else _payment_user_id_for_message(message)
+    )
     if buyer_id is None:
         await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
         return None
 
-    pricing_context = _payment_pricing_context_for_message(message)
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    pricing_context = _payment_pricing_context_for_identity(
+        user_id=buyer_id,
+        chat_id=chat_id if isinstance(chat_id, int) else None,
+    )
     product_metadata = get_payment_product_invoice_metadata(
         provider,
         product,
@@ -2699,7 +2745,12 @@ def _mark_payment_order_invoice_creation_failed(order: PaymentOrder) -> None:
         marker(order.order_id)
 
 
-async def _send_stars_invoice_link(message: Message, payload: str) -> None:
+async def _send_stars_invoice_link(
+    message: Message,
+    payload: str,
+    *,
+    buyer_user_id: int | None = None,
+) -> None:
     if not _public_payments_enabled():
         await _send_public_payments_disabled_notice(message)
         return
@@ -2711,6 +2762,7 @@ async def _send_stars_invoice_link(message: Message, payload: str) -> None:
         message,
         provider=provider,
         product=product,
+        buyer_user_id=buyer_user_id,
     )
     if order is None:
         return
@@ -2748,7 +2800,12 @@ async def _send_stars_invoice_link(message: Message, payload: str) -> None:
     )
 
 
-async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
+async def _send_yookassa_invoice_link(
+    message: Message,
+    payload: str,
+    *,
+    buyer_user_id: int | None = None,
+) -> None:
     if not _public_payments_enabled():
         await _send_public_payments_disabled_notice(message)
         return
@@ -2765,6 +2822,7 @@ async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
         message,
         provider=provider,
         product=product,
+        buyer_user_id=buyer_user_id,
     )
     if order is None:
         return

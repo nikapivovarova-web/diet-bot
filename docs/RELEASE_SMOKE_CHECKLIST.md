@@ -12,6 +12,7 @@ Use this checklist from the clean worktree before publishing a Telegram bot rele
 - Confirm `DIET_BOT_TOKEN` is set to a test or release Telegram bot token.
 - For local/dev JSON smoke, confirm `DIET_BOT_ALLOW_JSON_STORAGE=1` is set.
 - For production-like smoke, confirm `DIET_BOT_DATABASE_URL` is set and local JSON fallback is not the active storage path.
+- For payment invoice smoke, confirm `DIET_BOT_DATABASE_URL` points to Postgres. JSON mode is not valid for invoice smoke because payment orders require durable runtime storage.
 - Leave `TELEGRAM_PROVIDER_TOKEN` empty unless card-payment smoke is explicitly being tested with a Telegram/YooKassa test provider token.
 - For pilot releases, confirm `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`; public YooKassa/Stars payment buttons must stay hidden and access must be via promo code or admin monthly-access code.
 - For paid-mode releases, set `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` only after real YooKassa and Telegram Stars provider smoke is explicitly approved, run, and recorded.
@@ -94,6 +95,8 @@ Run this only against a staging/prod-like deployment after durable payment order
 
 Paid public release remains blocked while `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`. Enabling it for public users requires this smoke to pass with recorded YooKassa and Telegram Stars evidence.
 
+Payment invoice smoke must run with `DIET_BOT_DATABASE_URL` configured for Postgres. Do not use `DIET_BOT_ALLOW_JSON_STORAGE=1` or JSON fallback for this slice; invoice creation requires durable payment order storage and JSON mode should report unavailable/durable-store-required.
+
 ### Provider Smoke With Test Prices
 
 Use this slice only when the owner is ready to manually test provider checkout with minimal amounts. Do not run real payments from the development machine as part of this checklist.
@@ -101,6 +104,8 @@ Use this slice only when the owner is ready to manually test provider checkout w
 Set these env vars for the smoke deployment/session:
 
 ```powershell
+$env:DIET_BOT_DATABASE_URL = "postgresql://diet_bot@localhost:5432/diet_bot_test"
+Remove-Item Env:\DIET_BOT_ALLOW_JSON_STORAGE -ErrorAction SilentlyContinue
 $env:DIET_BOT_PUBLIC_PAYMENTS_ENABLED = "1"
 $env:DIET_BOT_PAYMENT_TEST_PRICES_ENABLED = "1"
 $env:DIET_BOT_ADMIN_USER_IDS = "replace-with-owner-telegram-user-id"
@@ -128,6 +133,7 @@ Also confirm the deployment/runtime environment no longer has `DIET_BOT_PAYMENT_
 
 - Confirm the bot build, branch, commit, deployment target, and `DIET_BOT_ENV` value.
 - Confirm `DIET_BOT_DATABASE_URL` is configured for the production-like environment.
+- Confirm JSON fallback is not active; invoice smoke in JSON mode is invalid and must stop with a durable-store-required/unavailable message.
 - Confirm `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` only for this paid-mode smoke and that the pilot-mode disabling evidence is already recorded for any pilot release.
 - Confirm the deployment uses durable DB-backed storage for payment orders, payment events, processed provider charges, entitlements, promo/test grants, and generation state.
 - Confirm production-like startup rejects JSON paid-state fallback and the active environment is not writing payment state to local JSON files.

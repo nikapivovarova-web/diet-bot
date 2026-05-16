@@ -243,6 +243,8 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_021,
         51_022,
         51_023,
+        51_024,
+        51_025,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -852,6 +854,46 @@ def test_subscription_payment_ui_shows_test_price_only_for_tester(
 
 
 @pytest.mark.anyio
+async def test_subscribe_callback_uses_actor_for_test_price_ui_when_message_author_is_bot(
+    monkeypatch,
+) -> None:
+    admin_user_id = 51_022
+    bot_user_id = 900_100
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+
+    message = FakeMessage(admin_user_id, user_id=bot_user_id)
+    await telegram_app.handle_callback(
+        FakeCallback(
+            telegram_app.CALLBACK_SUBSCRIBE,
+            message,
+            from_user_id=admin_user_id,
+        )
+    )
+
+    sent_text, markup = message.texts[-1]
+    buttons = [
+        (button.text, button.callback_data)
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+
+    assert "[TEST]" in sent_text
+    assert buttons[:2] == [
+        (
+            telegram_app.PAY_WITH_RU_CARD_TEST_TEXT,
+            telegram_app.CALLBACK_PAY_RU_CARD,
+        ),
+        (
+            telegram_app.PAY_WITH_TELEGRAM_STARS_TEST_TEXT,
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+        ),
+    ]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "callback_data",
     [
@@ -1223,6 +1265,303 @@ async def test_test_smoke_yookassa_invoice_uses_override_without_consuming_pendi
     }
     assert telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID[chat_id] == "ANNA20"
     assert store.invoice_links == [("order_smoke", "https://invoice.test/smoke")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("callback_data", "expected_amount"),
+    [
+        (telegram_app.CALLBACK_PAY_TELEGRAM_STARS, 1),
+        (telegram_app.CALLBACK_PAY_RU_CARD, 100),
+    ],
+)
+async def test_admin_callback_actor_gets_test_price_when_message_author_is_bot(
+    monkeypatch,
+    callback_data: str,
+    expected_amount: int,
+) -> None:
+    admin_user_id = 51_022
+    bot_user_id = 900_100
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/admin-smoke"
+
+    class FakePaymentStore:
+        def __init__(self) -> None:
+            self.created_orders: list[dict[str, object]] = []
+            self.orders: list[telegram_app.PaymentOrder] = []
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return telegram_app.Entitlement()
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            entitlement: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def create_or_reuse_pending_payment_order(
+            self,
+            *,
+            user_id: int,
+            delivery_chat_id: int | None,
+            provider: telegram_app.PaymentProvider,
+            product: telegram_app.PaymentProduct,
+            amount: int,
+            currency,
+            promo_code: str | None = None,
+            pricing_context: str | None = None,
+        ):
+            order = telegram_app.PaymentOrder(
+                order_id=f"order_{len(self.orders) + 1}",
+                nonce="nonce_admin_smoke",
+                user_id=user_id,
+                delivery_chat_id=delivery_chat_id,
+                provider=provider,
+                product=product,
+                amount=amount,
+                currency=currency,
+                list_amount=amount,
+                metadata={"pricing_context": pricing_context} if pricing_context else {},
+            )
+            self.created_orders.append(
+                {
+                    "user_id": user_id,
+                    "delivery_chat_id": delivery_chat_id,
+                    "amount": amount,
+                    "currency": currency,
+                    "pricing_context": pricing_context,
+                }
+            )
+            self.orders.append(order)
+            return SimpleNamespace(
+                accepted=True,
+                code=telegram_app.PaymentOrderCreationCode.CREATED,
+                order=order,
+            )
+
+    store = FakePaymentStore()
+    bot = FakeInvoiceBot()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+
+    payment_message = FakeMessage(admin_user_id, user_id=bot_user_id)
+    payment_message.bot = bot
+    await telegram_app.handle_callback(
+        FakeCallback(callback_data, payment_message, from_user_id=admin_user_id)
+    )
+
+    assert store.created_orders[0]["user_id"] == admin_user_id
+    assert store.created_orders[0]["delivery_chat_id"] == admin_user_id
+    assert store.created_orders[0]["amount"] == expected_amount
+    assert store.created_orders[0]["pricing_context"] == (
+        telegram_app.PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+    )
+    assert store.orders[0].metadata["pricing_context"] == (
+        telegram_app.PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+    )
+    assert bot.calls[0]["prices"][0].amount == expected_amount
+
+
+@pytest.mark.anyio
+async def test_admin_callback_actor_gets_test_price_when_message_author_is_none(
+    monkeypatch,
+) -> None:
+    admin_user_id = 51_022
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/admin-smoke"
+
+    class FakePaymentStore:
+        def __init__(self) -> None:
+            self.orders: list[telegram_app.PaymentOrder] = []
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return telegram_app.Entitlement()
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            entitlement: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def create_or_reuse_pending_payment_order(
+            self,
+            *,
+            user_id: int,
+            delivery_chat_id: int | None,
+            provider: telegram_app.PaymentProvider,
+            product: telegram_app.PaymentProduct,
+            amount: int,
+            currency,
+            promo_code: str | None = None,
+            pricing_context: str | None = None,
+        ):
+            order = telegram_app.PaymentOrder(
+                order_id="order_none_author",
+                nonce="nonce_none_author",
+                user_id=user_id,
+                delivery_chat_id=delivery_chat_id,
+                provider=provider,
+                product=product,
+                amount=amount,
+                currency=currency,
+                list_amount=amount,
+                metadata={"pricing_context": pricing_context} if pricing_context else {},
+            )
+            self.orders.append(order)
+            return SimpleNamespace(
+                accepted=True,
+                code=telegram_app.PaymentOrderCreationCode.CREATED,
+                order=order,
+            )
+
+    store = FakePaymentStore()
+    bot = FakeInvoiceBot()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {admin_user_id})
+    monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+
+    payment_message = FakeMessage(admin_user_id)
+    payment_message.from_user = None
+    payment_message.bot = bot
+    await telegram_app.handle_callback(
+        FakeCallback(
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+            payment_message,
+            from_user_id=admin_user_id,
+        )
+    )
+
+    assert store.orders[0].user_id == admin_user_id
+    assert store.orders[0].delivery_chat_id == admin_user_id
+    assert store.orders[0].metadata["pricing_context"] == (
+        telegram_app.PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+    )
+    assert bot.calls[0]["prices"][0].amount == 1
+
+
+@pytest.mark.anyio
+async def test_non_admin_callback_actor_keeps_production_stars_amount(monkeypatch) -> None:
+    non_admin_user_id = 51_024
+    bot_user_id = 900_100
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/production"
+
+    class FakePaymentStore:
+        def __init__(self) -> None:
+            self.created_orders: list[dict[str, object]] = []
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return telegram_app.Entitlement()
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            entitlement: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def create_or_reuse_pending_payment_order(
+            self,
+            *,
+            user_id: int,
+            delivery_chat_id: int | None,
+            provider: telegram_app.PaymentProvider,
+            product: telegram_app.PaymentProduct,
+            amount: int,
+            currency,
+            promo_code: str | None = None,
+            pricing_context: str | None = None,
+        ):
+            self.created_orders.append(
+                {
+                    "user_id": user_id,
+                    "delivery_chat_id": delivery_chat_id,
+                    "amount": amount,
+                    "pricing_context": pricing_context,
+                }
+            )
+            return SimpleNamespace(
+                accepted=True,
+                code=telegram_app.PaymentOrderCreationCode.CREATED,
+                order=telegram_app.PaymentOrder(
+                    order_id="order_production",
+                    nonce="nonce_production",
+                    user_id=user_id,
+                    delivery_chat_id=delivery_chat_id,
+                    provider=provider,
+                    product=product,
+                    amount=amount,
+                    currency=currency,
+                    list_amount=amount,
+                ),
+            )
+
+    store = FakePaymentStore()
+    bot = FakeInvoiceBot()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {51_022})
+    monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+
+    payment_message = FakeMessage(non_admin_user_id, user_id=bot_user_id)
+    payment_message.bot = bot
+    await telegram_app.handle_callback(
+        FakeCallback(
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+            payment_message,
+            from_user_id=non_admin_user_id,
+        )
+    )
+
+    assert store.created_orders[0]["user_id"] == non_admin_user_id
+    assert store.created_orders[0]["delivery_chat_id"] == non_admin_user_id
+    assert store.created_orders[0]["amount"] == telegram_app.SUBSCRIPTION_STARS_AMOUNT
+    assert store.created_orders[0]["pricing_context"] is None
+    assert bot.calls[0]["prices"][0].amount == telegram_app.SUBSCRIPTION_STARS_AMOUNT
+
+
+@pytest.mark.anyio
+async def test_json_storage_payment_smoke_reports_durable_store_required(monkeypatch) -> None:
+    chat_id = 51_025
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    message = FakeMessage(chat_id)
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PAY_TELEGRAM_STARS, message)
+    )
+
+    text = message.texts[-1][0]
+    assert "unavailable" in text
+    assert "durable payment storage" in text
+    assert "DIET_BOT_DATABASE_URL" in text
 
 
 @pytest.mark.anyio
