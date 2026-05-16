@@ -80,6 +80,7 @@ COLLAPSED_MEAL_CORE_MIN_KCAL = 25.0
 TINY_GARNISH_MAX_GRAMS = 75.0
 LOW_PROTEIN_CALORIE_RECOVERY_MAX_PROTEIN_G = 85.0
 LOW_PROTEIN_CALORIE_RECOVERY_MIN_KCAL_PER_PROTEIN = 30.0
+CALORIE_RECOVERY_BASE_MAX_PROTEIN_PER_100G = 8.0
 SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
     "несколько этап",
     "ваф",
@@ -2264,7 +2265,11 @@ def _relaxes_protein_ceiling_for_calorie_recovery(
     target: NutrientVector,
     slot: MealEnergySlot,
 ) -> bool:
-    return _is_calorie_recovery_base(food) and _is_calorie_recovery_context(meal, total, target, slot)
+    return (
+        food.nutrients_per_100g.get("protein_g") <= CALORIE_RECOVERY_BASE_MAX_PROTEIN_PER_100G
+        and _is_calorie_recovery_base(food)
+        and _is_calorie_recovery_context(meal, total, target, slot)
+    )
 
 
 def _skips_excessive_protein_limit_for_calorie_recovery(
