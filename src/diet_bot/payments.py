@@ -246,7 +246,7 @@ _PAYMENT_TEST_SMOKE_INVOICE_AMOUNTS: Mapping[
     int,
 ] = {
     (PaymentProvider.TELEGRAM_STARS, PaymentProduct.SUBSCRIPTION_MONTH): 1,
-    (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH): 100,
+    (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH): 10_000,
 }
 
 _PAYLOAD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")

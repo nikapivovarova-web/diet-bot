@@ -756,7 +756,7 @@ def test_product_invoice_metadata_uses_production_prices_by_default() -> None:
     ("provider", "currency", "amount"),
     [
         (PaymentProvider.TELEGRAM_STARS, PaymentCurrency.XTR, 1),
-        (PaymentProvider.YOOKASSA, PaymentCurrency.RUB, 100),
+        (PaymentProvider.YOOKASSA, PaymentCurrency.RUB, 10_000),
     ],
 )
 def test_test_smoke_subscription_invoice_metadata_uses_minimum_provider_amount(
@@ -775,7 +775,7 @@ def test_test_smoke_subscription_invoice_metadata_uses_minimum_provider_amount(
     if provider == PaymentProvider.YOOKASSA:
         assert metadata.provider_data is not None
         assert metadata.provider_data["receipt"]["items"][0]["amount"] == {
-            "value": "1.00",
+            "value": "100.00",
             "currency": "RUB",
         }
 
@@ -806,8 +806,8 @@ def test_test_smoke_payment_order_and_invoice_metadata_use_overridden_amount() -
     assert result.accepted is True
     order = result.order
     assert order is not None
-    assert order.amount == 100
-    assert order.list_amount == 100
+    assert order.amount == 10_000
+    assert order.list_amount == 10_000
     assert order.discount_amount == 0
     assert order.metadata["pricing_context"] == PAYMENT_TEST_SMOKE_PRICING_CONTEXT
 
@@ -817,16 +817,16 @@ def test_test_smoke_payment_order_and_invoice_metadata_use_overridden_amount() -
         payload=order.payload,
         user_id=order.user_id,
         currency=PaymentCurrency.RUB,
-        total_amount=100,
+        total_amount=10_000,
         expected_provider=PaymentProvider.YOOKASSA,
         expected_product=PaymentProduct.SUBSCRIPTION_MONTH,
         now=now,
     )
 
-    assert invoice_metadata.amount == 100
+    assert invoice_metadata.amount == 10_000
     assert invoice_metadata.provider_data is not None
     assert invoice_metadata.provider_data["receipt"]["items"][0]["amount"] == {
-        "value": "1.00",
+        "value": "100.00",
         "currency": "RUB",
     }
     assert pre_checkout.approved is True

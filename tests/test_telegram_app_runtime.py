@@ -1577,6 +1577,9 @@ async def test_test_smoke_yookassa_invoice_uses_override_without_consuming_pendi
         ),
     ]
     assert "[TEST]" in tester_text
+    assert telegram_app.TEST_SUBSCRIPTION_PRICE_RUB == 100
+    assert "100" in telegram_app.PAY_WITH_RU_CARD_TEST_TEXT
+    assert "100" in tester_text
     assert "ANNA20" not in tester_text
 
     payment_message = FakeMessage(chat_id)
@@ -1585,15 +1588,15 @@ async def test_test_smoke_yookassa_invoice_uses_override_without_consuming_pendi
         FakeCallback(telegram_app.CALLBACK_PAY_RU_CARD, payment_message)
     )
 
-    assert store.created_orders[0]["amount"] == 100
+    assert store.created_orders[0]["amount"] == 10_000
     assert store.created_orders[0]["promo_code"] is None
     assert store.created_orders[0]["pricing_context"] == (
         telegram_app.PAYMENT_TEST_SMOKE_PRICING_CONTEXT
     )
-    assert bot.calls[0]["prices"][0].amount == 100
+    assert bot.calls[0]["prices"][0].amount == 10_000
     provider_data = json.loads(str(bot.calls[0]["provider_data"]))
     assert provider_data["receipt"]["items"][0]["amount"] == {
-        "value": "1.00",
+        "value": "100.00",
         "currency": "RUB",
     }
     assert telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID[chat_id] == "ANNA20"
@@ -1605,7 +1608,7 @@ async def test_test_smoke_yookassa_invoice_uses_override_without_consuming_pendi
     ("callback_data", "expected_amount"),
     [
         (telegram_app.CALLBACK_PAY_TELEGRAM_STARS, 1),
-        (telegram_app.CALLBACK_PAY_RU_CARD, 100),
+        (telegram_app.CALLBACK_PAY_RU_CARD, 10_000),
     ],
 )
 async def test_admin_callback_actor_gets_test_price_when_message_author_is_bot(
