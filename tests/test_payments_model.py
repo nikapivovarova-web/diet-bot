@@ -596,6 +596,89 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
     assert item["payment_subject"] == "service"
 
 
+@pytest.mark.parametrize(
+    (
+        "provider",
+        "product",
+        "amount",
+        "currency",
+        "expected_is_recurring",
+        "expected_subscription_period",
+    ),
+    [
+        (
+            PaymentProvider.TELEGRAM_STARS,
+            PaymentProduct.SUBSCRIPTION_MONTH,
+            450,
+            PaymentCurrency.XTR,
+            True,
+            TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS,
+        ),
+        (
+            PaymentProvider.TELEGRAM_STARS,
+            PaymentProduct.EXTRA_ONE_DAY,
+            40,
+            PaymentCurrency.XTR,
+            False,
+            None,
+        ),
+        (
+            PaymentProvider.TELEGRAM_STARS,
+            PaymentProduct.EXTRA_WEEKLY_PDF,
+            199,
+            PaymentCurrency.XTR,
+            False,
+            None,
+        ),
+        (
+            PaymentProvider.YOOKASSA,
+            PaymentProduct.SUBSCRIPTION_MONTH,
+            79_900,
+            PaymentCurrency.RUB,
+            False,
+            None,
+        ),
+        (
+            PaymentProvider.YOOKASSA,
+            PaymentProduct.EXTRA_ONE_DAY,
+            6_900,
+            PaymentCurrency.RUB,
+            False,
+            None,
+        ),
+        (
+            PaymentProvider.YOOKASSA,
+            PaymentProduct.EXTRA_WEEKLY_PDF,
+            34_900,
+            PaymentCurrency.RUB,
+            False,
+            None,
+        ),
+    ],
+)
+def test_payment_order_is_recurring_only_for_stars_monthly_invoice_metadata(
+    provider: PaymentProvider,
+    product: PaymentProduct,
+    amount: int,
+    currency: PaymentCurrency,
+    expected_is_recurring: bool,
+    expected_subscription_period: int | None,
+) -> None:
+    order = _payment_order(
+        f"order_{provider.value}_{product.value}",
+        f"nonce_{provider.value}_{product.value}",
+        product,
+        provider=provider,
+        amount=amount,
+        currency=currency,
+    )
+
+    metadata = build_payment_invoice_metadata(order)
+
+    assert metadata.subscription_period == expected_subscription_period
+    assert (metadata.subscription_period is not None) is expected_is_recurring
+
+
 def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metadata() -> None:
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
     order = _payment_order(

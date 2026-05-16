@@ -89,6 +89,7 @@ from diet_bot.telegram_app import (
     PAY_WITH_RU_CARD_TEXT,
     PAY_WITH_TELEGRAM_STARS_TEXT,
     PAYLOAD_EXTRA_ONE_DAY,
+    PAYLOAD_EXTRA_WEEKLY_PDF,
     PAYLOAD_SUBSCRIPTION_MONTH,
     PAYMENT_PAYLOAD_AMOUNTS,
     PLAN_COUNT_BY_CHAT_ID,
@@ -1617,6 +1618,25 @@ async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkey
 
 
 @pytest.mark.anyio
+async def test_send_extra_weekly_pdf_invoice_link_creates_one_time_stars_invoice(monkeypatch) -> None:
+    store = FakePaymentStore(entitlements={12345: _active_payment_entitlement()})
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage()
+
+    await _send_stars_invoice_link(message, PAYLOAD_EXTRA_WEEKLY_PDF)
+
+    invoice = message.bot.invoice_links[0]
+    order_id, nonce = decode_payment_order_payload(invoice["payload"])
+    order = store.orders[0]
+
+    assert invoice["currency"] == "XTR"
+    assert invoice["payload"] == f"diet:order:{order_id}:{nonce}"
+    assert order.product == PaymentProduct.EXTRA_WEEKLY_PDF
+    assert invoice["prices"][0].amount == 199
+    assert invoice["subscription_period"] is None
+
+
+@pytest.mark.anyio
 async def test_repeated_stars_invoice_tap_reuses_active_pending_order(monkeypatch) -> None:
     store = FakePaymentStore()
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1689,6 +1709,7 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert order.product == PaymentProduct.SUBSCRIPTION_MONTH
     assert invoice["payload"] == order.payload
     assert invoice["prices"][0].amount == 79_900
+    assert "subscription_period" not in invoice
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
     assert item == {
