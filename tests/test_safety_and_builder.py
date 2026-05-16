@@ -311,6 +311,7 @@ def _eligible_food_ids_for_exclusion(value: str) -> set[str]:
         ("\u044f\u0439\u0446\u0430", {"egg", "egg_white", "egg_white_extra", "egg_yolk", "egg_noodles"}),
         ("\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438", {"broccoli"}),
         ("\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b", {"milk", "greek_yogurt", "cottage_cheese"}),
+        ("\u043c\u043e\u043b\u043e\u0447\u043a\u0430", {"milk", "greek_yogurt", "cottage_cheese"}),
         ("\u0442\u0432\u043e\u0440\u043e\u0433", {"cottage_cheese", "lactose_free_cottage_cheese"}),
         ("\u0441\u044b\u0440", {"cream_cheese", "goat_cheese", "swiss_cheese"}),
         ("\u043e\u0440\u0435\u0445\u0438", {"walnuts", "almonds", "cashews", "pecans"}),
@@ -409,6 +410,49 @@ def test_food_exclusion_word_boundaries_avoid_false_positives() -> None:
     assert not is_name_excluded("broccolinium supplement", broccoli_safety.excluded_food_names)
 
 
+def test_human_category_exclusion_aliases_expand_to_recipe_names() -> None:
+    porridge_safety = _safety_for_exclusion("\u043a\u0430\u0448\u0430")
+    assert is_name_excluded(
+        "\u041e\u0432\u0441\u044f\u043d\u043a\u0430 \u0441 \u0431\u0430\u043d\u0430\u043d\u043e\u043c",
+        porridge_safety.excluded_food_names,
+    )
+    assert is_name_excluded(
+        "\u0412\u0430\u043d\u0438\u043b\u044c\u043d\u043e-\u043c\u0438\u043d\u0434\u0430\u043b\u044c\u043d\u0430\u044f \u0447\u0438\u0430-\u043e\u0432\u0441\u044f\u043d\u0430\u044f \u0447\u0430\u0448\u0430",
+        porridge_safety.excluded_food_names,
+    )
+    assert is_name_excluded(
+        "\u0413\u0440\u0435\u0447\u043d\u0435\u0432\u0430\u044f \u043a\u0430\u0448\u0430",
+        porridge_safety.excluded_food_names,
+    )
+    assert is_name_excluded(
+        "\u0420\u0438\u0441\u043e\u0432\u0430\u044f \u043a\u0430\u0448\u0430",
+        porridge_safety.excluded_food_names,
+    )
+
+    mushroom_safety = _safety_for_exclusion("\u0433\u0440\u0438\u0431\u044b")
+    assert is_name_excluded(
+        "\u0422\u043e\u0441\u0442 \u0441 \u0448\u0430\u043c\u043f\u0438\u043d\u044c\u043e\u043d\u0430\u043c\u0438",
+        mushroom_safety.excluded_food_names,
+    )
+    assert is_name_excluded(
+        "\u041f\u0430\u0441\u0442\u0430 \u0441 \u0432\u0435\u0448\u0435\u043d\u043a\u0430\u043c\u0438",
+        mushroom_safety.excluded_food_names,
+    )
+    assert is_name_excluded(
+        "\u0417\u0440\u0430\u0437\u044b \u0441 \u0431\u0435\u043b\u044b\u043c\u0438 \u0433\u0440\u0438\u0431\u0430\u043c\u0438",
+        mushroom_safety.excluded_food_names,
+    )
+
+
+def test_milk_exclusion_does_not_expand_to_all_dairy() -> None:
+    eligible_ids = _eligible_food_ids_for_exclusion("\u043c\u043e\u043b\u043e\u043a\u043e")
+
+    assert "milk" not in eligible_ids
+    assert "greek_yogurt" in eligible_ids
+    assert "cottage_cheese" in eligible_ids
+    assert "cheddar" in eligible_ids
+
+
 def test_recipe_title_exclusions_are_applied_after_ingredient_id_pool(monkeypatch) -> None:
     safety = _safety_for_exclusion("egg")
     monkeypatch.setattr(
@@ -479,6 +523,84 @@ def test_excluded_mushrooms_filter_curated_recipes_by_alias() -> None:
     assert len(plan.meals) == 5
     assert "mushrooms" not in food_ids
     assert not any("excluded" in error for error in validation.errors)
+
+
+def test_porridge_exclusion_filters_oatmeal_recipes_from_curated_plan() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043a\u0430\u0448\u0430"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=0, recipe_source="curated_only")
+    forbidden_title_terms = (
+        "\u043a\u0430\u0448\u0430",
+        "\u043e\u0432\u0441\u044f\u043d\u043a\u0430",
+        "\u043e\u0432\u0441\u044f\u043d\u0430\u044f \u0447\u0430\u0448\u0430",
+        "\u043e\u0432\u0441\u044f\u043d\u044b\u0439 \u0431\u043e\u0443\u043b",
+    )
+    recipe_ids = {meal.recipe_id or "" for meal in plan.meals}
+
+    assert len(plan.meals) == 5
+    assert not any(
+        any(term in meal.name.lower() for term in forbidden_title_terms)
+        for meal in plan.meals
+    )
+    assert not any("ovsyank" in recipe_id or "porridge" in recipe_id for recipe_id in recipe_ids)
+
+
+def test_dairy_category_exclusion_filters_curated_dairy_recipes() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043c\u043e\u043b\u043e\u0447\u043a\u0430"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=0, recipe_source="curated_only")
+    dairy_ids = {
+        "milk",
+        "buttermilk",
+        "greek_yogurt",
+        "lactose_free_yogurt",
+        "cottage_cheese",
+        "lactose_free_cottage_cheese",
+        "cream_cheese",
+        "cheddar",
+        "feta",
+        "mozzarella",
+        "parmesan",
+        "ricotta",
+    }
+
+    assert len(plan.meals) == 5
+    assert dairy_ids.isdisjoint(food_ids(plan))
+    assert dairy_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+
+def test_milk_only_exclusion_keeps_other_dairy_available_in_curated_plan() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043c\u043e\u043b\u043e\u043a\u043e"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=1, recipe_source="curated_only")
+    plan_food_ids = food_ids(plan)
+
+    assert len(plan.meals) == 5
+    assert "milk" not in plan_food_ids
+    assert {"greek_yogurt", "cottage_cheese"} & plan_food_ids
+
+
+def test_mushroom_exclusion_filters_champignon_recipes_from_curated_plan() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u0433\u0440\u0438\u0431\u044b"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=1, recipe_source="curated_only")
+    mushroom_ids = {"mushrooms", "shiitake"}
+
+    assert len(plan.meals) == 5
+    assert mushroom_ids.isdisjoint(food_ids(plan))
+    assert mushroom_ids.isdisjoint(recipe_ingredient_ids(plan))
 
 
 def test_celiac_excludes_gluten_foods_and_oats_by_default() -> None:
