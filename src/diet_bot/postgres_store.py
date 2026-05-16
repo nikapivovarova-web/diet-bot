@@ -64,6 +64,7 @@ from .subscriptions import (
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
     grant_test_access,
+    has_active_managed_stars_subscription,
     refund_attempt,
 )
 from .storage import RecipeHistoryItem, SupportState, UserIdentity
@@ -1101,8 +1102,24 @@ class PostgresDietBotStore:
             with conn.cursor() as cur:
                 self._remember_user_cur(cur, UserIdentity(user_id))
                 cur.execute("SELECT 1 FROM users WHERE telegram_id = %s FOR UPDATE", (user_id,))
-                if requires_active_subscription:
-                    entitlement = self._select_entitlement_for_update_cur(cur, user_id)
+                is_stars_monthly = (
+                    provider_value == PaymentProvider.TELEGRAM_STARS
+                    and product_value == PaymentProduct.SUBSCRIPTION_MONTH
+                )
+                entitlement = (
+                    self._select_entitlement_for_update_cur(cur, user_id)
+                    if requires_active_subscription or is_stars_monthly
+                    else None
+                )
+                if is_stars_monthly and entitlement is not None:
+                    if has_active_managed_stars_subscription(entitlement, current_time):
+                        return PaymentOrderCreationResult(
+                            accepted=False,
+                            code=PaymentOrderCreationCode.ACTIVE_STARS_SUBSCRIPTION_EXISTS,
+                            message="Active Telegram Stars subscription already exists.",
+                            requires_active_subscription=False,
+                        )
+                if requires_active_subscription and entitlement is not None:
                     if not entitlement.is_subscription_active(current_time):
                         return PaymentOrderCreationResult(
                             accepted=False,

@@ -15,6 +15,7 @@ from .subscriptions import (
     apply_extra_one_day_payment,
     apply_extra_weekly_pdf_payment,
     apply_subscription_payment,
+    has_active_managed_stars_subscription,
 )
 
 
@@ -56,6 +57,7 @@ class PaymentOrderCreationCode(StrEnum):
     CREATED = "created"
     REUSED = "reused"
     ACTIVE_SUBSCRIPTION_REQUIRED = "active_subscription_required"
+    ACTIVE_STARS_SUBSCRIPTION_EXISTS = "active_stars_subscription_exists"
     PROMO_NOT_FOUND = "promo_not_found"
     PROMO_NOT_DISCOUNT = "promo_not_discount"
     PROMO_DISABLED = "promo_disabled"
@@ -236,7 +238,7 @@ _PAYMENT_PRODUCT_INVOICE_CATALOG: Mapping[
 }
 
 _PAYMENT_PRODUCT_RECEIPT_DESCRIPTIONS: Mapping[PaymentProduct, str] = {
-    PaymentProduct.SUBSCRIPTION_MONTH: "FoodBalance monthly access",
+    PaymentProduct.SUBSCRIPTION_MONTH: "FoodBalance 30-day access",
     PaymentProduct.EXTRA_ONE_DAY: "FoodBalance one-day ration",
     PaymentProduct.EXTRA_WEEKLY_PDF: "FoodBalance weekly PDF",
 }
@@ -1422,6 +1424,21 @@ def create_or_reuse_pending_payment_order(
 
     current_time = _normalize_datetime(now)
     requires_active_subscription = product_value in EXTRA_PAYMENT_PRODUCTS
+    if (
+        provider_value == PaymentProvider.TELEGRAM_STARS
+        and product_value == PaymentProduct.SUBSCRIPTION_MONTH
+        and _repository_has_active_managed_stars_subscription(
+            repository,
+            user_id=user_id,
+            now=current_time,
+        )
+    ):
+        return PaymentOrderCreationResult(
+            accepted=False,
+            code=PaymentOrderCreationCode.ACTIVE_STARS_SUBSCRIPTION_EXISTS,
+            message="Active Telegram Stars subscription already exists.",
+            requires_active_subscription=False,
+        )
     if requires_active_subscription and not _repository_has_active_subscription(
         repository,
         user_id=user_id,
@@ -2766,6 +2783,21 @@ def _repository_has_active_subscription(
         if callable(checker):
             return bool(checker(now))
     return provided is True
+
+
+def _repository_has_active_managed_stars_subscription(
+    repository: object,
+    *,
+    user_id: int,
+    now: datetime,
+) -> bool:
+    loader = getattr(repository, "get_entitlement", None)
+    if not callable(loader):
+        return False
+    entitlement = loader(user_id)
+    if not isinstance(entitlement, Entitlement):
+        return False
+    return has_active_managed_stars_subscription(entitlement, now)
 
 
 def _validate_payload_token(name: str, value: str) -> str:

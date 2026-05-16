@@ -893,6 +893,69 @@ def test_subscription_payment_keyboard_shows_paid_buttons_when_public_payments_e
     ]
 
 
+def test_subscription_payment_keyboard_distinguishes_stars_auto_renew_and_yookassa_one_time(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    keyboard = telegram_app._subscription_payment_keyboard(chat_id=51_024, user_id=51_024)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (
+        "💳 Разовый доступ на 30 дней - 799 ₽",
+        telegram_app.CALLBACK_PAY_RU_CARD,
+    ) in buttons
+    assert (
+        "⭐ Подписка с автопродлением - 450 Stars",
+        telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+    ) in buttons
+
+
+def test_active_stars_auto_renew_keyboard_does_not_offer_second_stars_subscription(
+    monkeypatch,
+) -> None:
+    chat_id = 51_025
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="enabled",
+    )
+
+    class FakeEntitlementStore:
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return entitlement
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            updated: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def load_profile_data(self, chat_id: int) -> dict[str, object] | None:
+            return None
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", FakeEntitlementStore())
+
+    keyboard = telegram_app._subscription_payment_keyboard(chat_id=chat_id, user_id=chat_id)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert all(
+        callback != telegram_app.CALLBACK_PAY_TELEGRAM_STARS
+        for _, callback in buttons
+    )
+    assert any(callback == telegram_app.CALLBACK_PAY_RU_CARD for _, callback in buttons)
+    assert any(callback == telegram_app.CALLBACK_PROMO_CODE for _, callback in buttons)
+
+
 def test_subscription_payment_text_shows_production_prices_without_discount(
     monkeypatch,
 ) -> None:
@@ -903,6 +966,84 @@ def test_subscription_payment_text_shows_production_prices_without_discount(
     assert f"{telegram_app.SUBSCRIPTION_PRICE_RUB} ₽" in text
     assert f"{telegram_app.SUBSCRIPTION_STARS_AMOUNT} Stars" in text
     assert "скид" not in text.lower()
+
+
+def test_subscription_payment_text_describes_yookassa_as_one_time_and_stars_as_auto_renew(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    text = telegram_app._subscription_payment_text(chat_id=51_026, user_id=51_026)
+
+    assert "Telegram Stars: автопродляемая подписка на месяц" in text
+    assert "YooKassa: разовый доступ на 30 дней" in text
+
+
+@pytest.mark.parametrize(
+    ("source", "auto_renew_status", "expected", "forbidden"),
+    [
+        (
+            "telegram_stars",
+            "enabled",
+            "Автопродление Telegram Stars включено. Следующее обновление периода: 15.06.2026",
+            "Разовый доступ",
+        ),
+        (
+            "telegram_stars",
+            "unknown",
+            "Статус автопродления Telegram Stars уточняется. Доступ действует до: 15.06.2026",
+            "Следующее обновление",
+        ),
+        (
+            "telegram_stars",
+            "canceled",
+            "Автопродление Telegram Stars отменено. Доступ действует до: 15.06.2026",
+            "Следующее обновление",
+        ),
+        (
+            "yookassa",
+            "not_applicable",
+            "Разовый доступ через YooKassa действует до: 15.06.2026",
+            "автопродлен",
+        ),
+    ],
+)
+def test_subscriber_cabinet_uses_renewal_wording_only_for_stars_auto_renew(
+    monkeypatch,
+    source: str,
+    auto_renew_status: str,
+    expected: str,
+    forbidden: str,
+) -> None:
+    chat_id = 51_031
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source=source,
+        auto_renew_status=auto_renew_status,
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=3,
+    )
+
+    class FakeEntitlementStore:
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return entitlement
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            updated: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def load_profile_data(self, chat_id: int) -> dict[str, object] | None:
+            return None
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", FakeEntitlementStore())
+
+    text = telegram_app._subscriber_cabinet_text(chat_id)
+
+    assert expected in text
+    assert forbidden.lower() not in text.lower()
 
 
 @pytest.mark.anyio
@@ -936,8 +1077,8 @@ async def test_discount_promo_payment_screen_shows_discounted_amounts_after_entr
     assert "70%" in payment_text
     assert "239.70 ₽" in payment_text
     assert "135 Stars" in payment_text
-    assert ("💳 Оплатить картой / SberPay - 239.70 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
-    assert ("⭐ Оплатить подписку - 135 Stars", telegram_app.CALLBACK_PAY_TELEGRAM_STARS) in buttons
+    assert ("💳 Разовый доступ на 30 дней - 239.70 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
+    assert ("⭐ Подписка с автопродлением - 135 Stars", telegram_app.CALLBACK_PAY_TELEGRAM_STARS) in buttons
 
 
 @pytest.mark.anyio
@@ -967,7 +1108,7 @@ async def test_yookassa_only_discount_keeps_stars_button_full_price_with_notice(
 
     assert "150 ₽" in sent_text
     assert "Telegram Stars без скидки: 450 Stars." in sent_text
-    assert ("💳 Оплатить картой / SberPay - 649 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
+    assert ("💳 Разовый доступ на 30 дней - 649 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
     assert (
         telegram_app.PAY_WITH_TELEGRAM_STARS_TEXT,
         telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
@@ -1031,6 +1172,79 @@ async def test_discount_promo_invoice_amount_matches_displayed_discounted_amount
     assert bot.calls[0]["prices"][0].amount == expected_amount
     assert expected_display in payment_message.texts[-1][0]
     assert chat_id not in telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID
+
+
+@pytest.mark.anyio
+async def test_active_stars_auto_renew_direct_invoice_request_is_not_created(
+    monkeypatch,
+) -> None:
+    chat_id = 51_030
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="enabled",
+    )
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/duplicate-stars"
+
+    class FakeStarsStore:
+        def __init__(self) -> None:
+            self.created_orders: list[dict[str, object]] = []
+
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return entitlement
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            updated: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def create_or_reuse_pending_payment_order(
+            self,
+            **kwargs,
+        ):
+            self.created_orders.append(kwargs)
+            return SimpleNamespace(
+                accepted=True,
+                code=telegram_app.PaymentOrderCreationCode.CREATED,
+                order=telegram_app.PaymentOrder(
+                    order_id="order_duplicate_stars",
+                    nonce="nonce_duplicate_stars",
+                    user_id=chat_id,
+                    delivery_chat_id=chat_id,
+                    provider=telegram_app.PaymentProvider.TELEGRAM_STARS,
+                    product=telegram_app.PaymentProduct.SUBSCRIPTION_MONTH,
+                    amount=telegram_app.SUBSCRIPTION_STARS_AMOUNT,
+                    currency="XTR",
+                    created_at=datetime(2026, 5, 16, 10, 0, tzinfo=UTC),
+                    expires_at=datetime(2026, 5, 16, 10, 15, tzinfo=UTC),
+                ),
+            )
+
+    store = FakeStarsStore()
+    bot = FakeInvoiceBot()
+    message = FakeMessage(chat_id)
+    message.bot = bot
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    await telegram_app._send_stars_invoice_link(
+        message,
+        telegram_app.PAYLOAD_SUBSCRIPTION_MONTH,
+        buyer_user_id=chat_id,
+    )
+
+    assert store.created_orders == []
+    assert bot.calls == []
+    assert "Telegram Stars" in message.texts[-1][0]
+    assert "автопродление" in message.texts[-1][0].lower()
 
 
 @pytest.mark.anyio
@@ -1233,6 +1447,34 @@ async def test_public_payment_callbacks_show_pilot_promo_text_when_disabled(
     assert buttons == [
         (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE),
     ]
+
+
+def test_paywall_keyboard_keeps_extra_one_time_purchase_buttons(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    keyboard = telegram_app._paywall_keyboard(preferred="weekly_pdf")
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (
+        telegram_app.BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT,
+        telegram_app.CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF,
+    ) in buttons
+    assert (
+        telegram_app.BUY_EXTRA_WEEKLY_PDF_TEXT,
+        telegram_app.CALLBACK_BUY_EXTRA_WEEKLY_PDF,
+    ) in buttons
+    assert (
+        telegram_app.BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
+        telegram_app.CALLBACK_PAY_RU_EXTRA_ONE_DAY,
+    ) in buttons
+    assert (
+        telegram_app.BUY_EXTRA_ONE_DAY_TEXT,
+        telegram_app.CALLBACK_BUY_EXTRA_ONE_DAY,
+    ) in buttons
 
 
 @pytest.mark.anyio

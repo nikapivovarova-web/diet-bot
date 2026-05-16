@@ -25,6 +25,9 @@ SUBSCRIPTION_SOURCES: frozenset[str] = frozenset(
 AUTO_RENEW_STATUSES: frozenset[str] = frozenset(
     {"not_applicable", "enabled", "canceled", "unknown"}
 )
+STARS_DUPLICATE_GUARD_AUTO_RENEW_STATUSES: frozenset[str] = frozenset(
+    {"enabled", "unknown", "canceled"}
+)
 _UNSET = object()
 
 
@@ -246,6 +249,17 @@ def set_test_access_enabled(
         return False
     entitlement.test_access_enabled = enabled
     return True
+
+
+def has_active_managed_stars_subscription(
+    entitlement: Entitlement,
+    now: datetime | None = None,
+) -> bool:
+    return (
+        entitlement.subscription_source == "telegram_stars"
+        and entitlement.auto_renew_status in STARS_DUPLICATE_GUARD_AUTO_RENEW_STATUSES
+        and entitlement.is_subscription_active(now)
+    )
 
 
 def apply_subscription_payment(

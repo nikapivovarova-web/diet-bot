@@ -929,8 +929,8 @@ async def test_active_subscription_limit_paywall_offers_only_extra_purchases(mon
     sent_text, markup = message.texts[-1]
     buttons = [row[0] for row in markup.inline_keyboard]
 
-    assert "Можно дождаться следующего обновления подписки или купить разовую попытку." in sent_text
-    assert "Следующее обновление подписки" in sent_text
+    assert "Можно дождаться окончания текущего периода доступа или купить разовую попытку." in sent_text
+    assert "Доступ действует до" in sent_text
     assert (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD) not in [
         (button.text, button.callback_data)
         for button in buttons
@@ -1713,7 +1713,7 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
     assert item == {
-        "description": "FoodBalance monthly access",
+        "description": "FoodBalance 30-day access",
         "quantity": "1.00",
         "amount": {
             "value": "799.00",
@@ -1724,7 +1724,7 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
         "payment_subject": "service",
     }
     assert store.invoice_link_updates == [(order.order_id, "https://t.me/invoice/test")]
-    assert message.texts[-1][0] == "FoodBalance: подписка на месяц\n\nСтоимость: 799 ₽."
+    assert message.texts[-1][0] == "FoodBalance: доступ на 30 дней\n\nСтоимость: 799 ₽."
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
 
@@ -1799,7 +1799,7 @@ async def test_ru_invoice_without_provider_token_shows_unavailable_message(monke
     sent_text, markup = message.texts[-1]
     assert "FoodBalance: 1 дневной рацион" in sent_text
     assert "Стоимость: 69 ₽." in sent_text
-    assert "ЮKassa сейчас недоступна" in sent_text
+    assert "YooKassa сейчас недоступна" in sent_text
     assert markup is None
 
 
@@ -3002,7 +3002,7 @@ async def test_test_access_off_keeps_active_subscription_access(monkeypatch, tmp
         assert weekly_consumption.source == "monthly"
         assert "PDF" in status_text
         assert "бесплатный сценарий" not in status_text
-        assert "Следующее обновление подписки" in paywall_text
+        assert "Доступ действует до" in paywall_text
         assert (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD) not in [
             (button.text, button.callback_data)
             for button in paywall_buttons
@@ -3059,7 +3059,7 @@ async def test_test_access_off_previews_free_menu_without_subscription(monkeypat
         ]
         assert not weekly_consumption.allowed
         assert one_day_consumption.source == "free_trial"
-        assert "Следующее обновление подписки" not in paywall_text
+        assert "Следующее обновление периода" not in paywall_text
         assert "бесплатный сценарий" in paywall_text
         assert [(button.text, button.callback_data) for button in paywall_buttons] == [
             (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),

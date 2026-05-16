@@ -113,6 +113,7 @@ from .subscriptions import (
     consume_one_day_attempt,
     consume_weekly_pdf_attempt,
     grant_test_access,
+    has_active_managed_stars_subscription,
     load_entitlements,
     refund_attempt,
     revoke_test_access,
@@ -247,24 +248,26 @@ TEST_SUBSCRIPTION_STARS_AMOUNT = 1
 TEST_SUBSCRIPTION_PRICE_RUB = 100
 SUBSCRIPTION_PAYMENT_TEXT = (
     "FoodBalance - цифровой сервис персональных рационов питания.\n\n"
-    f"Месячный доступ - {SUBSCRIPTION_PRICE_RUB} ₽ или {SUBSCRIPTION_STARS_AMOUNT} Stars.\n\n"
+    f"YooKassa: разовый доступ на 30 дней - {SUBSCRIPTION_PRICE_RUB} ₽.\n"
+    f"Telegram Stars: автопродляемая подписка на месяц - {SUBSCRIPTION_STARS_AMOUNT} Stars.\n\n"
     "Включено:\n"
     f"• {MONTHLY_WEEKLY_PDF_LIMIT} недельных PDF-рациона\n"
     f"• {MONTHLY_ONE_DAY_LIMIT} рационов на 1 день\n"
     "• рецепты и список продуктов по анкете\n\n"
     "Сервис носит информационный характер и не является медицинской консультацией."
 )
-PAY_WITH_TELEGRAM_STARS_TEXT = f"⭐ Оплатить подписку - {SUBSCRIPTION_STARS_AMOUNT} Stars"
-PAY_WITH_RU_CARD_TEXT = f"💳 Оплатить картой / SberPay - {SUBSCRIPTION_PRICE_RUB} ₽"
+PAY_WITH_TELEGRAM_STARS_TEXT = f"⭐ Подписка с автопродлением - {SUBSCRIPTION_STARS_AMOUNT} Stars"
+PAY_WITH_RU_CARD_TEXT = f"💳 Разовый доступ на 30 дней - {SUBSCRIPTION_PRICE_RUB} ₽"
 PAY_WITH_TELEGRAM_STARS_TEST_TEXT = (
-    f"[TEST] ⭐ Оплатить подписку - {TEST_SUBSCRIPTION_STARS_AMOUNT} Star"
+    f"[TEST] ⭐ Подписка с автопродлением - {TEST_SUBSCRIPTION_STARS_AMOUNT} Star"
 )
 PAY_WITH_RU_CARD_TEST_TEXT = (
-    f"[TEST] 💳 Оплатить картой / SberPay - {TEST_SUBSCRIPTION_PRICE_RUB} ₽"
+    f"[TEST] 💳 Разовый доступ на 30 дней - {TEST_SUBSCRIPTION_PRICE_RUB} ₽"
 )
 SUBSCRIPTION_TEST_PAYMENT_NOTICE_TEXT = (
     "[TEST] Smoke pricing включен для этого аккаунта: "
-    f"подписка - {TEST_SUBSCRIPTION_PRICE_RUB} ₽ или {TEST_SUBSCRIPTION_STARS_AMOUNT} Star."
+    f"YooKassa разовый доступ на 30 дней - {TEST_SUBSCRIPTION_PRICE_RUB} ₽; "
+    f"Telegram Stars подписка с автопродлением - {TEST_SUBSCRIPTION_STARS_AMOUNT} Star."
 )
 BUY_EXTRA_ONE_DAY_TEXT = f"⭐ Купить 1 дневной рацион - {EXTRA_ONE_DAY_STARS_AMOUNT} Stars"
 BUY_EXTRA_WEEKLY_PDF_TEXT = f"⭐ Купить 1 недельный PDF - {EXTRA_WEEKLY_PDF_STARS_AMOUNT} Stars"
@@ -413,22 +416,22 @@ RUB_PAYMENT_PAYLOAD_AMOUNTS = {
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: EXTRA_WEEKLY_PDF_PRICE_RUB * 100,
 }
 PAYMENT_PAYLOAD_TITLES = {
-    PAYLOAD_SUBSCRIPTION_MONTH: "FoodBalance: подписка на месяц",
+    PAYLOAD_SUBSCRIPTION_MONTH: "FoodBalance: подписка на месяц с автопродлением",
     PAYLOAD_EXTRA_ONE_DAY: "FoodBalance: 1 дневной рацион",
     PAYLOAD_EXTRA_WEEKLY_PDF: "FoodBalance: 1 недельный PDF",
 }
 RUB_PAYMENT_PAYLOAD_TITLES = {
-    PAYLOAD_RU_SUBSCRIPTION_MONTH: "FoodBalance: подписка на месяц",
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: "FoodBalance: доступ на 30 дней",
     PAYLOAD_RU_EXTRA_ONE_DAY: "FoodBalance: 1 дневной рацион",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "FoodBalance: 1 недельный PDF",
 }
 PAYMENT_PAYLOAD_DESCRIPTIONS = {
-    PAYLOAD_SUBSCRIPTION_MONTH: "30 дней доступа: 4 недельных PDF и 5 дневных рационов.",
+    PAYLOAD_SUBSCRIPTION_MONTH: "Автопродляемая подписка: 4 недельных PDF и 5 дневных рационов в месяц.",
     PAYLOAD_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
 RUB_PAYMENT_PAYLOAD_DESCRIPTIONS = {
-    PAYLOAD_RU_SUBSCRIPTION_MONTH: "30 дней доступа: 4 недельных PDF и 5 дневных рационов.",
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: "Разовый доступ на 30 дней: 4 недельных PDF и 5 дневных рационов.",
     PAYLOAD_RU_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
@@ -2639,12 +2642,12 @@ def _subscription_payment_price_preview(
 
 
 def _pay_with_ru_card_text(amount_kopecks: int) -> str:
-    return f"💳 Оплатить картой / SberPay - {_format_kopecks_for_display(amount_kopecks)} ₽"
+    return f"💳 Разовый доступ на 30 дней - {_format_kopecks_for_display(amount_kopecks)} ₽"
 
 
 def _pay_with_telegram_stars_text(amount: int) -> str:
     unit = "Star" if amount == 1 else "Stars"
-    return f"⭐ Оплатить подписку - {amount} {unit}"
+    return f"⭐ Подписка с автопродлением - {amount} {unit}"
 
 
 def _discount_promo_label(
@@ -2689,7 +2692,7 @@ def _subscription_discount_notice_text(
     ]
     if ru_card.discount_amount > 0:
         lines.append(
-            "Картой/SberPay: "
+            "YooKassa разовый доступ: "
             f"{_format_kopecks_for_display(ru_card.amount)} ₽ вместо "
             f"{_format_kopecks_for_display(ru_card.list_amount)} ₽."
         )
@@ -2802,11 +2805,16 @@ async def _send_extra_purchase_subscription_required_message(message: Message) -
 
 
 def _active_subscription_notice_text(entitlement: Entitlement) -> str:
-    renewal = _format_next_renewal_line(entitlement)
     lines = ["Месячный доступ уже активен."]
-    if renewal:
-        lines.append(renewal)
-    lines.append("Повторно купить месячный доступ можно после окончания текущего периода.")
+    status = _format_subscription_period_status_line(entitlement)
+    if status:
+        lines.append(status)
+    if has_active_managed_stars_subscription(entitlement):
+        lines.append(
+            "Новый счет на Telegram Stars не создаю, чтобы не оформить вторую автоподписку."
+        )
+    else:
+        lines.append("Повторно купить месячный доступ можно после окончания текущего периода.")
     return "\n".join(lines)
 
 
@@ -2816,7 +2824,7 @@ def _ru_card_payment_unavailable_text(payload: str) -> str:
     return (
         f"{title}\n\n"
         f"Стоимость: {_format_kopecks_for_display(amount)} ₽.\n\n"
-        "Оплата картой через ЮKassa сейчас недоступна. Попробуйте позже или оплатите через Telegram Stars."
+        "Оплата картой через YooKassa сейчас недоступна. Попробуйте позже или оплатите через Telegram Stars."
     )
 
 
@@ -2867,6 +2875,20 @@ async def _create_or_reuse_invoice_payment_order(
         product,
         pricing_context=pricing_context,
     )
+    if (
+        provider == PaymentProvider.TELEGRAM_STARS
+        and product == PaymentProduct.SUBSCRIPTION_MONTH
+    ):
+        entitlement = _entitlement_for_chat(message.chat.id)
+        if has_active_managed_stars_subscription(entitlement):
+            await message.answer(
+                _active_subscription_notice_text(entitlement),
+                reply_markup=_subscriber_cabinet_keyboard(
+                    message.chat.id,
+                    entitlement=entitlement,
+                ),
+            )
+            return None
     promo_code = (
         None
         if pricing_context == PAYMENT_TEST_SMOKE_PRICING_CONTEXT
@@ -2887,6 +2909,16 @@ async def _create_or_reuse_invoice_payment_order(
         return result.order
     if result.code == PaymentOrderCreationCode.ACTIVE_SUBSCRIPTION_REQUIRED:
         await _send_extra_purchase_subscription_required_message(message)
+        return None
+    if result.code == PaymentOrderCreationCode.ACTIVE_STARS_SUBSCRIPTION_EXISTS:
+        entitlement = _entitlement_for_chat(message.chat.id)
+        await message.answer(
+            _active_subscription_notice_text(entitlement),
+            reply_markup=_subscriber_cabinet_keyboard(
+                message.chat.id,
+                entitlement=entitlement,
+            ),
+        )
         return None
     await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
     return None
@@ -4056,11 +4088,15 @@ def _format_entitlement_status(chat_id: int) -> str:
         return "\n".join(lines)
     if _has_test_access(chat_id, entitlement):
         return _format_test_access_status(entitlement)
-    lines = [
+    lines = []
+    subscription_status = _format_subscription_period_status_line(entitlement)
+    if subscription_status:
+        lines.extend([subscription_status, ""])
+    lines.extend([
         "Осталось:",
         f"Рационы на 1 день: {entitlement.monthly_one_day_remaining} из {MONTHLY_ONE_DAY_LIMIT}",
         f"PDF на неделю: {entitlement.monthly_weekly_pdf_remaining} из {MONTHLY_WEEKLY_PDF_LIMIT}",
-    ]
+    ])
     if entitlement.extra_one_day_remaining or entitlement.extra_weekly_pdf_remaining:
         lines.extend(
             [
@@ -4073,13 +4109,53 @@ def _format_entitlement_status(chat_id: int) -> str:
     return "\n".join(lines)
 
 
-def _format_next_renewal_line(entitlement: Entitlement) -> str | None:
+def _format_subscription_period_status_line(entitlement: Entitlement) -> str | None:
     if not entitlement.is_subscription_active():
+        return None
+    period_end = entitlement.subscription_end_datetime()
+    until_text = f"{period_end:%d.%m.%Y}" if period_end is not None else None
+    if entitlement.subscription_source == "telegram_stars":
+        if entitlement.auto_renew_status == "enabled":
+            if until_text:
+                return (
+                    "Автопродление Telegram Stars включено. "
+                    f"Следующее обновление периода: {until_text}"
+                )
+            return "Автопродление Telegram Stars включено."
+        if entitlement.auto_renew_status == "canceled":
+            if until_text:
+                return f"Автопродление Telegram Stars отменено. Доступ действует до: {until_text}"
+            return "Автопродление Telegram Stars отменено."
+        if entitlement.auto_renew_status == "unknown":
+            if until_text:
+                return (
+                    "Статус автопродления Telegram Stars уточняется. "
+                    f"Доступ действует до: {until_text}"
+                )
+            return "Статус автопродления Telegram Stars уточняется."
+        if until_text:
+            return f"Доступ через Telegram Stars действует до: {until_text}"
+        return "Доступ через Telegram Stars активен."
+    if entitlement.subscription_source == "yookassa":
+        if until_text:
+            return f"Разовый доступ через YooKassa действует до: {until_text}"
+        return "Разовый доступ через YooKassa активен."
+    if until_text:
+        return f"Доступ действует до: {until_text}"
+    return "Доступ активен."
+
+
+def _format_next_renewal_line(entitlement: Entitlement) -> str | None:
+    if (
+        entitlement.subscription_source != "telegram_stars"
+        or entitlement.auto_renew_status != "enabled"
+        or not entitlement.is_subscription_active()
+    ):
         return None
     period_end = entitlement.subscription_end_datetime()
     if period_end is None:
         return None
-    return f"Следующее обновление подписки: {period_end:%d.%m.%Y}"
+    return f"Следующее обновление периода: {period_end:%d.%m.%Y}"
 
 
 async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
@@ -4093,19 +4169,12 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
         "",
         _format_entitlement_status(message.chat.id),
     ]
-    next_renewal = (
-        None
-        if _is_free_preview_mode(message.chat.id, entitlement)
-        else _format_next_renewal_line(entitlement)
-    )
-    if next_renewal:
-        lines.extend(["", next_renewal])
     if has_active_subscription:
         if _public_payments_enabled():
             lines.extend(
                 [
                     "",
-                    "Можно дождаться следующего обновления подписки или купить разовую попытку.",
+                    _extra_purchase_hint_text(entitlement),
                 ],
             )
             reply_markup = _paywall_keyboard(preferred=ration_kind)
@@ -4132,6 +4201,15 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
     )
 
 
+def _extra_purchase_hint_text(entitlement: Entitlement) -> str:
+    if (
+        entitlement.subscription_source == "telegram_stars"
+        and entitlement.auto_renew_status == "enabled"
+    ):
+        return "Можно дождаться следующего обновления периода или купить разовую попытку."
+    return "Можно дождаться окончания текущего периода доступа или купить разовую попытку."
+
+
 def _subscription_payment_keyboard(
     *,
     chat_id: int | None = None,
@@ -4155,13 +4233,27 @@ def _subscription_payment_keyboard(
         )
         ru_card_text = _pay_with_ru_card_text(ru_card.amount)
         stars_text = _pay_with_telegram_stars_text(stars.amount)
+    rows = [[InlineKeyboardButton(text=ru_card_text, callback_data=CALLBACK_PAY_RU_CARD)]]
+    if not _has_active_managed_stars_subscription_for_chat(chat_id):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=stars_text,
+                    callback_data=CALLBACK_PAY_TELEGRAM_STARS,
+                ),
+            ],
+        )
+    rows.append([InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)])
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=ru_card_text, callback_data=CALLBACK_PAY_RU_CARD)],
-            [InlineKeyboardButton(text=stars_text, callback_data=CALLBACK_PAY_TELEGRAM_STARS)],
-            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
-        ],
+        inline_keyboard=rows,
     )
+
+
+def _has_active_managed_stars_subscription_for_chat(chat_id: int | None) -> bool:
+    if not isinstance(chat_id, int):
+        return False
+    entitlement = _entitlement_for_chat(chat_id)
+    return has_active_managed_stars_subscription(entitlement)
 
 
 def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:

@@ -1124,6 +1124,97 @@ def test_create_subscription_month_payment_order_allows_inactive_user() -> None:
     assert result.order.product == PaymentProduct.SUBSCRIPTION_MONTH
 
 
+@pytest.mark.parametrize("auto_renew_status", ["enabled", "unknown", "canceled"])
+def test_create_stars_subscription_order_rejects_active_managed_stars_subscription(
+    auto_renew_status: str,
+) -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    entitlement = Entitlement(
+        subscription_period_end="2026-06-13T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status=auto_renew_status,
+    )
+    repository = InMemoryPaymentCheckoutRepository(
+        entitlements={1001: entitlement},
+    )
+
+    result = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=450,
+        currency=PaymentCurrency.XTR,
+        now=now,
+        order_id_factory=_sequence_factory("order_duplicate_stars"),
+        nonce_factory=_sequence_factory("nonce_duplicate_stars"),
+    )
+
+    assert result.accepted is False
+    assert str(result.code) == "active_stars_subscription_exists"
+    assert result.order is None
+    assert repository.orders == []
+
+
+def test_create_stars_subscription_order_allows_expired_managed_stars_subscription() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    entitlement = Entitlement(
+        subscription_period_end="2026-05-12T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="canceled",
+    )
+    repository = InMemoryPaymentCheckoutRepository(
+        entitlements={1001: entitlement},
+    )
+
+    result = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        product=PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=450,
+        currency=PaymentCurrency.XTR,
+        now=now,
+        order_id_factory=_sequence_factory("order_after_expiry"),
+        nonce_factory=_sequence_factory("nonce_after_expiry"),
+    )
+
+    assert result.accepted is True
+    assert result.code == PaymentOrderCreationCode.CREATED
+    assert result.order is not None
+
+
+def test_create_yookassa_one_time_month_order_allows_active_yookassa_access() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    entitlement = Entitlement(
+        subscription_period_end="2026-06-13T10:00:00+00:00",
+        subscription_source="yookassa",
+        auto_renew_status="not_applicable",
+    )
+    repository = InMemoryPaymentCheckoutRepository(
+        entitlements={1001: entitlement},
+    )
+
+    result = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=PaymentProvider.YOOKASSA,
+        product=PaymentProduct.SUBSCRIPTION_MONTH,
+        amount=79_900,
+        currency=PaymentCurrency.RUB,
+        now=now,
+        order_id_factory=_sequence_factory("order_yookassa_topup"),
+        nonce_factory=_sequence_factory("nonce_yookassa_topup"),
+    )
+
+    assert result.accepted is True
+    assert result.code == PaymentOrderCreationCode.CREATED
+    assert result.order is not None
+
+
 def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
     repository = InMemoryPaymentOrderRepository()
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
