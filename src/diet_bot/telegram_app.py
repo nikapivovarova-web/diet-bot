@@ -317,6 +317,16 @@ WEEK_PLAN_PDF_PLACEHOLDER_TEXT = "Функция рациона на недел�
 SUBSCRIBER_CABINET_TEXT = "Доступ активен. Выберите действие:"
 SUBSCRIBER_ONE_DAY_PLAN_TEXT = "Получить рацион на 1 день"
 SUBSCRIBER_WEEK_PLAN_PDF_TEXT = "Получить рацион на неделю PDF"
+STARS_AUTO_RENEW_CANCEL_TEXT = "Отключить автопродление"
+STARS_AUTO_RENEW_ENABLE_TEXT = "Возобновить автопродление"
+STARS_AUTO_RENEW_SUPPORT_TEXT = "Для управления автопродлением Telegram Stars напишите в техподдержку."
+STARS_AUTO_RENEW_CANCELLED_TEXT = (
+    "Автопродление Telegram Stars отключено. Доступ сохранится до конца оплаченного периода."
+)
+STARS_AUTO_RENEW_ENABLED_TEXT = "Автопродление Telegram Stars включено."
+STARS_AUTO_RENEW_FAILED_TEXT = (
+    "Не удалось изменить автопродление Telegram Stars. Попробуйте позже или напишите в техподдержку."
+)
 WEEK_PLAN_DAYS = 7
 WEEK_PLAN_CANDIDATE_COUNT = 4
 WEEK_PDF_STATUS_UPDATE_SECONDS = 4.0
@@ -366,6 +376,8 @@ CALLBACK_PAY_RU_EXTRA_ONE_DAY = "diet:pay_ru_extra_one_day"
 CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF = "diet:pay_ru_extra_weekly_pdf"
 CALLBACK_BUY_EXTRA_ONE_DAY = "diet:buy_extra_one_day"
 CALLBACK_BUY_EXTRA_WEEKLY_PDF = "diet:buy_extra_weekly_pdf"
+CALLBACK_STARS_AUTO_RENEW_CANCEL = "diet:stars_auto_renew_cancel"
+CALLBACK_STARS_AUTO_RENEW_ENABLE = "diet:stars_auto_renew_enable"
 CALLBACK_FEATURES = "diet:features"
 CALLBACK_PROMO_CODE = "diet:promo_code"
 CALLBACK_SUPPORT = "diet:support"
@@ -785,6 +797,16 @@ async def handle_callback(callback: CallbackQuery) -> None:
             PAYLOAD_EXTRA_WEEKLY_PDF,
             buyer_user_id=callback_user_id,
         )
+        return
+
+    if data == CALLBACK_STARS_AUTO_RENEW_CANCEL:
+        await callback.answer()
+        await _edit_stars_auto_renew(message, is_canceled=True)
+        return
+
+    if data == CALLBACK_STARS_AUTO_RENEW_ENABLE:
+        await callback.answer()
+        await _edit_stars_auto_renew(message, is_canceled=False)
         return
 
     if data == CALLBACK_FEATURES:
@@ -2477,24 +2499,50 @@ def _subscriber_cabinet_keyboard(
     entitlement: Entitlement | None = None,
 ) -> InlineKeyboardMarkup:
     entitlement = entitlement or _entitlement_for_chat(chat_id)
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=_subscriber_one_day_button_text(chat_id, entitlement),
-                    callback_data=CALLBACK_ONE_DAY_PLAN,
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=_subscriber_week_pdf_button_text(chat_id, entitlement),
-                    callback_data=CALLBACK_WEEK_PLAN_PDF,
-                ),
-            ],
-            [InlineKeyboardButton(text=CHANGE_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
-            [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_subscriber_one_day_button_text(chat_id, entitlement),
+                callback_data=CALLBACK_ONE_DAY_PLAN,
+            ),
         ],
+        [
+            InlineKeyboardButton(
+                text=_subscriber_week_pdf_button_text(chat_id, entitlement),
+                callback_data=CALLBACK_WEEK_PLAN_PDF,
+            ),
+        ],
+        [InlineKeyboardButton(text=CHANGE_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
+    ]
+    auto_renew_button = _stars_auto_renew_management_button(entitlement)
+    if auto_renew_button is not None:
+        rows.append([auto_renew_button])
+    rows.append([InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)])
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows,
     )
+
+
+def _stars_auto_renew_management_button(
+    entitlement: Entitlement,
+) -> InlineKeyboardButton | None:
+    if (
+        entitlement.subscription_source != "telegram_stars"
+        or not entitlement.stars_subscription_charge_id
+        or not entitlement.is_subscription_active()
+    ):
+        return None
+    if entitlement.auto_renew_status == "enabled":
+        return InlineKeyboardButton(
+            text=STARS_AUTO_RENEW_CANCEL_TEXT,
+            callback_data=CALLBACK_STARS_AUTO_RENEW_CANCEL,
+        )
+    if entitlement.auto_renew_status == "canceled":
+        return InlineKeyboardButton(
+            text=STARS_AUTO_RENEW_ENABLE_TEXT,
+            callback_data=CALLBACK_STARS_AUTO_RENEW_ENABLE,
+        )
+    return None
 
 
 def _subscriber_one_day_button_text(chat_id: int, entitlement: Entitlement) -> str:
@@ -2991,6 +3039,92 @@ async def _send_stars_invoice_link(
             ],
         ),
     )
+
+
+async def _edit_stars_auto_renew(message: Message, *, is_canceled: bool) -> None:
+    entitlement = _load_entitlement_for_chat(message.chat.id)
+    charge_id = str(entitlement.stars_subscription_charge_id or "").strip()
+    expected_status = "enabled" if is_canceled else "canceled"
+    next_status = "canceled" if is_canceled else "enabled"
+    if (
+        entitlement.subscription_source != "telegram_stars"
+        or entitlement.auto_renew_status != expected_status
+        or not entitlement.is_subscription_active()
+        or not charge_id
+    ):
+        await message.answer(
+            STARS_AUTO_RENEW_SUPPORT_TEXT,
+            reply_markup=_subscriber_cabinet_keyboard(message.chat.id, entitlement=entitlement),
+        )
+        return
+
+    try:
+        await message.bot.edit_user_star_subscription(
+            message.chat.id,
+            charge_id,
+            is_canceled,
+        )
+    except TelegramAPIError:
+        logger.warning(
+            "Telegram Stars auto-renew update failed: action=%s diagnostics=%s",
+            "cancel" if is_canceled else "enable",
+            _redacted_stars_auto_renew_diagnostic(charge_id),
+            exc_info=True,
+        )
+        await message.answer(
+            STARS_AUTO_RENEW_FAILED_TEXT,
+            reply_markup=_subscriber_cabinet_keyboard(message.chat.id, entitlement=entitlement),
+        )
+        return
+
+    entitlement.auto_renew_status = next_status
+    _save_entitlement_for_chat(message.chat.id, entitlement)
+    if is_canceled:
+        _record_stars_auto_renew_cancel_event_if_supported(message.chat.id, charge_id)
+
+    await message.answer(
+        STARS_AUTO_RENEW_CANCELLED_TEXT if is_canceled else STARS_AUTO_RENEW_ENABLED_TEXT,
+        reply_markup=_subscriber_cabinet_keyboard(message.chat.id, entitlement=entitlement),
+    )
+
+
+def _redacted_stars_auto_renew_diagnostic(charge_id: str) -> dict[str, object]:
+    return redact_payment_payload(
+        {
+            "provider": PaymentProvider.TELEGRAM_STARS.value,
+            "stars_subscription_charge_id": charge_id,
+        }
+    )
+
+
+def _record_stars_auto_renew_cancel_event_if_supported(
+    chat_id: int,
+    charge_id: str,
+) -> None:
+    store = _runtime_store()
+    if store is None:
+        return
+    try:
+        store.apply_payment_reversal(
+            PaymentReversalInput(
+                event_type=PaymentEventType.CANCEL_SUBSCRIPTION,
+                provider=PaymentProvider.TELEGRAM_STARS,
+                telegram_charge_id=charge_id,
+                reason="user_cancelled_stars_auto_renew",
+                raw_payload={
+                    "source": "subscriber_cabinet",
+                    "action": "cancel_stars_auto_renew",
+                    "stars_subscription_charge_id": charge_id,
+                },
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Could not record Telegram Stars auto-renew cancel event: chat_id=%s diagnostics=%s",
+            chat_id,
+            _redacted_stars_auto_renew_diagnostic(charge_id),
+            exc_info=True,
+        )
 
 
 async def _send_yookassa_invoice_link(

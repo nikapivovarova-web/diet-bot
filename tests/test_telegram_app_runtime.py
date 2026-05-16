@@ -956,6 +956,47 @@ def test_active_stars_auto_renew_keyboard_does_not_offer_second_stars_subscripti
     assert any(callback == telegram_app.CALLBACK_PROMO_CODE for _, callback in buttons)
 
 
+def test_canceled_active_stars_subscription_keyboard_does_not_offer_second_stars_subscription(
+    monkeypatch,
+) -> None:
+    chat_id = 51_025
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="canceled",
+    )
+
+    class FakeEntitlementStore:
+        def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+            return entitlement
+
+        def save_entitlement(
+            self,
+            user_id: int,
+            updated: telegram_app.Entitlement,
+        ) -> None:
+            pass
+
+        def load_profile_data(self, chat_id: int) -> dict[str, object] | None:
+            return None
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", FakeEntitlementStore())
+
+    keyboard = telegram_app._subscription_payment_keyboard(chat_id=chat_id, user_id=chat_id)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert all(
+        callback != telegram_app.CALLBACK_PAY_TELEGRAM_STARS
+        for _, callback in buttons
+    )
+    assert any(callback == telegram_app.CALLBACK_PAY_RU_CARD for _, callback in buttons)
+    assert any(callback == telegram_app.CALLBACK_PROMO_CODE for _, callback in buttons)
+
+
 def test_subscription_payment_text_shows_production_prices_without_discount(
     monkeypatch,
 ) -> None:
@@ -1044,6 +1085,247 @@ def test_subscriber_cabinet_uses_renewal_wording_only_for_stars_auto_renew(
 
     assert expected in text
     assert forbidden.lower() not in text.lower()
+
+
+@pytest.mark.parametrize(
+    ("entitlement", "expected_button", "expected_callback"),
+    [
+        (
+            telegram_app.Entitlement(
+                subscription_period_end="2026-06-15T10:00:00+00:00",
+                subscription_source="telegram_stars",
+                auto_renew_status="enabled",
+                stars_subscription_charge_id="stars-sub-active",
+            ),
+            "Отключить автопродление",
+            telegram_app.CALLBACK_STARS_AUTO_RENEW_CANCEL,
+        ),
+        (
+            telegram_app.Entitlement(
+                subscription_period_end="2026-06-15T10:00:00+00:00",
+                subscription_source="telegram_stars",
+                auto_renew_status="canceled",
+                stars_subscription_charge_id="stars-sub-canceled",
+            ),
+            "Возобновить автопродление",
+            telegram_app.CALLBACK_STARS_AUTO_RENEW_ENABLE,
+        ),
+    ],
+)
+def test_subscriber_cabinet_shows_stars_auto_renew_management_buttons(
+    entitlement: telegram_app.Entitlement,
+    expected_button: str,
+    expected_callback: str,
+) -> None:
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_032, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (expected_button, expected_callback) in buttons
+
+
+@pytest.mark.parametrize(
+    "entitlement",
+    [
+        telegram_app.Entitlement(
+            subscription_period_end="2026-06-15T10:00:00+00:00",
+            subscription_source="telegram_stars",
+            auto_renew_status="unknown",
+            stars_subscription_charge_id="stars-sub-unknown",
+        ),
+        telegram_app.Entitlement(
+            subscription_period_end="2026-06-15T10:00:00+00:00",
+            subscription_source="telegram_stars",
+            auto_renew_status="enabled",
+            stars_subscription_charge_id=None,
+        ),
+        telegram_app.Entitlement(
+            subscription_period_end="2026-06-15T10:00:00+00:00",
+            subscription_source="yookassa",
+            auto_renew_status="not_applicable",
+        ),
+        telegram_app.Entitlement(
+            subscription_period_end="2026-06-15T10:00:00+00:00",
+            subscription_source="promo",
+            auto_renew_status="not_applicable",
+        ),
+        telegram_app.Entitlement(
+            subscription_period_end="2026-06-15T10:00:00+00:00",
+            subscription_source="admin",
+            auto_renew_status="not_applicable",
+        ),
+        telegram_app.Entitlement(
+            subscription_period_end="2026-06-15T10:00:00+00:00",
+            subscription_source="legacy",
+            auto_renew_status="unknown",
+        ),
+    ],
+)
+def test_subscriber_cabinet_hides_unsafe_or_non_stars_auto_renew_buttons(
+    entitlement: telegram_app.Entitlement,
+) -> None:
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_032, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert ("Отключить автопродление", telegram_app.CALLBACK_STARS_AUTO_RENEW_CANCEL) not in buttons
+    assert ("Возобновить автопродление", telegram_app.CALLBACK_STARS_AUTO_RENEW_ENABLE) not in buttons
+
+
+class FakeStarsAutoRenewStore:
+    def __init__(self, entitlement: telegram_app.Entitlement) -> None:
+        self.entitlement = entitlement
+        self.saved: list[telegram_app.Entitlement] = []
+        self.payment_reversal_inputs: list[telegram_app.PaymentReversalInput] = []
+
+    def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+        return self.entitlement
+
+    def save_entitlement(
+        self,
+        user_id: int,
+        entitlement: telegram_app.Entitlement,
+    ) -> None:
+        self.entitlement = entitlement
+        self.saved.append(telegram_app.Entitlement.from_dict(entitlement.to_dict()))
+
+    def load_profile_data(self, chat_id: int) -> dict[str, object] | None:
+        return None
+
+    def apply_payment_reversal(
+        self,
+        reversal: telegram_app.PaymentReversalInput,
+        *,
+        now=None,
+    ) -> object:
+        self.payment_reversal_inputs.append(reversal)
+        return SimpleNamespace(processed=True)
+
+
+class FakeStarsSubscriptionBot:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[int, str, bool]] = []
+
+    async def edit_user_star_subscription(
+        self,
+        user_id: int,
+        telegram_payment_charge_id: str,
+        is_canceled: bool,
+    ) -> bool:
+        self.calls.append((user_id, telegram_payment_charge_id, is_canceled))
+        if self.fail:
+            raise telegram_app.TelegramAPIError(
+                method=SimpleNamespace(),
+                message="telegram unavailable",
+            )
+        return True
+
+
+@pytest.mark.anyio
+async def test_cancel_stars_auto_renew_calls_telegram_and_keeps_current_access(
+    monkeypatch,
+) -> None:
+    chat_id = 51_033
+    entitlement = telegram_app.Entitlement(
+        subscription_period_start="2026-05-15T10:00:00+00:00",
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="enabled",
+        stars_subscription_charge_id="stars-sub-cancel",
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=3,
+    )
+    store = FakeStarsAutoRenewStore(entitlement)
+    bot = FakeStarsSubscriptionBot()
+    message = FakeMessage(chat_id)
+    message.bot = bot
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_STARS_AUTO_RENEW_CANCEL, message)
+    )
+
+    updated = store.entitlement
+    assert bot.calls == [(chat_id, "stars-sub-cancel", True)]
+    assert updated.auto_renew_status == "canceled"
+    assert updated.is_subscription_active(datetime(2026, 5, 16, 10, 0, tzinfo=UTC))
+    assert updated.monthly_one_day_remaining == 2
+    assert updated.monthly_weekly_pdf_remaining == 3
+    assert store.payment_reversal_inputs[0].event_type == telegram_app.PaymentEventType.CANCEL_SUBSCRIPTION
+    assert store.payment_reversal_inputs[0].telegram_charge_id == "stars-sub-cancel"
+    assert "отключено" in message.texts[-1][0].lower()
+
+
+@pytest.mark.anyio
+async def test_reenable_stars_auto_renew_calls_telegram_and_keeps_current_access(
+    monkeypatch,
+) -> None:
+    chat_id = 51_034
+    entitlement = telegram_app.Entitlement(
+        subscription_period_start="2026-05-15T10:00:00+00:00",
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="canceled",
+        stars_subscription_charge_id="stars-sub-enable",
+        monthly_one_day_remaining=1,
+        monthly_weekly_pdf_remaining=2,
+    )
+    store = FakeStarsAutoRenewStore(entitlement)
+    bot = FakeStarsSubscriptionBot()
+    message = FakeMessage(chat_id)
+    message.bot = bot
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_STARS_AUTO_RENEW_ENABLE, message)
+    )
+
+    updated = store.entitlement
+    assert bot.calls == [(chat_id, "stars-sub-enable", False)]
+    assert updated.auto_renew_status == "enabled"
+    assert updated.is_subscription_active(datetime(2026, 5, 16, 10, 0, tzinfo=UTC))
+    assert updated.monthly_one_day_remaining == 1
+    assert updated.monthly_weekly_pdf_remaining == 2
+    assert store.payment_reversal_inputs == []
+    assert "включено" in message.texts[-1][0].lower()
+
+
+@pytest.mark.anyio
+async def test_stars_auto_renew_api_failure_does_not_mutate_local_status(
+    monkeypatch,
+) -> None:
+    chat_id = 51_035
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="telegram_stars",
+        auto_renew_status="enabled",
+        stars_subscription_charge_id="stars-sub-failure",
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=3,
+    )
+    before = entitlement.to_dict()
+    store = FakeStarsAutoRenewStore(entitlement)
+    bot = FakeStarsSubscriptionBot(fail=True)
+    message = FakeMessage(chat_id)
+    message.bot = bot
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_STARS_AUTO_RENEW_CANCEL, message)
+    )
+
+    assert bot.calls == [(chat_id, "stars-sub-failure", True)]
+    assert store.entitlement.to_dict() == before
+    assert store.saved == []
+    assert store.payment_reversal_inputs == []
+    assert "поддерж" in message.texts[-1][0].lower()
 
 
 @pytest.mark.anyio
