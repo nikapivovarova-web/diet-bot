@@ -17,8 +17,10 @@ Use this checklist from the clean worktree before publishing a Telegram bot rele
 - For market launch, confirm `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1`; public YooKassa/Stars payment buttons must be visible with production prices.
 - Confirm `DIET_BOT_PAYMENT_TEST_PRICES_ENABLED=0` for production/public launch.
 - Confirm `DIET_BOT_TESTER_CHAT_IDS` is empty for market launch and payment smoke; tester chat grants can mask paywall and payment evidence.
-- Use `DIET_BOT_ADMIN_USER_IDS` for owner/admin smoke access instead of tester-chat grants.
-- Production prices: monthly subscription `79900` minor units / `450` Stars, one-day extra `6900` minor units / `40` Stars, weekly PDF extra `34900` minor units / `199` Stars.
+- Use `DIET_BOT_ADMIN_USER_IDS` for owner/admin smoke access and smoke-price eligibility instead of tester-chat grants.
+- Stars monthly is an auto-renewing Telegram Stars subscription: production price `450` Stars.
+- YooKassa/card monthly access is a one-time 30-day purchase: production price `79900` minor units.
+- One-day extra and weekly PDF extra are one-time purchases: `6900` minor units / `40` Stars and `34900` minor units / `199` Stars.
 - Controlled-pilot docs are historical records, not the current release target.
 
 ## 2. Healthcheck
@@ -105,6 +107,7 @@ $env:DIET_BOT_TESTER_CHAT_IDS = ""
 - Confirm `DIET_BOT_TESTER_CHAT_IDS` remains empty during payment smoke so paywall and payment gates are not bypassed.
 - With `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1`, open the subscription/paywall path as a non-tester user and confirm YooKassa/card and Telegram Stars invoice buttons are visible.
 - Confirm production prices are shown: monthly `799 RUB` / `450` Stars, one-day extra `69 RUB` / `40` Stars, weekly PDF extra `349 RUB` / `199` Stars.
+- Confirm the Stars monthly path is labeled/handled as a subscription, while the card monthly path is a one-time 30-day access purchase.
 - Confirm no `[TEST]` labels or smoke prices are visible while production pricing is active.
 - If `TELEGRAM_PROVIDER_TOKEN` is empty in a non-launch local smoke, confirm card payment attempts do not create a broken invoice and the user receives a configuration message.
 - If `TELEGRAM_PROVIDER_TOKEN` is set, smoke invoice creation only with the approved launch/payment-smoke account and record redacted evidence.
@@ -136,8 +139,8 @@ $env:TELEGRAM_PROVIDER_TOKEN = "replace-with-yookassa-telegram-test-provider-tok
 Expected behavior:
 
 - Only users whose Telegram user id is in `DIET_BOT_ADMIN_USER_IDS` should be used for this smoke. Keep tester chat ids empty so free/test access does not mask payment gates.
-- Telegram Stars subscription invoice uses provider `telegram_stars`, currency `XTR`, amount `1`, and the normal 30-day subscription period.
-- YooKassa/card subscription invoice uses provider `yookassa`, currency `RUB`, amount `10_000` minor units (`100.00 RUB`), `need_email=True`, `send_email_to_provider=True`, and receipt provider data for `100.00 RUB`.
+- Telegram Stars monthly smoke invoice uses provider `telegram_stars`, currency `XTR`, amount `1`, and the normal recurring 30-day subscription period.
+- YooKassa/card monthly smoke invoice uses provider `yookassa`, currency `RUB`, amount `10_000` minor units (`100.00 RUB`), `need_email=True`, `send_email_to_provider=True`, and receipt provider data for `100.00 RUB`.
 - Non-tester users still see and receive production subscription prices: `450` Stars or `79900` minor units (`799.00 RUB`).
 - Pending discount promo codes are not consumed by this test-price smoke order; verify normal promo behavior separately with production pricing.
 
@@ -165,12 +168,16 @@ Also confirm the deployment/runtime environment has payment test prices disabled
 ### Subscription Invoices
 
 - Telegram Stars monthly subscription:
-  - Create a `subscription_month` invoice with provider `telegram_stars`, currency `XTR`, amount `450`, and 30-day subscription period.
+  - Create a `subscription_month` invoice with provider `telegram_stars`, currency `XTR`, amount `450`, and recurring 30-day subscription period.
   - Confirm invoice payload is an order nonce payload like `diet:order:<order_id>:<nonce>`, not a static product payload.
   - Pay through Telegram Stars and confirm the order becomes `paid`, a `successful_payment` event is recorded, processed charge aliases are stored, and the monthly entitlement period plus limits are active.
+  - Try to start a second active Stars monthly subscription and confirm the duplicate subscription guard prevents a second grant or second active managed subscription.
+  - In the subscriber cabinet, cancel Stars renewal; confirm the paid access period remains active until period end.
+  - In the subscriber cabinet, re-enable Stars renewal and confirm the cabinet status reflects renewal enabled again.
 - YooKassa/card monthly access:
   - Create a `subscription_month` invoice with provider `yookassa`, currency `RUB`, amount `79900`, `need_email=True`, `send_email_to_provider=True`, and receipt provider data.
-  - Complete a test card payment through Telegram Payments and confirm the same durable order/event/processed-charge/entitlement transition as Stars.
+  - Complete a test card payment through Telegram Payments and confirm durable order/event/processed-charge/entitlement transition for one-time 30-day access.
+  - Confirm the subscriber cabinet renewal controls are absent on the card monthly access path.
   - Confirm email, phone, full `order_info`, receipt/customer payload, provider token, bot token, and database URL are not present in general logs or support messages.
 
 ### Extras And Access Rules
@@ -205,7 +212,7 @@ Also confirm the deployment/runtime environment has payment test prices disabled
 
 ### Non-Goals And Launch Gate
 
-- Refund, chargeback, cancel-subscription, and admin reconciliation smoke belong in a separate section after that wiring exists.
+- Stars renewal cancel/re-enable belongs in the current subscription smoke. Refund, chargeback, and admin reconciliation smoke belong in a separate section after that wiring exists.
 - Do not approve production launch until P0 paid-launch items are complete and this manual payment smoke passes with recorded evidence.
 
 ## 7. Release Notes

@@ -29,15 +29,22 @@ Optional settings:
 - `TELEGRAM_BOT_TOKEN`: legacy alias used only when `DIET_BOT_TOKEN` is empty.
 - `TELEGRAM_PROVIDER_TOKEN`: Telegram/YooKassa provider token for card payments; required for market-launch YooKassa invoices and left empty only for local no-card smoke.
 - `DIET_BOT_PUBLIC_PAYMENTS_ENABLED`: set `1` for market launch so public YooKassa/Stars invoice buttons are visible. Use value `0` only for local no-payment smoke or explicitly historical controlled-pilot runs.
-- `DIET_BOT_PAYMENT_TEST_PRICES_ENABLED`: keep `0` for production and public launch. Approved provider smoke uses separate smoke pricing: 1 Star for Stars and 100 RUB / 10_000 minor units for YooKassa.
+- `DIET_BOT_PAYMENT_TEST_PRICES_ENABLED`: keep `0` for production and public launch. Approved provider smoke uses separate smoke pricing: 1 Star for the recurring Stars monthly subscription and 100 RUB / 10_000 minor units for one-time YooKassa monthly access.
 - `DIET_BOT_SUPPORT_CHAT_ID`: support chat target.
 - `DIET_BOT_ADMIN_USER_IDS`: comma/space/semicolon separated Telegram user IDs.
-- `DIET_BOT_TESTER_CHAT_IDS`: comma/space/semicolon separated tester chat IDs. Keep empty for market launch and payment smoke because tester access can mask paywall behavior.
+- `DIET_BOT_TESTER_CHAT_IDS`: comma/space/semicolon separated tester chat IDs. Keep empty for market launch and payment smoke because tester access can mask paywall behavior; use `DIET_BOT_ADMIN_USER_IDS` for owner/admin smoke, including smoke prices.
 - `DIET_BOT_STATE_FILE`: default `.diet_bot_state/history.json`.
 - `DIET_BOT_SUBSCRIPTIONS_STATE_FILE`: default `.diet_bot_state/subscriptions.json`.
 - `DIET_BOT_PROMO_CODES_STATE_FILE`: default `.diet_bot_state/promo_codes.json`.
 
 No payment webhook or external PDF service env is required in this clean state. Do not rely on implicit JSON fallback; set either `DIET_BOT_ALLOW_JSON_STORAGE=1` for local/dev JSON or `DIET_BOT_DATABASE_URL` for production-like storage.
+
+## Payment Model
+
+- Telegram Stars monthly is a true auto-renewing Telegram Stars subscription: production price `450` Stars, smoke price `1` Star, and the subscription behavior still applies in smoke.
+- YooKassa/card monthly is a one-time 30-day access purchase: production price `799 RUB`, smoke price `100 RUB` / `10_000` minor units. Users buy the next period manually.
+- One-day extra and weekly PDF extra are one-time purchases: production prices `69 RUB` / `40` Stars and `349 RUB` / `199` Stars.
+- The subscriber cabinet exposes cancel/re-enable controls only for Stars subscription renewal. Canceling renewal keeps paid access active until the current period end.
 
 ## Run Telegram Bot Locally
 
@@ -108,4 +115,4 @@ Weekly rations are delivered only as a Telegram PDF document. The bot must not s
 
 Before a release, run the manual Telegram smoke checklist in `docs/RELEASE_SMOKE_CHECKLIST.md`.
 
-Market launch requires public payments enabled, production prices, a live YooKassa Telegram provider token, production PostgreSQL storage, disabled payment test prices, and empty tester chat grants. Use `DIET_BOT_ADMIN_USER_IDS` for owner/admin smoke access so payment gates are not hidden by tester access.
+Market launch requires public payments enabled, production prices, a live YooKassa Telegram provider token, production PostgreSQL storage, disabled payment test prices, and empty tester chat grants. Use `DIET_BOT_ADMIN_USER_IDS` for owner/admin smoke access so payment gates are not hidden by tester access. Do not run public launch with payment test prices enabled.

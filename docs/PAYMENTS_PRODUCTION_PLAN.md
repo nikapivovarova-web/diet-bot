@@ -37,6 +37,7 @@ Old folder findings:
 - Provider: `telegram_stars`.
 - Currency: `XTR`.
 - Current intended amount: `450` Stars.
+- Subscription type: auto-renewing Telegram Stars subscription.
 - Billing period: 30 days / `2_592_000` seconds.
 - Grants an active monthly period plus monthly package:
   - 5 one-day ration attempts.
@@ -50,7 +51,7 @@ Old folder findings:
 - Provider: `yookassa` through Telegram Payments.
 - Currency: `RUB`.
 - Current intended amount: `79900` kopecks.
-- Production launch can use a monthly access invoice if recurring YooKassa subscription behavior is not implemented and verified. Do not market it as automatic card renewal unless recurring behavior is provider-tested and covered by tests.
+- Grants one-time 30-day access. Users purchase the next card period manually; do not market this path as recurring card billing.
 - Invoice must request email and send receipt data to provider:
   - `need_email=True`.
   - `send_email_to_provider=True`.
@@ -299,7 +300,7 @@ Do not begin these slices until durable storage and `payment_orders` placeholder
     - Keep payment unit tests fast; mark provider/Postgres integration separately.
 
 11. Manual payment smoke
-    - Run staging/prod-like Telegram + Stars + YooKassa smoke only after automated gates pass.
+    - Run staging/prod-like Telegram + Stars + YooKassa smoke only after test gates pass.
     - Record bot/environment, healthcheck, order ids, redacted charge ids, and refund/reconciliation evidence.
 
 ## Old Files To Use As Source Of Ideas
@@ -345,7 +346,8 @@ Priority 1: order and payload safety from `test_payments_smoke.py`.
 - Unique order payload per product/provider.
 - Tampered nonce rejected.
 - Static legacy payload rejected by default.
-- Stars and YooKassa orders preserve provider/product/currency/recurring metadata.
+- Stars orders preserve provider/product/currency and recurring subscription metadata.
+- YooKassa orders preserve provider/product/currency and one-time access metadata.
 - Repeated payment callback reuses active pending order.
 - Expired pending order rejected at pre-checkout.
 
@@ -420,22 +422,25 @@ Priority 6: promo/test access.
 
 ### Telegram Stars
 
-- Create monthly Stars invoice.
+- Create monthly Stars invoice with recurring 30-day subscription metadata.
 - Verify invoice payload is `diet:order:<order_id>:<nonce>`.
 - Pay monthly subscription.
 - Confirm order is `paid`, success event recorded, provider charge recorded, subscription period active, monthly limits set.
+- Attempt to create a second active Stars monthly subscription; confirm duplicate subscription guard blocks a second managed subscription or second grant.
 - Replay the same `successful_payment`; confirm no second grant.
 - Buy extra one-day with active subscription; confirm one extra grant.
 - Buy extra weekly PDF with active subscription; confirm one extra weekly PDF grant.
 - Attempt extra purchase without active subscription; confirm blocked before checkout and again at final application if state changed.
-- Run cancel subscription event; confirm paid period remains active.
+- From the subscriber cabinet, cancel renewal; confirm paid period remains active until period end.
+- From the subscriber cabinet, re-enable renewal; confirm managed subscription status returns to enabled.
 - Run refund/chargeback against the matching charge; confirm only matching access/quota changes.
 
 ### YooKassa/Card Via Telegram Payments
 
-- Create monthly YooKassa invoice with test provider token.
+- Create monthly YooKassa invoice with test provider token for one-time 30-day access.
 - Confirm `RUB`, amount in kopecks, `need_email=True`, `send_email_to_provider=True`, and receipt provider data.
 - Complete test card payment and verify durable order/event/charge records.
+- Confirm subscriber cabinet renewal controls are not shown for card monthly access.
 - Confirm email/phone/order_info are not stored in raw payload metadata.
 - Replay the successful payment update; confirm idempotency.
 - Apply YooKassa refund using provider charge id; confirm provider-charge alias matching.
