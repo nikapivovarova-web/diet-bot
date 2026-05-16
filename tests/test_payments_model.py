@@ -1264,6 +1264,175 @@ def test_successful_subscription_payment_marks_order_paid_and_grants_subscriptio
     ]
 
 
+def test_stars_first_recurring_successful_payment_stores_managed_subscription_state() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    expiration = int((now + timedelta(days=30)).timestamp())
+    order = _payment_order(
+        "order_stars_first_recurring",
+        "nonce_stars_first_recurring",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        amount=450,
+        currency=PaymentCurrency.XTR,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-stars-first-recurring",
+            is_recurring=True,
+            is_first_recurring=True,
+            subscription_expiration_timestamp=expiration,
+        ),
+        now=now,
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    event = repository.payment_events[0]
+    assert result.processed is True
+    assert entitlement.subscription_source == "telegram_stars"
+    assert entitlement.auto_renew_status == "enabled"
+    assert entitlement.stars_subscription_charge_id == "tg-stars-first-recurring"
+    assert entitlement.last_subscription_payment_charge_id == "tg-stars-first-recurring"
+    assert entitlement.current_period_payment_order_id == order.order_id
+    assert entitlement.subscription_end_datetime() == now + timedelta(days=30)
+    assert event.is_recurring is True
+    assert event.is_first_recurring is True
+    assert event.subscription_expiration_at == now + timedelta(days=30)
+
+
+def test_stars_recurring_renewal_on_paid_order_updates_period_and_preserves_identity() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    first_expiration = int((now + timedelta(days=30)).timestamp())
+    order = _payment_order(
+        "order_stars_renewal",
+        "nonce_stars_renewal",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        amount=450,
+        currency=PaymentCurrency.XTR,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+    first = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-stars-original",
+            is_recurring=True,
+            is_first_recurring=True,
+            subscription_expiration_timestamp=first_expiration,
+        ),
+        now=now,
+    )
+    repository.get_entitlement(order.user_id).monthly_one_day_remaining = 0
+    repository.get_entitlement(order.user_id).monthly_weekly_pdf_remaining = 0
+    renewal_at = now + timedelta(days=30)
+    renewal_expiration = int((renewal_at + timedelta(days=30)).timestamp())
+
+    renewal = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-stars-renewal",
+            is_recurring=True,
+            is_first_recurring=False,
+            subscription_expiration_timestamp=renewal_expiration,
+        ),
+        now=renewal_at,
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert first.processed is True
+    assert renewal.processed is True
+    assert renewal.code == PaymentSuccessfulPaymentCode.PROCESSED
+    assert entitlement.subscription_source == "telegram_stars"
+    assert entitlement.auto_renew_status == "enabled"
+    assert entitlement.stars_subscription_charge_id == "tg-stars-original"
+    assert entitlement.last_subscription_payment_charge_id == "tg-stars-renewal"
+    assert entitlement.current_period_payment_order_id == order.order_id
+    assert entitlement.monthly_one_day_remaining == 5
+    assert entitlement.monthly_weekly_pdf_remaining == 4
+    assert entitlement.subscription_end_datetime() == renewal_at + timedelta(days=30)
+    assert repository.processed_charge_ids() == [
+        "tg-stars-original",
+        "tg-stars-renewal",
+    ]
+    assert [event.status for event in repository.payment_events] == [
+        PaymentEventStatus.PROCESSED,
+        PaymentEventStatus.PROCESSED,
+    ]
+
+
+def test_yookassa_monthly_successful_payment_stores_managed_subscription_state() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_yookassa_monthly",
+        "nonce_yookassa_monthly",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.YOOKASSA,
+        amount=79_900,
+        currency=PaymentCurrency.RUB,
+        expires_at=now + timedelta(minutes=5),
+    )
+    repository = InMemoryPaymentLedgerRepository([order])
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(
+            order,
+            telegram_charge_id="tg-yookassa-monthly",
+            provider_charge_id="provider-yookassa-monthly",
+        ),
+        now=now,
+    )
+
+    entitlement = repository.get_entitlement(order.user_id)
+    assert result.processed is True
+    assert entitlement.subscription_source == "yookassa"
+    assert entitlement.auto_renew_status == "not_applicable"
+    assert entitlement.stars_subscription_charge_id is None
+    assert entitlement.last_subscription_payment_charge_id == "provider-yookassa-monthly"
+    assert entitlement.current_period_payment_order_id == order.order_id
+
+
+def test_extra_successful_payment_does_not_mutate_managed_subscription_state() -> None:
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    order = _payment_order(
+        "order_extra_weekly_state",
+        "nonce_extra_weekly_state",
+        PaymentProduct.EXTRA_WEEKLY_PDF,
+        amount=199,
+        expires_at=now + timedelta(minutes=5),
+    )
+    entitlement = _active_entitlement(now)
+    entitlement.subscription_source = "telegram_stars"
+    entitlement.auto_renew_status = "enabled"
+    entitlement.stars_subscription_charge_id = "tg-stars-original"
+    entitlement.last_subscription_payment_charge_id = "tg-stars-original"
+    entitlement.current_period_payment_order_id = "order_stars_original"
+    repository = InMemoryPaymentLedgerRepository([order])
+    repository.entitlements[order.user_id] = entitlement
+
+    result = apply_successful_payment(
+        repository,
+        _successful_payment(order, telegram_charge_id="tg-extra-weekly-state"),
+        now=now,
+    )
+
+    updated = repository.get_entitlement(order.user_id)
+    assert result.processed is True
+    assert updated.subscription_source == "telegram_stars"
+    assert updated.auto_renew_status == "enabled"
+    assert updated.stars_subscription_charge_id == "tg-stars-original"
+    assert updated.last_subscription_payment_charge_id == "tg-stars-original"
+    assert updated.current_period_payment_order_id == "order_stars_original"
+    assert updated.extra_weekly_pdf_remaining == 1
+
+
 def test_duplicate_same_successful_payment_does_not_grant_twice() -> None:
     now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
     order = _payment_order(

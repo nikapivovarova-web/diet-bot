@@ -924,11 +924,11 @@ def validate_successful_payment_order(
     if _conflicting_processed_charge(order, existing.values()) is not None:
         return PaymentSuccessfulPaymentCode.CHARGE_ALIAS_CONFLICT
     if order.status == PaymentOrderStatus.PAID:
-        return (
-            PaymentSuccessfulPaymentCode.DUPLICATE
-            if matching_alias is not None
-            else PaymentSuccessfulPaymentCode.ORDER_NOT_PENDING
-        )
+        if matching_alias is not None:
+            return PaymentSuccessfulPaymentCode.DUPLICATE
+        if _is_stars_monthly_recurring_renewal(successful_payment, order):
+            return PaymentSuccessfulPaymentCode.PROCESSED
+        return PaymentSuccessfulPaymentCode.ORDER_NOT_PENDING
     if matching_alias is not None:
         return PaymentSuccessfulPaymentCode.DUPLICATE
 
@@ -1019,6 +1019,18 @@ def _successful_payment_is_recurring(
     )
 
 
+def _is_stars_monthly_recurring_renewal(
+    successful_payment: PaymentSuccessfulPaymentInput,
+    order: PaymentOrder,
+) -> bool:
+    return (
+        successful_payment.is_recurring
+        and not successful_payment.is_first_recurring
+        and order.provider == PaymentProvider.TELEGRAM_STARS
+        and order.product == PaymentProduct.SUBSCRIPTION_MONTH
+    )
+
+
 def _subscription_expiration_at(
     successful_payment: PaymentSuccessfulPaymentInput,
 ) -> datetime | None:
@@ -1042,6 +1054,17 @@ def apply_successful_payment_entitlement(
             if order.provider == PaymentProvider.TELEGRAM_STARS
             else "yookassa"
         )
+        stars_subscription_charge_id = None
+        last_subscription_payment_charge_id = successful_payment.provider_charge_id
+        if subscription_source == "telegram_stars":
+            stars_subscription_charge_id = _stars_subscription_charge_id_for_payment(
+                entitlement,
+                successful_payment,
+                charge_id,
+            )
+            last_subscription_payment_charge_id = (
+                successful_payment.telegram_charge_id or charge_id
+            )
         return apply_subscription_payment(
             entitlement,
             charge_id,
@@ -1055,12 +1078,8 @@ def apply_successful_payment_entitlement(
                 if subscription_source == "telegram_stars"
                 else "not_applicable"
             ),
-            stars_subscription_charge_id=(
-                successful_payment.telegram_charge_id or charge_id
-                if subscription_source == "telegram_stars"
-                else None
-            ),
-            last_subscription_payment_charge_id=charge_id,
+            stars_subscription_charge_id=stars_subscription_charge_id,
+            last_subscription_payment_charge_id=last_subscription_payment_charge_id,
             current_period_payment_order_id=order.order_id,
         )
     if order.product == PaymentProduct.EXTRA_ONE_DAY:
@@ -1068,6 +1087,20 @@ def apply_successful_payment_entitlement(
     if order.product == PaymentProduct.EXTRA_WEEKLY_PDF:
         return apply_extra_weekly_pdf_payment(entitlement, charge_id)
     raise ValueError("unsupported successful payment product")
+
+
+def _stars_subscription_charge_id_for_payment(
+    entitlement: Entitlement,
+    successful_payment: PaymentSuccessfulPaymentInput,
+    charge_id: str,
+) -> str:
+    if (
+        successful_payment.is_recurring
+        and not successful_payment.is_first_recurring
+        and entitlement.stars_subscription_charge_id
+    ):
+        return entitlement.stars_subscription_charge_id
+    return successful_payment.telegram_charge_id or charge_id
 
 
 def apply_payment_reversal(

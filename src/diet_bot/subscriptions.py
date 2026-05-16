@@ -25,6 +25,7 @@ SUBSCRIPTION_SOURCES: frozenset[str] = frozenset(
 AUTO_RENEW_STATUSES: frozenset[str] = frozenset(
     {"not_applicable", "enabled", "canceled", "unknown"}
 )
+_UNSET = object()
 
 
 @dataclass
@@ -256,7 +257,7 @@ def apply_subscription_payment(
     subscription_source: SubscriptionSource | None = None,
     auto_renew_status: AutoRenewStatus | None = None,
     stars_subscription_charge_id: str | None = None,
-    last_subscription_payment_charge_id: str | None = None,
+    last_subscription_payment_charge_id: str | None | object = _UNSET,
     current_period_payment_order_id: str | None = None,
 ) -> PaymentApplication:
     if _is_duplicate_charge(entitlement, charge_id):
@@ -282,8 +283,11 @@ def apply_subscription_payment(
         entitlement.stars_subscription_charge_id = stars_subscription_charge_id
     elif subscription_source == "telegram_stars":
         entitlement.stars_subscription_charge_id = charge_id
-    if last_subscription_payment_charge_id is not None:
-        entitlement.last_subscription_payment_charge_id = last_subscription_payment_charge_id
+    if last_subscription_payment_charge_id is not _UNSET:
+        entitlement.last_subscription_payment_charge_id = cast(
+            str | None,
+            last_subscription_payment_charge_id,
+        )
     elif subscription_source is not None:
         entitlement.last_subscription_payment_charge_id = charge_id
     if current_period_payment_order_id is not None:
