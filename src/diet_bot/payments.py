@@ -205,32 +205,32 @@ _PAYMENT_PRODUCT_INVOICE_CATALOG: Mapping[
         PaymentProduct.SUBSCRIPTION_MONTH,
     ): (
         PaymentCurrency.XTR,
-        400,
+        450,
         TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS,
     ),
     (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY): (
         PaymentCurrency.XTR,
-        35,
+        40,
         None,
     ),
     (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF): (
         PaymentCurrency.XTR,
-        170,
+        199,
         None,
     ),
     (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH): (
         PaymentCurrency.RUB,
-        59_900,
+        79_900,
         None,
     ),
     (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY): (
         PaymentCurrency.RUB,
-        5_000,
+        6_900,
         None,
     ),
     (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF): (
         PaymentCurrency.RUB,
-        25_000,
+        34_900,
         None,
     ),
 }

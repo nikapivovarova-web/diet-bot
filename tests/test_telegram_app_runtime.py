@@ -931,13 +931,13 @@ async def test_discount_promo_payment_screen_shows_discounted_amounts_after_entr
     )
 
     assert "70%" in sent_text
-    assert "179.70 ₽" in sent_text
-    assert "120 Stars" in sent_text
+    assert "239.70 ₽" in sent_text
+    assert "135 Stars" in sent_text
     assert "70%" in payment_text
-    assert "179.70 ₽" in payment_text
-    assert "120 Stars" in payment_text
-    assert ("💳 Оплатить картой / SberPay - 179.70 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
-    assert ("⭐ Оплатить подписку - 120 Stars", telegram_app.CALLBACK_PAY_TELEGRAM_STARS) in buttons
+    assert "239.70 ₽" in payment_text
+    assert "135 Stars" in payment_text
+    assert ("💳 Оплатить картой / SberPay - 239.70 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
+    assert ("⭐ Оплатить подписку - 135 Stars", telegram_app.CALLBACK_PAY_TELEGRAM_STARS) in buttons
 
 
 @pytest.mark.anyio
@@ -966,8 +966,8 @@ async def test_yookassa_only_discount_keeps_stars_button_full_price_with_notice(
     ]
 
     assert "150 ₽" in sent_text
-    assert "Telegram Stars без скидки: 400 Stars." in sent_text
-    assert ("💳 Оплатить картой / SberPay - 449 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
+    assert "Telegram Stars без скидки: 450 Stars." in sent_text
+    assert ("💳 Оплатить картой / SberPay - 649 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
     assert (
         telegram_app.PAY_WITH_TELEGRAM_STARS_TEXT,
         telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
@@ -978,12 +978,12 @@ async def test_yookassa_only_discount_keeps_stars_button_full_price_with_notice(
 @pytest.mark.parametrize(
     ("callback_data", "button_callback", "expected_display", "expected_amount"),
     [
-        (telegram_app.CALLBACK_PAY_RU_CARD, telegram_app.CALLBACK_PAY_RU_CARD, "179.70 ₽", 17_970),
+        (telegram_app.CALLBACK_PAY_RU_CARD, telegram_app.CALLBACK_PAY_RU_CARD, "239.70 ₽", 23_970),
         (
             telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
             telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
-            "120 Stars",
-            120,
+            "135 Stars",
+            135,
         ),
     ],
 )
@@ -1402,7 +1402,7 @@ async def test_discount_promo_code_applies_to_next_yookassa_invoice(
             promo_code: str | None = None,
             pricing_context: str | None = None,
         ):
-            discount_amount = 11_980
+            discount_amount = 15_980
             self.created_orders.append(
                 {
                     "user_id": user_id,
@@ -1460,7 +1460,7 @@ async def test_discount_promo_code_applies_to_next_yookassa_invoice(
     )
 
     assert store.created_orders[0]["promo_code"] == "ANNA20"
-    assert bot.calls[0]["prices"][0].amount == 47_920
+    assert bot.calls[0]["prices"][0].amount == 63_920
     assert store.invoice_links == [("order_discounted", "https://invoice.test/discounted")]
     assert chat_id not in telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID
 

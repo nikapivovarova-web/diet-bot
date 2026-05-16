@@ -396,8 +396,8 @@ def test_pre_checkout_validation_rejects_wrong_provider_or_product_when_expected
 @pytest.mark.parametrize(
     ("product", "amount"),
     [
-        (PaymentProduct.EXTRA_ONE_DAY, 35),
-        (PaymentProduct.EXTRA_WEEKLY_PDF, 170),
+        (PaymentProduct.EXTRA_ONE_DAY, 40),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 199),
     ],
 )
 def test_pre_checkout_validation_requires_active_subscription_for_extras_without_mutating_entitlement(
@@ -459,7 +459,7 @@ def test_extra_pre_checkout_rejects_when_subscription_expired_after_order_creati
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentCheckoutRepository(
@@ -560,7 +560,7 @@ def test_stars_subscription_invoice_metadata_contains_amount_and_subscription_pe
     assert metadata.product == PaymentProduct.SUBSCRIPTION_MONTH
     assert metadata.payload == "diet:order:order_sub1:nonce_sub1"
     assert metadata.currency == PaymentCurrency.XTR
-    assert metadata.amount == 400
+    assert metadata.amount == 450
     assert metadata.subscription_period == TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS == 2_592_000
     assert metadata.need_email is False
     assert metadata.send_email_to_provider is False
@@ -573,7 +573,7 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
         "nonce_ru1",
         PaymentProduct.SUBSCRIPTION_MONTH,
         provider=PaymentProvider.YOOKASSA,
-        amount=59_900,
+        amount=79_900,
         currency=PaymentCurrency.RUB,
     )
 
@@ -583,13 +583,13 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
     assert metadata.product == PaymentProduct.SUBSCRIPTION_MONTH
     assert metadata.payload == "diet:order:order_ru1:nonce_ru1"
     assert metadata.currency == PaymentCurrency.RUB
-    assert metadata.amount == 59_900
+    assert metadata.amount == 79_900
     assert metadata.subscription_period is None
     assert metadata.need_email is True
     assert metadata.send_email_to_provider is True
     assert metadata.provider_data is not None
     item = metadata.provider_data["receipt"]["items"][0]
-    assert item["amount"] == {"value": "599.00", "currency": "RUB"}
+    assert item["amount"] == {"value": "799.00", "currency": "RUB"}
     assert item["quantity"] == "1.00"
     assert item["vat_code"] == 1
     assert item["payment_mode"] == "full_payment"
@@ -603,11 +603,11 @@ def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metada
         "nonce_discount1",
         PaymentProduct.SUBSCRIPTION_MONTH,
         provider=PaymentProvider.YOOKASSA,
-        amount=47_920,
+        amount=63_920,
         currency=PaymentCurrency.RUB,
         expires_at=now + timedelta(minutes=5),
-        list_amount=59_900,
-        discount_amount=11_980,
+        list_amount=79_900,
+        discount_amount=15_980,
         promo_code_id=42,
         promo_redemption_id=77,
         promo_code_hash="a" * 64,
@@ -616,8 +616,8 @@ def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metada
             "promo_code_id": 42,
             "promo_code_hash": "a" * 64,
             "promo_code_suffix": "2026",
-            "discount_amount": 11_980,
-            "final_amount": 47_920,
+            "discount_amount": 15_980,
+            "final_amount": 63_920,
         },
     )
     repository = InMemoryPaymentLedgerRepository([order])
@@ -628,7 +628,7 @@ def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metada
         payload=order.payload,
         user_id=order.user_id,
         currency=order.currency,
-        total_amount=47_920,
+        total_amount=63_920,
         expected_provider=order.provider,
         expected_product=order.product,
         now=now,
@@ -639,16 +639,16 @@ def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metada
             order,
             telegram_charge_id="tg-charge-discount1",
             provider_charge_id="provider-charge-discount1",
-            total_amount=47_920,
+            total_amount=63_920,
         ),
         now=now,
     )
     serialized_metadata = json.dumps(order.metadata, sort_keys=True)
 
-    assert metadata.amount == 47_920
+    assert metadata.amount == 63_920
     assert metadata.provider_data is not None
     assert metadata.provider_data["receipt"]["items"][0]["amount"] == {
-        "value": "479.20",
+        "value": "639.20",
         "currency": "RUB",
     }
     assert pre_checkout.approved is True
@@ -664,9 +664,9 @@ def test_discounted_order_rejects_catalog_amount_at_pre_checkout_and_success() -
         "order_discount1",
         "nonce_discount1",
         PaymentProduct.SUBSCRIPTION_MONTH,
-        amount=300,
+        amount=350,
         expires_at=now + timedelta(minutes=5),
-        list_amount=400,
+        list_amount=450,
         discount_amount=100,
         promo_code_id=42,
         promo_code_hash="b" * 64,
@@ -679,7 +679,7 @@ def test_discounted_order_rejects_catalog_amount_at_pre_checkout_and_success() -
         payload=order.payload,
         user_id=order.user_id,
         currency=order.currency,
-        total_amount=400,
+        total_amount=450,
         now=now,
     )
     success = apply_successful_payment(
@@ -687,7 +687,7 @@ def test_discounted_order_rejects_catalog_amount_at_pre_checkout_and_success() -
         _successful_payment(
             order,
             telegram_charge_id="tg-charge-discount1",
-            total_amount=400,
+            total_amount=450,
         ),
         now=now,
     )
@@ -702,12 +702,12 @@ def test_discounted_order_rejects_catalog_amount_at_pre_checkout_and_success() -
 @pytest.mark.parametrize(
     ("provider", "product", "currency", "amount"),
     [
-        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.XTR, 400),
-        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.XTR, 35),
-        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.XTR, 170),
-        (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.RUB, 59_900),
-        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.RUB, 5_000),
-        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.RUB, 25_000),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.XTR, 450),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.XTR, 40),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.XTR, 199),
+        (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.RUB, 79_900),
+        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.RUB, 6_900),
+        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.RUB, 34_900),
     ],
 )
 def test_product_invoice_metadata_contains_provider_product_currency_and_amount(
@@ -743,11 +743,11 @@ def test_product_invoice_metadata_uses_production_prices_by_default() -> None:
         PaymentProduct.SUBSCRIPTION_MONTH,
     )
 
-    assert stars.amount == 400
-    assert yookassa.amount == 59_900
+    assert stars.amount == 450
+    assert yookassa.amount == 79_900
     assert yookassa.provider_data is not None
     assert yookassa.provider_data["receipt"]["items"][0]["amount"] == {
-        "value": "599.00",
+        "value": "799.00",
         "currency": "RUB",
     }
 
@@ -854,7 +854,7 @@ def test_payment_dataclasses_represent_order_event_and_processed_charge_without_
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.SUBSCRIPTION_MONTH,
-        amount=400,
+        amount=450,
         currency=PaymentCurrency.XTR,
         status=PaymentOrderStatus.PENDING,
         created_at=now,
@@ -908,7 +908,7 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.SUBSCRIPTION_MONTH,
-        amount=400,
+        amount=450,
         currency=PaymentCurrency.XTR,
         now=now,
         order_id_factory=_sequence_factory("order_new1"),
@@ -925,7 +925,7 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
     assert order.delivery_chat_id == 2002
     assert order.provider == PaymentProvider.TELEGRAM_STARS
     assert order.product == PaymentProduct.SUBSCRIPTION_MONTH
-    assert order.amount == 400
+    assert order.amount == 450
     assert order.currency == PaymentCurrency.XTR
     assert order.status == PaymentOrderStatus.PENDING
     assert order.created_at == now
@@ -938,8 +938,8 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
 @pytest.mark.parametrize(
     ("product", "amount"),
     [
-        (PaymentProduct.EXTRA_ONE_DAY, 35),
-        (PaymentProduct.EXTRA_WEEKLY_PDF, 170),
+        (PaymentProduct.EXTRA_ONE_DAY, 40),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 199),
     ],
 )
 def test_create_pending_extra_payment_order_requires_active_subscription(
@@ -977,7 +977,7 @@ def test_create_subscription_month_payment_order_allows_inactive_user() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.SUBSCRIPTION_MONTH,
-        amount=400,
+        amount=450,
         currency=PaymentCurrency.XTR,
         now=datetime(2026, 5, 13, 10, 0, tzinfo=UTC),
         order_id_factory=_sequence_factory("order_sub1"),
@@ -1000,7 +1000,7 @@ def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.YOOKASSA,
         product=PaymentProduct.EXTRA_WEEKLY_PDF,
-        amount=25000,
+        amount=34_900,
         currency=PaymentCurrency.RUB,
         now=now,
         has_active_subscription=True,
@@ -1013,7 +1013,7 @@ def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.YOOKASSA,
         product=PaymentProduct.EXTRA_WEEKLY_PDF,
-        amount=25000,
+        amount=34_900,
         currency=PaymentCurrency.RUB,
         now=now + timedelta(minutes=1),
         has_active_subscription=True,
@@ -1038,7 +1038,7 @@ def test_expired_pending_payment_order_is_not_reused() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         currency=PaymentCurrency.XTR,
         status=PaymentOrderStatus.PENDING,
         created_at=now - timedelta(hours=1),
@@ -1052,7 +1052,7 @@ def test_expired_pending_payment_order_is_not_reused() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         currency=PaymentCurrency.XTR,
         now=now,
         has_active_subscription=True,
@@ -1086,7 +1086,7 @@ def test_payment_order_creation_does_not_mutate_entitlement() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.YOOKASSA,
         product=PaymentProduct.SUBSCRIPTION_MONTH,
-        amount=59900,
+        amount=79_900,
         currency=PaymentCurrency.RUB,
         now=datetime(2026, 5, 13, 10, 0, tzinfo=UTC),
         order_id_factory=_sequence_factory("order_new1"),
@@ -1136,7 +1136,7 @@ def test_duplicate_same_successful_payment_does_not_grant_twice() -> None:
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentLedgerRepository([order])
@@ -1206,7 +1206,7 @@ def test_successful_payment_missing_order_is_recorded_as_orphan_without_grant() 
             user_id=1001,
             delivery_chat_id=2002,
             currency=PaymentCurrency.XTR,
-            total_amount=400,
+            total_amount=450,
         ),
         now=now,
     )
@@ -1293,8 +1293,8 @@ def test_successful_payment_rejects_wrong_provider_product_currency_or_amount(
 @pytest.mark.parametrize(
     ("product", "amount", "field_name"),
     [
-        (PaymentProduct.EXTRA_ONE_DAY, 35, "extra_one_day_remaining"),
-        (PaymentProduct.EXTRA_WEEKLY_PDF, 170, "extra_weekly_pdf_remaining"),
+        (PaymentProduct.EXTRA_ONE_DAY, 40, "extra_one_day_remaining"),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 199, "extra_weekly_pdf_remaining"),
     ],
 )
 def test_successful_payment_extras_require_active_subscription_at_success_time(
@@ -1344,7 +1344,7 @@ def test_extra_successful_payment_rejects_when_subscription_expired_after_pre_ch
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         expires_at=success_at + timedelta(minutes=5),
         pre_checkout_approved_at=pre_checkout_at,
     )
@@ -1427,7 +1427,7 @@ def test_successful_payment_records_telegram_and_provider_charge_aliases() -> No
         "nonce_ru1",
         PaymentProduct.SUBSCRIPTION_MONTH,
         provider=PaymentProvider.YOOKASSA,
-        amount=59_900,
+        amount=79_900,
         currency=PaymentCurrency.RUB,
         expires_at=now + timedelta(minutes=5),
     )
@@ -1737,13 +1737,13 @@ def test_duplicate_chargeback_does_not_revoke_newer_subscription() -> None:
     [
         (
             PaymentProduct.EXTRA_ONE_DAY,
-            35,
+            40,
             "extra_one_day_remaining",
             "extra_weekly_pdf_remaining",
         ),
         (
             PaymentProduct.EXTRA_WEEKLY_PDF,
-            170,
+            199,
             "extra_weekly_pdf_remaining",
             "extra_one_day_remaining",
         ),
@@ -1792,7 +1792,7 @@ def test_refund_consumed_extra_records_ignored_reason_without_wrong_quota_change
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentLedgerRepository([order])
@@ -1844,7 +1844,7 @@ def test_unknown_negative_reversal_is_pending_reconciliation_without_entitlement
             event_type=event_type,
             provider=PaymentProvider.TELEGRAM_STARS,
             telegram_charge_id="tg-charge-missing",
-            amount=400,
+            amount=450,
             currency=PaymentCurrency.XTR,
             raw_payload={"email": "buyer@example.com"},
         ),
@@ -1867,7 +1867,7 @@ def test_refund_matches_original_payment_by_provider_charge_alias() -> None:
         "nonce_ru1",
         PaymentProduct.SUBSCRIPTION_MONTH,
         provider=PaymentProvider.YOOKASSA,
-        amount=59_900,
+        amount=79_900,
         currency=PaymentCurrency.RUB,
         expires_at=now + timedelta(minutes=5),
     )
@@ -1957,7 +1957,7 @@ def test_orphan_successful_payment_can_be_reconciled_to_matching_pending_order_o
             user_id=1001,
             delivery_chat_id=2002,
             currency=PaymentCurrency.XTR,
-            total_amount=400,
+            total_amount=450,
         ),
         now=now,
     )
@@ -2064,13 +2064,13 @@ def test_duplicate_orphan_reconciliation_does_not_grant_twice() -> None:
     event = _orphan_success_event(
         event_id="evt_orphan_extra1",
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
     )
     order = _payment_order(
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentLedgerRepository([order])
@@ -2121,7 +2121,7 @@ def test_pending_terminal_reversal_reconciles_after_matching_success_and_revokes
             event_type=event_type,
             provider=PaymentProvider.TELEGRAM_STARS,
             telegram_charge_id="tg-charge-pending1",
-            amount=400,
+            amount=450,
             currency=PaymentCurrency.XTR,
         ),
         now=now,
@@ -2430,7 +2430,7 @@ def _payment_order(
     product: PaymentProduct,
     *,
     provider: PaymentProvider = PaymentProvider.TELEGRAM_STARS,
-    amount: int = 400,
+    amount: int = 450,
     currency: PaymentCurrency = PaymentCurrency.XTR,
     status: PaymentOrderStatus = PaymentOrderStatus.PENDING,
     user_id: int = 1001,
@@ -2523,7 +2523,7 @@ def _orphan_success_event(
     product: PaymentProduct | None = PaymentProduct.SUBSCRIPTION_MONTH,
     user_id: int = 1001,
     delivery_chat_id: int | None = 2002,
-    amount: int = 400,
+    amount: int = 450,
     currency: PaymentCurrency = PaymentCurrency.XTR,
     telegram_charge_id: str = "tg-charge-orphan1",
     provider_charge_id: str | None = None,

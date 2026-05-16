@@ -36,7 +36,7 @@ Old folder findings:
 - Product: `subscription_month`.
 - Provider: `telegram_stars`.
 - Currency: `XTR`.
-- Current intended amount: `400` Stars.
+- Current intended amount: `450` Stars.
 - Billing period: 30 days / `2_592_000` seconds.
 - Grants an active monthly period plus monthly package:
   - 5 one-day ration attempts.
@@ -49,7 +49,7 @@ Old folder findings:
 - Product: `subscription_month`.
 - Provider: `yookassa` through Telegram Payments.
 - Currency: `RUB`.
-- Current intended amount: `59900` kopecks.
+- Current intended amount: `79900` kopecks.
 - Production launch can use a monthly access invoice if recurring YooKassa subscription behavior is not implemented and verified. Do not market it as automatic card renewal unless recurring behavior is provider-tested and covered by tests.
 - Invoice must request email and send receipt data to provider:
   - `need_email=True`.
@@ -61,8 +61,8 @@ Old folder findings:
 
 - Product: `extra_one_day`.
 - Providers:
-  - Telegram Stars: `35` Stars.
-  - YooKassa/card: `5000` kopecks.
+  - Telegram Stars: `40` Stars.
+  - YooKassa/card: `6900` kopecks.
 - Must be purchasable and applicable only with active paid subscription access, unless a future explicit product decision changes this.
 - Extra quota is separate from monthly quota and is consumed only after monthly one-day quota is exhausted.
 
@@ -70,8 +70,8 @@ Old folder findings:
 
 - Product: `extra_weekly_pdf`.
 - Providers:
-  - Telegram Stars: `170` Stars.
-  - YooKassa/card: `25000` kopecks.
+  - Telegram Stars: `199` Stars.
+  - YooKassa/card: `34900` kopecks.
 - Must be purchasable and applicable only with active paid subscription access, unless a future explicit product decision changes this.
 - Delivery must be Telegram document PDF only. No text fallback weekly ration can satisfy this paid product.
 

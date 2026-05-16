@@ -870,14 +870,14 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     keyboard = _subscription_payment_keyboard()
     buttons = [row[0] for row in keyboard.inline_keyboard]
 
-    assert SUBSCRIPTION_STARS_AMOUNT == 400
-    assert "599 ₽" in SUBSCRIPTION_PAYMENT_TEXT
-    assert "400 Stars" in SUBSCRIPTION_PAYMENT_TEXT
+    assert SUBSCRIPTION_STARS_AMOUNT == 450
+    assert "799 ₽" in SUBSCRIPTION_PAYMENT_TEXT
+    assert "450 Stars" in SUBSCRIPTION_PAYMENT_TEXT
     assert "4 недельных PDF-рациона" in SUBSCRIPTION_PAYMENT_TEXT
     assert "5 рационов на 1 день" in SUBSCRIPTION_PAYMENT_TEXT
     assert "Разовые покупки" not in SUBSCRIPTION_PAYMENT_TEXT
-    assert "50 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
-    assert "250 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
+    assert "69 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
+    assert "349 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "не является медицинской консультацией" in SUBSCRIPTION_PAYMENT_TEXT
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
@@ -1089,7 +1089,7 @@ async def test_extra_pre_checkout_without_active_subscription_is_rejected(monkey
             order_id="order_extra",
             nonce="nonce_extra",
             product=PaymentProduct.EXTRA_ONE_DAY,
-            amount=35,
+            amount=40,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1178,7 +1178,7 @@ async def test_duplicate_successful_payment_handler_does_not_grant_twice(monkeyp
             order_id="order_extra_day",
             nonce="nonce_extra_day",
             product=PaymentProduct.EXTRA_ONE_DAY,
-            amount=35,
+            amount=40,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1286,7 +1286,7 @@ async def test_extra_successful_payment_handler_grants_only_with_active_subscrip
             order_id="order_extra_active",
             nonce="nonce_extra_active",
             product=PaymentProduct.EXTRA_WEEKLY_PDF,
-            amount=170,
+            amount=199,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1294,7 +1294,7 @@ async def test_extra_successful_payment_handler_grants_only_with_active_subscrip
     message.successful_payment = _successful_payment_for_order(
         order,
         telegram_charge_id="tg-charge-weekly-extra1",
-        total_amount=170,
+        total_amount=199,
     )
 
     await telegram_app.handle_successful_payment(message)
@@ -1313,7 +1313,7 @@ async def test_extra_successful_payment_handler_without_active_subscription_does
             order_id="order_extra_inactive",
             nonce="nonce_extra_inactive",
             product=PaymentProduct.EXTRA_ONE_DAY,
-            amount=35,
+            amount=40,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1420,7 +1420,7 @@ async def test_admin_chargeback_command_calls_reversal_core_and_returns_redacted
         order_id="order_chargeback_secret",
         charge_id="tg-chargeback-secret",
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=35,
+        amount=40,
         entitlement=telegram_app.Entitlement(
             subscription_period_start=datetime.now(UTC).isoformat(),
             subscription_period_end=(datetime.now(UTC) + timedelta(days=3)).isoformat(),
@@ -1612,7 +1612,7 @@ async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkey
     assert invoice["currency"] == "XTR"
     assert invoice["payload"] == f"diet:order:{order_id}:{nonce}"
     assert order.product == PaymentProduct.EXTRA_ONE_DAY
-    assert invoice["prices"][0].amount == 35
+    assert invoice["prices"][0].amount == 40
     assert invoice["subscription_period"] is None
 
 
@@ -1688,14 +1688,14 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert order.provider == PaymentProvider.YOOKASSA
     assert order.product == PaymentProduct.SUBSCRIPTION_MONTH
     assert invoice["payload"] == order.payload
-    assert invoice["prices"][0].amount == 59_900
+    assert invoice["prices"][0].amount == 79_900
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
     assert item == {
         "description": "FoodBalance monthly access",
         "quantity": "1.00",
         "amount": {
-            "value": "599.00",
+            "value": "799.00",
             "currency": "RUB",
         },
         "vat_code": 1,
@@ -1703,7 +1703,7 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
         "payment_subject": "service",
     }
     assert store.invoice_link_updates == [(order.order_id, "https://t.me/invoice/test")]
-    assert message.texts[-1][0] == "FoodBalance: подписка на месяц\n\nСтоимость: 599 ₽."
+    assert message.texts[-1][0] == "FoodBalance: подписка на месяц\n\nСтоимость: 799 ₽."
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
 
@@ -1733,14 +1733,14 @@ async def test_entered_discount_code_applies_to_next_yookassa_invoice(monkeypatc
     invoice = message.bot.invoice_links[0]
     order = store.orders[0]
     provider_data = json.loads(invoice["provider_data"])
-    assert invoice["prices"][0].amount == 47_920
+    assert invoice["prices"][0].amount == 63_920
     assert provider_data["receipt"]["items"][0]["amount"] == {
-        "value": "479.20",
+        "value": "639.20",
         "currency": "RUB",
     }
-    assert order.amount == 47_920
-    assert order.list_amount == 59_900
-    assert order.discount_amount == 11_980
+    assert order.amount == 63_920
+    assert order.list_amount == 79_900
+    assert order.discount_amount == 15_980
     assert order.promo_code_suffix == "2026"
     assert store.payment_order_promo_codes == [code]
     assert code not in str(order.metadata)
@@ -1777,7 +1777,7 @@ async def test_ru_invoice_without_provider_token_shows_unavailable_message(monke
     assert message.bot.invoice_links == []
     sent_text, markup = message.texts[-1]
     assert "FoodBalance: 1 дневной рацион" in sent_text
-    assert "Стоимость: 50 ₽." in sent_text
+    assert "Стоимость: 69 ₽." in sent_text
     assert "ЮKassa сейчас недоступна" in sent_text
     assert markup is None
 
@@ -2446,7 +2446,7 @@ def _pending_payment_order(
     delivery_chat_id: int | None = 12345,
     provider: PaymentProvider = PaymentProvider.TELEGRAM_STARS,
     product: PaymentProduct = PaymentProduct.SUBSCRIPTION_MONTH,
-    amount: int = 400,
+    amount: int = 450,
     currency: PaymentCurrency = PaymentCurrency.XTR,
     expires_at: datetime | None = None,
 ) -> PaymentOrder:
@@ -2470,7 +2470,7 @@ def _paid_store_order(
     order_id: str,
     charge_id: str,
     product: PaymentProduct = PaymentProduct.SUBSCRIPTION_MONTH,
-    amount: int = 400,
+    amount: int = 450,
     entitlement: telegram_app.Entitlement | None = None,
 ) -> PaymentOrder:
     now = datetime.now(UTC)

@@ -117,8 +117,8 @@ Expected behavior:
 
 - Only users whose Telegram user id is in `DIET_BOT_ADMIN_USER_IDS` or whose chat id is in `DIET_BOT_TESTER_CHAT_IDS` see `[TEST]` subscription prices.
 - Telegram Stars subscription invoice uses provider `telegram_stars`, currency `XTR`, amount `1`, and the normal 30-day subscription period.
-- YooKassa/card subscription invoice uses provider `yookassa`, currency `RUB`, amount `100` minor units (`1.00 RUB`), `need_email=True`, `send_email_to_provider=True`, and receipt provider data for `1.00 RUB`.
-- Non-tester users still see and receive production subscription prices: `400` Stars or `59900` minor units (`599.00 RUB`).
+- YooKassa/card subscription invoice uses provider `yookassa`, currency `RUB`, amount `10000` minor units (`100.00 RUB`), `need_email=True`, `send_email_to_provider=True`, and receipt provider data for `100.00 RUB`.
+- Non-tester users still see and receive production subscription prices: `450` Stars or `79900` minor units (`799.00 RUB`).
 - Pending discount promo codes are not consumed by this test-price smoke order; verify normal promo behavior separately with production pricing.
 
 After the smoke, immediately turn the slice off:
@@ -145,11 +145,11 @@ Also confirm the deployment/runtime environment no longer has `DIET_BOT_PAYMENT_
 ### Subscription Invoices
 
 - Telegram Stars monthly subscription:
-  - Create a `subscription_month` invoice with provider `telegram_stars`, currency `XTR`, amount `400`, and 30-day subscription period.
+  - Create a `subscription_month` invoice with provider `telegram_stars`, currency `XTR`, amount `450`, and 30-day subscription period.
   - Confirm invoice payload is an order nonce payload like `diet:order:<order_id>:<nonce>`, not a static product payload.
   - Pay through Telegram Stars and confirm the order becomes `paid`, a `successful_payment` event is recorded, processed charge aliases are stored, and the monthly entitlement period plus limits are active.
 - YooKassa/card monthly access:
-  - Create a `subscription_month` invoice with provider `yookassa`, currency `RUB`, amount `59900`, `need_email=True`, `send_email_to_provider=True`, and receipt provider data.
+  - Create a `subscription_month` invoice with provider `yookassa`, currency `RUB`, amount `79900`, `need_email=True`, `send_email_to_provider=True`, and receipt provider data.
   - Complete a test card payment through Telegram Payments and confirm the same durable order/event/processed-charge/entitlement transition as Stars.
   - Confirm email, phone, full `order_info`, receipt/customer payload, provider token, bot token, and database URL are not present in general logs or support messages.
 
