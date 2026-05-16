@@ -209,23 +209,63 @@ def test_runtime_config_enables_public_payments_only_with_explicit_flag() -> Non
             "DIET_BOT_ENV": "production",
             "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
             "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "1",
+            "TELEGRAM_PROVIDER_TOKEN": "provider-token",
         },
     )
 
     assert config.public_payments_enabled is True
 
 
-def test_runtime_config_enables_payment_test_prices_only_with_explicit_flag() -> None:
+def test_runtime_config_rejects_production_tester_chat_ids() -> None:
+    with pytest.raises(RuntimeConfigError, match="DIET_BOT_TESTER_CHAT_IDS"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+                "DIET_BOT_TESTER_CHAT_IDS": "100 200",
+            },
+        )
+
+
+def test_runtime_config_rejects_production_payment_test_prices() -> None:
+    with pytest.raises(RuntimeConfigError, match="DIET_BOT_PAYMENT_TEST_PRICES_ENABLED"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+                "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED": "1",
+            },
+        )
+
+
+def test_runtime_config_rejects_production_public_payments_without_provider_token() -> None:
+    with pytest.raises(RuntimeConfigError, match="TELEGRAM_PROVIDER_TOKEN"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+                "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "1",
+            },
+        )
+
+
+def test_runtime_config_allows_development_test_prices_and_tester_ids() -> None:
     config = load_runtime_config(
         {
-            "DIET_BOT_TOKEN": "prod-token",
-            "DIET_BOT_ENV": "production",
-            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+            "DIET_BOT_TOKEN": "local-token",
+            "DIET_BOT_ENV": "development",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+            "DIET_BOT_TESTER_CHAT_IDS": "100 200",
             "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "1",
             "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED": "1",
         },
     )
 
+    assert config.tester_chat_ids == frozenset({100, 200})
+    assert config.public_payments_enabled is True
     assert config.payment_test_prices_enabled is True
 
 

@@ -92,6 +92,16 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         default=False,
         name="DIET_BOT_PAYMENT_TEST_PRICES_ENABLED",
     )
+    telegram_provider_token = _env_value(env, "TELEGRAM_PROVIDER_TOKEN")
+    admin_user_ids = _parse_id_set(_env_value(env, "DIET_BOT_ADMIN_USER_IDS"))
+    tester_chat_ids = _parse_id_set(_env_value(env, "DIET_BOT_TESTER_CHAT_IDS"))
+    if production_environment:
+        _validate_production_startup_safety(
+            tester_chat_ids=tester_chat_ids,
+            payment_test_prices_enabled=payment_test_prices_enabled,
+            public_payments_enabled=public_payments_enabled,
+            telegram_provider_token=telegram_provider_token,
+        )
 
     default_state_file = Path(__file__).resolve().parents[2] / ".diet_bot_state" / "history.json"
     state_file = _path_from_env(env, "DIET_BOT_STATE_FILE", default_state_file)
@@ -109,10 +119,10 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
     return RuntimeConfig(
         environment=environment.strip(),
         bot_token=bot_token,
-        telegram_provider_token=_env_value(env, "TELEGRAM_PROVIDER_TOKEN"),
+        telegram_provider_token=telegram_provider_token,
         support_chat_id=_parse_optional_int(_env_value(env, "DIET_BOT_SUPPORT_CHAT_ID")),
-        admin_user_ids=_parse_id_set(_env_value(env, "DIET_BOT_ADMIN_USER_IDS")),
-        tester_chat_ids=_parse_id_set(_env_value(env, "DIET_BOT_TESTER_CHAT_IDS")),
+        admin_user_ids=admin_user_ids,
+        tester_chat_ids=tester_chat_ids,
         state_file=state_file,
         subscriptions_state_file=subscriptions_state_file,
         promo_codes_state_file=promo_codes_state_file,
@@ -127,6 +137,25 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
 
 def is_production_environment(environment: str | None) -> bool:
     return (environment or "").strip().lower() in PRODUCTION_ENV_NAMES
+
+
+def _validate_production_startup_safety(
+    *,
+    tester_chat_ids: frozenset[int],
+    payment_test_prices_enabled: bool,
+    public_payments_enabled: bool,
+    telegram_provider_token: str,
+) -> None:
+    if tester_chat_ids:
+        raise RuntimeConfigError("DIET_BOT_TESTER_CHAT_IDS must be empty in production.")
+    if payment_test_prices_enabled:
+        raise RuntimeConfigError(
+            "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED must be disabled in production."
+        )
+    if public_payments_enabled and not telegram_provider_token:
+        raise RuntimeConfigError(
+            "Set TELEGRAM_PROVIDER_TOKEN when DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1 in production."
+        )
 
 
 def _first_non_blank(env: Mapping[str, str], *names: str) -> str:
