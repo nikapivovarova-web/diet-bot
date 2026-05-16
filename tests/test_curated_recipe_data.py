@@ -181,7 +181,14 @@ def test_curated_recipe_data_has_local_photos() -> None:
 
     imported = _imported_recipe_rows()
     assert len(imported) == INTAKE_RECIPE_COUNT
-    assert all(not recipe.get("image_url") for recipe in imported)
+    imported_missing = [
+        recipe["recipe_id"]
+        for recipe in imported
+        if not recipe.get("image_url")
+        or not str(recipe["image_url"]).startswith("recipe_photos/")
+        or not (DATA_DIR / recipe["image_url"]).exists()
+    ]
+    assert imported_missing == []
     assert all(recipe.get("photo_prompt_ru") for recipe in imported)
 
 
