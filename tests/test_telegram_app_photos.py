@@ -2935,7 +2935,7 @@ async def test_tester_can_toggle_test_access_mode(monkeypatch, tmp_path) -> None
 
 
 @pytest.mark.anyio
-async def test_test_access_off_previews_free_menu_even_with_subscription(monkeypatch, tmp_path) -> None:
+async def test_test_access_off_keeps_active_subscription_access(monkeypatch, tmp_path) -> None:
     target_chat_id = 91_013
     subscriptions_path = tmp_path / "subscriptions.json"
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
@@ -2943,9 +2943,69 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
     entitlement = _save_active_subscription(
         subscriptions_path,
         target_chat_id,
-        one_day_remaining=4,
-        weekly_pdf_remaining=3,
+        one_day_remaining=5,
+        weekly_pdf_remaining=4,
     )
+    telegram_app.grant_test_access(entitlement, now=datetime(2026, 5, 8, tzinfo=UTC))
+    telegram_app.save_entitlements(subscriptions_path, {target_chat_id: entitlement})
+    PROFILE_BY_CHAT_ID[target_chat_id] = profile_with()
+
+    try:
+        await secret_access_command(
+            FakeMessage(chat_id=target_chat_id, text="/330366 off", user_id=target_chat_id),
+        )
+        message = FakeMessage(target_chat_id)
+
+        await telegram_app.start(message)
+        one_day_consumption = _consume_generation_attempt(target_chat_id, "one_day")
+        weekly_consumption = _consume_generation_attempt(target_chat_id, "weekly_pdf")
+        status_text = _format_entitlement_status(target_chat_id)
+        paywall_message = FakeMessage(target_chat_id)
+        await telegram_app._send_limit_paywall(paywall_message, "weekly_pdf")
+
+        sent_text, markup = message.texts[-1]
+        paywall_text, paywall_markup = paywall_message.texts[-1]
+        buttons = [row[0] for row in markup.inline_keyboard]
+        paywall_buttons = [row[0] for row in paywall_markup.inline_keyboard]
+        saved_entitlement = telegram_app.load_entitlements(subscriptions_path)[target_chat_id]
+
+        assert telegram_app._has_active_paid_access(target_chat_id)
+        assert sent_text.startswith(SUBSCRIBER_CABINET_TEXT)
+        assert [(button.text, button.callback_data) for button in buttons] == [
+            (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 5 из 5", CALLBACK_ONE_DAY_PLAN),
+            (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 4 из 4", CALLBACK_WEEK_PLAN_PDF),
+            (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        ]
+        assert one_day_consumption.source == "monthly"
+        assert weekly_consumption.source == "monthly"
+        assert "PDF" in status_text
+        assert "бесплатный сценарий" not in status_text
+        assert "Следующее обновление подписки" in paywall_text
+        assert (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD) not in [
+            (button.text, button.callback_data)
+            for button in paywall_buttons
+        ]
+        assert (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS) not in [
+            (button.text, button.callback_data)
+            for button in paywall_buttons
+        ]
+        assert saved_entitlement.is_subscription_active()
+        assert saved_entitlement.test_access_until is not None
+        assert not saved_entitlement.test_access_enabled
+        assert saved_entitlement.monthly_one_day_remaining == 4
+        assert saved_entitlement.monthly_weekly_pdf_remaining == 3
+    finally:
+        PROFILE_BY_CHAT_ID.pop(target_chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_test_access_off_previews_free_menu_without_subscription(monkeypatch, tmp_path) -> None:
+    target_chat_id = 91_014
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", set())
+    entitlement = telegram_app.Entitlement()
     telegram_app.grant_test_access(entitlement, now=datetime(2026, 5, 8, tzinfo=UTC))
     telegram_app.save_entitlements(subscriptions_path, {target_chat_id: entitlement})
     PROFILE_BY_CHAT_ID[target_chat_id] = profile_with()
@@ -2963,8 +3023,9 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
         await telegram_app._send_limit_paywall(paywall_message, "weekly_pdf")
 
         sent_text, markup = message.texts[-1]
-        paywall_text, _ = paywall_message.texts[-1]
+        paywall_text, paywall_markup = paywall_message.texts[-1]
         buttons = [row[0] for row in markup.inline_keyboard]
+        paywall_buttons = [row[0] for row in paywall_markup.inline_keyboard]
         saved_entitlement = telegram_app.load_entitlements(subscriptions_path)[target_chat_id]
 
         assert not telegram_app._has_active_paid_access(target_chat_id)
@@ -2979,9 +3040,14 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
         assert one_day_consumption.source == "free_trial"
         assert "Следующее обновление подписки" not in paywall_text
         assert "бесплатный сценарий" in paywall_text
-        assert saved_entitlement.is_subscription_active()
-        assert saved_entitlement.monthly_one_day_remaining == 4
-        assert saved_entitlement.monthly_weekly_pdf_remaining == 3
+        assert [(button.text, button.callback_data) for button in paywall_buttons] == [
+            (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
+            (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
+        ]
+        assert not saved_entitlement.is_subscription_active()
+        assert saved_entitlement.test_access_until is not None
+        assert not saved_entitlement.test_access_enabled
     finally:
         PROFILE_BY_CHAT_ID.pop(target_chat_id, None)
 

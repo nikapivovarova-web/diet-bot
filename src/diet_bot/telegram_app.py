@@ -3778,6 +3778,8 @@ def _is_free_preview_mode(chat_id: int, entitlement: Entitlement | None = None) 
     if chat_id in TESTER_CHAT_IDS:
         return False
     entitlement = entitlement or _entitlement_for_chat(chat_id)
+    if entitlement.is_subscription_active():
+        return False
     return entitlement.is_test_access_available() and not entitlement.test_access_enabled
 
 
