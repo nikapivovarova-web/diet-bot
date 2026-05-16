@@ -76,6 +76,10 @@ LEDGER_EVENT_REFUND = "refund"
 LEDGER_EVENT_ENTITLEMENT_SNAPSHOT = "entitlement_snapshot"
 LEDGER_EVENT_PROMO_GRANT = "grant"
 PROMO_ACCESS_KINDS = frozenset({"monthly_access", "subscription_month"})
+MONTHLY_LEDGER_SOURCE_BY_RATION_KIND = {
+    "one_day": "monthly_one_day",
+    "weekly_pdf": "monthly_weekly_pdf",
+}
 
 
 class PostgresDietBotStore:
@@ -295,6 +299,7 @@ class PostgresDietBotStore:
                         self._update_entitlement_cur(cur, user_id, entitlement)
                         return consumption
 
+                    ledger_source = _ledger_source_for_consumption(consumption)
                     self._update_entitlement_cur(cur, user_id, entitlement)
                     generation_id = self._insert_generation_cur(
                         cur,
@@ -307,7 +312,7 @@ class PostgresDietBotStore:
                         user_id,
                         LEDGER_EVENT_CONSUME,
                         generation_id=generation_id,
-                        source=consumption.source,
+                        source=ledger_source,
                         amount=_event_amount(consumption),
                         delta_generations=_consume_delta(consumption),
                         metadata={
@@ -2617,7 +2622,7 @@ class PostgresDietBotStore:
             user_id,
             LEDGER_EVENT_REFUND,
             generation_id=generation_id,
-            source=consumed.source,
+            source=_ledger_source_for_consumption(consumed),
             amount=_event_amount(consumed),
             related_event_id=int(consume_event["id"]),
             reason=reason,
@@ -3610,9 +3615,17 @@ def _consumption_from_event(row: dict[str, Any]) -> AttemptConsumption | None:
     source = row.get("source") or metadata.get("attempt_source")
     if ration_kind not in {"one_day", "weekly_pdf"}:
         return None
+    if source == MONTHLY_LEDGER_SOURCE_BY_RATION_KIND.get(ration_kind):
+        source = "monthly"
     if source not in {"monthly", "extra", "free_trial", "test_access"}:
         return None
     return AttemptConsumption(True, ration_kind, source)  # type: ignore[arg-type]
+
+
+def _ledger_source_for_consumption(consumption: AttemptConsumption) -> str | None:
+    if consumption.source == "monthly":
+        return MONTHLY_LEDGER_SOURCE_BY_RATION_KIND[consumption.ration_kind]
+    return consumption.source
 
 
 def _event_amount(consumption: AttemptConsumption) -> int:

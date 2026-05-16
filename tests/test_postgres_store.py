@@ -259,6 +259,11 @@ def test_postgres_generation_consumption_and_refund_are_atomic() -> None:
         assert store.get_entitlement(user_id).monthly_one_day_remaining == 1
         assert generation["status"] == "failed"
         assert [event["event_type"] for event in events] == ["consume", "refund"]
+        assert [event["source"] for event in events] == ["monthly_one_day", "monthly_one_day"]
+        assert [event["metadata_json"]["attempt_source"] for event in events] == [
+            "monthly",
+            "monthly",
+        ]
         assert events[0]["generation_id"] == generation["id"]
         assert events[0]["delta_generations"] == -1
         assert events[1]["related_event_id"] == events[0]["id"]
@@ -274,6 +279,52 @@ def test_postgres_generation_consumption_and_refund_are_atomic() -> None:
         assert [event["delta_generations"] for event in test_access_events] == [0, 0]
     finally:
         _cleanup_users(store, user_id, test_access_user_id)
+
+
+@pytest.mark.parametrize(
+    ("ration_kind", "remaining_attr", "expected_source"),
+    [
+        ("one_day", "monthly_one_day_remaining", "monthly_one_day"),
+        ("weekly_pdf", "monthly_weekly_pdf_remaining", "monthly_weekly_pdf"),
+    ],
+)
+def test_postgres_monthly_consumption_events_use_ration_specific_source(
+    ration_kind: str,
+    remaining_attr: str,
+    expected_source: str,
+) -> None:
+    from diet_bot.subscriptions import Entitlement, apply_subscription_payment
+
+    store = _store()
+    user_id = _unique_user_id()
+    now = datetime(2026, 5, 10, tzinfo=UTC)
+    entitlement = Entitlement()
+    apply_subscription_payment(
+        entitlement,
+        "seed-subscription",
+        now=now,
+        subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
+    )
+    entitlement.monthly_one_day_remaining = 0
+    entitlement.monthly_weekly_pdf_remaining = 0
+    setattr(entitlement, remaining_attr, 1)
+    try:
+        store.save_entitlement(user_id, entitlement)
+
+        consumed = store.consume_generation_attempt(user_id, ration_kind)  # type: ignore[arg-type]
+        generation = _latest_generation_for_user(store, user_id)
+        events = _events_for_generation(store, generation["id"])
+
+        assert consumed.allowed
+        assert consumed.source == "monthly"
+        assert [event["source"] for event in events] == [expected_source]
+        assert "monthly" not in [event["source"] for event in events]
+        assert events[0]["metadata_json"] == {
+            "ration_kind": ration_kind,
+            "attempt_source": "monthly",
+        }
+    finally:
+        _cleanup_users(store, user_id)
 
 
 def test_postgres_one_active_generation_per_user() -> None:
