@@ -208,6 +208,138 @@ class FakePromoAdminStore:
         return disabled
 
 
+class FakeDiscountPaymentStore(FakePromoAdminStore):
+    def __init__(
+        self,
+        *,
+        discount_percent: int | None = 70,
+        discount_amount: int | None = None,
+        code: str | None = None,
+        accepted: bool = True,
+    ) -> None:
+        promo_code = code or (
+            f"ANNA{discount_percent}" if discount_percent is not None else "RUBFIX"
+        )
+        super().__init__(
+            [
+                telegram_app.PromoCodeDefinition(
+                    code=promo_code,
+                    kind=telegram_app.PromoCodeKind.DISCOUNT,
+                    max_redemptions=10,
+                    discount_percent=discount_percent,
+                    discount_amount=discount_amount,
+                )
+            ]
+        )
+        self.accepted = accepted
+        self.created_orders: list[dict[str, object]] = []
+        self.invoice_links: list[tuple[str, str]] = []
+        self.orders: list[telegram_app.PaymentOrder] = []
+
+    def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+        return telegram_app.Entitlement()
+
+    def save_entitlement(
+        self,
+        user_id: int,
+        entitlement: telegram_app.Entitlement,
+    ) -> None:
+        pass
+
+    def activate_promo_code(
+        self,
+        user_id: int,
+        raw_code: str,
+    ) -> telegram_app.PromoCodeActivation:
+        return telegram_app.PromoCodeActivation(
+            "not_access_code",
+            telegram_app.normalize_promo_code(raw_code),
+            user_id,
+        )
+
+    def create_or_reuse_pending_payment_order(
+        self,
+        *,
+        user_id: int,
+        delivery_chat_id: int | None,
+        provider: telegram_app.PaymentProvider,
+        product: telegram_app.PaymentProduct,
+        amount: int,
+        currency,
+        promo_code: str | None = None,
+        pricing_context: str | None = None,
+    ):
+        self.created_orders.append(
+            {
+                "user_id": user_id,
+                "delivery_chat_id": delivery_chat_id,
+                "provider": provider,
+                "product": product,
+                "amount": amount,
+                "currency": currency,
+                "promo_code": promo_code,
+                "pricing_context": pricing_context,
+            }
+        )
+        if not self.accepted:
+            return SimpleNamespace(
+                accepted=False,
+                code=telegram_app.PaymentOrderCreationCode.PROMO_INVALID_DISCOUNT,
+                order=None,
+            )
+
+        discount_amount = 0
+        promo_code_id = None
+        promo_code_hash = None
+        promo_code_suffix = None
+        if promo_code is not None:
+            promo = self.get_promo_code(promo_code, active_only=True)
+            assert promo is not None
+            if promo.discount_percent is not None:
+                discount_amount = amount * promo.discount_percent // 100
+            else:
+                discount_amount = promo.discount_amount or 0
+            if discount_amount <= 0 or amount - discount_amount <= 0:
+                return SimpleNamespace(
+                    accepted=False,
+                    code=telegram_app.PaymentOrderCreationCode.PROMO_INVALID_DISCOUNT,
+                    order=None,
+                )
+            promo_code_id = 7
+            promo_code_hash = "d" * 64
+            promo_code_suffix = promo.code[-4:]
+
+        order = telegram_app.PaymentOrder(
+            order_id=f"order_{len(self.orders) + 1}",
+            nonce=f"nonce_{len(self.orders) + 1}",
+            user_id=user_id,
+            delivery_chat_id=delivery_chat_id,
+            provider=provider,
+            product=product,
+            amount=amount - discount_amount,
+            currency=currency,
+            list_amount=amount,
+            discount_amount=discount_amount,
+            promo_code_id=promo_code_id,
+            promo_code_hash=promo_code_hash,
+            promo_code_suffix=promo_code_suffix,
+            metadata={"pricing_context": pricing_context} if pricing_context else {},
+        )
+        self.orders.append(order)
+        return SimpleNamespace(
+            accepted=True,
+            code=telegram_app.PaymentOrderCreationCode.CREATED,
+            order=order,
+        )
+
+    def mark_payment_order_invoice_link(
+        self,
+        order_id: str,
+        invoice_link: str,
+    ) -> None:
+        self.invoice_links.append((order_id, invoice_link))
+
+
 @pytest.fixture(autouse=True)
 def isolated_telegram_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
@@ -245,6 +377,10 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_023,
         51_024,
         51_025,
+        51_026,
+        51_027,
+        51_028,
+        51_029,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -757,6 +893,177 @@ def test_subscription_payment_keyboard_shows_paid_buttons_when_public_payments_e
     ]
 
 
+def test_subscription_payment_text_shows_production_prices_without_discount(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    text = telegram_app._subscription_payment_text(chat_id=51_026, user_id=51_026)
+
+    assert f"{telegram_app.SUBSCRIPTION_PRICE_RUB} ₽" in text
+    assert f"{telegram_app.SUBSCRIPTION_STARS_AMOUNT} Stars" in text
+    assert "скид" not in text.lower()
+
+
+@pytest.mark.anyio
+async def test_discount_promo_payment_screen_shows_discounted_amounts_after_entry(
+    monkeypatch,
+) -> None:
+    chat_id = 51_026
+    store = FakeDiscountPaymentStore(discount_percent=70)
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PROMO_CODE, FakeMessage(chat_id))
+    )
+    input_message = FakeMessage(chat_id, text="anna70")
+    await telegram_app.handle_answer(input_message)
+
+    sent_text, markup = input_message.texts[-1]
+    buttons = [
+        (button.text, button.callback_data)
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+    payment_text = telegram_app._subscription_payment_text(
+        chat_id=chat_id,
+        user_id=chat_id,
+    )
+
+    assert "70%" in sent_text
+    assert "179.70 ₽" in sent_text
+    assert "120 Stars" in sent_text
+    assert "70%" in payment_text
+    assert "179.70 ₽" in payment_text
+    assert "120 Stars" in payment_text
+    assert ("💳 Оплатить картой / SberPay - 179.70 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
+    assert ("⭐ Оплатить подписку - 120 Stars", telegram_app.CALLBACK_PAY_TELEGRAM_STARS) in buttons
+
+
+@pytest.mark.anyio
+async def test_yookassa_only_discount_keeps_stars_button_full_price_with_notice(
+    monkeypatch,
+) -> None:
+    chat_id = 51_029
+    store = FakeDiscountPaymentStore(
+        discount_percent=None,
+        discount_amount=15_000,
+        code="RUB150",
+    )
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PROMO_CODE, FakeMessage(chat_id))
+    )
+    input_message = FakeMessage(chat_id, text="rub150")
+    await telegram_app.handle_answer(input_message)
+
+    sent_text, markup = input_message.texts[-1]
+    buttons = [
+        (button.text, button.callback_data)
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+
+    assert "150 ₽" in sent_text
+    assert "Telegram Stars без скидки: 400 Stars." in sent_text
+    assert ("💳 Оплатить картой / SberPay - 449 ₽", telegram_app.CALLBACK_PAY_RU_CARD) in buttons
+    assert (
+        telegram_app.PAY_WITH_TELEGRAM_STARS_TEXT,
+        telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+    ) in buttons
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("callback_data", "button_callback", "expected_display", "expected_amount"),
+    [
+        (telegram_app.CALLBACK_PAY_RU_CARD, telegram_app.CALLBACK_PAY_RU_CARD, "179.70 ₽", 17_970),
+        (
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+            "120 Stars",
+            120,
+        ),
+    ],
+)
+async def test_discount_promo_invoice_amount_matches_displayed_discounted_amount(
+    monkeypatch,
+    callback_data: str,
+    button_callback: str,
+    expected_display: str,
+    expected_amount: int,
+) -> None:
+    chat_id = 51_027
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/discounted"
+
+    store = FakeDiscountPaymentStore(discount_percent=70)
+    bot = FakeInvoiceBot()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PROMO_CODE, FakeMessage(chat_id))
+    )
+    input_message = FakeMessage(chat_id, text="anna70")
+    await telegram_app.handle_answer(input_message)
+    _, markup = input_message.texts[-1]
+    display_button = next(
+        button
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data == button_callback
+    )
+
+    payment_message = FakeMessage(chat_id)
+    payment_message.bot = bot
+    await telegram_app.handle_callback(FakeCallback(callback_data, payment_message))
+
+    assert expected_display in display_button.text
+    assert store.created_orders[0]["promo_code"] == "ANNA70"
+    assert bot.calls[0]["prices"][0].amount == expected_amount
+    assert expected_display in payment_message.texts[-1][0]
+    assert chat_id not in telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID
+
+
+@pytest.mark.anyio
+async def test_pending_discount_is_kept_when_order_creation_is_rejected(
+    monkeypatch,
+) -> None:
+    chat_id = 51_028
+
+    class FakeInvoiceBot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs):
+            self.calls.append(kwargs)
+            return "https://invoice.test/rejected"
+
+    store = FakeDiscountPaymentStore(discount_percent=70, accepted=False)
+    bot = FakeInvoiceBot()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID[chat_id] = "ANNA70"
+
+    payment_message = FakeMessage(chat_id)
+    payment_message.bot = bot
+    await telegram_app.handle_callback(
+        FakeCallback(telegram_app.CALLBACK_PAY_RU_CARD, payment_message)
+    )
+
+    assert store.created_orders[0]["promo_code"] == "ANNA70"
+    assert bot.calls == []
+    assert telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID[chat_id] == "ANNA70"
+
+
 def test_payment_test_price_gate_requires_public_flag_test_flag_and_tester_or_admin(
     monkeypatch,
 ) -> None:
@@ -1245,6 +1552,32 @@ async def test_test_smoke_yookassa_invoice_uses_override_without_consuming_pendi
     monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", set())
     monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
     telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID[chat_id] = "ANNA20"
+
+    tester_keyboard = telegram_app._subscription_payment_keyboard(
+        chat_id=chat_id,
+        user_id=chat_id,
+    )
+    tester_buttons = [
+        (button.text, button.callback_data)
+        for row in tester_keyboard.inline_keyboard
+        for button in row
+    ]
+    tester_text = telegram_app._subscription_payment_text(
+        chat_id=chat_id,
+        user_id=chat_id,
+    )
+    assert tester_buttons[:2] == [
+        (
+            telegram_app.PAY_WITH_RU_CARD_TEST_TEXT,
+            telegram_app.CALLBACK_PAY_RU_CARD,
+        ),
+        (
+            telegram_app.PAY_WITH_TELEGRAM_STARS_TEST_TEXT,
+            telegram_app.CALLBACK_PAY_TELEGRAM_STARS,
+        ),
+    ]
+    assert "[TEST]" in tester_text
+    assert "ANNA20" not in tester_text
 
     payment_message = FakeMessage(chat_id)
     payment_message.bot = bot

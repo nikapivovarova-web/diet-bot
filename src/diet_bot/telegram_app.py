@@ -89,6 +89,7 @@ from .promo_codes import (
     PromoCodeKind,
     PromoCodeRecord,
     activate_promo_code,
+    calculate_discount_amount,
     generate_promo_codes,
     load_promo_codes,
     normalize_promo_code,
@@ -157,6 +158,14 @@ class _RecentRecipeAvoidance:
 class _WeekPlanBuildResult:
     plans: tuple[MealPlan, ...]
     avoidance_phase: str
+
+
+@dataclass(frozen=True)
+class _SubscriptionPaymentPricePreview:
+    amount: int
+    list_amount: int
+    discount_amount: int = 0
+    promo: PromoCodeDefinition | None = None
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
@@ -281,7 +290,7 @@ PROMO_CODE_ALREADY_USED_TEXT = "Этот промокод уже был акти
 PROMO_CODE_DISABLED_TEXT = "Этот промокод сейчас не активен. Если вы получили его от поддержки, напишите нам."
 PROMO_CODE_EXPIRED_TEXT = "Срок действия этого промокода закончился."
 PROMO_CODE_NOT_ACCESS_TEXT = "Этот промокод не активирует месячный доступ. Сейчас здесь можно применить только промокод на доступ."
-PROMO_CODE_DISCOUNT_APPLIED_TEXT = "Промокод на скидку применен. Выберите способ оплаты, и я пересчитаю счет."
+PROMO_CODE_DISCOUNT_APPLIED_TEXT = "Промокод на скидку применен."
 SUPPORT_TEXT = "🛟 Техподдержка"
 SUPPORT_PROMPT_TEXT = (
     "Опишите проблему одним сообщением.\n\n"
@@ -1149,11 +1158,15 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
     if activation.status == "not_access_code":
         if _remember_discount_promo_code_for_chat(message.chat.id, text):
             PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+            payment_user_id = _payment_user_id_for_message(message)
             await message.answer(
-                PROMO_CODE_DISCOUNT_APPLIED_TEXT,
+                _discount_promo_code_applied_text(
+                    chat_id=message.chat.id,
+                    user_id=payment_user_id,
+                ),
                 reply_markup=_subscription_payment_keyboard(
                     chat_id=message.chat.id,
-                    user_id=_payment_user_id_for_message(message),
+                    user_id=payment_user_id,
                 ),
             )
             return
@@ -2558,6 +2571,148 @@ def _public_payments_disabled_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _pending_discount_promo_definition_for_order(
+    chat_id: int | None,
+    product: PaymentProduct,
+) -> PromoCodeDefinition | None:
+    if not isinstance(chat_id, int):
+        return None
+    promo_code = _pending_discount_promo_code_for_order(chat_id, product)
+    if promo_code is None:
+        return None
+    store = _runtime_store()
+    getter = getattr(store, "get_promo_code", None)
+    if not callable(getter):
+        return None
+    try:
+        promo = getter(promo_code, active_only=True)
+    except Exception:
+        return None
+    if promo is None or getattr(promo, "kind", None) != PromoCodeKind.DISCOUNT:
+        return None
+    return promo
+
+
+def _subscription_payment_price_preview(
+    provider: PaymentProvider,
+    *,
+    chat_id: int | None,
+    user_id: int | None,
+) -> _SubscriptionPaymentPricePreview:
+    pricing_context = _payment_pricing_context_for_identity(
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    metadata = get_payment_product_invoice_metadata(
+        provider,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        pricing_context=pricing_context,
+    )
+    if pricing_context == PAYMENT_TEST_SMOKE_PRICING_CONTEXT:
+        return _SubscriptionPaymentPricePreview(
+            amount=metadata.amount,
+            list_amount=metadata.amount,
+        )
+
+    promo = _pending_discount_promo_definition_for_order(
+        chat_id,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+    )
+    if promo is None:
+        return _SubscriptionPaymentPricePreview(
+            amount=metadata.amount,
+            list_amount=metadata.amount,
+        )
+    try:
+        discount_amount = calculate_discount_amount(promo, metadata.amount)
+    except ValueError:
+        return _SubscriptionPaymentPricePreview(
+            amount=metadata.amount,
+            list_amount=metadata.amount,
+        )
+    return _SubscriptionPaymentPricePreview(
+        amount=metadata.amount - discount_amount,
+        list_amount=metadata.amount,
+        discount_amount=discount_amount,
+        promo=promo,
+    )
+
+
+def _pay_with_ru_card_text(amount_kopecks: int) -> str:
+    return f"💳 Оплатить картой / SberPay - {_format_kopecks_for_display(amount_kopecks)} ₽"
+
+
+def _pay_with_telegram_stars_text(amount: int) -> str:
+    unit = "Star" if amount == 1 else "Stars"
+    return f"⭐ Оплатить подписку - {amount} {unit}"
+
+
+def _discount_promo_label(
+    promo: PromoCodeDefinition,
+    *,
+    ru_card: _SubscriptionPaymentPricePreview,
+    stars: _SubscriptionPaymentPricePreview,
+) -> str:
+    if promo.discount_percent is not None:
+        return f"{promo.discount_percent}%"
+    if promo.discount_amount is not None:
+        if ru_card.discount_amount > 0:
+            return f"{_format_kopecks_for_display(ru_card.discount_amount)} ₽"
+        if stars.discount_amount > 0:
+            return f"{stars.discount_amount} Stars"
+    return "по промокоду"
+
+
+def _subscription_discount_notice_text(
+    *,
+    chat_id: int | None,
+    user_id: int | None,
+) -> str | None:
+    if _payment_test_prices_visible(chat_id=chat_id, user_id=user_id):
+        return None
+    ru_card = _subscription_payment_price_preview(
+        PaymentProvider.YOOKASSA,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    stars = _subscription_payment_price_preview(
+        PaymentProvider.TELEGRAM_STARS,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    promo = ru_card.promo or stars.promo
+    if promo is None:
+        return None
+
+    lines = [
+        f"Скидка {_discount_promo_label(promo, ru_card=ru_card, stars=stars)} применена к месячному доступу."
+    ]
+    if ru_card.discount_amount > 0:
+        lines.append(
+            "Картой/SberPay: "
+            f"{_format_kopecks_for_display(ru_card.amount)} ₽ вместо "
+            f"{_format_kopecks_for_display(ru_card.list_amount)} ₽."
+        )
+    if stars.discount_amount > 0:
+        lines.append(
+            f"Telegram Stars: {stars.amount} Stars вместо {stars.list_amount} Stars."
+        )
+    elif ru_card.discount_amount > 0:
+        lines.append(f"Telegram Stars без скидки: {stars.amount} Stars.")
+    return "\n".join(lines)
+
+
+def _discount_promo_code_applied_text(
+    *,
+    chat_id: int | None,
+    user_id: int | None,
+) -> str:
+    notice = _subscription_discount_notice_text(chat_id=chat_id, user_id=user_id)
+    if not notice:
+        return PROMO_CODE_DISCOUNT_APPLIED_TEXT
+    return f"{PROMO_CODE_DISCOUNT_APPLIED_TEXT}\n\n{notice}"
+
+
 def _subscription_payment_text(
     *,
     chat_id: int | None = None,
@@ -2566,6 +2721,12 @@ def _subscription_payment_text(
     if _public_payments_enabled():
         if _payment_test_prices_visible(chat_id=chat_id, user_id=user_id):
             return f"{SUBSCRIPTION_PAYMENT_TEXT}\n\n{SUBSCRIPTION_TEST_PAYMENT_NOTICE_TEXT}"
+        discount_notice = _subscription_discount_notice_text(
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+        if discount_notice:
+            return f"{SUBSCRIPTION_PAYMENT_TEXT}\n\n{discount_notice}"
         return SUBSCRIPTION_PAYMENT_TEXT
     return (
         "FoodBalance - цифровой сервис персональных рационов питания.\n\n"
@@ -3980,8 +4141,18 @@ def _subscription_payment_keyboard(
         ru_card_text = PAY_WITH_RU_CARD_TEST_TEXT
         stars_text = PAY_WITH_TELEGRAM_STARS_TEST_TEXT
     else:
-        ru_card_text = PAY_WITH_RU_CARD_TEXT
-        stars_text = PAY_WITH_TELEGRAM_STARS_TEXT
+        ru_card = _subscription_payment_price_preview(
+            PaymentProvider.YOOKASSA,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+        stars = _subscription_payment_price_preview(
+            PaymentProvider.TELEGRAM_STARS,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+        ru_card_text = _pay_with_ru_card_text(ru_card.amount)
+        stars_text = _pay_with_telegram_stars_text(stars.amount)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=ru_card_text, callback_data=CALLBACK_PAY_RU_CARD)],
