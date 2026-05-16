@@ -441,6 +441,9 @@ class PaymentEvent:
     currency: PaymentCurrency | str | None = None
     status: PaymentEventStatus | str = PaymentEventStatus.PROCESSED
     reason: str | None = None
+    is_recurring: bool = False
+    is_first_recurring: bool = False
+    subscription_expiration_at: datetime | None = None
     raw_payload_redacted: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
     processed_at: datetime | None = None
@@ -453,6 +456,18 @@ class PaymentEvent:
             object.__setattr__(self, "product", PaymentProduct(self.product))
         if self.currency is not None:
             object.__setattr__(self, "currency", PaymentCurrency(self.currency))
+        object.__setattr__(self, "is_first_recurring", bool(self.is_first_recurring))
+        object.__setattr__(
+            self,
+            "is_recurring",
+            bool(self.is_recurring or self.is_first_recurring),
+        )
+        if self.subscription_expiration_at is not None:
+            object.__setattr__(
+                self,
+                "subscription_expiration_at",
+                _normalize_datetime(self.subscription_expiration_at),
+            )
         if self.amount is not None and self.amount < 0:
             raise ValueError("payment event amount must be non-negative")
 
@@ -503,6 +518,8 @@ class PaymentSuccessfulPaymentInput:
     expected_product: PaymentProduct | str | None = None
     raw_payload: Mapping[str, Any] | None = None
     subscription_expiration_timestamp: int | None = None
+    is_recurring: bool = False
+    is_first_recurring: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "provider", PaymentProvider(self.provider))
@@ -518,6 +535,12 @@ class PaymentSuccessfulPaymentInput:
                 "provider_charge_id",
                 text_provider_charge_id or None,
             )
+        object.__setattr__(self, "is_first_recurring", bool(self.is_first_recurring))
+        object.__setattr__(
+            self,
+            "is_recurring",
+            bool(self.is_recurring or self.is_first_recurring),
+        )
         object.__setattr__(self, "telegram_charge_id", str(self.telegram_charge_id).strip())
 
 
@@ -950,6 +973,7 @@ def build_successful_payment_event(
     order_id: str | None = None,
     reason: str | None = None,
 ) -> PaymentEvent:
+    is_recurring = _successful_payment_is_recurring(successful_payment, order)
     return PaymentEvent(
         event_id=_payment_event_id(),
         event_type=PaymentEventType.SUCCESSFUL_PAYMENT,
@@ -965,6 +989,9 @@ def build_successful_payment_event(
         currency=successful_payment.currency,
         status=event_status,
         reason=reason,
+        is_recurring=is_recurring,
+        is_first_recurring=successful_payment.is_first_recurring,
+        subscription_expiration_at=_subscription_expiration_at(successful_payment),
         raw_payload_redacted=_successful_payment_redacted_payload(
             successful_payment,
             code=code,
@@ -978,6 +1005,29 @@ def build_successful_payment_event(
     )
 
 
+def _successful_payment_is_recurring(
+    successful_payment: PaymentSuccessfulPaymentInput,
+    order: PaymentOrder | None,
+) -> bool:
+    if successful_payment.is_recurring:
+        return True
+    if order is None:
+        return successful_payment.subscription_expiration_timestamp is not None
+    return (
+        order.provider == PaymentProvider.TELEGRAM_STARS
+        and order.product == PaymentProduct.SUBSCRIPTION_MONTH
+    )
+
+
+def _subscription_expiration_at(
+    successful_payment: PaymentSuccessfulPaymentInput,
+) -> datetime | None:
+    expiration = successful_payment.subscription_expiration_timestamp
+    if expiration is None:
+        return None
+    return datetime.fromtimestamp(expiration, UTC)
+
+
 def apply_successful_payment_entitlement(
     entitlement: Entitlement,
     order: PaymentOrder,
@@ -987,6 +1037,11 @@ def apply_successful_payment_entitlement(
     now: datetime,
 ) -> PaymentApplication:
     if order.product == PaymentProduct.SUBSCRIPTION_MONTH:
+        subscription_source = (
+            "telegram_stars"
+            if order.provider == PaymentProvider.TELEGRAM_STARS
+            else "yookassa"
+        )
         return apply_subscription_payment(
             entitlement,
             charge_id,
@@ -994,6 +1049,19 @@ def apply_successful_payment_entitlement(
             subscription_expiration_timestamp=(
                 successful_payment.subscription_expiration_timestamp
             ),
+            subscription_source=subscription_source,
+            auto_renew_status=(
+                "enabled"
+                if subscription_source == "telegram_stars"
+                else "not_applicable"
+            ),
+            stars_subscription_charge_id=(
+                successful_payment.telegram_charge_id or charge_id
+                if subscription_source == "telegram_stars"
+                else None
+            ),
+            last_subscription_payment_charge_id=charge_id,
+            current_period_payment_order_id=order.order_id,
         )
     if order.product == PaymentProduct.EXTRA_ONE_DAY:
         return apply_extra_one_day_payment(entitlement, charge_id)
@@ -1861,6 +1929,13 @@ def _successful_payment_input_from_event(
         currency=event.currency if event.currency is not None else order.currency,
         total_amount=event.amount if event.amount is not None else order.amount,
         expected_product=order.product,
+        subscription_expiration_timestamp=(
+            int(event.subscription_expiration_at.timestamp())
+            if event.subscription_expiration_at is not None
+            else None
+        ),
+        is_recurring=event.is_recurring,
+        is_first_recurring=event.is_first_recurring,
         raw_payload={
             "reconciliation_target_event_id": event.event_id,
             "reconciliation_action": PaymentReconciliationAction.RECONCILE_ORPHAN_SUCCESS.value,
@@ -2604,6 +2679,9 @@ def _successful_payment_redacted_payload(
         "total_amount": successful_payment.total_amount,
         "has_telegram_charge_id": bool(successful_payment.telegram_charge_id),
         "has_provider_charge_id": bool(successful_payment.provider_charge_id),
+        "is_recurring": successful_payment.is_recurring,
+        "is_first_recurring": successful_payment.is_first_recurring,
+        "has_subscription_expiration": successful_payment.subscription_expiration_timestamp is not None,
         "raw_payload": redact_payment_payload(dict(successful_payment.raw_payload or {})),
     }
 

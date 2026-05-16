@@ -3148,6 +3148,8 @@ def _successful_payment_input_for_message(
             currency=str(getattr(payment, "currency", "")),
             total_amount=int(getattr(payment, "total_amount", -1)),
             subscription_expiration_timestamp=_successful_payment_subscription_expiration(payment),
+            is_recurring=bool(getattr(payment, "is_recurring", False)),
+            is_first_recurring=bool(getattr(payment, "is_first_recurring", False)),
         )
     except (TypeError, ValueError):
         return None

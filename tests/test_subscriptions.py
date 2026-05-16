@@ -186,3 +186,57 @@ def test_subscription_state_round_trips_json(tmp_path) -> None:
     assert loaded[123].test_access_enabled
     assert loaded[123].extra_one_day_remaining == 1
     assert loaded[123].processed_payment_charge_ids == ["charge-1"]
+
+
+def test_old_entitlement_json_defaults_managed_subscription_fields() -> None:
+    entitlement = Entitlement.from_dict(
+        {
+            "subscription_period_start": "2026-05-01T00:00:00+00:00",
+            "subscription_period_end": "2026-06-01T00:00:00+00:00",
+            "monthly_one_day_remaining": 2,
+            "processed_payment_charge_ids": ["old-charge"],
+        }
+    )
+
+    assert entitlement.subscription_source == "none"
+    assert entitlement.auto_renew_status == "not_applicable"
+    assert entitlement.stars_subscription_charge_id is None
+    assert entitlement.last_subscription_payment_charge_id is None
+    assert entitlement.current_period_payment_order_id is None
+
+
+def test_new_entitlement_json_round_trips_managed_subscription_fields() -> None:
+    entitlement = Entitlement(
+        subscription_source="telegram_stars",
+        auto_renew_status="enabled",
+        stars_subscription_charge_id="stars-sub-1",
+        last_subscription_payment_charge_id="payment-charge-1",
+        current_period_payment_order_id="order-1",
+    )
+
+    loaded = Entitlement.from_dict(entitlement.to_dict())
+
+    assert loaded.subscription_source == "telegram_stars"
+    assert loaded.auto_renew_status == "enabled"
+    assert loaded.stars_subscription_charge_id == "stars-sub-1"
+    assert loaded.last_subscription_payment_charge_id == "payment-charge-1"
+    assert loaded.current_period_payment_order_id == "order-1"
+
+
+def test_extra_payments_do_not_mutate_managed_subscription_fields() -> None:
+    entitlement = Entitlement(
+        subscription_source="telegram_stars",
+        auto_renew_status="enabled",
+        stars_subscription_charge_id="stars-sub-1",
+        last_subscription_payment_charge_id="payment-charge-1",
+        current_period_payment_order_id="order-1",
+    )
+
+    apply_extra_one_day_payment(entitlement, "extra-day-1")
+    apply_extra_weekly_pdf_payment(entitlement, "extra-week-1")
+
+    assert entitlement.subscription_source == "telegram_stars"
+    assert entitlement.auto_renew_status == "enabled"
+    assert entitlement.stars_subscription_charge_id == "stars-sub-1"
+    assert entitlement.last_subscription_payment_charge_id == "payment-charge-1"
+    assert entitlement.current_period_payment_order_id == "order-1"

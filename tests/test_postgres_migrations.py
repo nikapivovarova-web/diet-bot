@@ -38,6 +38,7 @@ REQUIRED_INDEXES = {
     "idx_payment_orders_user_status",
     "idx_payment_events_order_created_at",
     "idx_payment_events_charge",
+    "uniq_entitlements_stars_subscription_charge_id",
     "idx_payment_orders_promo_code",
     "idx_processed_provider_charges_order",
     "idx_promo_codes_active_expires",
@@ -118,6 +119,14 @@ def test_migrations_include_required_paid_storage_tables() -> None:
         r"\bdiscount_amount\s+INTEGER\b",
         r"\bmonthly_duration_months\s+INTEGER\b",
         r"\bmetadata_json\s+JSONB\s+NOT\s+NULL\s+DEFAULT\s+'\{\}'::jsonb\b",
+        r"\bsubscription_source\s+TEXT\s+NOT\s+NULL\s+DEFAULT\s+'none'",
+        r"\bauto_renew_status\s+TEXT\s+NOT\s+NULL\s+DEFAULT\s+'not_applicable'",
+        r"\bstars_subscription_charge_id\s+TEXT\b",
+        r"\blast_subscription_payment_charge_id\s+TEXT\b",
+        r"\bcurrent_period_payment_order_id\s+TEXT\b",
+        r"\bis_recurring\s+BOOLEAN\s+NOT\s+NULL\s+DEFAULT\s+false\b",
+        r"\bis_first_recurring\s+BOOLEAN\s+NOT\s+NULL\s+DEFAULT\s+false\b",
+        r"\bsubscription_expiration_at\s+TIMESTAMPTZ\b",
         r"\bgeneration_id\s+BIGINT\s+REFERENCES\s+generation_records\(id\)\s+ON\s+DELETE\s+SET\s+NULL\b",
         r"\bgenerated_at\s+TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+now\(\)",
         r"\bmeal_slot\s+TEXT\s+NOT\s+NULL\b",
@@ -125,6 +134,21 @@ def test_migrations_include_required_paid_storage_tables() -> None:
         r"\brecipe_key\s+TEXT\s+NOT\s+NULL\b",
     ):
         assert re.search(column_pattern, sql, flags=re.IGNORECASE), column_pattern
+    assert "subscription_source IN ('none', 'telegram_stars', 'yookassa', 'promo', 'admin', 'legacy')" in sql
+    assert "auto_renew_status IN ('not_applicable', 'enabled', 'canceled', 'unknown')" in sql
+    assert re.search(
+        r"CREATE\s+UNIQUE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+"
+        r"uniq_entitlements_stars_subscription_charge_id\s+"
+        r"ON\s+entitlements\(stars_subscription_charge_id\)\s+"
+        r"WHERE\s+stars_subscription_charge_id\s+IS\s+NOT\s+NULL",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    assert re.search(
+        r"CHECK\s+\(\s*NOT\s+is_first_recurring\s+OR\s+is_recurring\s*\)",
+        sql,
+        flags=re.IGNORECASE,
+    )
 
 
 def test_migrations_use_idempotent_sql_shapes() -> None:

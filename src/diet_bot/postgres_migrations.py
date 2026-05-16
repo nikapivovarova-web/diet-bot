@@ -52,6 +52,11 @@ BASE_SCHEMA_STATEMENTS = (
         status TEXT NOT NULL DEFAULT 'inactive',
         subscription_period_start TIMESTAMPTZ,
         subscription_period_end TIMESTAMPTZ,
+        subscription_source TEXT NOT NULL DEFAULT 'none',
+        auto_renew_status TEXT NOT NULL DEFAULT 'not_applicable',
+        stars_subscription_charge_id TEXT,
+        last_subscription_payment_charge_id TEXT,
+        current_period_payment_order_id TEXT,
         test_access_until TIMESTAMPTZ,
         test_access_enabled BOOLEAN NOT NULL DEFAULT false,
         free_trial_used BOOLEAN NOT NULL DEFAULT false,
@@ -62,6 +67,8 @@ BASE_SCHEMA_STATEMENTS = (
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CHECK (plan IN ('free', 'monthly', 'test_access')),
         CHECK (status IN ('active', 'inactive')),
+        CHECK (subscription_source IN ('none', 'telegram_stars', 'yookassa', 'promo', 'admin', 'legacy')),
+        CHECK (auto_renew_status IN ('not_applicable', 'enabled', 'canceled', 'unknown')),
         CHECK (
             monthly_one_day_remaining >= 0
             AND monthly_weekly_pdf_remaining >= 0
@@ -235,6 +242,11 @@ BASE_SCHEMA_STATEMENTS = (
         ON entitlement_events(user_id, created_at DESC)
     """,
     """
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_entitlements_stars_subscription_charge_id
+        ON entitlements(stars_subscription_charge_id)
+        WHERE stars_subscription_charge_id IS NOT NULL
+    """,
+    """
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_consume_per_generation
         ON entitlement_events(generation_id, event_type)
         WHERE event_type = 'consume' AND generation_id IS NOT NULL
@@ -325,6 +337,9 @@ PAYMENT_SUCCESS_LEDGER_MIGRATION = PostgresMigration(
             currency TEXT,
             status TEXT NOT NULL,
             reason TEXT,
+            is_recurring BOOLEAN NOT NULL DEFAULT false,
+            is_first_recurring BOOLEAN NOT NULL DEFAULT false,
+            subscription_expiration_at TIMESTAMPTZ,
             raw_payload_redacted JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             processed_at TIMESTAMPTZ,
@@ -348,7 +363,8 @@ PAYMENT_SUCCESS_LEDGER_MIGRATION = PostgresMigration(
                 'orphan_recoverable',
                 'ignored_non_terminal'
             )),
-            CHECK (amount IS NULL OR amount >= 0)
+            CHECK (amount IS NULL OR amount >= 0),
+            CHECK (NOT is_first_recurring OR is_recurring)
         )
         """,
         """
@@ -835,6 +851,211 @@ RECIPE_HISTORY_MIGRATION = PostgresMigration(
 )
 
 
+MANAGED_SUBSCRIPTION_STATE_MIGRATION = PostgresMigration(
+    version="202605160001",
+    description="Add managed subscription state fields",
+    statements=(
+        """
+        ALTER TABLE entitlements
+        ADD COLUMN IF NOT EXISTS subscription_source TEXT NOT NULL DEFAULT 'none'
+        """,
+        """
+        ALTER TABLE entitlements
+        ADD COLUMN IF NOT EXISTS auto_renew_status TEXT NOT NULL DEFAULT 'not_applicable'
+        """,
+        """
+        ALTER TABLE entitlements
+        ADD COLUMN IF NOT EXISTS stars_subscription_charge_id TEXT
+        """,
+        """
+        ALTER TABLE entitlements
+        ADD COLUMN IF NOT EXISTS last_subscription_payment_charge_id TEXT
+        """,
+        """
+        ALTER TABLE entitlements
+        ADD COLUMN IF NOT EXISTS current_period_payment_order_id TEXT
+        """,
+        """
+        ALTER TABLE payment_events
+        ADD COLUMN IF NOT EXISTS is_recurring BOOLEAN NOT NULL DEFAULT false
+        """,
+        """
+        ALTER TABLE payment_events
+        ADD COLUMN IF NOT EXISTS is_first_recurring BOOLEAN NOT NULL DEFAULT false
+        """,
+        """
+        ALTER TABLE payment_events
+        ADD COLUMN IF NOT EXISTS subscription_expiration_at TIMESTAMPTZ
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'entitlements'::regclass
+                  AND conname = 'entitlements_subscription_source_supported_check'
+            ) THEN
+                ALTER TABLE entitlements
+                ADD CONSTRAINT entitlements_subscription_source_supported_check
+                CHECK (subscription_source IN ('none', 'telegram_stars', 'yookassa', 'promo', 'admin', 'legacy'));
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'entitlements'::regclass
+                  AND conname = 'entitlements_auto_renew_status_supported_check'
+            ) THEN
+                ALTER TABLE entitlements
+                ADD CONSTRAINT entitlements_auto_renew_status_supported_check
+                CHECK (auto_renew_status IN ('not_applicable', 'enabled', 'canceled', 'unknown'));
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'entitlements'::regclass
+                  AND conname = 'entitlements_current_period_payment_order_id_fkey'
+            ) THEN
+                ALTER TABLE entitlements
+                ADD CONSTRAINT entitlements_current_period_payment_order_id_fkey
+                FOREIGN KEY (current_period_payment_order_id)
+                REFERENCES payment_orders(order_id)
+                ON DELETE SET NULL;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'payment_events'::regclass
+                  AND conname = 'payment_events_recurring_consistency_check'
+            ) THEN
+                ALTER TABLE payment_events
+                ADD CONSTRAINT payment_events_recurring_consistency_check
+                CHECK (NOT is_first_recurring OR is_recurring);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            UPDATE entitlements
+            SET subscription_source = 'none',
+                auto_renew_status = 'not_applicable',
+                stars_subscription_charge_id = NULL,
+                last_subscription_payment_charge_id = NULL,
+                current_period_payment_order_id = NULL
+            WHERE subscription_period_end IS NULL
+               OR subscription_period_end <= now();
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            WITH latest_paid_subscription AS (
+                SELECT DISTINCT ON (orders.user_id)
+                    orders.user_id,
+                    orders.order_id,
+                    orders.provider,
+                    events.charge_id,
+                    events.telegram_charge_id
+                FROM payment_orders AS orders
+                LEFT JOIN LATERAL (
+                    SELECT charge_id, telegram_charge_id, created_at, event_id
+                    FROM payment_events
+                    WHERE order_id = orders.order_id
+                      AND event_type = 'successful_payment'
+                      AND status = 'processed'
+                    ORDER BY created_at DESC NULLS LAST, event_id DESC
+                    LIMIT 1
+                ) AS events ON TRUE
+                WHERE orders.product = 'subscription_month'
+                  AND orders.status = 'paid'
+                  AND orders.provider IN ('telegram_stars', 'yookassa')
+                ORDER BY orders.user_id,
+                         COALESCE(orders.paid_at, orders.updated_at, orders.created_at) DESC,
+                         orders.order_id DESC
+            )
+            UPDATE entitlements AS entitlements
+            SET subscription_source = latest_paid_subscription.provider,
+                auto_renew_status = CASE
+                    WHEN latest_paid_subscription.provider = 'telegram_stars' THEN 'enabled'
+                    ELSE 'not_applicable'
+                END,
+                stars_subscription_charge_id = CASE
+                    WHEN latest_paid_subscription.provider = 'telegram_stars'
+                        THEN COALESCE(
+                            latest_paid_subscription.telegram_charge_id,
+                            latest_paid_subscription.charge_id,
+                            entitlements.stars_subscription_charge_id
+                        )
+                    ELSE NULL
+                END,
+                last_subscription_payment_charge_id = latest_paid_subscription.charge_id,
+                current_period_payment_order_id = latest_paid_subscription.order_id
+            FROM latest_paid_subscription
+            WHERE entitlements.user_id = latest_paid_subscription.user_id
+              AND entitlements.subscription_period_end IS NOT NULL
+              AND entitlements.subscription_period_end > now();
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            WITH latest_subscription_grant AS (
+                SELECT DISTINCT ON (user_id)
+                    user_id,
+                    source
+                FROM entitlement_events
+                WHERE event_type = 'grant'
+                  AND (
+                      (
+                          source = 'promo'
+                          AND metadata_json->>'promo_kind' IN ('monthly_access', 'subscription_month')
+                      )
+                      OR (
+                          source = 'admin'
+                          AND (
+                              metadata_json->>'grant' = 'subscription_month'
+                              OR metadata_json->>'subscription_source' = 'admin'
+                          )
+                      )
+                  )
+                ORDER BY user_id, id DESC
+            )
+            UPDATE entitlements AS entitlements
+            SET subscription_source = latest_subscription_grant.source,
+                auto_renew_status = 'not_applicable',
+                stars_subscription_charge_id = NULL
+            FROM latest_subscription_grant
+            WHERE entitlements.user_id = latest_subscription_grant.user_id
+              AND entitlements.subscription_source = 'none'
+              AND entitlements.subscription_period_end IS NOT NULL
+              AND entitlements.subscription_period_end > now();
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            UPDATE entitlements
+            SET subscription_source = 'legacy',
+                auto_renew_status = 'unknown',
+                stars_subscription_charge_id = NULL
+            WHERE subscription_source = 'none'
+              AND subscription_period_end IS NOT NULL
+              AND subscription_period_end > now();
+        END $$;
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_entitlements_stars_subscription_charge_id
+            ON entitlements(stars_subscription_charge_id)
+            WHERE stars_subscription_charge_id IS NOT NULL
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
@@ -842,6 +1063,7 @@ POSTGRES_MIGRATIONS = (
     PROMO_STORAGE_FOUNDATION_MIGRATION,
     PROMO_PAYMENT_DISCOUNT_MIGRATION,
     RECIPE_HISTORY_MIGRATION,
+    MANAGED_SUBSCRIPTION_STATE_MIGRATION,
 )
 
 

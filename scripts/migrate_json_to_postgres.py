@@ -171,11 +171,12 @@ def _build_plan(sources: dict[str, Any], *, limited_mode: bool) -> dict[str, Any
     chat_states, profiles_from_state = _extract_chat_states_and_profiles(sources["state"])
     profiles = dict(profiles_from_state)
     profiles.update(_normalize_profiles(sources["profiles"]))
+    payment_orders, payment_order_stats = _normalize_payment_orders(sources["payment_orders"])
     entitlements, entitlement_stats = _extract_entitlements(
         sources["subscriptions"],
         limited_mode=limited_mode,
+        payment_orders=payment_orders,
     )
-    payment_orders, payment_order_stats = _normalize_payment_orders(sources["payment_orders"])
 
     summary["chat_states"] = len(chat_states)
     summary["profiles"] = len(profiles)
@@ -305,10 +306,12 @@ def _extract_entitlements(
     raw_subscriptions: dict[str, Any],
     *,
     limited_mode: bool,
+    payment_orders: list[dict[str, Any]],
 ) -> tuple[dict[int, Entitlement], dict[str, int]]:
     entitlements: dict[int, Entitlement] = {}
     paid_sanitized = 0
     processed_ignored = 0
+    order_evidence = _subscription_order_evidence_by_user(payment_orders)
     for raw_user_id, raw_entitlement in raw_subscriptions.items():
         user_id = _optional_int(raw_user_id)
         if user_id is None or not isinstance(raw_entitlement, dict):
@@ -320,6 +323,12 @@ def _extract_entitlements(
             if entitlement.processed_payment_charge_ids:
                 processed_ignored += 1
             entitlement = _non_payment_entitlement(entitlement)
+        else:
+            entitlement = _classify_managed_subscription_import(
+                entitlement,
+                raw_entitlement,
+                order_evidence.get(user_id),
+            )
         entitlements[user_id] = entitlement
     return entitlements, {
         "paid_entitlements_sanitized": paid_sanitized,
@@ -333,6 +342,90 @@ def _non_payment_entitlement(entitlement: Entitlement) -> Entitlement:
         test_access_until=entitlement.test_access_until,
         test_access_enabled=entitlement.test_access_enabled,
     )
+
+
+def _classify_managed_subscription_import(
+    entitlement: Entitlement,
+    raw_entitlement: dict[str, Any],
+    payment_order: dict[str, Any] | None,
+) -> Entitlement:
+    if not _has_active_monthly_period(entitlement):
+        _clear_managed_subscription_fields(entitlement)
+        return entitlement
+
+    if entitlement.subscription_source != "none":
+        return entitlement
+
+    if payment_order is not None:
+        provider = str(payment_order["provider"])
+        entitlement.subscription_source = provider  # type: ignore[assignment]
+        entitlement.auto_renew_status = (
+            "enabled" if provider == "telegram_stars" else "not_applicable"
+        )
+        entitlement.current_period_payment_order_id = str(payment_order["order_id"])
+        return entitlement
+
+    if _has_promo_subscription_evidence(entitlement, raw_entitlement):
+        entitlement.subscription_source = "promo"
+        entitlement.auto_renew_status = "not_applicable"
+        return entitlement
+
+    if _has_admin_subscription_evidence(raw_entitlement):
+        entitlement.subscription_source = "admin"
+        entitlement.auto_renew_status = "not_applicable"
+        return entitlement
+
+    entitlement.subscription_source = "legacy"
+    entitlement.auto_renew_status = "unknown"
+    return entitlement
+
+
+def _clear_managed_subscription_fields(entitlement: Entitlement) -> None:
+    entitlement.subscription_source = "none"
+    entitlement.auto_renew_status = "not_applicable"
+    entitlement.stars_subscription_charge_id = None
+    entitlement.last_subscription_payment_charge_id = None
+    entitlement.current_period_payment_order_id = None
+
+
+def _has_active_monthly_period(entitlement: Entitlement) -> bool:
+    end = entitlement.subscription_end_datetime()
+    return bool(end and end > datetime.now(UTC))
+
+
+def _subscription_order_evidence_by_user(
+    payment_orders: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    evidence: dict[int, dict[str, Any]] = {}
+    for order in payment_orders:
+        if str(order.get("product")) != "subscription_month":
+            continue
+        if str(order.get("status", "")).lower() not in SUCCESSFUL_ORDER_STATUSES:
+            continue
+        if str(order.get("provider")) not in {"telegram_stars", "yookassa"}:
+            continue
+        user_id = _optional_int(order.get("user_id"))
+        if user_id is None or user_id in evidence:
+            continue
+        evidence[user_id] = order
+    return evidence
+
+
+def _has_promo_subscription_evidence(
+    entitlement: Entitlement,
+    raw_entitlement: dict[str, Any],
+) -> bool:
+    raw_source = _optional_str(raw_entitlement.get("subscription_source"))
+    if raw_source == "promo":
+        return True
+    return any(
+        str(charge_id).startswith("promo:")
+        for charge_id in entitlement.processed_payment_charge_ids
+    )
+
+
+def _has_admin_subscription_evidence(raw_entitlement: dict[str, Any]) -> bool:
+    return _optional_str(raw_entitlement.get("subscription_source")) == "admin"
 
 
 def _has_paid_launch_state(entitlement: Entitlement) -> bool:

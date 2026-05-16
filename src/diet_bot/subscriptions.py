@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 MONTHLY_ONE_DAY_LIMIT = 5
@@ -16,6 +16,15 @@ PROCESSED_CHARGE_ID_LIMIT = 200
 RationKind = Literal["one_day", "weekly_pdf"]
 AttemptSource = Literal["monthly", "extra", "free_trial", "test_access"]
 PaymentGrant = Literal["subscription", "extra_one_day", "extra_weekly_pdf"]
+SubscriptionSource = Literal["none", "telegram_stars", "yookassa", "promo", "admin", "legacy"]
+AutoRenewStatus = Literal["not_applicable", "enabled", "canceled", "unknown"]
+
+SUBSCRIPTION_SOURCES: frozenset[str] = frozenset(
+    {"none", "telegram_stars", "yookassa", "promo", "admin", "legacy"}
+)
+AUTO_RENEW_STATUSES: frozenset[str] = frozenset(
+    {"not_applicable", "enabled", "canceled", "unknown"}
+)
 
 
 @dataclass
@@ -23,6 +32,11 @@ class Entitlement:
     free_trial_used: bool = False
     subscription_period_start: str | None = None
     subscription_period_end: str | None = None
+    subscription_source: SubscriptionSource = "none"
+    auto_renew_status: AutoRenewStatus = "not_applicable"
+    stars_subscription_charge_id: str | None = None
+    last_subscription_payment_charge_id: str | None = None
+    current_period_payment_order_id: str | None = None
     test_access_until: str | None = None
     test_access_enabled: bool = False
     monthly_one_day_remaining: int = 0
@@ -37,6 +51,15 @@ class Entitlement:
             free_trial_used=bool(data.get("free_trial_used", False)),
             subscription_period_start=_optional_str(data.get("subscription_period_start")),
             subscription_period_end=_optional_str(data.get("subscription_period_end")),
+            subscription_source=_subscription_source(data.get("subscription_source")),
+            auto_renew_status=_auto_renew_status(data.get("auto_renew_status")),
+            stars_subscription_charge_id=_optional_str(data.get("stars_subscription_charge_id")),
+            last_subscription_payment_charge_id=_optional_str(
+                data.get("last_subscription_payment_charge_id")
+            ),
+            current_period_payment_order_id=_optional_str(
+                data.get("current_period_payment_order_id")
+            ),
             test_access_until=_optional_str(data.get("test_access_until")),
             test_access_enabled=bool(data.get("test_access_enabled", bool(data.get("test_access_until")))),
             monthly_one_day_remaining=_non_negative_int(data.get("monthly_one_day_remaining")),
@@ -55,6 +78,11 @@ class Entitlement:
             "free_trial_used": self.free_trial_used,
             "subscription_period_start": self.subscription_period_start,
             "subscription_period_end": self.subscription_period_end,
+            "subscription_source": self.subscription_source,
+            "auto_renew_status": self.auto_renew_status,
+            "stars_subscription_charge_id": self.stars_subscription_charge_id,
+            "last_subscription_payment_charge_id": self.last_subscription_payment_charge_id,
+            "current_period_payment_order_id": self.current_period_payment_order_id,
             "test_access_until": self.test_access_until,
             "test_access_enabled": self.test_access_enabled,
             "monthly_one_day_remaining": self.monthly_one_day_remaining,
@@ -225,6 +253,11 @@ def apply_subscription_payment(
     *,
     now: datetime | None = None,
     subscription_expiration_timestamp: int | None = None,
+    subscription_source: SubscriptionSource | None = None,
+    auto_renew_status: AutoRenewStatus | None = None,
+    stars_subscription_charge_id: str | None = None,
+    last_subscription_payment_charge_id: str | None = None,
+    current_period_payment_order_id: str | None = None,
 ) -> PaymentApplication:
     if _is_duplicate_charge(entitlement, charge_id):
         return PaymentApplication(False, "subscription", duplicate=True)
@@ -239,6 +272,22 @@ def apply_subscription_payment(
     entitlement.subscription_period_end = _format_datetime(end)
     entitlement.monthly_one_day_remaining = MONTHLY_ONE_DAY_LIMIT
     entitlement.monthly_weekly_pdf_remaining = MONTHLY_WEEKLY_PDF_LIMIT
+    if subscription_source is not None:
+        entitlement.subscription_source = subscription_source
+        if subscription_source != "telegram_stars":
+            entitlement.stars_subscription_charge_id = None
+    if auto_renew_status is not None:
+        entitlement.auto_renew_status = auto_renew_status
+    if stars_subscription_charge_id is not None:
+        entitlement.stars_subscription_charge_id = stars_subscription_charge_id
+    elif subscription_source == "telegram_stars":
+        entitlement.stars_subscription_charge_id = charge_id
+    if last_subscription_payment_charge_id is not None:
+        entitlement.last_subscription_payment_charge_id = last_subscription_payment_charge_id
+    elif subscription_source is not None:
+        entitlement.last_subscription_payment_charge_id = charge_id
+    if current_period_payment_order_id is not None:
+        entitlement.current_period_payment_order_id = current_period_payment_order_id
     _remember_charge_id(entitlement, charge_id)
     return PaymentApplication(True, "subscription")
 
@@ -261,6 +310,9 @@ def apply_monthly_access_promo_grant(
         subscription_expiration_timestamp=int(
             (extension_base + timedelta(seconds=duration)).timestamp()
         ),
+        subscription_source="promo",
+        auto_renew_status="not_applicable",
+        last_subscription_payment_charge_id=charge_id,
     )
 
 
@@ -285,6 +337,20 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _subscription_source(value: Any) -> SubscriptionSource:
+    text = _optional_str(value)
+    if text in SUBSCRIPTION_SOURCES:
+        return cast(SubscriptionSource, text)
+    return "none"
+
+
+def _auto_renew_status(value: Any) -> AutoRenewStatus:
+    text = _optional_str(value)
+    if text in AUTO_RENEW_STATUSES:
+        return cast(AutoRenewStatus, text)
+    return "not_applicable"
 
 
 def _non_negative_int(value: Any) -> int:

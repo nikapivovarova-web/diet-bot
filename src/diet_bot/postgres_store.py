@@ -1957,11 +1957,14 @@ class PostgresDietBotStore:
                 currency,
                 status,
                 reason,
+                is_recurring,
+                is_first_recurring,
+                subscription_expiration_at,
                 raw_payload_redacted,
                 created_at,
                 processed_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -1979,6 +1982,9 @@ class PostgresDietBotStore:
                 event.currency.value if event.currency is not None else None,
                 event.status.value,
                 event.reason,
+                event.is_recurring,
+                event.is_first_recurring,
+                event.subscription_expiration_at,
                 _jsonb(event.raw_payload_redacted),
                 _normalize_datetime(event.created_at),
                 (
@@ -2008,6 +2014,9 @@ class PostgresDietBotStore:
                 currency = %s,
                 status = %s,
                 reason = %s,
+                is_recurring = %s,
+                is_first_recurring = %s,
+                subscription_expiration_at = %s,
                 raw_payload_redacted = %s,
                 processed_at = %s
             WHERE event_id = %s
@@ -2025,6 +2034,9 @@ class PostgresDietBotStore:
                 event.currency.value if event.currency is not None else None,
                 event.status.value,
                 event.reason,
+                event.is_recurring,
+                event.is_first_recurring,
+                event.subscription_expiration_at,
                 _jsonb(event.raw_payload_redacted),
                 (
                     _normalize_datetime(event.processed_at)
@@ -2297,6 +2309,11 @@ class PostgresDietBotStore:
                 status,
                 subscription_period_start,
                 subscription_period_end,
+                subscription_source,
+                auto_renew_status,
+                stars_subscription_charge_id,
+                last_subscription_payment_charge_id,
+                current_period_payment_order_id,
                 test_access_until,
                 test_access_enabled,
                 free_trial_used,
@@ -2305,12 +2322,17 @@ class PostgresDietBotStore:
                 extra_one_day_remaining,
                 extra_weekly_pdf_remaining
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE
             SET plan = EXCLUDED.plan,
                 status = EXCLUDED.status,
                 subscription_period_start = EXCLUDED.subscription_period_start,
                 subscription_period_end = EXCLUDED.subscription_period_end,
+                subscription_source = EXCLUDED.subscription_source,
+                auto_renew_status = EXCLUDED.auto_renew_status,
+                stars_subscription_charge_id = EXCLUDED.stars_subscription_charge_id,
+                last_subscription_payment_charge_id = EXCLUDED.last_subscription_payment_charge_id,
+                current_period_payment_order_id = EXCLUDED.current_period_payment_order_id,
                 test_access_until = EXCLUDED.test_access_until,
                 test_access_enabled = EXCLUDED.test_access_enabled,
                 free_trial_used = EXCLUDED.free_trial_used,
@@ -2326,6 +2348,11 @@ class PostgresDietBotStore:
                 status,
                 _parse_datetime(entitlement.subscription_period_start),
                 _parse_datetime(entitlement.subscription_period_end),
+                entitlement.subscription_source,
+                entitlement.auto_renew_status,
+                entitlement.stars_subscription_charge_id,
+                entitlement.last_subscription_payment_charge_id,
+                entitlement.current_period_payment_order_id,
                 _parse_datetime(entitlement.test_access_until),
                 entitlement.test_access_enabled,
                 entitlement.free_trial_used,
@@ -3315,6 +3342,23 @@ def _row_to_entitlement(row: dict[str, Any]) -> Entitlement:
         free_trial_used=bool(row.get("free_trial_used", False)),
         subscription_period_start=_format_datetime(row.get("subscription_period_start")),
         subscription_period_end=_format_datetime(row.get("subscription_period_end")),
+        subscription_source=str(row.get("subscription_source") or "none"),
+        auto_renew_status=str(row.get("auto_renew_status") or "not_applicable"),
+        stars_subscription_charge_id=(
+            str(row["stars_subscription_charge_id"])
+            if row.get("stars_subscription_charge_id") is not None
+            else None
+        ),
+        last_subscription_payment_charge_id=(
+            str(row["last_subscription_payment_charge_id"])
+            if row.get("last_subscription_payment_charge_id") is not None
+            else None
+        ),
+        current_period_payment_order_id=(
+            str(row["current_period_payment_order_id"])
+            if row.get("current_period_payment_order_id") is not None
+            else None
+        ),
         test_access_until=_format_datetime(row.get("test_access_until")),
         test_access_enabled=bool(row.get("test_access_enabled", False)),
         monthly_one_day_remaining=_non_negative_int(row.get("monthly_one_day_remaining")),
@@ -3447,6 +3491,13 @@ def _row_to_payment_event(row: dict[str, Any]) -> PaymentEvent:
         currency=str(row["currency"]) if row.get("currency") is not None else None,
         status=str(row["status"]),
         reason=str(row["reason"]) if row.get("reason") is not None else None,
+        is_recurring=bool(row.get("is_recurring", False)),
+        is_first_recurring=bool(row.get("is_first_recurring", False)),
+        subscription_expiration_at=(
+            _normalize_datetime(row["subscription_expiration_at"])
+            if row.get("subscription_expiration_at") is not None
+            else None
+        ),
         raw_payload_redacted=(
             dict(row["raw_payload_redacted"])
             if isinstance(row.get("raw_payload_redacted"), dict)

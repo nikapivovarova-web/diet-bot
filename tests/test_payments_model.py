@@ -36,6 +36,7 @@ from diet_bot.payments import (
     apply_payment_reversal,
     apply_payment_reconciliation,
     apply_successful_payment,
+    build_successful_payment_event,
     build_payment_invoice_metadata,
     build_payment_invoice_payload,
     create_or_reuse_pending_payment_order,
@@ -677,6 +678,56 @@ def test_payment_order_is_recurring_only_for_stars_monthly_invoice_metadata(
 
     assert metadata.subscription_period == expected_subscription_period
     assert (metadata.subscription_period is not None) is expected_is_recurring
+
+
+def test_successful_payment_event_records_recurring_subscription_audit_fields() -> None:
+    now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+    expiration = int((now + timedelta(days=30)).timestamp())
+    stars_order = _payment_order(
+        "order_stars_recurring",
+        "nonce_stars_recurring",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.TELEGRAM_STARS,
+        amount=450,
+        currency=PaymentCurrency.XTR,
+    )
+
+    stars_event = build_successful_payment_event(
+        _successful_payment(
+            stars_order,
+            is_recurring=True,
+            is_first_recurring=True,
+            subscription_expiration_timestamp=expiration,
+        ),
+        code=PaymentSuccessfulPaymentCode.PROCESSED,
+        event_status=PaymentEventStatus.PROCESSED,
+        now=now,
+        order=stars_order,
+    )
+
+    assert stars_event.is_recurring is True
+    assert stars_event.is_first_recurring is True
+    assert stars_event.subscription_expiration_at == now + timedelta(days=30)
+
+    yookassa_order = _payment_order(
+        "order_yookassa_once",
+        "nonce_yookassa_once",
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        provider=PaymentProvider.YOOKASSA,
+        amount=79_900,
+        currency=PaymentCurrency.RUB,
+    )
+    yookassa_event = build_successful_payment_event(
+        _successful_payment(yookassa_order),
+        code=PaymentSuccessfulPaymentCode.PROCESSED,
+        event_status=PaymentEventStatus.PROCESSED,
+        now=now,
+        order=yookassa_order,
+    )
+
+    assert yookassa_event.is_recurring is False
+    assert yookassa_event.is_first_recurring is False
+    assert yookassa_event.subscription_expiration_at is None
 
 
 def test_discounted_yookassa_invoice_uses_final_amount_and_redacted_promo_metadata() -> None:
@@ -2563,6 +2614,9 @@ def _successful_payment(
     total_amount: int | None = None,
     expected_product: PaymentProduct | str | None = None,
     raw_payload: dict[str, object] | None = None,
+    subscription_expiration_timestamp: int | None = None,
+    is_recurring: bool = False,
+    is_first_recurring: bool = False,
 ) -> PaymentSuccessfulPaymentInput:
     return PaymentSuccessfulPaymentInput(
         payload=payload or order.payload,
@@ -2575,6 +2629,9 @@ def _successful_payment(
         total_amount=order.amount if total_amount is None else total_amount,
         expected_product=expected_product,
         raw_payload=raw_payload,
+        subscription_expiration_timestamp=subscription_expiration_timestamp,
+        is_recurring=is_recurring,
+        is_first_recurring=is_first_recurring,
     )
 
 

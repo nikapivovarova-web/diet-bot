@@ -232,6 +232,126 @@ def test_migration_imports_payment_orders_as_metadata_without_granting_access(tm
     assert not any(call[0] == "save_entitlement" for call in store.calls)
 
 
+def test_migration_preserves_managed_subscription_defaults_for_old_json(tmp_path: Path) -> None:
+    migration = _migration_module()
+    paths = _write_json_sources(
+        tmp_path,
+        subscriptions={"101": {"free_trial_used": True}},
+    )
+    store = FakeStore()
+
+    migration.run_migration(
+        _argv(
+            paths,
+            "defaults-001",
+            "--apply",
+            "--scope",
+            "non_payment_state_only",
+            "--acknowledge-no-payment-ledger",
+        ),
+        store=store,
+    )
+
+    entitlement = store.entitlements[101]
+    assert entitlement.subscription_source == "none"
+    assert entitlement.auto_renew_status == "not_applicable"
+    assert entitlement.stars_subscription_charge_id is None
+    assert entitlement.last_subscription_payment_charge_id is None
+    assert entitlement.current_period_payment_order_id is None
+
+
+def test_migration_backfills_subscription_source_from_successful_monthly_order(
+    tmp_path: Path,
+) -> None:
+    migration = _migration_module()
+    paths = _write_json_sources(
+        tmp_path,
+        subscriptions={
+            "101": {
+                "subscription_period_start": "2026-05-01T00:00:00+00:00",
+                "subscription_period_end": "2099-06-01T00:00:00+00:00",
+                "monthly_one_day_remaining": 5,
+                "monthly_weekly_pdf_remaining": 4,
+            },
+            "202": {
+                "subscription_period_start": "2026-05-01T00:00:00+00:00",
+                "subscription_period_end": "2099-06-01T00:00:00+00:00",
+                "monthly_one_day_remaining": 5,
+                "monthly_weekly_pdf_remaining": 4,
+            },
+        },
+        payment_orders=[
+            {
+                "order_id": "order-stars-101",
+                "nonce": "nonce-stars-101",
+                "user_id": 101,
+                "delivery_chat_id": 101,
+                "product": "subscription_month",
+                "provider": "telegram_stars",
+                "amount": 450,
+                "currency": "XTR",
+                "status": "paid",
+                "expires_at": "2026-05-13T12:00:00+00:00",
+            },
+            {
+                "order_id": "order-yookassa-202",
+                "nonce": "nonce-yookassa-202",
+                "user_id": 202,
+                "delivery_chat_id": 202,
+                "product": "subscription_month",
+                "provider": "yookassa",
+                "amount": 79_900,
+                "currency": "RUB",
+                "status": "paid",
+                "expires_at": "2026-05-13T12:00:00+00:00",
+            },
+        ],
+    )
+    store = FakeStore()
+
+    migration.run_migration(
+        _argv(paths, "paid-source-001", "--apply", "--require-payment-ledger"),
+        store=store,
+    )
+
+    stars = store.entitlements[101]
+    yookassa = store.entitlements[202]
+    assert stars.subscription_source == "telegram_stars"
+    assert stars.auto_renew_status == "enabled"
+    assert stars.current_period_payment_order_id == "order-stars-101"
+    assert yookassa.subscription_source == "yookassa"
+    assert yookassa.auto_renew_status == "not_applicable"
+    assert yookassa.current_period_payment_order_id == "order-yookassa-202"
+
+
+def test_migration_marks_active_unproved_monthly_access_legacy_unknown(
+    tmp_path: Path,
+) -> None:
+    migration = _migration_module()
+    paths = _write_json_sources(
+        tmp_path,
+        subscriptions={
+            "101": {
+                "subscription_period_start": "2026-05-01T00:00:00+00:00",
+                "subscription_period_end": "2099-06-01T00:00:00+00:00",
+                "monthly_one_day_remaining": 5,
+                "monthly_weekly_pdf_remaining": 4,
+            },
+        },
+    )
+    store = FakeStore()
+
+    migration.run_migration(
+        _argv(paths, "legacy-001", "--apply", "--require-payment-ledger"),
+        store=store,
+    )
+
+    entitlement = store.entitlements[101]
+    assert entitlement.subscription_source == "legacy"
+    assert entitlement.auto_renew_status == "unknown"
+    assert entitlement.current_period_payment_order_id is None
+
+
 @dataclass
 class FakeStore:
     chat_states: dict[int, dict[str, Any]] = field(default_factory=dict)
