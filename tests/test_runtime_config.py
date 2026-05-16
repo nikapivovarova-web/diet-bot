@@ -199,6 +199,7 @@ def test_runtime_config_disables_public_payments_by_default() -> None:
     )
 
     assert config.public_payments_enabled is False
+    assert config.payment_test_prices_enabled is False
 
 
 def test_runtime_config_enables_public_payments_only_with_explicit_flag() -> None:
@@ -214,6 +215,20 @@ def test_runtime_config_enables_public_payments_only_with_explicit_flag() -> Non
     assert config.public_payments_enabled is True
 
 
+def test_runtime_config_enables_payment_test_prices_only_with_explicit_flag() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+            "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED": "1",
+        },
+    )
+
+    assert config.payment_test_prices_enabled is True
+
+
 def test_runtime_config_rejects_invalid_public_payments_flag() -> None:
     with pytest.raises(RuntimeConfigError, match="DIET_BOT_PUBLIC_PAYMENTS_ENABLED"):
         load_runtime_config(
@@ -221,6 +236,17 @@ def test_runtime_config_rejects_invalid_public_payments_flag() -> None:
                 "DIET_BOT_TOKEN": "local-token",
                 "DIET_BOT_ALLOW_JSON_STORAGE": "1",
                 "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "maybe",
+            },
+        )
+
+
+def test_runtime_config_rejects_invalid_payment_test_prices_flag() -> None:
+    with pytest.raises(RuntimeConfigError, match="DIET_BOT_PAYMENT_TEST_PRICES_ENABLED"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "local-token",
+                "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+                "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED": "maybe",
             },
         )
 

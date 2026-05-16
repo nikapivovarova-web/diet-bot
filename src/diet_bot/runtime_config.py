@@ -43,6 +43,7 @@ class RuntimeConfig:
     postgres_statement_timeout_ms: int
     postgres_lock_timeout_ms: int
     public_payments_enabled: bool
+    payment_test_prices_enabled: bool
 
 
 def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -86,6 +87,11 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         default=False,
         name="DIET_BOT_PUBLIC_PAYMENTS_ENABLED",
     )
+    payment_test_prices_enabled = _parse_bool_flag(
+        _env_value(env, "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED"),
+        default=False,
+        name="DIET_BOT_PAYMENT_TEST_PRICES_ENABLED",
+    )
 
     default_state_file = Path(__file__).resolve().parents[2] / ".diet_bot_state" / "history.json"
     state_file = _path_from_env(env, "DIET_BOT_STATE_FILE", default_state_file)
@@ -115,6 +121,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         postgres_statement_timeout_ms=postgres_statement_timeout_ms,
         postgres_lock_timeout_ms=postgres_lock_timeout_ms,
         public_payments_enabled=public_payments_enabled,
+        payment_test_prices_enabled=payment_test_prices_enabled,
     )
 
 

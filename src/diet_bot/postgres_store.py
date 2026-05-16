@@ -8,6 +8,7 @@ from typing import Any
 from .payments import (
     EXTRA_PAYMENT_PRODUCTS,
     PAYMENT_ORDER_TTL_SECONDS,
+    PAYMENT_PRICING_CONTEXT_METADATA_KEY,
     PROVIDER_CURRENCIES,
     PaymentEvent,
     PaymentEventStatus,
@@ -1072,6 +1073,7 @@ class PostgresDietBotStore:
         now: datetime | None = None,
         ttl_seconds: int = PAYMENT_ORDER_TTL_SECONDS,
         promo_code: str | None = None,
+        pricing_context: str | None = None,
     ) -> PaymentOrderCreationResult:
         provider_value = PaymentProvider(provider)
         product_value = PaymentProduct(product)
@@ -1086,6 +1088,10 @@ class PostgresDietBotStore:
         current_time = _normalize_datetime(now)
         requires_active_subscription = product_value in EXTRA_PAYMENT_PRODUCTS
         normalized_promo_code = normalize_promo_code(promo_code) if promo_code else None
+        pricing_context_value = str(pricing_context or "").strip() or None
+        base_metadata: dict[str, object] = {}
+        if pricing_context_value is not None:
+            base_metadata[PAYMENT_PRICING_CONTEXT_METADATA_KEY] = pricing_context_value
         with self._connect() as conn:
             with conn.cursor() as cur:
                 self._remember_user_cur(cur, UserIdentity(user_id))
@@ -1104,7 +1110,7 @@ class PostgresDietBotStore:
                 discount_amount = 0
                 promo: dict[str, Any] | None = None
                 promo_id: int | None = None
-                promo_metadata: dict[str, object] = {}
+                promo_metadata: dict[str, object] = dict(base_metadata)
                 promo_code_hash: str | None = None
                 promo_code_suffix: str | None = None
                 if normalized_promo_code is not None:
@@ -1150,13 +1156,16 @@ class PostgresDietBotStore:
                         now=current_time,
                     )
                     promo = self._select_promo_by_id_for_update_cur(cur, promo_id) or promo
-                    promo_metadata = promo_code_audit_metadata(
-                        normalized_promo_code,
-                        promo_code_id=promo_id,
-                        discount_amount=discount_amount,
-                        list_amount=list_amount,
-                        final_amount=final_amount,
-                    )
+                    promo_metadata = {
+                        **base_metadata,
+                        **promo_code_audit_metadata(
+                            normalized_promo_code,
+                            promo_code_id=promo_id,
+                            discount_amount=discount_amount,
+                            list_amount=list_amount,
+                            final_amount=final_amount,
+                        ),
+                    }
                     promo_code_hash = str(promo_metadata["code_hash"])
                     promo_code_suffix = str(promo_metadata["code_suffix"])
                 existing = self._find_active_pending_payment_order_cur(

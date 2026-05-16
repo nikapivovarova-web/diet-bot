@@ -162,6 +162,8 @@ PROVIDER_CURRENCIES: Mapping[PaymentProvider, PaymentCurrency] = {
     PaymentProvider.TELEGRAM_STARS: PaymentCurrency.XTR,
     PaymentProvider.YOOKASSA: PaymentCurrency.RUB,
 }
+PAYMENT_PRICING_CONTEXT_METADATA_KEY = "pricing_context"
+PAYMENT_TEST_SMOKE_PRICING_CONTEXT = "test_smoke"
 
 PAYMENT_PRODUCTS = frozenset(product.value for product in PaymentProduct)
 
@@ -237,6 +239,14 @@ _PAYMENT_PRODUCT_RECEIPT_DESCRIPTIONS: Mapping[PaymentProduct, str] = {
     PaymentProduct.SUBSCRIPTION_MONTH: "FoodBalance monthly access",
     PaymentProduct.EXTRA_ONE_DAY: "FoodBalance one-day ration",
     PaymentProduct.EXTRA_WEEKLY_PDF: "FoodBalance weekly PDF",
+}
+
+_PAYMENT_TEST_SMOKE_INVOICE_AMOUNTS: Mapping[
+    tuple[PaymentProvider, PaymentProduct],
+    int,
+] = {
+    (PaymentProvider.TELEGRAM_STARS, PaymentProduct.SUBSCRIPTION_MONTH): 1,
+    (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH): 100,
 }
 
 _PAYLOAD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
@@ -1175,29 +1185,70 @@ def build_payment_reconciliation_audit_event(
     )
 
 
+def _normalize_payment_pricing_context(pricing_context: str | None) -> str | None:
+    if pricing_context is None:
+        return None
+    normalized = str(pricing_context).strip()
+    if not normalized:
+        return None
+    if normalized == PAYMENT_TEST_SMOKE_PRICING_CONTEXT:
+        return normalized
+    raise ValueError("unsupported payment pricing context")
+
+
+def _payment_invoice_amount(
+    provider: PaymentProvider,
+    product: PaymentProduct,
+    production_amount: int,
+    *,
+    pricing_context: str | None,
+) -> int:
+    if pricing_context == PAYMENT_TEST_SMOKE_PRICING_CONTEXT:
+        return _PAYMENT_TEST_SMOKE_INVOICE_AMOUNTS.get(
+            (provider, product),
+            production_amount,
+        )
+    return production_amount
+
+
+def _payment_order_pricing_context(order: PaymentOrder) -> str | None:
+    return _normalize_payment_pricing_context(
+        order.metadata.get(PAYMENT_PRICING_CONTEXT_METADATA_KEY),
+    )
+
+
 def get_payment_product_invoice_metadata(
     provider: PaymentProvider | str,
     product: PaymentProduct | str,
+    *,
+    pricing_context: str | None = None,
 ) -> PaymentProductInvoiceMetadata:
     provider_value = PaymentProvider(provider)
     product_value = PaymentProduct(product)
+    pricing_context_value = _normalize_payment_pricing_context(pricing_context)
     try:
         currency, amount, subscription_period = _PAYMENT_PRODUCT_INVOICE_CATALOG[
             (provider_value, product_value)
         ]
     except KeyError as exc:
         raise ValueError("unsupported payment provider/product combination") from exc
+    invoice_amount = _payment_invoice_amount(
+        provider_value,
+        product_value,
+        amount,
+        pricing_context=pricing_context_value,
+    )
 
     return PaymentProductInvoiceMetadata(
         provider=provider_value,
         product=product_value,
         currency=currency,
-        amount=amount,
+        amount=invoice_amount,
         subscription_period=subscription_period,
         need_email=provider_value == PaymentProvider.YOOKASSA,
         send_email_to_provider=provider_value == PaymentProvider.YOOKASSA,
         provider_data=(
-            _build_yookassa_provider_data(product_value, amount)
+            _build_yookassa_provider_data(product_value, invoice_amount)
             if provider_value == PaymentProvider.YOOKASSA
             else None
         ),
@@ -1205,7 +1256,11 @@ def get_payment_product_invoice_metadata(
 
 
 def build_payment_invoice_metadata(order: PaymentOrder) -> PaymentInvoiceMetadata:
-    product_metadata = get_payment_product_invoice_metadata(order.provider, order.product)
+    product_metadata = get_payment_product_invoice_metadata(
+        order.provider,
+        order.product,
+        pricing_context=_payment_order_pricing_context(order),
+    )
     if (
         order.list_amount != product_metadata.amount
         or order.currency != product_metadata.currency
@@ -1251,10 +1306,12 @@ def create_or_reuse_pending_payment_order(
     promo_code_hash: str | None = None,
     promo_code_suffix: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    pricing_context: str | None = None,
 ) -> PaymentOrderCreationResult:
     provider_value = PaymentProvider(provider)
     product_value = PaymentProduct(product)
     currency_value = PaymentCurrency(currency)
+    pricing_context_value = _normalize_payment_pricing_context(pricing_context)
     if PROVIDER_CURRENCIES[provider_value] != currency_value:
         raise ValueError("payment provider and currency do not match")
     if amount <= 0:
@@ -1295,6 +1352,10 @@ def create_or_reuse_pending_payment_order(
             requires_active_subscription=requires_active_subscription,
         )
 
+    order_metadata = dict(metadata or {})
+    if pricing_context_value is not None:
+        order_metadata[PAYMENT_PRICING_CONTEXT_METADATA_KEY] = pricing_context_value
+
     order = PaymentOrder(
         order_id=(order_id_factory or _default_payment_token)(),
         nonce=(nonce_factory or _default_payment_token)(),
@@ -1314,7 +1375,7 @@ def create_or_reuse_pending_payment_order(
         promo_redemption_id=promo_redemption_id,
         promo_code_hash=promo_code_hash,
         promo_code_suffix=promo_code_suffix,
-        metadata=dict(metadata or {}),
+        metadata=order_metadata,
     )
     return PaymentOrderCreationResult(
         accepted=True,
@@ -2440,7 +2501,11 @@ def _validate_order_against_invoice_catalog(
     order: PaymentOrder,
 ) -> PaymentSuccessfulPaymentCode | None:
     try:
-        metadata = get_payment_product_invoice_metadata(order.provider, order.product)
+        metadata = get_payment_product_invoice_metadata(
+            order.provider,
+            order.product,
+            pricing_context=_payment_order_pricing_context(order),
+        )
     except ValueError:
         return PaymentSuccessfulPaymentCode.PRODUCT_MISMATCH
     if order.currency != metadata.currency:
@@ -2714,8 +2779,10 @@ __all__ = [
     "LEGACY_STATIC_PAYMENT_PAYLOADS",
     "PAYMENT_ORDER_PAYLOAD_PREFIX",
     "PAYMENT_ORDER_TTL_SECONDS",
+    "PAYMENT_PRICING_CONTEXT_METADATA_KEY",
     "PAYMENT_PRODUCTS",
     "PAYMENT_REVERSAL_EVENT_TYPES",
+    "PAYMENT_TEST_SMOKE_PRICING_CONTEXT",
     "PROVIDER_CURRENCIES",
     "TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS",
     "PaymentCurrency",

@@ -61,6 +61,7 @@ from .json_storage import (
     record_recipe_history_in_json,
 )
 from .payments import (
+    PAYMENT_TEST_SMOKE_PRICING_CONTEXT,
     PaymentOrder,
     PaymentOrderCreationCode,
     PaymentEventType,
@@ -233,6 +234,8 @@ EXTRA_WEEKLY_PDF_PRICE_RUB = 250
 SUBSCRIPTION_STARS_AMOUNT = 400
 EXTRA_ONE_DAY_STARS_AMOUNT = 35
 EXTRA_WEEKLY_PDF_STARS_AMOUNT = 170
+TEST_SUBSCRIPTION_STARS_AMOUNT = 1
+TEST_SUBSCRIPTION_PRICE_RUB = 1
 SUBSCRIPTION_PAYMENT_TEXT = (
     "FoodBalance - цифровой сервис персональных рационов питания.\n\n"
     f"Месячный доступ - {SUBSCRIPTION_PRICE_RUB} ₽ или {SUBSCRIPTION_STARS_AMOUNT} Stars.\n\n"
@@ -244,6 +247,16 @@ SUBSCRIPTION_PAYMENT_TEXT = (
 )
 PAY_WITH_TELEGRAM_STARS_TEXT = f"⭐ Оплатить подписку - {SUBSCRIPTION_STARS_AMOUNT} Stars"
 PAY_WITH_RU_CARD_TEXT = f"💳 Оплатить картой / SberPay - {SUBSCRIPTION_PRICE_RUB} ₽"
+PAY_WITH_TELEGRAM_STARS_TEST_TEXT = (
+    f"[TEST] ⭐ Оплатить подписку - {TEST_SUBSCRIPTION_STARS_AMOUNT} Star"
+)
+PAY_WITH_RU_CARD_TEST_TEXT = (
+    f"[TEST] 💳 Оплатить картой / SberPay - {TEST_SUBSCRIPTION_PRICE_RUB} ₽"
+)
+SUBSCRIPTION_TEST_PAYMENT_NOTICE_TEXT = (
+    "[TEST] Smoke pricing включен для этого аккаунта: "
+    f"подписка - {TEST_SUBSCRIPTION_PRICE_RUB} ₽ или {TEST_SUBSCRIPTION_STARS_AMOUNT} Star."
+)
 BUY_EXTRA_ONE_DAY_TEXT = f"⭐ Купить 1 дневной рацион - {EXTRA_ONE_DAY_STARS_AMOUNT} Stars"
 BUY_EXTRA_WEEKLY_PDF_TEXT = f"⭐ Купить 1 недельный PDF - {EXTRA_WEEKLY_PDF_STARS_AMOUNT} Stars"
 BUY_EXTRA_ONE_DAY_RU_CARD_TEXT = f"🥗 Купить 1 дневной рацион - {EXTRA_ONE_DAY_PRICE_RUB} ₽"
@@ -329,6 +342,7 @@ ADMIN_USER_IDS = _parse_id_set(os.getenv("DIET_BOT_ADMIN_USER_IDS"))
 TESTER_CHAT_IDS = _parse_id_set(os.getenv("DIET_BOT_TESTER_CHAT_IDS"))
 TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "").strip()
 PUBLIC_PAYMENTS_ENABLED = os.getenv("DIET_BOT_PUBLIC_PAYMENTS_ENABLED", "").strip() == "1"
+PAYMENT_TEST_PRICES_ENABLED = os.getenv("DIET_BOT_PAYMENT_TEST_PRICES_ENABLED", "").strip() == "1"
 SUPPORT_CHAT_ID = _parse_optional_int(os.getenv("DIET_BOT_SUPPORT_CHAT_ID")) or DEFAULT_SUPPORT_CHAT_ID
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
@@ -821,7 +835,10 @@ async def handle_successful_payment(message: Message) -> None:
     if not result.processed:
         await message.answer(
             PAYMENT_SUCCESSFUL_PAYMENT_REJECTED_TEXT,
-            reply_markup=_subscription_payment_keyboard(),
+            reply_markup=_subscription_payment_keyboard(
+                chat_id=message.chat.id,
+                user_id=_payment_user_id_for_message(message),
+            ),
         )
         return
 
@@ -1004,6 +1021,7 @@ def _initialize_runtime_store(config: RuntimeConfig) -> DietBotStore | None:
 
 def _apply_runtime_config(config: RuntimeConfig) -> None:
     global ADMIN_USER_IDS
+    global PAYMENT_TEST_PRICES_ENABLED
     global PROMO_CODES_STATE_FILE
     global PUBLIC_PAYMENTS_ENABLED
     global STATE_FILE
@@ -1019,6 +1037,7 @@ def _apply_runtime_config(config: RuntimeConfig) -> None:
     TESTER_CHAT_IDS = set(config.tester_chat_ids)
     TELEGRAM_PROVIDER_TOKEN = config.telegram_provider_token
     PUBLIC_PAYMENTS_ENABLED = config.public_payments_enabled
+    PAYMENT_TEST_PRICES_ENABLED = config.payment_test_prices_enabled
     SUPPORT_CHAT_ID = config.support_chat_id or DEFAULT_SUPPORT_CHAT_ID
 
 
@@ -1104,7 +1123,10 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
             PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
             await message.answer(
                 PROMO_CODE_DISCOUNT_APPLIED_TEXT,
-                reply_markup=_subscription_payment_keyboard(),
+                reply_markup=_subscription_payment_keyboard(
+                    chat_id=message.chat.id,
+                    user_id=_payment_user_id_for_message(message),
+                ),
             )
             return
         await message.answer(_promo_code_retry_text(PROMO_CODE_NOT_ACCESS_TEXT))
@@ -2460,11 +2482,44 @@ def _payment_result_keyboard(chat_id: int, result: PaymentApplication) -> Inline
         return _subscriber_cabinet_keyboard(chat_id)
     if result.grant in {"extra_one_day", "extra_weekly_pdf"}:
         return _plan_choice_keyboard()
-    return _subscription_payment_keyboard()
+    return _subscription_payment_keyboard(chat_id=chat_id, user_id=chat_id)
 
 
 def _public_payments_enabled() -> bool:
     return PUBLIC_PAYMENTS_ENABLED
+
+
+def _payment_pricing_context_for_identity(
+    *,
+    user_id: int | None,
+    chat_id: int | None,
+) -> str | None:
+    if not (PUBLIC_PAYMENTS_ENABLED and PAYMENT_TEST_PRICES_ENABLED):
+        return None
+    if user_id is not None and user_id in ADMIN_USER_IDS:
+        return PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+    if chat_id is not None and chat_id in TESTER_CHAT_IDS:
+        return PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+    return None
+
+
+def _payment_pricing_context_for_message(message: Message) -> str | None:
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    return _payment_pricing_context_for_identity(
+        user_id=_payment_user_id_for_message(message),
+        chat_id=chat_id if isinstance(chat_id, int) else None,
+    )
+
+
+def _payment_test_prices_visible(
+    *,
+    chat_id: int | None,
+    user_id: int | None,
+) -> bool:
+    return (
+        _payment_pricing_context_for_identity(user_id=user_id, chat_id=chat_id)
+        == PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+    )
 
 
 def _public_payments_disabled_keyboard() -> InlineKeyboardMarkup:
@@ -2475,8 +2530,14 @@ def _public_payments_disabled_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _subscription_payment_text() -> str:
+def _subscription_payment_text(
+    *,
+    chat_id: int | None = None,
+    user_id: int | None = None,
+) -> str:
     if _public_payments_enabled():
+        if _payment_test_prices_visible(chat_id=chat_id, user_id=user_id):
+            return f"{SUBSCRIPTION_PAYMENT_TEXT}\n\n{SUBSCRIPTION_TEST_PAYMENT_NOTICE_TEXT}"
         return SUBSCRIPTION_PAYMENT_TEXT
     return (
         "FoodBalance - цифровой сервис персональных рационов питания.\n\n"
@@ -2498,7 +2559,11 @@ async def _send_public_payments_disabled_notice(message: Message) -> None:
 async def _send_subscription_payment_options(message: Message) -> None:
     if await _send_active_subscription_notice_if_needed(message):
         return
-    await message.answer(_subscription_payment_text(), reply_markup=_subscription_payment_keyboard())
+    user_id = _payment_user_id_for_message(message)
+    await message.answer(
+        _subscription_payment_text(chat_id=message.chat.id, user_id=user_id),
+        reply_markup=_subscription_payment_keyboard(chat_id=message.chat.id, user_id=user_id),
+    )
 
 
 async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
@@ -2531,7 +2596,10 @@ async def _send_extra_purchase_subscription_required_message(message: Message) -
     await message.answer(
         "Разовые покупки доступны только при активной подписке.\n\n"
         "Чтобы продолжить, оформите месячный доступ.",
-        reply_markup=_subscription_payment_keyboard(),
+        reply_markup=_subscription_payment_keyboard(
+            chat_id=message.chat.id,
+            user_id=_payment_user_id_for_message(message),
+        ),
     )
 
 
@@ -2586,8 +2654,17 @@ async def _create_or_reuse_invoice_payment_order(
         await message.answer(PAYMENT_INVOICE_CREATION_FAILED_TEXT)
         return None
 
-    product_metadata = get_payment_product_invoice_metadata(provider, product)
-    promo_code = _pending_discount_promo_code_for_order(message.chat.id, product)
+    pricing_context = _payment_pricing_context_for_message(message)
+    product_metadata = get_payment_product_invoice_metadata(
+        provider,
+        product,
+        pricing_context=pricing_context,
+    )
+    promo_code = (
+        None
+        if pricing_context == PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+        else _pending_discount_promo_code_for_order(message.chat.id, product)
+    )
     result = store.create_or_reuse_pending_payment_order(
         user_id=buyer_id,
         delivery_chat_id=message.chat.id,
@@ -2596,6 +2673,7 @@ async def _create_or_reuse_invoice_payment_order(
         amount=product_metadata.amount,
         currency=product_metadata.currency,
         promo_code=promo_code,
+        pricing_context=pricing_context,
     )
     if result.accepted and result.order is not None:
         _clear_pending_discount_promo_code(message.chat.id, promo_code)
@@ -3821,20 +3899,33 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
             )
         else:
             lines.extend(["", PUBLIC_PAYMENTS_PILOT_TEXT])
-        reply_markup = _subscription_payment_keyboard()
+        reply_markup = _subscription_payment_keyboard(
+            chat_id=message.chat.id,
+            user_id=_payment_user_id_for_message(message),
+        )
     await message.answer(
         "\n".join(lines),
         reply_markup=reply_markup,
     )
 
 
-def _subscription_payment_keyboard() -> InlineKeyboardMarkup:
+def _subscription_payment_keyboard(
+    *,
+    chat_id: int | None = None,
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
     if not _public_payments_enabled():
         return _public_payments_disabled_keyboard()
+    if _payment_test_prices_visible(chat_id=chat_id, user_id=user_id):
+        ru_card_text = PAY_WITH_RU_CARD_TEST_TEXT
+        stars_text = PAY_WITH_TELEGRAM_STARS_TEST_TEXT
+    else:
+        ru_card_text = PAY_WITH_RU_CARD_TEXT
+        stars_text = PAY_WITH_TELEGRAM_STARS_TEXT
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=PAY_WITH_RU_CARD_TEXT, callback_data=CALLBACK_PAY_RU_CARD)],
-            [InlineKeyboardButton(text=PAY_WITH_TELEGRAM_STARS_TEXT, callback_data=CALLBACK_PAY_TELEGRAM_STARS)],
+            [InlineKeyboardButton(text=ru_card_text, callback_data=CALLBACK_PAY_RU_CARD)],
+            [InlineKeyboardButton(text=stars_text, callback_data=CALLBACK_PAY_TELEGRAM_STARS)],
             [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
         ],
     )

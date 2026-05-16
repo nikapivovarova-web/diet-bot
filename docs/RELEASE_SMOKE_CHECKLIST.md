@@ -15,6 +15,7 @@ Use this checklist from the clean worktree before publishing a Telegram bot rele
 - Leave `TELEGRAM_PROVIDER_TOKEN` empty unless card-payment smoke is explicitly being tested with a Telegram/YooKassa test provider token.
 - For pilot releases, confirm `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`; public YooKassa/Stars payment buttons must stay hidden and access must be via promo code or admin monthly-access code.
 - For paid-mode releases, set `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1` only after real YooKassa and Telegram Stars provider smoke is explicitly approved, run, and recorded.
+- Keep `DIET_BOT_PAYMENT_TEST_PRICES_ENABLED=0` unless running the provider smoke pricing slice for a configured admin/tester only.
 
 ## 2. Healthcheck
 
@@ -62,6 +63,7 @@ $env:DIET_BOT_ALLOW_JSON_STORAGE = "1"
 $env:DIET_BOT_TOKEN = "replace-with-telegram-bot-token"
 $env:TELEGRAM_PROVIDER_TOKEN = ""
 $env:DIET_BOT_PUBLIC_PAYMENTS_ENABLED = "0"
+$env:DIET_BOT_PAYMENT_TEST_PRICES_ENABLED = "0"
 
 & $py -m diet_bot.telegram_app
 ```
@@ -91,6 +93,36 @@ Expected: the process starts polling without a startup config error.
 Run this only against a staging/prod-like deployment after durable payment order/event storage and payment handler wiring are present. This is a happy-path and safety smoke before refund/admin reconciliation wiring; it is not production launch approval.
 
 Paid public release remains blocked while `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=0`. Enabling it for public users requires this smoke to pass with recorded YooKassa and Telegram Stars evidence.
+
+### Provider Smoke With Test Prices
+
+Use this slice only when the owner is ready to manually test provider checkout with minimal amounts. Do not run real payments from the development machine as part of this checklist.
+
+Set these env vars for the smoke deployment/session:
+
+```powershell
+$env:DIET_BOT_PUBLIC_PAYMENTS_ENABLED = "1"
+$env:DIET_BOT_PAYMENT_TEST_PRICES_ENABLED = "1"
+$env:DIET_BOT_ADMIN_USER_IDS = "replace-with-owner-telegram-user-id"
+$env:DIET_BOT_TESTER_CHAT_IDS = "replace-with-owner-private-chat-id"
+$env:TELEGRAM_PROVIDER_TOKEN = "replace-with-yookassa-telegram-test-provider-token"
+```
+
+Expected behavior:
+
+- Only users whose Telegram user id is in `DIET_BOT_ADMIN_USER_IDS` or whose chat id is in `DIET_BOT_TESTER_CHAT_IDS` see `[TEST]` subscription prices.
+- Telegram Stars subscription invoice uses provider `telegram_stars`, currency `XTR`, amount `1`, and the normal 30-day subscription period.
+- YooKassa/card subscription invoice uses provider `yookassa`, currency `RUB`, amount `100` minor units (`1.00 RUB`), `need_email=True`, `send_email_to_provider=True`, and receipt provider data for `1.00 RUB`.
+- Non-tester users still see and receive production subscription prices: `400` Stars or `59900` minor units (`599.00 RUB`).
+- Pending discount promo codes are not consumed by this test-price smoke order; verify normal promo behavior separately with production pricing.
+
+After the smoke, immediately turn the slice off:
+
+```powershell
+$env:DIET_BOT_PAYMENT_TEST_PRICES_ENABLED = "0"
+```
+
+Also confirm the deployment/runtime environment no longer has `DIET_BOT_PAYMENT_TEST_PRICES_ENABLED=1` before leaving the smoke session.
 
 ### Preflight Production-Like Config
 

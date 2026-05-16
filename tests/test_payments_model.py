@@ -8,6 +8,7 @@ import pytest
 
 from diet_bot.payments import (
     PAYMENT_ORDER_TTL_SECONDS,
+    PAYMENT_TEST_SMOKE_PRICING_CONTEXT,
     PROVIDER_CURRENCIES,
     TELEGRAM_STARS_SUBSCRIPTION_PERIOD_SECONDS,
     PaymentCurrency,
@@ -730,6 +731,105 @@ def test_product_invoice_metadata_contains_provider_product_currency_and_amount(
         assert metadata.need_email is False
         assert metadata.send_email_to_provider is False
         assert metadata.provider_data is None
+
+
+def test_product_invoice_metadata_uses_production_prices_by_default() -> None:
+    stars = get_payment_product_invoice_metadata(
+        PaymentProvider.TELEGRAM_STARS,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+    )
+    yookassa = get_payment_product_invoice_metadata(
+        PaymentProvider.YOOKASSA,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+    )
+
+    assert stars.amount == 400
+    assert yookassa.amount == 59_900
+    assert yookassa.provider_data is not None
+    assert yookassa.provider_data["receipt"]["items"][0]["amount"] == {
+        "value": "599.00",
+        "currency": "RUB",
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider", "currency", "amount"),
+    [
+        (PaymentProvider.TELEGRAM_STARS, PaymentCurrency.XTR, 1),
+        (PaymentProvider.YOOKASSA, PaymentCurrency.RUB, 100),
+    ],
+)
+def test_test_smoke_subscription_invoice_metadata_uses_minimum_provider_amount(
+    provider: PaymentProvider,
+    currency: PaymentCurrency,
+    amount: int,
+) -> None:
+    metadata = get_payment_product_invoice_metadata(
+        provider,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        pricing_context=PAYMENT_TEST_SMOKE_PRICING_CONTEXT,
+    )
+
+    assert metadata.currency == currency
+    assert metadata.amount == amount
+    if provider == PaymentProvider.YOOKASSA:
+        assert metadata.provider_data is not None
+        assert metadata.provider_data["receipt"]["items"][0]["amount"] == {
+            "value": "1.00",
+            "currency": "RUB",
+        }
+
+
+def test_test_smoke_payment_order_and_invoice_metadata_use_overridden_amount() -> None:
+    repository = InMemoryPaymentOrderRepository()
+    now = datetime(2026, 5, 13, 10, 0, tzinfo=UTC)
+    product_metadata = get_payment_product_invoice_metadata(
+        PaymentProvider.YOOKASSA,
+        PaymentProduct.SUBSCRIPTION_MONTH,
+        pricing_context=PAYMENT_TEST_SMOKE_PRICING_CONTEXT,
+    )
+
+    result = create_or_reuse_pending_payment_order(
+        repository,
+        user_id=1001,
+        delivery_chat_id=2002,
+        provider=product_metadata.provider,
+        product=product_metadata.product,
+        amount=product_metadata.amount,
+        currency=product_metadata.currency,
+        pricing_context=PAYMENT_TEST_SMOKE_PRICING_CONTEXT,
+        now=now,
+        order_id_factory=_sequence_factory("order_smoke1"),
+        nonce_factory=_sequence_factory("nonce_smoke1"),
+    )
+
+    assert result.accepted is True
+    order = result.order
+    assert order is not None
+    assert order.amount == 100
+    assert order.list_amount == 100
+    assert order.discount_amount == 0
+    assert order.metadata["pricing_context"] == PAYMENT_TEST_SMOKE_PRICING_CONTEXT
+
+    invoice_metadata = build_payment_invoice_metadata(order)
+    pre_checkout = validate_payment_pre_checkout(
+        repository,
+        payload=order.payload,
+        user_id=order.user_id,
+        currency=PaymentCurrency.RUB,
+        total_amount=100,
+        expected_provider=PaymentProvider.YOOKASSA,
+        expected_product=PaymentProduct.SUBSCRIPTION_MONTH,
+        now=now,
+    )
+
+    assert invoice_metadata.amount == 100
+    assert invoice_metadata.provider_data is not None
+    assert invoice_metadata.provider_data["receipt"]["items"][0]["amount"] == {
+        "value": "1.00",
+        "currency": "RUB",
+    }
+    assert pre_checkout.approved is True
 
 
 def test_invoice_metadata_helper_does_not_require_telegram_bot_api() -> None:

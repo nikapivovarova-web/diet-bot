@@ -149,6 +149,7 @@ from diet_bot.questionnaire import start_session
 @pytest.fixture(autouse=True)
 def enabled_public_payment_buttons_for_legacy_telegram_tests(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", False, raising=False)
 
 
 def test_photo_input_resolves_curated_local_photo() -> None:
@@ -2128,6 +2129,7 @@ class FakePaymentStore:
         now: datetime | None = None,
         ttl_seconds: int = 900,
         promo_code: str | None = None,
+        pricing_context: str | None = None,
     ) -> PaymentOrderCreationResult:
         list_amount = amount
         discount_amount = 0
@@ -2177,6 +2179,7 @@ class FakePaymentStore:
             ttl_seconds=ttl_seconds,
             order_id_factory=lambda: f"order_{sequence}",
             nonce_factory=lambda: f"nonce_{sequence}",
+            pricing_context=pricing_context,
         )
         if result.order is None or promo_code is None:
             return result
