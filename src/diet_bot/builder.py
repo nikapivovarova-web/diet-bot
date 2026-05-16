@@ -2264,10 +2264,19 @@ def _relaxes_protein_ceiling_for_calorie_recovery(
     target: NutrientVector,
     slot: MealEnergySlot,
 ) -> bool:
+    return _is_calorie_recovery_base(food) and _is_calorie_recovery_context(meal, total, target, slot)
+
+
+def _skips_excessive_protein_limit_for_calorie_recovery(
+    food: Food,
+    meal: Meal,
+    total: NutrientVector,
+    target: NutrientVector,
+    slot: MealEnergySlot,
+) -> bool:
     return (
         food.nutrients_per_100g.get("protein_g") <= 5.0
-        and _is_calorie_recovery_base(food)
-        and _is_calorie_recovery_context(meal, total, target, slot)
+        and _relaxes_protein_ceiling_for_calorie_recovery(food, meal, total, target, slot)
     )
 
 
@@ -2327,7 +2336,7 @@ def _top_up_if_needed(
                     grams = _limit_grams_for_protein_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_fat_ceiling(food, grams, total, target, portions)
                 grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target, portions)
-                if not _relaxes_protein_ceiling_for_calorie_recovery(
+                if not _skips_excessive_protein_limit_for_calorie_recovery(
                     food,
                     meal,
                     total,
@@ -2424,7 +2433,7 @@ def _increase_existing_portions(
                         continue
                     max_total_for_rounding = min(food.max_per_meal_g, portion.grams + max(0.0, room_day))
                     protein_per_g = food.nutrients_per_100g.get("protein_g") / 100
-                    if protein_per_g > 0 and not _relaxes_protein_ceiling_for_calorie_recovery(
+                    if protein_per_g > 0 and not _skips_excessive_protein_limit_for_calorie_recovery(
                         food,
                         meal,
                         total,
