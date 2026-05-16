@@ -69,6 +69,9 @@ MUTED_COLOR = colors.HexColor("#66736A")
 LINE_COLOR = colors.HexColor("#D8E2D3")
 WARNING_BG = colors.HexColor("#FFF1DC")
 WARNING_TEXT = colors.HexColor("#875A1C")
+PERCENT_GREEN_BG = colors.HexColor("#DDEEDC")
+PERCENT_YELLOW_BG = colors.HexColor("#F4E7C4")
+PERCENT_RED_BG = colors.HexColor("#F0D1C8")
 EMOJI_RE = re.compile("[\U0001f300-\U0001faff\u2600-\u27bf\ufe0f]")
 LONG_TOKEN_MAX_CHARS = 48
 LONG_TOKEN_RE = re.compile(r"\S{" + str(LONG_TOKEN_MAX_CHARS + 1) + r",}")
@@ -1698,13 +1701,13 @@ def _coverage_percent_style(value: float, target: float) -> str:
 
 def _coverage_percent_color(value: float, target: float):
     if target <= 0:
-        return colors.HexColor("#C95B4A")
+        return PERCENT_RED_BG
     percent = value / target * 100
     if percent >= 95:
-        return colors.HexColor("#4F9E5D")
+        return PERCENT_GREEN_BG
     if percent >= 45:
-        return colors.HexColor("#D8A23A")
-    return colors.HexColor("#C95B4A")
+        return PERCENT_YELLOW_BG
+    return PERCENT_RED_BG
 
 
 def _register_fonts() -> tuple[str, str, str]:

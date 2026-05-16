@@ -163,12 +163,12 @@ def test_pdf_brand_assets_can_be_embedded_and_scaled() -> None:
 
 def test_nutrient_percent_thresholds_for_pdf_display() -> None:
     cases = (
-        (100, "PercentGreen", "#4F9E5D"),
-        (97, "PercentGreen", "#4F9E5D"),
-        (95, "PercentGreen", "#4F9E5D"),
-        (94, "PercentYellow", "#D8A23A"),
-        (45, "PercentYellow", "#D8A23A"),
-        (44, "PercentRed", "#C95B4A"),
+        (100, "PercentGreen", "#DDEEDC"),
+        (97, "PercentGreen", "#DDEEDC"),
+        (95, "PercentGreen", "#DDEEDC"),
+        (94, "PercentYellow", "#F4E7C4"),
+        (45, "PercentYellow", "#F4E7C4"),
+        (44, "PercentRed", "#F0D1C8"),
     )
 
     assert [
@@ -211,10 +211,10 @@ def test_daily_totals_table_fills_percent_cells_with_status_color_without_dots()
     assert table._cellvalues[2][2].style.textColor == pdf_renderer.colors.black
     assert table._cellvalues[3][2].style.textColor == pdf_renderer.colors.black
     assert table._cellvalues[4][2].style.textColor == pdf_renderer.colors.black
-    assert ("BACKGROUND", (2, 1), (2, 1), pdf_renderer.colors.HexColor("#4F9E5D")) in table._bkgrndcmds
-    assert ("BACKGROUND", (2, 2), (2, 2), pdf_renderer.colors.HexColor("#D8A23A")) in table._bkgrndcmds
-    assert ("BACKGROUND", (2, 3), (2, 3), pdf_renderer.colors.HexColor("#D8A23A")) in table._bkgrndcmds
-    assert ("BACKGROUND", (2, 4), (2, 4), pdf_renderer.colors.HexColor("#C95B4A")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 1), (2, 1), pdf_renderer.colors.HexColor("#DDEEDC")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 2), (2, 2), pdf_renderer.colors.HexColor("#F4E7C4")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 3), (2, 3), pdf_renderer.colors.HexColor("#F4E7C4")) in table._bkgrndcmds
+    assert ("BACKGROUND", (2, 4), (2, 4), pdf_renderer.colors.HexColor("#F0D1C8")) in table._bkgrndcmds
 
 
 def test_week_pdf_daily_totals_text_contains_percentages(tmp_path: Path, sample_week_dates) -> None:
