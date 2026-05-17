@@ -9,6 +9,7 @@ from diet_bot.builder import (
     _meal_energy_slots,
     _rank_recipes,
     _recipe_matches_cooking_effort,
+    _recipe_time_bucket,
     filter_foods,
 )
 from diet_bot.calculator import calculate_targets
@@ -78,12 +79,13 @@ def _simple_recipe(
     title: str,
     instructions: str,
     time_text: str = "25 minutes",
+    ingredients_g: dict[str, float] | None = None,
 ) -> RecipeTemplate:
     return RecipeTemplate(
         id=recipe_id,
         slot="main",
         title=title,
-        ingredients_g={"chicken_breast": 140, "rice": 90, "tomato": 120},
+        ingredients_g=ingredients_g or {"chicken_breast": 140, "rice": 90, "tomato": 120},
         instructions=instructions,
         tags=frozenset({"curated"}),
         time_text=time_text,
@@ -160,6 +162,66 @@ def test_passive_overnight_time_can_be_simple_but_active_eight_hours_is_not() ->
 
     assert _recipe_matches_cooking_effort(passive_overnight, CookingTimePreference.SIMPLE)
     assert not _recipe_matches_cooking_effort(active_eight_hours, CookingTimePreference.SIMPLE)
+
+
+def test_active_time_metadata_overrides_passive_total_time_for_simple_effort() -> None:
+    passive_roast = RecipeTemplate(
+        id="passive_roast",
+        slot="main",
+        title="Passive roast chicken bowl",
+        ingredients_g={"chicken_breast": 140, "potato": 180, "tomato": 120},
+        instructions="Season the chicken and vegetables. Roast until done. Serve with tomato.",
+        tags=frozenset({"curated"}),
+        time_text="1 hour 15 minutes",
+        active_time_min=15,
+    )
+
+    assert _recipe_matches_cooking_effort(passive_roast, CookingTimePreference.SIMPLE)
+    assert _recipe_time_bucket(passive_roast) == "quick"
+
+
+def test_kitchen_unit_abbreviations_do_not_inflate_instruction_sentence_count() -> None:
+    concise_old_style_recipe = _simple_recipe(
+        "old_style_abbreviations",
+        title="Old style skillet pork",
+        instructions=(
+            "Season the pork. "
+            "Warm 1/2 ч. л. olive oil in a skillet. "
+            "Stir in 1 ст. л. sauce. "
+            "Cook the pork until done. "
+            "Warm the grains. "
+            "Serve with greens."
+        ),
+        time_text="25 minutes",
+    )
+
+    assert _recipe_matches_cooking_effort(concise_old_style_recipe, CookingTimePreference.SIMPLE)
+
+
+def test_simple_ingredient_count_ignores_basic_pantry_items_but_not_substantive_items() -> None:
+    pantry_heavy_recipe = _simple_recipe(
+        "pantry_heavy",
+        title="Pantry counted bowl",
+        ingredients_g={
+            **{f"food_{index}": 10 for index in range(11)},
+            "salt": 1,
+            "black_pepper": 1,
+            "olive_oil": 5,
+            "water": 50,
+        },
+        instructions="Cook the grains. Warm the protein. Serve with vegetables.",
+        time_text="25 minutes",
+    )
+    substantive_heavy_recipe = _simple_recipe(
+        "substantive_heavy",
+        title="Too many substantive ingredients",
+        ingredients_g={f"food_{index}": 10 for index in range(12)},
+        instructions="Cook the grains. Warm the protein. Serve with vegetables.",
+        time_text="25 minutes",
+    )
+
+    assert _recipe_matches_cooking_effort(pantry_heavy_recipe, CookingTimePreference.SIMPLE)
+    assert not _recipe_matches_cooking_effort(substantive_heavy_recipe, CookingTimePreference.SIMPLE)
 
 
 def test_garlic_night_substring_does_not_make_simple_recipe_complex() -> None:
@@ -724,6 +786,6 @@ def test_simple_main_eligible_coverage_exceeds_audit_baseline() -> None:
     legacy_eligible = ranked_main_count([recipe for recipe in simple_curated if not is_imported_intake(recipe)])
     eligible = ranked_main_count(simple_curated)
 
-    assert legacy_eligible >= 55
+    assert legacy_eligible >= 70
     assert eligible >= 86
     assert eligible - legacy_eligible >= 26

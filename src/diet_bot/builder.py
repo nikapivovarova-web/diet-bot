@@ -102,7 +102,26 @@ SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
     "fryer",
 )
 SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS = SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS
+SIMPLE_COOKING_PANTRY_INGREDIENT_IDS = frozenset(
+    {
+        "black_pepper",
+        "butter",
+        "canola_oil",
+        "olive_oil",
+        "olive_oil_spray",
+        "peanut_oil",
+        "salt",
+        "sesame_oil",
+        "vegetable_oil",
+        "water",
+        "white_pepper",
+    }
+)
 MATCH_TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
+RECIPE_SENTENCE_ABBREVIATION_RE = re.compile(
+    r"\b(?:ст|ч)\.\s*л\.|\b(?:г|гр|ккал|л|мл)\.",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -829,10 +848,10 @@ def _recipe_matches_cooking_effort(
         if isinstance(cooking_time, CookingEffortConstraints)
         else _cooking_effort_constraints(cooking_time)
     )
-    active_minutes = _parse_active_minutes(recipe.time_text)
+    active_minutes = _recipe_active_minutes(recipe)
     if active_minutes is not None and active_minutes > constraints.max_active_minutes:
         return False
-    if len(recipe.ingredients_g) > constraints.max_ingredients:
+    if _recipe_effort_ingredient_count(recipe) > constraints.max_ingredients:
         return False
     if _instruction_sentence_count(recipe.instructions) > constraints.max_instruction_sentences:
         return False
@@ -875,8 +894,13 @@ def _recipe_title_uses_excluded_food(
 
 
 def _instruction_sentence_count(text: str) -> int:
-    sentences = [part.strip() for part in re.split(r"[.!?]+", text) if part.strip()]
+    normalized = RECIPE_SENTENCE_ABBREVIATION_RE.sub(lambda match: match.group(0).replace(".", ""), text)
+    sentences = [part.strip() for part in re.split(r"[.!?]+", normalized) if part.strip()]
     return len(sentences)
+
+
+def _recipe_effort_ingredient_count(recipe: RecipeTemplate) -> int:
+    return sum(1 for food_id in recipe.ingredients_g if food_id not in SIMPLE_COOKING_PANTRY_INGREDIENT_IDS)
 
 
 def _has_complex_cooking_technique(recipe: RecipeTemplate) -> bool:
@@ -905,7 +929,7 @@ def _text_contains_keyword(text: str, keyword: str) -> bool:
 
 
 def _recipe_time_bucket(recipe: RecipeTemplate) -> TimeBucket:
-    minutes = _parse_active_minutes(recipe.time_text)
+    minutes = _recipe_active_minutes(recipe)
     if minutes is None:
         return "medium"
     if minutes <= 15:
@@ -913,6 +937,12 @@ def _recipe_time_bucket(recipe: RecipeTemplate) -> TimeBucket:
     if minutes <= 30:
         return "medium"
     return "long"
+
+
+def _recipe_active_minutes(recipe: RecipeTemplate) -> float | None:
+    if recipe.active_time_min is not None:
+        return float(recipe.active_time_min)
+    return _parse_active_minutes(recipe.time_text)
 
 
 def _parse_active_minutes(time_text: str) -> float | None:
