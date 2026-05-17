@@ -1131,6 +1131,10 @@ ANALYTICS_FOUNDATION_MIGRATION = PostgresMigration(
         )
         """,
         """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_user_attribution_source_campaign
             ON user_attribution(source, campaign)
         """,

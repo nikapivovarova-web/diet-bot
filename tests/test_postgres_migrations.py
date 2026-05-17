@@ -202,6 +202,31 @@ def test_migrations_replace_legacy_promo_kind_constraint() -> None:
     assert "kind IN (\n                    'monthly_access',\n                    'discount'," in sql
 
 
+def test_analytics_migration_repairs_existing_events_table_before_indexes() -> None:
+    from diet_bot import postgres_migrations
+
+    migration = next(
+        migration
+        for migration in postgres_migrations.POSTGRES_MIGRATIONS
+        if migration.version == "202605170003"
+    )
+    statements = [_normalize_sql(statement) for statement in migration.statements]
+    repair_statement = (
+        "ALTER TABLE analytics_events "
+        "ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+    )
+
+    assert repair_statement in statements
+    repair_index = statements.index(repair_statement)
+    index_indexes = [
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("CREATE INDEX IF NOT EXISTS idx_analytics_events_")
+    ]
+    assert index_indexes
+    assert repair_index < min(index_indexes)
+
+
 def test_run_postgres_migrations_records_each_version_once() -> None:
     from diet_bot import postgres_migrations
 
