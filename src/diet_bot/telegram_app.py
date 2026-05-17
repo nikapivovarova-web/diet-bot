@@ -1067,6 +1067,7 @@ def _build_store_from_runtime_config(config: RuntimeConfig) -> DietBotStore | No
         config.database_url,
         statement_timeout_ms=config.postgres_statement_timeout_ms,
         lock_timeout_ms=config.postgres_lock_timeout_ms,
+        pool_max_size=config.postgres_pool_max_size,
     )
 
 
@@ -1076,9 +1077,29 @@ def _initialize_runtime_store(config: RuntimeConfig) -> DietBotStore | None:
     _RUNTIME_STORE = None
     store = _build_store_from_runtime_config(config)
     if store is not None:
-        store.initialize()
+        try:
+            store.initialize()
+        except Exception:
+            _close_store(store)
+            raise
     _RUNTIME_STORE = store
     return store
+
+
+def _close_store(store: DietBotStore | None) -> None:
+    if store is None:
+        return
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
+
+
+def _close_runtime_store() -> None:
+    global _RUNTIME_STORE
+
+    store = _RUNTIME_STORE
+    _RUNTIME_STORE = None
+    _close_store(store)
 
 
 def _apply_runtime_config(config: RuntimeConfig) -> None:
@@ -1107,14 +1128,17 @@ async def run_bot() -> None:
     global _RUNTIME_STORE
 
     _RUNTIME_STORE = None
-    config = load_runtime_config()
-    _apply_runtime_config(config)
-    _initialize_runtime_store(config)
+    try:
+        config = load_runtime_config()
+        _apply_runtime_config(config)
+        _initialize_runtime_store(config)
 
-    bot = Bot(config.bot_token)
-    await _set_bot_commands(bot)
-    dispatcher = create_dispatcher()
-    await dispatcher.start_polling(bot)
+        bot = Bot(config.bot_token)
+        await _set_bot_commands(bot)
+        dispatcher = create_dispatcher()
+        await dispatcher.start_polling(bot)
+    finally:
+        _close_runtime_store()
 
 
 def main() -> None:

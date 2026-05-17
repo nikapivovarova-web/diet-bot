@@ -67,16 +67,28 @@ def check_postgres(config: RuntimeConfig) -> list[str]:
             return ["Set DIET_BOT_DATABASE_URL for production durable storage."]
         return []
 
+    store: PostgresDietBotStore | None = None
+    errors: list[str] = []
     try:
         store = PostgresDietBotStore(
             config.database_url,
             statement_timeout_ms=config.postgres_statement_timeout_ms,
             lock_timeout_ms=config.postgres_lock_timeout_ms,
+            pool_max_size=config.postgres_pool_max_size,
         )
         store.healthcheck()
     except Exception as exc:  # noqa: BLE001 - healthcheck must translate DB failures.
-        return [f"PostgreSQL healthcheck failed ({exc.__class__.__name__})."]
-    return []
+        errors.append(f"PostgreSQL healthcheck failed ({exc.__class__.__name__}).")
+    finally:
+        if store is not None:
+            try:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+            except Exception as exc:  # noqa: BLE001 - healthcheck must translate DB failures.
+                if not errors:
+                    errors.append(f"PostgreSQL healthcheck failed ({exc.__class__.__name__}).")
+    return errors
 
 
 def run_healthcheck(

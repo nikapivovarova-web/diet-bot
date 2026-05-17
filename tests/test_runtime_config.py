@@ -64,6 +64,33 @@ def test_runtime_config_accepts_production_only_with_database_url() -> None:
     assert config.local_json_storage_allowed is False
     assert config.postgres_statement_timeout_ms == 5000
     assert config.postgres_lock_timeout_ms == 1000
+    assert config.postgres_pool_max_size == 20
+
+
+def test_runtime_config_accepts_postgres_pool_max_size() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+            "DIET_BOT_DB_POOL_MAX_SIZE": "12",
+        },
+    )
+
+    assert config.postgres_pool_max_size == 12
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-1", "not-an-int"])
+def test_runtime_config_rejects_invalid_postgres_pool_max_size(raw_value: str) -> None:
+    with pytest.raises(RuntimeConfigError, match="DIET_BOT_DB_POOL_MAX_SIZE"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+                "DIET_BOT_DB_POOL_MAX_SIZE": raw_value,
+            },
+        )
 
 
 def test_runtime_config_rejects_production_json_only() -> None:

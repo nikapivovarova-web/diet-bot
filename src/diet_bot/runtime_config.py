@@ -42,6 +42,7 @@ class RuntimeConfig:
     local_json_storage_allowed: bool
     postgres_statement_timeout_ms: int
     postgres_lock_timeout_ms: int
+    postgres_pool_max_size: int
     public_payments_enabled: bool
     payment_test_prices_enabled: bool
 
@@ -81,6 +82,11 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         _env_value(env, "DIET_BOT_POSTGRES_LOCK_TIMEOUT_MS"),
         default=1000,
         name="DIET_BOT_POSTGRES_LOCK_TIMEOUT_MS",
+    )
+    postgres_pool_max_size = _parse_positive_int(
+        _env_value(env, "DIET_BOT_DB_POOL_MAX_SIZE"),
+        default=20,
+        name="DIET_BOT_DB_POOL_MAX_SIZE",
     )
     public_payments_enabled = _parse_bool_flag(
         _env_value(env, "DIET_BOT_PUBLIC_PAYMENTS_ENABLED"),
@@ -130,6 +136,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         local_json_storage_allowed=local_json_storage_allowed,
         postgres_statement_timeout_ms=postgres_statement_timeout_ms,
         postgres_lock_timeout_ms=postgres_lock_timeout_ms,
+        postgres_pool_max_size=postgres_pool_max_size,
         public_payments_enabled=public_payments_enabled,
         payment_test_prices_enabled=payment_test_prices_enabled,
     )

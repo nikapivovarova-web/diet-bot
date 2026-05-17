@@ -2807,11 +2807,15 @@ async def test_run_bot_initializes_store_before_polling_when_database_url_exists
     events: list[str] = []
 
     class FakeStore:
-        def __init__(self, dsn: str, **_kwargs: object) -> None:
+        def __init__(self, dsn: str, **kwargs: object) -> None:
             events.append(f"store:{dsn}")
+            assert kwargs["pool_max_size"] == 11
 
         def initialize(self) -> None:
             events.append("store.initialize")
+
+        def close(self) -> None:
+            events.append("store.close")
 
     class FakeBot:
         def __init__(self, token: str) -> None:
@@ -2827,6 +2831,7 @@ async def test_run_bot_initializes_store_before_polling_when_database_url_exists
     monkeypatch.setenv("DIET_BOT_ENV", "development")
     monkeypatch.setenv("DIET_BOT_TOKEN", "local-token")
     monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://diet_bot@localhost:5432/diet_bot")
+    monkeypatch.setenv("DIET_BOT_DB_POOL_MAX_SIZE", "11")
     monkeypatch.delenv("DIET_BOT_ALLOW_JSON_STORAGE", raising=False)
     monkeypatch.setattr(telegram_app, "PostgresDietBotStore", FakeStore)
     monkeypatch.setattr(telegram_app, "Bot", FakeBot)
@@ -2841,6 +2846,7 @@ async def test_run_bot_initializes_store_before_polling_when_database_url_exists
         "bot:local-token",
         "commands",
         "polling",
+        "store.close",
     ]
 
 

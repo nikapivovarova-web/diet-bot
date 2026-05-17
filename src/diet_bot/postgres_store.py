@@ -92,6 +92,8 @@ class PostgresDietBotStore:
         statement_timeout_ms: int = 5000,
         lock_timeout_ms: int = 1000,
         connect_attempts: int = 1,
+        pool_min_size: int = 1,
+        pool_max_size: int = 20,
     ) -> None:
         self.dsn = dsn
         self.connect_timeout = _positive_int(connect_timeout, name="connect_timeout")
@@ -101,11 +103,23 @@ class PostgresDietBotStore:
         )
         self.lock_timeout_ms = _positive_int(lock_timeout_ms, name="lock_timeout_ms")
         self.connect_attempts = _positive_int(connect_attempts, name="connect_attempts")
+        self.pool_min_size = _positive_int(pool_min_size, name="pool_min_size")
+        self.pool_max_size = _positive_int(pool_max_size, name="pool_max_size")
+        if self.pool_max_size < self.pool_min_size:
+            raise ValueError("pool_max_size must be greater than or equal to pool_min_size")
+        self._pool: Any | None = None
 
     def initialize(self) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                run_postgres_migrations(cur)
+        created_pool = self._pool is None
+        try:
+            self._ensure_pool()
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    run_postgres_migrations(cur)
+        except Exception:
+            if created_pool:
+                self.close()
+            raise
 
     def healthcheck(self) -> None:
         with self._connect() as conn:
@@ -114,6 +128,12 @@ class PostgresDietBotStore:
                 row = cur.fetchone()
         if row is None or int(row["ok"]) != 1:
             raise RuntimeError("PostgreSQL healthcheck failed")
+
+    def close(self) -> None:
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            pool.close()
 
     def remember_user(self, user: UserIdentity) -> None:
         with self._connect() as conn:
@@ -2251,26 +2271,35 @@ class PostgresDietBotStore:
             raise RuntimeError("Could not create payment order.")
         return _row_to_payment_order(row)
 
-    def _connect(self):
-        import psycopg
+    def _ensure_pool(self) -> Any:
+        if self._pool is not None:
+            return self._pool
+
         from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
 
-        last_error: Exception | None = None
-        for _attempt in range(self.connect_attempts):
-            try:
-                conn = psycopg.connect(
-                    self.dsn,
-                    connect_timeout=self.connect_timeout,
-                    row_factory=dict_row,
-                )
-                self._configure_connection(conn)
-                return conn
-            except Exception as exc:
-                last_error = exc
+        pool = ConnectionPool(
+            self.dsn,
+            min_size=self.pool_min_size,
+            max_size=self.pool_max_size,
+            kwargs={
+                "connect_timeout": self.connect_timeout,
+                "row_factory": dict_row,
+            },
+            configure=self._configure_connection,
+            open=False,
+        )
+        try:
+            pool.open(wait=True, timeout=float(self.connect_timeout * self.connect_attempts))
+        except Exception:
+            pool.close()
+            raise
+        self._pool = pool
+        return pool
 
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("PostgreSQL connection was not attempted")
+    def _connect(self):
+        pool = self._ensure_pool()
+        return pool.connection()
 
     def _configure_connection(self, conn: Any) -> None:
         with conn.cursor() as cur:
@@ -2282,6 +2311,7 @@ class PostgresDietBotStore:
                 "SELECT set_config('lock_timeout', %s, false)",
                 (f"{self.lock_timeout_ms}ms",),
             )
+        conn.commit()
 
     def _remember_user_cur(self, cur: Any, user: UserIdentity) -> None:
         cur.execute(

@@ -93,7 +93,7 @@ def test_healthcheck_does_not_import_telegram_or_postgres(monkeypatch) -> None:
 
 
 def test_healthcheck_strict_requires_postgres_in_production(monkeypatch) -> None:
-    checked: list[tuple[str, int, int]] = []
+    checked: list[tuple[str, int, int, int]] = []
 
     class FakePostgresStore:
         def __init__(
@@ -102,12 +102,13 @@ def test_healthcheck_strict_requires_postgres_in_production(monkeypatch) -> None
             *,
             statement_timeout_ms: int,
             lock_timeout_ms: int,
+            pool_max_size: int,
             **_kwargs: object,
         ) -> None:
-            checked.append((dsn, statement_timeout_ms, lock_timeout_ms))
+            checked.append((dsn, statement_timeout_ms, lock_timeout_ms, pool_max_size))
 
         def healthcheck(self) -> None:
-            checked.append(("healthcheck", 0, 0))
+            checked.append(("healthcheck", 0, 0, 0))
 
     monkeypatch.setattr(healthcheck, "PostgresDietBotStore", FakePostgresStore)
 
@@ -126,11 +127,12 @@ def test_healthcheck_strict_requires_postgres_in_production(monkeypatch) -> None
             "DIET_BOT_ENV": "production",
             "DIET_BOT_TOKEN": "prod-token",
             "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@localhost:5432/diet_bot",
+            "DIET_BOT_DB_POOL_MAX_SIZE": "9",
         },
     )
 
     assert errors == []
     assert checked == [
-        ("postgresql://diet_bot@localhost:5432/diet_bot", 5000, 1000),
-        ("healthcheck", 0, 0),
+        ("postgresql://diet_bot@localhost:5432/diet_bot", 5000, 1000, 9),
+        ("healthcheck", 0, 0, 0),
     ]
