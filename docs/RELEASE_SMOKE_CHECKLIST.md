@@ -20,7 +20,7 @@ Use this checklist from the clean worktree before publishing a Telegram bot rele
 - Use `DIET_BOT_ADMIN_USER_IDS` for owner/admin smoke access and smoke-price eligibility instead of tester-chat grants.
 - Stars monthly is an auto-renewing Telegram Stars subscription: production price `450` Stars.
 - YooKassa/card monthly access is a one-time 30-day purchase: production price `79900` minor units.
-- One-day extra and weekly PDF extra are one-time purchases: `6900` minor units / `40` Stars and `34900` minor units / `199` Stars.
+- One-day extra and weekly PDF extra are one-time purchases: `5000` minor units / `29` Stars and `25000` minor units / `141` Stars.
 - Controlled-pilot docs are historical records, not the current release target.
 
 ## 2. Healthcheck
@@ -106,7 +106,7 @@ $env:DIET_BOT_TESTER_CHAT_IDS = ""
 - Confirm weekly PDF success sends only the PDF document plus its caption; no text fallback menu should appear before or after the document.
 - Confirm `DIET_BOT_TESTER_CHAT_IDS` remains empty during payment smoke so paywall and payment gates are not bypassed.
 - With `DIET_BOT_PUBLIC_PAYMENTS_ENABLED=1`, open the subscription/paywall path as a non-tester user and confirm YooKassa/card and Telegram Stars invoice buttons are visible.
-- Confirm production prices are shown: monthly `799 RUB` / `450` Stars, one-day extra `69 RUB` / `40` Stars, weekly PDF extra `349 RUB` / `199` Stars.
+- Confirm production prices are shown: monthly `799 RUB` / `450` Stars, one-day extra `50 RUB` / `29` Stars, weekly PDF extra `250 RUB` / `141` Stars.
 - Confirm the Stars monthly path is labeled/handled as a subscription, while the card monthly path is a one-time 30-day access purchase.
 - Confirm no `[TEST]` labels or smoke prices are visible while production pricing is active.
 - If `TELEGRAM_PROVIDER_TOKEN` is empty in a non-launch local smoke, confirm card payment attempts do not create a broken invoice and the user receives a configuration message.
