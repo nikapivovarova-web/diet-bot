@@ -457,6 +457,37 @@ def test_curated_recipe_runtime_text_uses_accessible_ingredient_names() -> None:
         assert term not in runtime_text
 
 
+def test_curated_recipe_data_uses_specific_minced_meat_names() -> None:
+    foods = {food.id: food for food in curated_foods()}
+    ingredients = _source_ingredients()
+    ambiguous_names = {
+        "\u0444\u0430\u0440\u0448",
+        "\u043c\u044f\u0441\u043e \u0438\u043b\u0438 \u0444\u0430\u0440\u0448",
+        "\u0444\u0430\u0440\u0448 \u0438\u043b\u0438 \u043a\u0443\u0440\u0438\u0446\u0430",
+    }
+
+    assert foods["ground_meat"].name == "\u0433\u043e\u0432\u044f\u0436\u0438\u0439 \u0444\u0430\u0440\u0448"
+    for row in ingredients:
+        ingredient_name = str(row.get("ingredient_name_ru") or "").casefold()
+        raw_name = str(row.get("raw_text") or "").split("\u2014", 1)[0].strip().casefold()
+
+        assert ingredient_name not in ambiguous_names
+        assert raw_name not in ambiguous_names
+
+
+def test_curated_recipe_data_has_no_user_facing_american_cheese() -> None:
+    blocked = "\u0430\u043c\u0435\u0440\u0438\u043a\u0430\u043d\u0441\u043a\u0438\u0439 \u0441\u044b\u0440"
+    foods = curated_foods()
+    ingredients = _source_ingredients()
+
+    assert all(blocked not in food.name.casefold() for food in foods)
+    assert all(
+        blocked not in str(row.get(field) or "").casefold()
+        for row in ingredients
+        for field in ("raw_text", "ingredient_name_ru")
+    )
+
+
 def test_curated_recipe_runtime_preserves_normal_ingredient_mappings() -> None:
     recipes = _runtime_recipe_by_no()
 

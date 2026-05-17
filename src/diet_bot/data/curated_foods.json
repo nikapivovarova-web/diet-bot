@@ -333,7 +333,7 @@
   },
   {
     "food_id": "american_cheese",
-    "name_ru": "американский сыр",
+    "name_ru": "плавленый сыр в ломтиках",
     "name_en": "cheese pasteurized process American",
     "category": "dairy",
     "tags": [
@@ -7808,7 +7808,7 @@
   },
   {
     "food_id": "ground_meat",
-    "name_ru": "фарш",
+    "name_ru": "говяжий фарш",
     "name_en": "beef ground 90% lean meat 10% fat raw",
     "category": "protein",
     "tags": [],

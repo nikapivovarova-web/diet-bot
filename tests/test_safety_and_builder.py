@@ -80,6 +80,47 @@ def recipe_ingredient_ids(plan) -> set[str]:
     }
 
 
+MEAT_AND_POULTRY_IDS = {
+    "bacon",
+    "beef_broth",
+    "beef_chuck",
+    "beef_ground",
+    "beef_sirloin",
+    "beef_stew",
+    "chicken_breast",
+    "chicken_breast_cooked",
+    "chicken_broth",
+    "chicken_drumstick",
+    "chicken_ground",
+    "chicken_liver",
+    "chicken_thigh",
+    "chicken_thigh_skinless",
+    "chorizo",
+    "ground_meat",
+    "ham",
+    "italian_sausage",
+    "lamb_ground",
+    "pork_chop",
+    "pork_loin",
+    "pork_tenderloin",
+    "prosciutto",
+    "sausage",
+    "turkey",
+    "turkey_breast_cooked",
+    "turkey_ground",
+    "turkey_or_chicken_breast",
+}
+
+
+MINCED_MEAT_IDS = {
+    "beef_ground",
+    "chicken_ground",
+    "ground_meat",
+    "lamb_ground",
+    "turkey_ground",
+}
+
+
 def recipe_ids(plans: tuple[MealPlan, ...]) -> list[str]:
     return [
         meal.recipe_id
@@ -321,6 +362,7 @@ def _eligible_food_ids_for_exclusion(value: str) -> set[str]:
         ("\u0440\u044b\u0431\u0430", {"salmon", "tuna", "cod_fillet", "white_fish"}),
         ("\u043c\u043e\u0440\u0435\u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b", {"shrimp", "mussels", "calamari", "scallops"}),
         ("\u043a\u0443\u0440\u0438\u0446\u0430", {"chicken_breast", "chicken_thigh", "chicken_ground"}),
+        ("\u043d\u0435 \u0435\u043c \u043c\u044f\u0441\u043e", {"chicken_breast", "turkey", "beef_ground", "ground_meat", "pork_tenderloin"}),
         ("\u0441\u0432\u0438\u043d\u0438\u043d\u0430", {"pork_chop", "pork_tenderloin", "bacon"}),
         ("\u0433\u043e\u0432\u044f\u0434\u0438\u043d\u0430", {"beef_ground", "beef_chuck", "beef_stew"}),
         ("\u043f\u0448\u0435\u043d\u0438\u0446\u0430", {"wheat_flour", "whole_wheat_pasta", "whole_grain_bread"}),
@@ -373,6 +415,8 @@ def test_english_food_exclusion_aliases_filter_ingredients(
         ("\u0430\u0440\u0430\u0445\u0438\u0441\u043e\u0432\u0430\u044f \u043f\u0430\u0441\u0442\u0430", "peanut_butter"),
         ("\u043a\u0440\u0435\u0432\u0435\u0442\u043a\u0438", "shrimp"),
         ("\u043a\u0443\u0440\u0438\u043d\u0430\u044f \u0433\u0440\u0443\u0434\u043a\u0430", "chicken_breast"),
+        ("\u043d\u0435 \u0435\u043c \u0444\u0430\u0440\u0448", "chicken_ground"),
+        ("\u043d\u0435 \u0435\u043c \u0444\u0430\u0440\u0448", "beef_ground"),
         ("\u043f\u0448\u0435\u043d\u0438\u0447\u043d\u0430\u044f \u043c\u0443\u043a\u0430", "wheat_flour"),
     ),
 )
@@ -603,6 +647,22 @@ def test_mushroom_exclusion_filters_champignon_recipes_from_curated_plan() -> No
     assert len(plan.meals) == 5
     assert mushroom_ids.isdisjoint(food_ids(plan))
     assert mushroom_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+
+@pytest.mark.parametrize("seed", (1, 16))
+def test_meat_exclusion_filters_curated_chicken_and_minced_meat_recipes(seed: int) -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043d\u0435 \u0435\u043c \u043c\u044f\u0441\u043e"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    plan = build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only")
+
+    assert len(plan.meals) == 5
+    assert MEAT_AND_POULTRY_IDS.isdisjoint(food_ids(plan))
+    assert MEAT_AND_POULTRY_IDS.isdisjoint(recipe_ingredient_ids(plan))
+    assert MINCED_MEAT_IDS.isdisjoint(food_ids(plan))
+    assert MINCED_MEAT_IDS.isdisjoint(recipe_ingredient_ids(plan))
 
 
 def _sodium_debug(plan) -> str:
