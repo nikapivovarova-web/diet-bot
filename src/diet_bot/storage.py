@@ -56,6 +56,28 @@ class RecipeHistoryItem:
     user_id: int | None = None
 
 
+@dataclass(frozen=True)
+class UserAttribution:
+    user_id: int
+    source: str | None = None
+    campaign: str | None = None
+    referral: str | None = None
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AnalyticsEventRecord:
+    id: int
+    occurred_at: datetime
+    event_name: str
+    user_id: int | None = None
+    chat_id: int | None = None
+    source: str | None = None
+    campaign: str | None = None
+    referral: str | None = None
+    properties_json: dict[str, object] | None = None
+
+
 class DietBotStore(Protocol):
     def initialize(self) -> None: ...
     def healthcheck(self) -> None: ...
@@ -100,6 +122,30 @@ class DietBotStore(Protocol):
         since: datetime | None = None,
         limit: int = 400,
     ) -> list[RecipeHistoryItem]: ...
+
+    def get_user_attribution(self, user_id: int) -> UserAttribution | None: ...
+
+    def set_user_attribution(
+        self,
+        user_id: int,
+        *,
+        source: str | None = None,
+        campaign: str | None = None,
+        referral: str | None = None,
+    ) -> UserAttribution: ...
+
+    def record_analytics_event(
+        self,
+        *,
+        event_name: str,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+        source: str | None = None,
+        campaign: str | None = None,
+        referral: str | None = None,
+        properties_json: dict[str, object] | None = None,
+        occurred_at: datetime | None = None,
+    ) -> AnalyticsEventRecord: ...
 
     def cleanup_stale_generations(self, now: datetime | None = None) -> int: ...
     def upsert_promo_code(self, code: str, record: PromoCodeRecord) -> None: ...

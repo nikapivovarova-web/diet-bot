@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .analytics import sanitize_analytics_properties
 from .payments import (
     EXTRA_PAYMENT_PRODUCTS,
     PAYMENT_ORDER_TTL_SECONDS,
@@ -67,7 +68,13 @@ from .subscriptions import (
     has_active_managed_stars_subscription,
     refund_attempt,
 )
-from .storage import RecipeHistoryItem, SupportState, UserIdentity
+from .storage import (
+    AnalyticsEventRecord,
+    RecipeHistoryItem,
+    SupportState,
+    UserAttribution,
+    UserIdentity,
+)
 
 
 GENERATION_STALE_TIMEOUT = timedelta(minutes=30)
@@ -272,6 +279,102 @@ class PostgresDietBotStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_recipe_history_item(dict(row)) for row in rows]
+
+    def get_user_attribution(self, user_id: int) -> UserAttribution | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._get_user_attribution_cur(cur, user_id)
+
+    def set_user_attribution(
+        self,
+        user_id: int,
+        *,
+        source: str | None = None,
+        campaign: str | None = None,
+        referral: str | None = None,
+    ) -> UserAttribution:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                self._remember_user_cur(cur, UserIdentity(user_id))
+                cur.execute(
+                    """
+                    INSERT INTO user_attribution (user_id, source, campaign, referral)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                    RETURNING user_id, source, campaign, referral, created_at
+                    """,
+                    (
+                        user_id,
+                        _optional_text(source),
+                        _optional_text(campaign),
+                        _optional_text(referral),
+                    ),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    return _row_to_user_attribution(dict(row))
+                existing = self._get_user_attribution_cur(cur, user_id)
+        if existing is None:
+            raise RuntimeError(f"Could not load attribution row for user {user_id}.")
+        return existing
+
+    def record_analytics_event(
+        self,
+        *,
+        event_name: str,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+        source: str | None = None,
+        campaign: str | None = None,
+        referral: str | None = None,
+        properties_json: dict[str, object] | None = None,
+        occurred_at: datetime | None = None,
+    ) -> AnalyticsEventRecord:
+        normalized_event_name = str(event_name).strip()
+        if not normalized_event_name:
+            raise ValueError("analytics event_name is required")
+        safe_properties = sanitize_analytics_properties(properties_json)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if user_id is not None:
+                    self._remember_user_cur(cur, UserIdentity(user_id))
+                    if source is None and campaign is None and referral is None:
+                        attribution = self._get_user_attribution_cur(cur, user_id)
+                        if attribution is not None:
+                            source = attribution.source
+                            campaign = attribution.campaign
+                            referral = attribution.referral
+                cur.execute(
+                    """
+                    INSERT INTO analytics_events (
+                        occurred_at,
+                        user_id,
+                        chat_id,
+                        event_name,
+                        source,
+                        campaign,
+                        referral,
+                        properties_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id, occurred_at, user_id, chat_id, event_name,
+                              source, campaign, referral, properties_json
+                    """,
+                    (
+                        _normalize_datetime(occurred_at),
+                        user_id,
+                        chat_id,
+                        normalized_event_name,
+                        _optional_text(source),
+                        _optional_text(campaign),
+                        _optional_text(referral),
+                        _jsonb(safe_properties),
+                    ),
+                )
+                row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Could not create analytics event.")
+        return _row_to_analytics_event(dict(row))
 
     def get_entitlement(self, user_id: int) -> Entitlement:
         with self._connect() as conn:
@@ -2326,6 +2429,18 @@ class PostgresDietBotStore:
             (user.telegram_id, user.username, user.first_name),
         )
 
+    def _get_user_attribution_cur(self, cur: Any, user_id: int) -> UserAttribution | None:
+        cur.execute(
+            """
+            SELECT user_id, source, campaign, referral, created_at
+            FROM user_attribution
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_user_attribution(dict(row)) if row is not None else None
+
     def _select_entitlement_for_update_cur(self, cur: Any, user_id: int) -> Entitlement:
         self._remember_user_cur(cur, UserIdentity(user_id))
         cur.execute(
@@ -3510,6 +3625,31 @@ def _row_to_recipe_history_item(row: dict[str, Any]) -> RecipeHistoryItem:
     )
 
 
+def _row_to_user_attribution(row: dict[str, Any]) -> UserAttribution:
+    return UserAttribution(
+        user_id=int(row["user_id"]),
+        source=_optional_text(row.get("source")),
+        campaign=_optional_text(row.get("campaign")),
+        referral=_optional_text(row.get("referral")),
+        created_at=_normalize_datetime(row["created_at"]),
+    )
+
+
+def _row_to_analytics_event(row: dict[str, Any]) -> AnalyticsEventRecord:
+    properties = row.get("properties_json")
+    return AnalyticsEventRecord(
+        id=int(row["id"]),
+        occurred_at=_normalize_datetime(row["occurred_at"]),
+        event_name=str(row["event_name"]),
+        user_id=int(row["user_id"]) if row.get("user_id") is not None else None,
+        chat_id=int(row["chat_id"]) if row.get("chat_id") is not None else None,
+        source=_optional_text(row.get("source")),
+        campaign=_optional_text(row.get("campaign")),
+        referral=_optional_text(row.get("referral")),
+        properties_json=dict(properties) if isinstance(properties, dict) else {},
+    )
+
+
 def _row_to_payment_event(row: dict[str, Any]) -> PaymentEvent:
     return PaymentEvent(
         event_id=str(row["event_id"]),
@@ -3676,6 +3816,13 @@ def _normalize_datetime(value: datetime | None) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _non_negative_int(value: Any) -> int:

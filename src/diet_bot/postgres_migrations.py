@@ -1103,6 +1103,49 @@ POSTGRES_LEGACY_LEDGER_COMPATIBILITY_MIGRATION = PostgresMigration(
 )
 
 
+ANALYTICS_FOUNDATION_MIGRATION = PostgresMigration(
+    version="202605170003",
+    description="Add first-party analytics attribution and events",
+    statements=(
+        """
+        CREATE TABLE IF NOT EXISTS user_attribution (
+            user_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+            source TEXT,
+            campaign TEXT,
+            referral TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS analytics_events (
+            id BIGSERIAL PRIMARY KEY,
+            occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            user_id BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+            chat_id BIGINT,
+            event_name TEXT NOT NULL,
+            source TEXT,
+            campaign TEXT,
+            referral TEXT,
+            properties_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            CHECK (event_name <> '')
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_attribution_source_campaign
+            ON user_attribution(source, campaign)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_analytics_events_user_occurred_at
+            ON analytics_events(user_id, occurred_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_analytics_events_name_occurred_at
+            ON analytics_events(event_name, occurred_at DESC)
+        """,
+    ),
+)
+
+
 POSTGRES_MIGRATIONS = (
     BASE_SCHEMA_MIGRATION,
     PAYMENT_PRE_CHECKOUT_APPROVAL_MIGRATION,
@@ -1113,6 +1156,7 @@ POSTGRES_MIGRATIONS = (
     MANAGED_SUBSCRIPTION_STATE_MIGRATION,
     PROMO_KIND_CONSTRAINT_COMPATIBILITY_MIGRATION,
     POSTGRES_LEGACY_LEDGER_COMPATIBILITY_MIGRATION,
+    ANALYTICS_FOUNDATION_MIGRATION,
 )
 
 

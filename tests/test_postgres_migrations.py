@@ -21,6 +21,8 @@ REQUIRED_TABLES = {
     "promo_redemptions",
     "promo_events",
     "support_state",
+    "user_attribution",
+    "analytics_events",
 }
 
 REQUIRED_INDEXES = {
@@ -47,6 +49,9 @@ REQUIRED_INDEXES = {
     "idx_promo_redemptions_user",
     "idx_promo_events_code_created",
     "idx_support_state_status_updated",
+    "idx_user_attribution_source_campaign",
+    "idx_analytics_events_user_occurred_at",
+    "idx_analytics_events_name_occurred_at",
 }
 
 
@@ -132,6 +137,13 @@ def test_migrations_include_required_paid_storage_tables() -> None:
         r"\bmeal_slot\s+TEXT\s+NOT\s+NULL\b",
         r"\brecipe_id\s+TEXT\s+NOT\s+NULL\b",
         r"\brecipe_key\s+TEXT\s+NOT\s+NULL\b",
+        r"\bsource\s+TEXT\b",
+        r"\bcampaign\s+TEXT\b",
+        r"\breferral\s+TEXT\b",
+        r"\bchat_id\s+BIGINT\b",
+        r"\bevent_name\s+TEXT\s+NOT\s+NULL\b",
+        r"\bproperties_json\s+JSONB\s+NOT\s+NULL\s+DEFAULT\s+'\{\}'::jsonb\b",
+        r"\boccurred_at\s+TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+now\(\)",
     ):
         assert re.search(column_pattern, sql, flags=re.IGNORECASE), column_pattern
     assert "subscription_source IN ('none', 'telegram_stars', 'yookassa', 'promo', 'admin', 'legacy')" in sql

@@ -77,6 +77,7 @@ class FakeGenerationStore:
         self.recent_history: list[RecipeHistoryItem] = []
         self.chat_states: dict[int, dict[str, object]] = {}
         self.events: list[str] = []
+        self.analytics_events: list[dict[str, object]] = []
 
     def load_chat_state(self, chat_id: int) -> dict[str, object]:
         return dict(self.chat_states.get(chat_id, {}))
@@ -141,6 +142,54 @@ class FakeGenerationStore:
             if since is None or (item.generated_at is not None and item.generated_at >= since)
         ]
         return items[:limit]
+
+    def record_analytics_event(self, **kwargs) -> object:
+        self.analytics_events.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.analytics_events), **kwargs)
+
+
+class FakeAnalyticsStore:
+    def __init__(self) -> None:
+        self.entitlements: dict[int, telegram_app.Entitlement] = {}
+        self.attributions: dict[int, object] = {}
+        self.analytics_events: list[dict[str, object]] = []
+
+    def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
+        return self.entitlements.get(user_id, telegram_app.Entitlement())
+
+    def save_entitlement(
+        self,
+        user_id: int,
+        entitlement: telegram_app.Entitlement,
+    ) -> None:
+        self.entitlements[user_id] = entitlement
+
+    def load_profile_data(self, user_id: int) -> dict[str, object] | None:
+        return None
+
+    def get_user_attribution(self, user_id: int) -> object | None:
+        return self.attributions.get(user_id)
+
+    def set_user_attribution(
+        self,
+        user_id: int,
+        *,
+        source: str | None,
+        campaign: str | None,
+        referral: str | None,
+    ) -> object:
+        if user_id not in self.attributions:
+            self.attributions[user_id] = SimpleNamespace(
+                user_id=user_id,
+                source=source,
+                campaign=campaign,
+                referral=referral,
+            )
+        return self.attributions[user_id]
+
+    def record_analytics_event(self, **kwargs) -> object:
+        self.analytics_events.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.analytics_events), **kwargs)
 
 
 class FakePromoAdminStore:
@@ -235,6 +284,7 @@ class FakeDiscountPaymentStore(FakePromoAdminStore):
         self.created_orders: list[dict[str, object]] = []
         self.invoice_links: list[tuple[str, str]] = []
         self.orders: list[telegram_app.PaymentOrder] = []
+        self.analytics_events: list[dict[str, object]] = []
 
     def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
         return telegram_app.Entitlement()
@@ -339,6 +389,10 @@ class FakeDiscountPaymentStore(FakePromoAdminStore):
     ) -> None:
         self.invoice_links.append((order_id, invoice_link))
 
+    def record_analytics_event(self, **kwargs) -> object:
+        self.analytics_events.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.analytics_events), **kwargs)
+
 
 @pytest.fixture(autouse=True)
 def isolated_telegram_runtime_state(monkeypatch, tmp_path):
@@ -381,6 +435,13 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_027,
         51_028,
         51_029,
+        51_030,
+        51_031,
+        51_032,
+        51_033,
+        51_034,
+        51_035,
+        51_036,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -399,6 +460,141 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
         telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID.pop(chat_id, None)
         getattr(telegram_app, "ADMIN_PROMO_ACTION_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_start_payload_stores_first_touch_attribution(monkeypatch) -> None:
+    chat_id = 51_030
+    store = FakeAnalyticsStore()
+
+    async def no_welcome_photo(message) -> None:
+        return None
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_send_welcome_photo", no_welcome_photo)
+
+    first_message = FakeMessage(chat_id, text="/start ig_ad_001")
+    second_message = FakeMessage(chat_id, text="/start tt_ad_002")
+
+    await telegram_app.start(first_message)
+    await telegram_app.start(second_message)
+
+    attribution = store.attributions[chat_id]
+    assert attribution.source == "ig"
+    assert attribution.campaign == "ig_ad_001"
+    assert attribution.referral == "ig_ad_001"
+    assert [event["event_name"] for event in store.analytics_events] == [
+        "bot_start",
+        "bot_start",
+    ]
+    assert store.analytics_events[0]["source"] == "ig"
+    assert store.analytics_events[1]["source"] == "ig"
+    assert first_message.texts
+    assert second_message.texts
+
+
+@pytest.mark.anyio
+async def test_start_analytics_write_failure_does_not_break_handler(
+    monkeypatch,
+    caplog,
+) -> None:
+    chat_id = 51_031
+
+    class FailingAnalyticsStore(FakeAnalyticsStore):
+        def set_user_attribution(self, *args, **kwargs) -> object:
+            raise RuntimeError("analytics attribution unavailable")
+
+        def record_analytics_event(self, **kwargs) -> object:
+            raise RuntimeError("analytics event unavailable")
+
+    async def no_welcome_photo(message) -> None:
+        return None
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", FailingAnalyticsStore())
+    monkeypatch.setattr(telegram_app, "_send_welcome_photo", no_welcome_photo)
+    caplog.set_level("WARNING", logger=telegram_app.__name__)
+
+    message = FakeMessage(chat_id, text="/start ig_ad_001")
+    await telegram_app.start(message)
+
+    assert message.texts
+    assert "analytics" in caplog.text.lower()
+
+
+def test_analytics_properties_drop_sensitive_profile_and_payment_fields(
+    monkeypatch,
+) -> None:
+    store = FakeAnalyticsStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+
+    telegram_app._record_analytics_event(
+        user_id=51_032,
+        chat_id=51_032,
+        event_name="questionnaire_completed",
+        properties={
+            "provider": "telegram_stars",
+            "weight_kg": 70,
+            "height_cm": 170,
+            "medical_details": "hypertension",
+            "raw_questionnaire_answers": {"goal": "fat_loss"},
+            "nested": {
+                "amount": 450,
+                "telegram_payment_charge_id": "tg-secret",
+            },
+        },
+    )
+
+    properties = store.analytics_events[0]["properties_json"]
+    assert properties == {
+        "provider": "telegram_stars",
+        "nested": {"amount": 450},
+    }
+
+
+@pytest.mark.anyio
+async def test_payment_success_records_safe_analytics_properties(monkeypatch) -> None:
+    chat_id = 51_033
+
+    class FakePaymentSuccessStore(FakeAnalyticsStore):
+        def apply_successful_payment(self, payment_input):
+            order = telegram_app.PaymentOrder(
+                order_id="order_analytics",
+                nonce="nonce_analytics",
+                user_id=chat_id,
+                delivery_chat_id=chat_id,
+                provider=telegram_app.PaymentProvider.YOOKASSA,
+                product=telegram_app.PaymentProduct.SUBSCRIPTION_MONTH,
+                amount=79_900,
+                currency="RUB",
+                list_amount=79_900,
+                metadata={"pricing_context": "launch"},
+            )
+            return SimpleNamespace(processed=True, duplicate=False, order=order)
+
+    store = FakePaymentSuccessStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    message = FakeMessage(chat_id)
+    message.successful_payment = SimpleNamespace(
+        currency="RUB",
+        total_amount=79_900,
+        invoice_payload="diet:order:order_analytics:nonce_analytics",
+        telegram_payment_charge_id="tg-secret",
+        provider_payment_charge_id="provider-secret",
+    )
+
+    await telegram_app.handle_successful_payment(message)
+
+    event = store.analytics_events[0]
+    assert event["event_name"] == "payment_success"
+    assert event["properties_json"] == {
+        "provider": "yookassa",
+        "product": "subscription_month",
+        "amount": 79_900,
+        "currency": "RUB",
+        "pricing_context": "launch",
+    }
+    assert "charge" not in json.dumps(event["properties_json"])
+    assert message.texts
 
 
 @pytest.mark.anyio
@@ -775,6 +971,7 @@ async def test_promo_code_runtime_store_activation_grants_access_and_rejects_rep
         def __init__(self) -> None:
             self.entitlements: dict[int, telegram_app.Entitlement] = {}
             self.redeemed_codes: set[str] = set()
+            self.analytics_events: list[dict[str, object]] = []
 
         def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
             return self.entitlements.get(user_id, telegram_app.Entitlement())
@@ -802,6 +999,10 @@ async def test_promo_code_runtime_store_activation_grants_access_and_rejects_rep
             self.redeemed_codes.add(raw_code)
             return telegram_app.PromoCodeActivation("activated", raw_code, user_id)
 
+        def record_analytics_event(self, **kwargs) -> object:
+            self.analytics_events.append(dict(kwargs))
+            return SimpleNamespace(id=len(self.analytics_events), **kwargs)
+
     store = FakePromoStore()
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
 
@@ -826,6 +1027,11 @@ async def test_promo_code_runtime_store_activation_grants_access_and_rejects_rep
         None,
     )
     assert entitlement.subscription_period_end == first_end
+    assert store.analytics_events[-1]["event_name"] == "promo_applied"
+    assert store.analytics_events[-1]["properties_json"] == {
+        "promo_kind": "monthly_access",
+        "promo_code_suffix": "2026",
+    }
 
 
 def test_subscription_payment_keyboard_offers_promo_code_entry() -> None:
@@ -1183,6 +1389,7 @@ class FakeStarsAutoRenewStore:
         self.entitlement = entitlement
         self.saved: list[telegram_app.Entitlement] = []
         self.payment_reversal_inputs: list[telegram_app.PaymentReversalInput] = []
+        self.analytics_events: list[dict[str, object]] = []
 
     def get_entitlement(self, user_id: int) -> telegram_app.Entitlement:
         return self.entitlement
@@ -1206,6 +1413,10 @@ class FakeStarsAutoRenewStore:
     ) -> object:
         self.payment_reversal_inputs.append(reversal)
         return SimpleNamespace(processed=True)
+
+    def record_analytics_event(self, **kwargs) -> object:
+        self.analytics_events.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.analytics_events), **kwargs)
 
 
 class FakeStarsSubscriptionBot:
@@ -1260,6 +1471,11 @@ async def test_cancel_stars_auto_renew_calls_telegram_and_keeps_current_access(
     assert updated.monthly_weekly_pdf_remaining == 3
     assert store.payment_reversal_inputs[0].event_type == telegram_app.PaymentEventType.CANCEL_SUBSCRIPTION
     assert store.payment_reversal_inputs[0].telegram_charge_id == "stars-sub-cancel"
+    assert store.analytics_events[-1]["event_name"] == "stars_auto_renew_canceled"
+    assert store.analytics_events[-1]["properties_json"] == {
+        "provider": "telegram_stars",
+        "action": "cancel",
+    }
     assert "отключено" in message.texts[-1][0].lower()
 
 
@@ -1294,6 +1510,11 @@ async def test_reenable_stars_auto_renew_calls_telegram_and_keeps_current_access
     assert updated.monthly_one_day_remaining == 1
     assert updated.monthly_weekly_pdf_remaining == 2
     assert store.payment_reversal_inputs == []
+    assert store.analytics_events[-1]["event_name"] == "stars_auto_renew_reenabled"
+    assert store.analytics_events[-1]["properties_json"] == {
+        "provider": "telegram_stars",
+        "action": "reenable",
+    }
     assert "включено" in message.texts[-1][0].lower()
 
 
@@ -1454,6 +1675,11 @@ async def test_discount_promo_invoice_amount_matches_displayed_discounted_amount
     assert bot.calls[0]["prices"][0].amount == expected_amount
     assert expected_display in payment_message.texts[-1][0]
     assert chat_id not in telegram_app.DISCOUNT_PROMO_CODE_BY_CHAT_ID
+    invoice_event = store.analytics_events[-1]
+    assert invoice_event["event_name"] == "invoice_created"
+    assert invoice_event["properties_json"]["product"] == "subscription_month"
+    assert invoice_event["properties_json"]["amount"] == expected_amount
+    assert "charge" not in json.dumps(invoice_event["properties_json"])
 
 
 @pytest.mark.anyio
@@ -1757,6 +1983,26 @@ def test_paywall_keyboard_keeps_extra_one_time_purchase_buttons(monkeypatch) -> 
         telegram_app.BUY_EXTRA_ONE_DAY_TEXT,
         telegram_app.CALLBACK_BUY_EXTRA_ONE_DAY,
     ) in buttons
+
+
+@pytest.mark.anyio
+async def test_limit_paywall_records_analytics_event(monkeypatch) -> None:
+    chat_id = 51_036
+    store = FakeAnalyticsStore()
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    message = FakeMessage(chat_id)
+    await telegram_app._send_limit_paywall(message, "one_day")
+
+    assert message.texts
+    event = store.analytics_events[-1]
+    assert event["event_name"] == "paywall_shown"
+    assert event["properties_json"] == {
+        "ration_kind": "one_day",
+        "has_active_subscription": False,
+        "public_payments_enabled": True,
+    }
 
 
 @pytest.mark.anyio
@@ -2533,6 +2779,12 @@ async def test_successful_one_day_access_generation_completes_postgres_lock(monk
     assert store.consumed == [(chat_id, "one_day")]
     assert store.completed == [(chat_id, "one_day", None, None)]
     assert store.refunded == []
+    assert store.analytics_events[-1]["event_name"] == "ration_delivered"
+    assert store.analytics_events[-1]["properties_json"] == {
+        "ration_kind": "one_day",
+        "attempt_source": "test_access",
+        "generation_id": 1,
+    }
 
 
 @pytest.mark.anyio
@@ -2586,6 +2838,12 @@ async def test_successful_weekly_pdf_access_generation_completes_postgres_lock(m
     assert store.consumed == [(chat_id, "weekly_pdf")]
     assert store.completed == [(chat_id, "weekly_pdf", None, None)]
     assert store.refunded == []
+    assert store.analytics_events[-1]["event_name"] == "weekly_pdf_delivered"
+    assert store.analytics_events[-1]["properties_json"] == {
+        "ration_kind": "weekly_pdf",
+        "attempt_source": "test_access",
+        "generation_id": 1,
+    }
 
 
 @pytest.mark.anyio

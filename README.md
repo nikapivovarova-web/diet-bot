@@ -37,6 +37,16 @@ Optional settings:
 - `DIET_BOT_SUBSCRIPTIONS_STATE_FILE`: default `.diet_bot_state/subscriptions.json`.
 - `DIET_BOT_PROMO_CODES_STATE_FILE`: default `.diet_bot_state/promo_codes.json`.
 
+## Launch Attribution
+
+Ad and launch attribution is first-party only and requires PostgreSQL storage. Telegram deep-link campaign payloads use this format:
+
+```text
+https://t.me/FoodbalanceRu_bot?start=<source>_<campaign>
+```
+
+Example: `https://t.me/FoodbalanceRu_bot?start=ig_ad_001`. The first valid `/start` payload stores first-touch source/campaign/referral for that Telegram user; repeated `/start` payloads do not overwrite it.
+
 No payment webhook or external PDF service env is required in this clean state. Do not rely on implicit JSON fallback; set either `DIET_BOT_ALLOW_JSON_STORAGE=1` for local/dev JSON or `DIET_BOT_DATABASE_URL` for production-like storage.
 
 ## Payment Model

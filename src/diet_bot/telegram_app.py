@@ -30,6 +30,21 @@ from aiogram.types import (
     SuccessfulPayment,
 )
 
+from .analytics import (
+    ANALYTICS_EVENT_BOT_START,
+    ANALYTICS_EVENT_INVOICE_CREATED,
+    ANALYTICS_EVENT_PAYMENT_SUCCESS,
+    ANALYTICS_EVENT_PAYWALL_SHOWN,
+    ANALYTICS_EVENT_PROMO_APPLIED,
+    ANALYTICS_EVENT_QUESTIONNAIRE_COMPLETED,
+    ANALYTICS_EVENT_RATION_DELIVERED,
+    ANALYTICS_EVENT_STARS_AUTO_RENEW_CANCELED,
+    ANALYTICS_EVENT_STARS_AUTO_RENEW_REENABLED,
+    ANALYTICS_EVENT_WEEKLY_PDF_DELIVERED,
+    StartAttribution,
+    parse_start_attribution,
+    sanitize_analytics_properties,
+)
 from .builder import build_one_day_plan
 from .calculator import calculate_targets
 from .domain import (
@@ -61,6 +76,7 @@ from .json_storage import (
     record_recipe_history_in_json,
 )
 from .payments import (
+    PAYMENT_PRICING_CONTEXT_METADATA_KEY,
     PAYMENT_TEST_SMOKE_PRICING_CONTEXT,
     PaymentOrder,
     PaymentOrderCreationCode,
@@ -99,7 +115,7 @@ from .promo_codes import (
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import RuntimeConfig, is_production_environment, load_runtime_config
 from .safety import evaluate_safety
-from .storage import DietBotStore, RecipeHistoryItem, SupportState
+from .storage import DietBotStore, RecipeHistoryItem, SupportState, UserAttribution
 from .subscriptions import (
     MONTHLY_ONE_DAY_LIMIT,
     MONTHLY_WEEKLY_PDF_LIMIT,
@@ -499,6 +515,7 @@ async def start(message: Message) -> None:
         return
     if not await ensure_private_chat(message):
         return
+    _record_start_analytics(message)
     await _send_welcome_photo(message)
     if _has_active_paid_access(message.chat.id):
         await message.answer(
@@ -1032,6 +1049,12 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     SESSION_BY_CHAT_ID.pop(chat_id, None)
     is_trial = chat_id in TRIAL_CHAT_IDS
     TRIAL_CHAT_IDS.discard(chat_id)
+    _record_analytics_event(
+        user_id=_payment_user_id_for_message(message),
+        chat_id=chat_id,
+        event_name=ANALYTICS_EVENT_QUESTIONNAIRE_COMPLETED,
+        properties={"is_trial": is_trial},
+    )
     if is_trial:
         await _send_trial_plan(message, profile)
         return
@@ -1190,6 +1213,7 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
     activation = _activate_promo_code_for_chat(message.chat.id, text)
     if activation.activated:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+        _record_promo_applied_analytics(message, activation.code, "monthly_access")
         await message.answer(
             _promo_code_success_text(message.chat.id),
             reply_markup=_subscriber_cabinet_keyboard(message.chat.id),
@@ -1207,6 +1231,7 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
     if activation.status == "not_access_code":
         if _remember_discount_promo_code_for_chat(message.chat.id, text):
             PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+            _record_promo_applied_analytics(message, text, "discount")
             payment_user_id = _payment_user_id_for_message(message)
             await message.answer(
                 _discount_promo_code_applied_text(
@@ -2305,6 +2330,123 @@ def _runtime_store() -> DietBotStore | None:
     return _RUNTIME_STORE
 
 
+def _record_start_analytics(message: Message) -> None:
+    user_id = _payment_user_id_for_message(message)
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    payload = _start_payload_from_message(message)
+    parsed_attribution = parse_start_attribution(payload)
+    attribution = (
+        _set_user_attribution(user_id, parsed_attribution)
+        if user_id is not None and parsed_attribution is not None
+        else _get_user_attribution(user_id)
+    )
+    if attribution is None and parsed_attribution is not None:
+        source = parsed_attribution.source
+        campaign = parsed_attribution.campaign
+        referral = parsed_attribution.referral
+    else:
+        source = attribution.source if attribution is not None else None
+        campaign = attribution.campaign if attribution is not None else None
+        referral = attribution.referral if attribution is not None else None
+    _record_analytics_event(
+        user_id=user_id,
+        chat_id=chat_id if isinstance(chat_id, int) else None,
+        event_name=ANALYTICS_EVENT_BOT_START,
+        source=source,
+        campaign=campaign,
+        referral=referral,
+        properties={"has_start_payload": parsed_attribution is not None},
+    )
+
+
+def _start_payload_from_message(message: Message) -> str | None:
+    text = str(getattr(message, "text", "") or "").strip()
+    if not text:
+        return None
+    command, separator, payload = text.partition(" ")
+    normalized_command = command[1:].split("@", 1)[0].lower() if command.startswith("/") else ""
+    if normalized_command != "start" or not separator:
+        return None
+    payload = payload.strip()
+    return payload or None
+
+
+def _set_user_attribution(
+    user_id: int,
+    attribution: StartAttribution,
+) -> UserAttribution | None:
+    store = _runtime_store()
+    setter = getattr(store, "set_user_attribution", None) if store is not None else None
+    if not callable(setter):
+        return None
+    try:
+        return setter(
+            user_id,
+            source=attribution.source,
+            campaign=attribution.campaign,
+            referral=attribution.referral,
+        )
+    except Exception:
+        logger.warning(
+            "analytics attribution write failed: user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _get_user_attribution(user_id: int | None) -> UserAttribution | None:
+    if user_id is None:
+        return None
+    store = _runtime_store()
+    getter = getattr(store, "get_user_attribution", None) if store is not None else None
+    if not callable(getter):
+        return None
+    try:
+        return getter(user_id)
+    except Exception:
+        logger.warning(
+            "analytics attribution read failed: user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _record_analytics_event(
+    *,
+    event_name: str,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    source: str | None = None,
+    campaign: str | None = None,
+    referral: str | None = None,
+    properties: dict[str, object] | None = None,
+) -> None:
+    store = _runtime_store()
+    recorder = getattr(store, "record_analytics_event", None) if store is not None else None
+    if not callable(recorder):
+        return
+    try:
+        recorder(
+            user_id=user_id,
+            chat_id=chat_id,
+            event_name=event_name,
+            source=source,
+            campaign=campaign,
+            referral=referral,
+            properties_json=sanitize_analytics_properties(properties),
+        )
+    except Exception:
+        logger.warning(
+            "analytics event write failed: event_name=%s user_id=%s chat_id=%s",
+            event_name,
+            user_id,
+            chat_id,
+            exc_info=True,
+        )
+
+
 def _load_chat_state_for_chat(chat_id: int) -> dict[str, object]:
     store = _runtime_store()
     if store is not None:
@@ -2908,6 +3050,40 @@ def _payment_product_for_payload(payload: str) -> PaymentProduct | None:
     return PAYMENT_PAYLOAD_PRODUCTS.get(payload)
 
 
+def _record_invoice_created_analytics(message: Message, order: PaymentOrder) -> None:
+    _record_analytics_event(
+        user_id=order.user_id,
+        chat_id=message.chat.id,
+        event_name=ANALYTICS_EVENT_INVOICE_CREATED,
+        properties=_payment_order_analytics_properties(order),
+    )
+
+
+def _record_payment_success_analytics(result: object) -> None:
+    order = getattr(result, "order", None)
+    if order is None:
+        return
+    _record_analytics_event(
+        user_id=getattr(order, "user_id", None),
+        chat_id=getattr(order, "delivery_chat_id", None),
+        event_name=ANALYTICS_EVENT_PAYMENT_SUCCESS,
+        properties=_payment_order_analytics_properties(order),
+    )
+
+
+def _payment_order_analytics_properties(order: PaymentOrder) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "provider": order.provider.value,
+        "product": order.product.value,
+        "amount": order.amount,
+        "currency": order.currency.value,
+    }
+    pricing_context = order.metadata.get(PAYMENT_PRICING_CONTEXT_METADATA_KEY)
+    if pricing_context is not None:
+        properties["pricing_context"] = str(pricing_context)
+    return properties
+
+
 def _payment_user_id_for_message(message: Message) -> int | None:
     user_id = _message_user_id(message)
     if user_id is not None:
@@ -3063,6 +3239,7 @@ async def _send_stars_invoice_link(
             ],
         ),
     )
+    _record_invoice_created_analytics(message, order)
 
 
 async def _edit_stars_auto_renew(message: Message, *, is_canceled: bool) -> None:
@@ -3105,6 +3282,19 @@ async def _edit_stars_auto_renew(message: Message, *, is_canceled: bool) -> None
     _save_entitlement_for_chat(message.chat.id, entitlement)
     if is_canceled:
         _record_stars_auto_renew_cancel_event_if_supported(message.chat.id, charge_id)
+    _record_analytics_event(
+        user_id=message.chat.id,
+        chat_id=message.chat.id,
+        event_name=(
+            ANALYTICS_EVENT_STARS_AUTO_RENEW_CANCELED
+            if is_canceled
+            else ANALYTICS_EVENT_STARS_AUTO_RENEW_REENABLED
+        ),
+        properties={
+            "provider": PaymentProvider.TELEGRAM_STARS.value,
+            "action": "cancel" if is_canceled else "reenable",
+        },
+    )
 
     await message.answer(
         STARS_AUTO_RENEW_CANCELLED_TEXT if is_canceled else STARS_AUTO_RENEW_ENABLED_TEXT,
@@ -3211,6 +3401,7 @@ async def _send_yookassa_invoice_link(
             ],
         ),
     )
+    _record_invoice_created_analytics(message, order)
 
 
 def _yookassa_provider_data(payload: str) -> dict[str, object]:
@@ -3314,6 +3505,8 @@ def _apply_successful_payment(message: Message, payment: SuccessfulPayment) -> P
         result = store.apply_successful_payment(payment_input)
     except Exception:
         return PaymentApplication(False)
+    if bool(getattr(result, "processed", False)) and not bool(getattr(result, "duplicate", False)):
+        _record_payment_success_analytics(result)
     return _payment_application_from_successful_payment_result(result)
 
 
@@ -3440,6 +3633,23 @@ def _clear_pending_discount_promo_code(chat_id: int, promo_code: str | None) -> 
         return
     if DISCOUNT_PROMO_CODE_BY_CHAT_ID.get(chat_id) == promo_code:
         DISCOUNT_PROMO_CODE_BY_CHAT_ID.pop(chat_id, None)
+
+
+def _record_promo_applied_analytics(
+    message: Message,
+    promo_code: str,
+    promo_kind: str,
+) -> None:
+    normalized_code = normalize_promo_code(promo_code)
+    _record_analytics_event(
+        user_id=_payment_user_id_for_message(message),
+        chat_id=message.chat.id,
+        event_name=ANALYTICS_EVENT_PROMO_APPLIED,
+        properties={
+            "promo_kind": promo_kind,
+            "promo_code_suffix": normalized_code[-4:],
+        },
+    )
 
 
 def _promo_code_success_text(chat_id: int) -> str:
@@ -4226,6 +4436,21 @@ def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) 
     store = _runtime_store()
     if store is not None and getattr(consumption, "_postgres_generation_id", None) is not None:
         store.complete_generation_attempt(chat_id, consumption)
+    event_name = (
+        ANALYTICS_EVENT_WEEKLY_PDF_DELIVERED
+        if consumption.ration_kind == "weekly_pdf"
+        else ANALYTICS_EVENT_RATION_DELIVERED
+    )
+    _record_analytics_event(
+        user_id=chat_id,
+        chat_id=chat_id,
+        event_name=event_name,
+        properties={
+            "ration_kind": consumption.ration_kind,
+            "attempt_source": consumption.source,
+            "generation_id": _history_generation_id(consumption),
+        },
+    )
 
 
 def _entitlement_for_chat(chat_id: int) -> Entitlement:
@@ -4356,6 +4581,16 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
     await message.answer(
         "\n".join(lines),
         reply_markup=reply_markup,
+    )
+    _record_analytics_event(
+        user_id=_payment_user_id_for_message(message),
+        chat_id=message.chat.id,
+        event_name=ANALYTICS_EVENT_PAYWALL_SHOWN,
+        properties={
+            "ration_kind": ration_kind,
+            "has_active_subscription": has_active_subscription,
+            "public_payments_enabled": _public_payments_enabled(),
+        },
     )
 
 

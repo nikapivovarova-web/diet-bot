@@ -1506,6 +1506,80 @@ def test_postgres_discount_reservation_is_released_when_invoice_creation_fails()
         _cleanup_users(store, user_id, second_user_id)
 
 
+def test_postgres_analytics_first_touch_and_event_round_trip() -> None:
+    store = _store()
+    user_id = _unique_user_id()
+    try:
+        first = store.set_user_attribution(
+            user_id,
+            source="ig",
+            campaign="ig_ad_001",
+            referral="ig_ad_001",
+        )
+        second = store.set_user_attribution(
+            user_id,
+            source="tt",
+            campaign="tt_ad_002",
+            referral="tt_ad_002",
+        )
+        event = store.record_analytics_event(
+            user_id=user_id,
+            chat_id=user_id,
+            event_name="payment_success",
+            properties_json={
+                "provider": "telegram_stars",
+                "product": "subscription_month",
+                "amount": 450,
+                "currency": "XTR",
+                "weight_kg": 70,
+                "telegram_payment_charge_id": "tg-secret",
+            },
+        )
+
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source, campaign, referral
+                    FROM user_attribution
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                attribution_row = dict(cur.fetchone())
+                cur.execute(
+                    """
+                    SELECT event_name, source, campaign, referral, properties_json
+                    FROM analytics_events
+                    WHERE id = %s
+                    """,
+                    (event.id,),
+                )
+                event_row = dict(cur.fetchone())
+
+        assert first.source == "ig"
+        assert second.source == "ig"
+        assert attribution_row == {
+            "source": "ig",
+            "campaign": "ig_ad_001",
+            "referral": "ig_ad_001",
+        }
+        assert event_row == {
+            "event_name": "payment_success",
+            "source": "ig",
+            "campaign": "ig_ad_001",
+            "referral": "ig_ad_001",
+            "properties_json": {
+                "provider": "telegram_stars",
+                "product": "subscription_month",
+                "amount": 450,
+                "currency": "XTR",
+            },
+        }
+    finally:
+        _cleanup_users(store, user_id)
+
+
 def _store(**kwargs: Any):
     from diet_bot.postgres_store import PostgresDietBotStore
 
