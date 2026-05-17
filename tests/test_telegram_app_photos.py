@@ -149,6 +149,7 @@ from diet_bot.questionnaire import start_session
 
 @pytest.fixture(autouse=True)
 def enabled_public_payment_buttons_for_legacy_telegram_tests(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "_RUNTIME_CONFIG_APPLIED", True, raising=False)
     monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
     monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", False, raising=False)
 

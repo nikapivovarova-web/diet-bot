@@ -399,6 +399,7 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app, "_RUNTIME_CONFIG_APPLIED", True, raising=False)
     monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
     monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", False, raising=False)
     touched_ids = {
@@ -1050,6 +1051,16 @@ def test_subscription_payment_keyboard_offers_promo_code_entry() -> None:
 
     assert len(promo_buttons) == 1
     assert promo_buttons[0].callback_data == telegram_app.CALLBACK_PROMO_CODE
+
+
+def test_payment_runtime_paths_raise_before_runtime_config_applied(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "_RUNTIME_CONFIG_APPLIED", False, raising=False)
+
+    with pytest.raises(RuntimeError, match="Runtime config must be applied"):
+        telegram_app._subscription_payment_keyboard()
+
+    with pytest.raises(RuntimeError, match="Runtime config must be applied"):
+        telegram_app._payment_pricing_context_for_identity(user_id=51_026, chat_id=51_026)
 
 
 def test_subscription_payment_keyboard_hides_paid_buttons_when_public_payments_disabled(

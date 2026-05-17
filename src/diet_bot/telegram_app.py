@@ -381,6 +381,7 @@ TESTER_CHAT_IDS = _parse_id_set(os.getenv("DIET_BOT_TESTER_CHAT_IDS"))
 TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "").strip()
 PUBLIC_PAYMENTS_ENABLED = os.getenv("DIET_BOT_PUBLIC_PAYMENTS_ENABLED", "").strip() == "1"
 PAYMENT_TEST_PRICES_ENABLED = os.getenv("DIET_BOT_PAYMENT_TEST_PRICES_ENABLED", "").strip() == "1"
+_RUNTIME_CONFIG_APPLIED = False
 SUPPORT_CHAT_ID = _parse_optional_int(os.getenv("DIET_BOT_SUPPORT_CHAT_ID")) or DEFAULT_SUPPORT_CHAT_ID
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
@@ -1130,6 +1131,7 @@ def _apply_runtime_config(config: RuntimeConfig) -> None:
     global PAYMENT_TEST_PRICES_ENABLED
     global PROMO_CODES_STATE_FILE
     global PUBLIC_PAYMENTS_ENABLED
+    global _RUNTIME_CONFIG_APPLIED
     global STATE_FILE
     global SUBSCRIPTIONS_STATE_FILE
     global SUPPORT_CHAT_ID
@@ -1145,6 +1147,15 @@ def _apply_runtime_config(config: RuntimeConfig) -> None:
     PUBLIC_PAYMENTS_ENABLED = config.public_payments_enabled
     PAYMENT_TEST_PRICES_ENABLED = config.payment_test_prices_enabled
     SUPPORT_CHAT_ID = config.support_chat_id or DEFAULT_SUPPORT_CHAT_ID
+    _RUNTIME_CONFIG_APPLIED = True
+
+
+def _require_payment_runtime_config_applied() -> None:
+    if not _RUNTIME_CONFIG_APPLIED:
+        raise RuntimeError(
+            "Runtime config must be applied before using payment runtime settings. "
+            "Call _apply_runtime_config() during startup or initialize runtime config in tests."
+        )
 
 
 async def run_bot() -> None:
@@ -2744,6 +2755,7 @@ def _payment_result_keyboard(chat_id: int, result: PaymentApplication) -> Inline
 
 
 def _public_payments_enabled() -> bool:
+    _require_payment_runtime_config_applied()
     return PUBLIC_PAYMENTS_ENABLED
 
 
@@ -2752,6 +2764,7 @@ def _payment_pricing_context_for_identity(
     user_id: int | None,
     chat_id: int | None,
 ) -> str | None:
+    _require_payment_runtime_config_applied()
     if not (PUBLIC_PAYMENTS_ENABLED and PAYMENT_TEST_PRICES_ENABLED):
         return None
     if user_id is not None and user_id in ADMIN_USER_IDS:
