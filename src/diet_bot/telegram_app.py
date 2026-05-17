@@ -2727,13 +2727,13 @@ def _subscriber_cabinet_keyboard(
         [
             InlineKeyboardButton(
                 text=_subscriber_one_day_button_text(chat_id, entitlement),
-                callback_data=CALLBACK_ONE_DAY_PLAN,
+                callback_data=_subscriber_one_day_button_callback(chat_id, entitlement),
             ),
         ],
         [
             InlineKeyboardButton(
                 text=_subscriber_week_pdf_button_text(chat_id, entitlement),
-                callback_data=CALLBACK_WEEK_PLAN_PDF,
+                callback_data=_subscriber_week_pdf_button_callback(chat_id, entitlement),
             ),
         ],
         [InlineKeyboardButton(text=CHANGE_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
@@ -2741,6 +2741,7 @@ def _subscriber_cabinet_keyboard(
     auto_renew_button = _stars_auto_renew_management_button(entitlement)
     if auto_renew_button is not None:
         rows.append([auto_renew_button])
+    rows.append([InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)])
     rows.append([InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)])
     return InlineKeyboardMarkup(
         inline_keyboard=rows,
@@ -2772,6 +2773,13 @@ def _stars_auto_renew_management_button(
 def _subscriber_one_day_button_text(chat_id: int, entitlement: Entitlement) -> str:
     if _has_test_access(chat_id, entitlement):
         return SUBSCRIBER_ONE_DAY_PLAN_TEXT
+    if entitlement.monthly_one_day_remaining <= 0 and entitlement.extra_one_day_remaining > 0:
+        return _subscriber_extra_quota_button_text(
+            SUBSCRIBER_ONE_DAY_PLAN_TEXT,
+            entitlement.extra_one_day_remaining,
+        )
+    if _subscriber_one_day_quota_exhausted(entitlement):
+        return BUY_EXTRA_ONE_DAY_TEXT
     extra_text = _extra_attempts_text(entitlement.extra_one_day_remaining)
     return (
         f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось "
@@ -2779,14 +2787,55 @@ def _subscriber_one_day_button_text(chat_id: int, entitlement: Entitlement) -> s
     )
 
 
+def _subscriber_one_day_button_callback(chat_id: int, entitlement: Entitlement) -> str:
+    if _has_test_access(chat_id, entitlement):
+        return CALLBACK_ONE_DAY_PLAN
+    if _subscriber_one_day_quota_exhausted(entitlement):
+        return CALLBACK_BUY_EXTRA_ONE_DAY
+    return CALLBACK_ONE_DAY_PLAN
+
+
+def _subscriber_one_day_quota_exhausted(entitlement: Entitlement) -> bool:
+    return (
+        entitlement.monthly_one_day_remaining <= 0
+        and entitlement.extra_one_day_remaining <= 0
+    )
+
+
 def _subscriber_week_pdf_button_text(chat_id: int, entitlement: Entitlement) -> str:
     if _has_test_access(chat_id, entitlement):
         return SUBSCRIBER_WEEK_PLAN_PDF_TEXT
+    if entitlement.monthly_weekly_pdf_remaining <= 0 and entitlement.extra_weekly_pdf_remaining > 0:
+        return _subscriber_extra_quota_button_text(
+            SUBSCRIBER_WEEK_PLAN_PDF_TEXT,
+            entitlement.extra_weekly_pdf_remaining,
+        )
+    if _subscriber_week_pdf_quota_exhausted(entitlement):
+        return BUY_EXTRA_WEEKLY_PDF_TEXT
     extra_text = _extra_attempts_text(entitlement.extra_weekly_pdf_remaining)
     return (
         f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось "
         f"{entitlement.monthly_weekly_pdf_remaining} из {MONTHLY_WEEKLY_PDF_LIMIT}{extra_text}"
     )
+
+
+def _subscriber_week_pdf_button_callback(chat_id: int, entitlement: Entitlement) -> str:
+    if _has_test_access(chat_id, entitlement):
+        return CALLBACK_WEEK_PLAN_PDF
+    if _subscriber_week_pdf_quota_exhausted(entitlement):
+        return CALLBACK_BUY_EXTRA_WEEKLY_PDF
+    return CALLBACK_WEEK_PLAN_PDF
+
+
+def _subscriber_week_pdf_quota_exhausted(entitlement: Entitlement) -> bool:
+    return (
+        entitlement.monthly_weekly_pdf_remaining <= 0
+        and entitlement.extra_weekly_pdf_remaining <= 0
+    )
+
+
+def _subscriber_extra_quota_button_text(label: str, extra_remaining: int) -> str:
+    return f"{label} - осталось {extra_remaining} доп."
 
 
 def _extra_attempts_text(extra_remaining: int) -> str:
@@ -4749,6 +4798,7 @@ def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:
             [extra_buttons[1]],
             [extra_buttons[2]],
             [extra_buttons[3]],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
         ],
     )
 
@@ -4759,6 +4809,7 @@ def _trial_subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=SUBSCRIBE_CTA_TEXT, callback_data=CALLBACK_SUBSCRIBE)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
         ],
     )
 
@@ -4783,6 +4834,7 @@ def _plan_choice_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=ONE_DAY_PLAN_TEXT, callback_data=CALLBACK_ONE_DAY_PLAN)],
             [InlineKeyboardButton(text=WEEK_PLAN_PDF_TEXT, callback_data=CALLBACK_WEEK_PLAN_PDF)],
             [InlineKeyboardButton(text=CHANGE_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )

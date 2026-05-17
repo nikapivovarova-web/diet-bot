@@ -1344,6 +1344,166 @@ def test_subscriber_cabinet_shows_stars_auto_renew_management_buttons(
     assert (expected_button, expected_callback) in buttons
 
 
+def test_subscriber_cabinet_exhausted_one_day_routes_to_extra_purchase() -> None:
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="yookassa",
+        monthly_one_day_remaining=0,
+        monthly_weekly_pdf_remaining=2,
+    )
+
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_033, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (
+        telegram_app.BUY_EXTRA_ONE_DAY_TEXT,
+        telegram_app.CALLBACK_BUY_EXTRA_ONE_DAY,
+    ) in buttons
+    assert (
+        f"{telegram_app.SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 0 из "
+        f"{telegram_app.MONTHLY_ONE_DAY_LIMIT}",
+        telegram_app.CALLBACK_ONE_DAY_PLAN,
+    ) not in buttons
+
+
+def test_subscriber_cabinet_exhausted_weekly_pdf_routes_to_extra_purchase() -> None:
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="yookassa",
+        monthly_one_day_remaining=2,
+        monthly_weekly_pdf_remaining=0,
+    )
+
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_034, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (
+        telegram_app.BUY_EXTRA_WEEKLY_PDF_TEXT,
+        telegram_app.CALLBACK_BUY_EXTRA_WEEKLY_PDF,
+    ) in buttons
+    assert (
+        f"{telegram_app.SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 0 из "
+        f"{telegram_app.MONTHLY_WEEKLY_PDF_LIMIT}",
+        telegram_app.CALLBACK_WEEK_PLAN_PDF,
+    ) not in buttons
+
+
+def test_subscriber_cabinet_keeps_remaining_quota_generation_actions() -> None:
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="yookassa",
+        monthly_one_day_remaining=1,
+        monthly_weekly_pdf_remaining=1,
+    )
+
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_035, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (
+        f"{telegram_app.SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 1 из "
+        f"{telegram_app.MONTHLY_ONE_DAY_LIMIT}",
+        telegram_app.CALLBACK_ONE_DAY_PLAN,
+    ) in buttons
+    assert (
+        f"{telegram_app.SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 1 из "
+        f"{telegram_app.MONTHLY_WEEKLY_PDF_LIMIT}",
+        telegram_app.CALLBACK_WEEK_PLAN_PDF,
+    ) in buttons
+
+
+def test_subscriber_cabinet_uses_extra_quota_text_without_zero_monthly_limit() -> None:
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="yookassa",
+        monthly_one_day_remaining=0,
+        monthly_weekly_pdf_remaining=0,
+        extra_one_day_remaining=1,
+        extra_weekly_pdf_remaining=1,
+    )
+
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_035, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (
+        f"{telegram_app.SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 1 доп.",
+        telegram_app.CALLBACK_ONE_DAY_PLAN,
+    ) in buttons
+    assert (
+        f"{telegram_app.SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 1 доп.",
+        telegram_app.CALLBACK_WEEK_PLAN_PDF,
+    ) in buttons
+    assert all("0 из" not in text for text, _ in buttons)
+
+
+def test_subscriber_cabinet_offers_promo_code_entry() -> None:
+    entitlement = telegram_app.Entitlement(
+        subscription_period_end="2026-06-15T10:00:00+00:00",
+        subscription_source="yookassa",
+        monthly_one_day_remaining=1,
+        monthly_weekly_pdf_remaining=1,
+    )
+
+    keyboard = telegram_app._subscriber_cabinet_keyboard(51_036, entitlement=entitlement)
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE) in buttons
+
+
+def test_plan_choice_keyboard_offers_promo_code_entry() -> None:
+    keyboard = telegram_app._plan_choice_keyboard()
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE) in buttons
+
+
+def test_paywall_keyboard_offers_promo_code_entry(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", True, raising=False)
+
+    keyboard = telegram_app._paywall_keyboard(preferred="one_day")
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE) in buttons
+
+
+def test_trial_subscription_keyboard_offers_promo_code_entry() -> None:
+    keyboard = telegram_app._trial_subscription_keyboard()
+    buttons = [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert (telegram_app.PROMO_CODE_TEXT, telegram_app.CALLBACK_PROMO_CODE) in buttons
+
+
 @pytest.mark.parametrize(
     "entitlement",
     [

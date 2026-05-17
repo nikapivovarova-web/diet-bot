@@ -803,6 +803,7 @@ def test_subscriber_cabinet_keyboard_shows_limits_without_upsells(monkeypatch, t
         (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 3 из 5 + 1 доп.", CALLBACK_ONE_DAY_PLAN),
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 2 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
     assert TRY_FREE_TEXT not in button_texts
@@ -829,6 +830,7 @@ async def test_start_sends_subscriber_cabinet_instead_of_free_trial(monkeypatch,
         (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 4 из 5", CALLBACK_ONE_DAY_PLAN),
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 3 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
 
@@ -864,6 +866,7 @@ def test_subscription_payment_result_opens_subscriber_cabinet(monkeypatch, tmp_p
         (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 5 из 5", CALLBACK_ONE_DAY_PLAN),
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 4 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
 
@@ -912,14 +915,22 @@ def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
         BUY_EXTRA_WEEKLY_PDF_TEXT,
         CALLBACK_BUY_EXTRA_WEEKLY_PDF,
     )
-    assert [(row[0].text, row[0].callback_data) for row in day_keyboard.inline_keyboard[2:]] == [
+    assert [(row[0].text, row[0].callback_data) for row in day_keyboard.inline_keyboard[2:4]] == [
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
     ]
-    assert [(row[0].text, row[0].callback_data) for row in week_keyboard.inline_keyboard[2:]] == [
+    assert [(row[0].text, row[0].callback_data) for row in week_keyboard.inline_keyboard[2:4]] == [
         (BUY_EXTRA_ONE_DAY_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_ONE_DAY),
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
     ]
+    assert (day_keyboard.inline_keyboard[-1][0].text, day_keyboard.inline_keyboard[-1][0].callback_data) == (
+        PROMO_CODE_TEXT,
+        CALLBACK_PROMO_CODE,
+    )
+    assert (week_keyboard.inline_keyboard[-1][0].text, week_keyboard.inline_keyboard[-1][0].callback_data) == (
+        PROMO_CODE_TEXT,
+        CALLBACK_PROMO_CODE,
+    )
 
 
 @pytest.mark.anyio
@@ -949,6 +960,7 @@ async def test_active_subscription_limit_paywall_offers_only_extra_purchases(mon
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
     ]
 
 
@@ -1855,6 +1867,7 @@ def test_plan_choice_keyboard_has_day_and_week_pdf_buttons() -> None:
         (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
         (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
     ]
     assert WEEK_PLAN_PDF_PLACEHOLDER_TEXT == "Функция рациона на неделю в PDF пока в разработке."
@@ -2812,6 +2825,7 @@ async def test_start_with_saved_profile_shows_calculation_summary_and_plan_butto
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
     finally:
@@ -2874,6 +2888,7 @@ async def test_cancel_clarifies_saved_profile_is_kept() -> None:
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
     finally:
@@ -3001,6 +3016,7 @@ async def test_test_access_off_keeps_active_subscription_access(monkeypatch, tmp
             (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 5 из 5", CALLBACK_ONE_DAY_PLAN),
             (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 4 из 4", CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
         assert one_day_consumption.source == "monthly"
@@ -3060,6 +3076,7 @@ async def test_test_access_off_previews_free_menu_without_subscription(monkeypat
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
         assert not weekly_consumption.allowed
@@ -3274,6 +3291,7 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
     finally:
@@ -3326,6 +3344,7 @@ async def test_saved_questionnaire_profile_survives_memory_reset(monkeypatch, tm
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
     finally:
@@ -3376,6 +3395,7 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
             (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 2 из 5", CALLBACK_ONE_DAY_PLAN),
             (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 1 из 4", CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
         ]
     finally:
@@ -3432,6 +3452,7 @@ async def test_trial_questionnaire_completion_sends_one_day_plan_and_subscriptio
                     (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
                     (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
                     (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+                    (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
                     (SUPPORT_TEXT, CALLBACK_SUPPORT),
                 ]
             )
