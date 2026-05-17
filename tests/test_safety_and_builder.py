@@ -1606,3 +1606,45 @@ def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:
         for meal in plan.meals
     )
     assert plan.totals.get("protein_g") <= plan.targets.targets.get("protein_g") * 1.50
+
+
+def test_curated_maintenance_seed31_rebalances_protein_heavy_low_fat_case() -> None:
+    profile = UserProfile(
+        age=32,
+        sex=Sex.MALE,
+        height_cm=178,
+        weight_kg=86,
+        goal=Goal.MAINTAIN,
+        activity=ActivityLevel.MODERATE,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    plan = build_one_day_plan(profile, variety_seed=31, recipe_source="curated_only")
+    lower_energy, upper_energy = plan.targets.calorie_bounds
+    target = plan.targets.targets
+
+    assert lower_energy <= plan.totals.get("energy_kcal") <= upper_energy
+    assert plan.totals.get("protein_g") <= target.get("protein_g") * 1.45
+    assert plan.totals.get("fat_g") >= target.get("fat_g") * 0.90
+
+
+def test_curated_small_maintenance_seed1_rebalances_protein_heavy_low_carb_case() -> None:
+    profile = UserProfile(
+        age=36,
+        sex=Sex.FEMALE,
+        height_cm=160,
+        weight_kg=52,
+        goal=Goal.MAINTAIN,
+        activity=ActivityLevel.LIGHT,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    plan = build_one_day_plan(profile, variety_seed=1, recipe_source="curated_only")
+    lower_energy, upper_energy = plan.targets.calorie_bounds
+    target = plan.targets.targets
+
+    assert lower_energy <= plan.totals.get("energy_kcal") <= upper_energy
+    assert plan.totals.get("protein_g") <= target.get("protein_g") * 1.45
+    assert plan.totals.get("carbohydrate_g") >= target.get("carbohydrate_g") * 0.90

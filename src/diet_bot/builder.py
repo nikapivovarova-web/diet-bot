@@ -1349,6 +1349,11 @@ def _rank_recipes(
             current_total,
             target,
         )
+        macro_penalty += _recipe_projected_macro_balance_penalty(
+            projected,
+            current_total,
+            target,
+        )
         macro_penalty += _recipe_projected_fat_penalty(
             projected,
             current_total,
@@ -1551,7 +1556,7 @@ def _recipe_projected_macro_gap_bonus(
     if protein_gap > 0:
         bonus += min(estimated.get("protein_g"), protein_gap) / max(1.0, protein_floor) * 8.0
 
-    for nutrient, weight in (("fat_g", 1.0), ("carbohydrate_g", 0.9)):
+    for nutrient, weight in (("fat_g", 2.2), ("carbohydrate_g", 2.5)):
         nutrient_target = target.get(nutrient)
         if nutrient_target <= 0:
             continue
@@ -1678,6 +1683,43 @@ def _recipe_projected_protein_penalty(
     if projected_protein > hard_limit:
         penalty += (projected_protein - hard_limit) / max(1.0, protein_target) * 45.0
     return penalty
+
+
+def _recipe_projected_macro_balance_penalty(
+    estimated: NutrientVector | None,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    if estimated is None:
+        return 0.0
+
+    protein_target = target.get("protein_g")
+    if protein_target <= 0:
+        return 0.0
+
+    projected = current_total.plus(estimated)
+    projected_protein_ratio = projected.get("protein_g") / protein_target
+    if projected_protein_ratio < PROTEIN_TOP_UP_TARGET_MULTIPLIER:
+        return 0.0
+
+    low_macro_pressure = 0.0
+    for nutrient, weight in (("fat_g", 1.4), ("carbohydrate_g", 1.2)):
+        nutrient_target = target.get(nutrient)
+        if nutrient_target <= 0:
+            continue
+        projected_ratio = projected.get(nutrient) / nutrient_target
+        if projected_ratio < 0.90:
+            low_macro_pressure += (0.90 - projected_ratio) * weight
+
+    if low_macro_pressure <= 0:
+        return 0.0
+
+    protein_pressure = max(
+        0.0,
+        projected_protein_ratio - PROTEIN_TOP_UP_TARGET_MULTIPLIER,
+    )
+    estimated_protein_ratio = estimated.get("protein_g") / protein_target
+    return low_macro_pressure * (protein_pressure * 28.0 + estimated_protein_ratio * 8.0)
 
 
 def _recipe_projected_fat_penalty(
