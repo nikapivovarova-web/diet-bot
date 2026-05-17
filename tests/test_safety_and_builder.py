@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from diet_bot import builder as builder_module
 from diet_bot.builder import (
     _build_recipe_plan_for_time,
     _cooking_effort_constraints,
@@ -14,6 +15,7 @@ from diet_bot.builder import (
     build_one_day_plan,
     filter_foods,
 )
+from diet_bot.calculator import calculate_targets
 from diet_bot.catalog import built_in_foods
 from diet_bot.domain import (
     ActivityLevel,
@@ -808,6 +810,54 @@ def test_five_repeat_generations_keep_key_meals_unique() -> None:
     assert len({plan.meals[1].name for plan in plans}) == 5
     assert len({plan.meals[2].name for plan in plans}) == 5
     assert len({tuple(meal.name for meal in plan.meals) for plan in plans}) == 5
+
+
+def test_recipe_selector_projects_candidate_nutrients_once(monkeypatch) -> None:
+    profile = profile_with(meal_count=5)
+    safety = evaluate_safety(profile)
+    foods = filter_foods(built_in_foods(), safety)
+    food_by_id = {food.id: food for food in foods}
+    recipes = [
+        recipe
+        for recipe in built_in_recipes()
+        if recipe.slot == "main"
+        and "curated" in recipe.tags
+        and builder_module._resolve_recipe_ingredients(recipe, food_by_id) is not None
+    ][:12]
+    target = calculate_targets(profile).targets
+    slots = _meal_energy_slots(profile.meal_count)
+    main_slot = slots[1]
+    slot_energy_target = target.get("energy_kcal") * main_slot.target_ratio
+    projection_counts: Counter[str] = Counter()
+    original_project = builder_module._project_recipe_nutrients
+
+    def counted_projection(recipe, food_by_id, slot_energy_target, meal_slot=None):
+        projection_counts[recipe.id] += 1
+        return original_project(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
+
+    monkeypatch.setattr(builder_module, "_project_recipe_nutrients", counted_projection)
+
+    ranked = builder_module._rank_recipes(
+        recipes,
+        "main",
+        set(),
+        Counter(),
+        Counter(),
+        food_by_id,
+        NutrientVector(),
+        target,
+        slot_energy_target,
+        target.get("energy_kcal") * main_slot.min_ratio,
+        target.get("energy_kcal") * main_slot.max_ratio,
+        variety_seed=7,
+        index=1,
+        ranking_mode="protein_floor",
+        manage_sodium=True,
+    )
+
+    assert ranked
+    assert projection_counts
+    assert max(projection_counts.values()) == 1
 
 
 @pytest.mark.slow_pdf_builder

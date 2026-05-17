@@ -1317,31 +1317,26 @@ def _rank_recipes(
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
         seed_score = _seeded_score(recipe.id, variety_seed, index) * 2.0
         nutrient_bonus = _recipe_nutrient_bonus(recipe, current_total, target)
+        projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=slot)
         macro_bonus = _recipe_projected_macro_gap_bonus(
-            recipe,
-            food_by_id,
-            slot_energy_target,
+            projected,
             current_total,
             target,
-            meal_slot=slot,
         )
         calorie_recovery_bonus = _recipe_low_protein_calorie_recovery_bonus(
             recipe,
             food_by_id,
+            projected,
             slot_energy_target,
             current_total,
             target,
-            meal_slot=slot,
         )
         if ranking_mode == "protein_floor":
             seed_score = _seeded_score(recipe.id, variety_seed, index) * 0.25
             macro_bonus += _recipe_projected_protein_floor_bonus(
-                recipe,
-                food_by_id,
-                slot_energy_target,
+                projected,
                 current_total,
                 target,
-                meal_slot=slot,
             )
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
@@ -1350,45 +1345,32 @@ def _rank_recipes(
         format_penalty = used_formats[_recipe_format(recipe)] * 0.85
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(
-            recipe,
-            food_by_id,
-            slot_energy_target,
+            projected,
             current_total,
             target,
-            meal_slot=slot,
         )
         macro_penalty += _recipe_projected_fat_penalty(
-            recipe,
-            food_by_id,
-            slot_energy_target,
+            projected,
             current_total,
             target,
-            meal_slot=slot,
         )
         macro_penalty += _recipe_projected_carbohydrate_penalty(
-            recipe,
-            food_by_id,
-            slot_energy_target,
+            projected,
             current_total,
             target,
-            meal_slot=slot,
         )
         if manage_sodium:
             macro_penalty += _recipe_projected_sodium_penalty(
-                recipe,
-                food_by_id,
+                projected,
                 slot_energy_target,
                 current_total,
                 target,
-                meal_slot=slot,
             )
         energy_penalty = _recipe_projected_energy_penalty(
-            recipe,
-            food_by_id,
-            slot_energy_target,
+            projected,
             slot_min_energy,
             slot_max_energy,
-            meal_slot=slot,
+            slot_energy_target,
         )
         return (
             seed_score
@@ -1556,14 +1538,10 @@ def _recipe_nutrient_bonus(recipe: RecipeTemplate, current_total: NutrientVector
 
 
 def _recipe_projected_macro_gap_bonus(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
+    estimated: NutrientVector | None,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
 
@@ -1586,15 +1564,14 @@ def _recipe_projected_macro_gap_bonus(
 def _recipe_low_protein_calorie_recovery_bonus(
     recipe: RecipeTemplate,
     food_by_id: dict[str, Food],
+    estimated: NutrientVector | None,
     slot_energy_target: float,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
     if not _is_low_protein_calorie_recovery_target(target):
         return 0.0
 
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
 
@@ -1644,14 +1621,10 @@ def _is_low_protein_calorie_recovery_target(target: NutrientVector) -> bool:
 
 
 def _recipe_projected_protein_floor_bonus(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
+    estimated: NutrientVector | None,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
 
@@ -1682,18 +1655,14 @@ def _recipe_macro_penalty(recipe: RecipeTemplate, current_total: NutrientVector,
 
 
 def _recipe_projected_protein_penalty(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
+    estimated: NutrientVector | None,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
     protein_target = target.get("protein_g")
     if protein_target <= 0:
         return 0.0
 
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
     estimated_protein = estimated.get("protein_g")
@@ -1712,18 +1681,14 @@ def _recipe_projected_protein_penalty(
 
 
 def _recipe_projected_fat_penalty(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
+    estimated: NutrientVector | None,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
     fat_target = target.get("fat_g")
     if fat_target <= 0:
         return 0.0
 
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
 
@@ -1743,18 +1708,14 @@ def _recipe_projected_fat_penalty(
 
 
 def _recipe_projected_carbohydrate_penalty(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
+    estimated: NutrientVector | None,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
     carbohydrate_target = target.get("carbohydrate_g")
     if carbohydrate_target <= 0:
         return 0.0
 
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
 
@@ -1771,18 +1732,15 @@ def _recipe_projected_carbohydrate_penalty(
 
 
 def _recipe_projected_sodium_penalty(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
+    estimated: NutrientVector | None,
     slot_energy_target: float,
     current_total: NutrientVector,
     target: NutrientVector,
-    meal_slot: str | None = None,
 ) -> float:
     sodium_limit = target.get("sodium_mg")
     if sodium_limit <= 0:
         return 0.0
 
-    estimated = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
     if estimated is None:
         return 0.0
 
@@ -1800,16 +1758,14 @@ def _recipe_projected_sodium_penalty(
 
 
 def _recipe_projected_energy_penalty(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
+    projected: NutrientVector | None,
     slot_min_energy: float,
     slot_max_energy: float,
-    meal_slot: str | None = None,
+    slot_energy_target: float,
 ) -> float:
-    projected_energy = _project_recipe_energy(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
-    if projected_energy is None:
+    if projected is None:
         return 0.0
+    projected_energy = projected.get("energy_kcal")
 
     if projected_energy < slot_min_energy:
         return (slot_min_energy - projected_energy) / max(1.0, slot_energy_target) * 10.0
