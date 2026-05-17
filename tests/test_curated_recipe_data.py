@@ -9,9 +9,10 @@ from openpyxl import load_workbook
 from diet_bot.builder import _add_missing_garnishes
 from diet_bot.builder import build_one_day_plan
 from diet_bot.curated_data import _looks_incomplete_instruction, _recipe_instruction, curated_foods, curated_recipes
-from diet_bot.domain import ActivityLevel, Goal, Sex, UserProfile
+from diet_bot.domain import ActivityLevel, Goal, Restriction, RestrictionType, Sex, UserProfile
 from diet_bot.domain import Meal, NutrientVector
 from diet_bot.recipe_catalog import built_in_recipes
+from diet_bot.safety import evaluate_safety, is_food_excluded
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
@@ -22,6 +23,83 @@ BATCH2_INTAKE_RECIPE_COUNT = 105
 INTAKE_RECIPE_COUNT = BATCH1_INTAKE_RECIPE_COUNT + BATCH2_INTAKE_RECIPE_COUNT
 TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT
 INTAKE_RECIPE_KEY_PREFIXES = ("intake_", "batch2_")
+AUDIT_TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
+HIGH_SIGNAL_NAMED_FOOD_GROUPS = {
+    "tuna": ({"tuna", "tuna_steak"}, ("\u0442\u0443\u043d\u0446", "tuna")),
+    "chicken": (
+        {
+            "chicken_breast",
+            "chicken_breast_cooked",
+            "chicken_broth",
+            "chicken_drumstick",
+            "chicken_ground",
+            "chicken_liver",
+            "chicken_thigh",
+            "chicken_thigh_skinless",
+            "turkey_or_chicken_breast",
+        },
+        ("\u043a\u0443\u0440\u0438\u0446", "\u043a\u0443\u0440\u0438\u043d", "chicken"),
+    ),
+    "turkey": ({"turkey", "turkey_breast_cooked", "turkey_ground", "turkey_or_chicken_breast"}, ("\u0438\u043d\u0434\u0435\u0439\u043a", "turkey")),
+    "beef": (
+        {"beef_broth", "beef_chuck", "beef_ground", "beef_sirloin", "beef_stew", "ground_meat"},
+        ("\u0433\u043e\u0432\u044f\u0434", "\u0433\u043e\u0432\u044f\u0436", "beef"),
+    ),
+    "pork": (
+        {"bacon", "chorizo", "ham", "italian_sausage", "pork_chop", "pork_loin", "pork_tenderloin", "prosciutto", "sausage"},
+        ("\u0441\u0432\u0438\u043d", "\u0431\u0435\u043a\u043e\u043d", "\u0432\u0435\u0442\u0447\u0438\u043d", "\u0447\u043e\u0440\u0438\u0437", "pork", "bacon", "ham", "chorizo"),
+    ),
+    "salmon": ({"salmon"}, ("\u043b\u043e\u0441\u043e\u0441", "salmon")),
+    "shrimp": ({"shrimp"}, ("\u043a\u0440\u0435\u0432\u0435\u0442", "shrimp", "prawn")),
+    "egg": ({"egg", "egg_white", "egg_white_extra", "egg_yolk", "egg_noodles"}, ("\u044f\u0439", "\u044f\u0438\u0447", "\u0436\u0435\u043b\u0442\u043e\u043a", "egg")),
+    "cottage_cheese": ({"cottage_cheese", "lactose_free_cottage_cheese"}, ("\u0442\u0432\u043e\u0440\u043e\u0433", "cottage")),
+    "yogurt": ({"greek_yogurt", "lactose_free_yogurt"}, ("\u0439\u043e\u0433\u0443\u0440\u0442", "yogurt", "yoghurt")),
+    "cheese": (
+        {
+            "american_cheese",
+            "cheddar",
+            "cream_cheese",
+            "feta",
+            "goat_cheese",
+            "gouda",
+            "mascarpone",
+            "monterey_jack",
+            "mozzarella",
+            "parmesan",
+            "pecorino",
+            "processed_cheese",
+            "ricotta",
+            "swiss_cheese",
+            "wensleydale_cheese",
+        },
+        (
+            "\u0441\u044b\u0440",
+            "\u0444\u0435\u0442",
+            "\u0447\u0435\u0434\u0434\u0435\u0440",
+            "\u0433\u0430\u0443\u0434",
+            "\u043f\u0430\u0440\u043c\u0435\u0437\u0430\u043d",
+            "\u0440\u0438\u043a\u043e\u0442\u0442",
+            "\u043c\u043e\u0446\u0430\u0440\u0435\u043b",
+            "\u0433\u0440\u044e\u0439",
+            "cheese",
+            "feta",
+            "cheddar",
+            "gouda",
+            "parmesan",
+            "ricotta",
+            "mozzarella",
+        ),
+    ),
+    "mushrooms": ({"mushrooms", "shiitake"}, ("\u0433\u0440\u0438\u0431", "\u0448\u0430\u043c\u043f\u0438\u043d\u044c\u043e\u043d", "\u0448\u0438\u0438\u0442\u0430\u043a\u0435", "mushroom")),
+    "rice": ({"rice", "rice_flour", "rice_noodles"}, ("\u0440\u0438\u0441", "rice")),
+    "potato": ({"potato"}, ("\u043a\u0430\u0440\u0442\u043e\u0444", "potato")),
+    "avocado": ({"avocado"}, ("\u0430\u0432\u043e\u043a\u0430\u0434\u043e", "avocado")),
+}
+EXPECTED_PRODUCT_DECISION_NAMED_FOOD_GAPS = {
+    ("r171_spagetti_boloneze_s_govyadinoy_i_svininoy", "pork"),
+    ("r575_ogurtsy_s_tuntsovym_kremom", "avocado"),
+    ("r590_risovye_hlebtsy_so_shprotnym_pashtetom", "rice"),
+}
 
 
 def _source_recipes() -> list[dict]:
@@ -72,6 +150,25 @@ def _runtime_recipe_by_no() -> dict[int, object]:
         for recipe in built_in_recipes()
         if recipe.id.startswith("r") and recipe.id[1:4].isdigit()
     }
+
+
+def _audit_tokens(text: str) -> list[str]:
+    return AUDIT_TOKEN_RE.findall(str(text or "").casefold())
+
+
+def _has_audited_food_mention(text: str, stems: tuple[str, ...]) -> bool:
+    tokens = _audit_tokens(text)
+    for index, token in enumerate(tokens):
+        if set(tokens[max(0, index - 2) : index]) & {"\u0431\u0435\u0437", "without", "no"}:
+            continue
+        for stem in stems:
+            if token.startswith(stem):
+                if stem == "\u0441\u044b\u0440" and token.startswith(("\u0441\u044b\u0440\u043d\u0438\u043a", "\u0441\u044b\u0440\u043e")):
+                    continue
+                if stem == "egg" and token.startswith("eggplant"):
+                    continue
+                return True
+    return False
 
 
 def test_curated_recipe_data_has_full_calculation_coverage() -> None:
@@ -498,6 +595,97 @@ def test_curated_recipe_runtime_preserves_normal_ingredient_mappings() -> None:
     assert recipes[247].ingredients_g["chili_oil"] > 0
     assert recipes[287].ingredients_g["tomato"] == 130.0
     assert recipes[306].ingredients_g["pecans"] == 5.0
+
+
+def test_rice_balls_with_tuna_has_positive_tuna_portion_and_nutrition() -> None:
+    recipe_id = "r579_risovye_shariki_s_tuntsom"
+    recipes = {recipe.id: recipe for recipe in built_in_recipes()}
+    foods = {food.id: food for food in curated_foods()}
+    ingredients = _source_ingredients()
+    nutrition = {
+        row["recipe_id"]: row
+        for row in json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    }
+    tuna_row = next(row for row in ingredients if row["recipe_id"] == recipe_id and row["food_id"] == "tuna")
+    recipe = recipes[recipe_id]
+
+    assert tuna_row["grams"] == 40.0
+    assert tuna_row["is_optional"] is False
+    assert recipe.ingredients_g["tuna"] == 40.0
+    assert nutrition[recipe_id]["protein_g"] > 20
+    assert nutrition[recipe_id]["vitamin_b12_mcg"] > 0
+
+    safety = evaluate_safety(
+        UserProfile(
+            age=32,
+            sex=Sex.FEMALE,
+            height_cm=168,
+            weight_kg=64,
+            goal=Goal.MAINTAIN,
+            activity=ActivityLevel.MODERATE,
+            meal_count=4,
+            restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u0442\u0443\u043d\u0435\u0446"),),
+        )
+    )
+
+    assert is_food_excluded(foods["tuna"], safety.excluded_food_names)
+    assert any(is_food_excluded(foods[food_id], safety.excluded_food_names) for food_id in recipe.ingredients_g)
+
+
+def test_curated_recipe_named_food_rows_are_structured_with_positive_portions() -> None:
+    ingredients = _source_ingredients()
+    by_no_and_raw = {
+        (row["recipe_no"], row["raw_text"]): row
+        for row in ingredients
+    }
+
+    cottage = by_no_and_raw[(40, "\u0442\u0432\u043e\u0440\u043e\u0436\u043d\u044b\u0439 \u0441\u044b\u0440 \u0437\u0435\u0440\u043d\u0435\u043d\u044b\u0439 \u0442\u0432\u043e\u0440\u043e\u0433 2% \u2014 20 \u0433")]
+    hard_cheese = by_no_and_raw[(67, "\u0442\u0432\u0435\u0440\u0434\u044b\u0439 \u0441\u044b\u0440 \u2014 14,2 \u0433")]
+    tuna = by_no_and_raw[(579, "\u0442\u0443\u043d\u0435\u0446 \u2014 0,25 \u0431\u0430\u043d\u043a\u0438")]
+
+    assert cottage["food_id"] == "cottage_cheese"
+    assert cottage["grams"] == 20.0
+    assert hard_cheese["food_id"] == "parmesan"
+    assert hard_cheese["grams"] == 14.2
+    assert tuna["food_id"] == "tuna"
+    assert tuna["grams"] == 40.0
+
+
+def test_high_signal_recipe_mentions_match_positive_structured_ingredients() -> None:
+    recipes = _source_recipes()
+    ingredients_by_recipe: dict[str, list[dict]] = defaultdict(list)
+    for row in _source_ingredients():
+        ingredients_by_recipe[row["recipe_id"]].append(row)
+
+    missing = []
+    for recipe in recipes:
+        rows = ingredients_by_recipe[recipe["recipe_id"]]
+        title = recipe.get("title_ru", "")
+        full_text = f'{title}\n{recipe.get("instructions_ru", "")}'
+        positive_food_ids = {
+            row["food_id"]
+            for row in rows
+            if row.get("food_id") and float(row.get("grams") or 0) > 0
+        }
+
+        for food_name, (food_ids, stems) in HIGH_SIGNAL_NAMED_FOOD_GROUPS.items():
+            title_mentions_food = _has_audited_food_mention(title, stems)
+            nonpositive_rows = [
+                row
+                for row in rows
+                if row.get("food_id") in food_ids
+                and float(row.get("grams") or 0) <= 0
+                and not ("\u0441\u0432\u0435\u0440\u0445\u0443" in str(row.get("raw_text") or "").casefold() and not title_mentions_food)
+            ]
+            if not title_mentions_food and not (
+                nonpositive_rows and _has_audited_food_mention(full_text, stems)
+            ):
+                continue
+            if positive_food_ids & food_ids:
+                continue
+            missing.append((recipe["recipe_id"], food_name))
+
+    assert sorted(missing) == sorted(EXPECTED_PRODUCT_DECISION_NAMED_FOOD_GAPS)
 
 
 def test_curated_recipe_titles_match_corrected_main_ingredients() -> None:
