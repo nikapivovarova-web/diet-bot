@@ -554,8 +554,8 @@ Payment no-payment invoice screen checks:
 - Confirm production prices only:
   - Stars monthly subscription: `450` Stars, auto-renewing monthly.
   - YooKassa monthly access: `799 RUB`, one-time 30-day access.
-  - One-day extra: `69 RUB` or `40` Stars.
-  - Weekly PDF extra: `349 RUB` or `199` Stars.
+  - One-day extra: `50 RUB` or `29` Stars.
+  - Weekly PDF extra: `250 RUB` or `141` Stars.
 - Confirm no `[TEST]` label or smoke price is visible.
 - Open the Stars invoice screen and back out before paying.
 - Open the YooKassa invoice screen and back out before paying.
