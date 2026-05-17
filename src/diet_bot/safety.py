@@ -39,6 +39,8 @@ class FoodExclusionCategory:
     ingredient_ids: tuple[str, ...]
     aliases: tuple[str, ...]
     excluded_tags: tuple[str, ...] = ()
+    allergy_extra_ingredient_ids: tuple[str, ...] = ()
+    allergy_extra_aliases: tuple[str, ...] = ()
 
 
 FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
@@ -61,6 +63,55 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
             "egg yolk",
             "egg noodles",
         ),
+        allergy_extra_ingredient_ids=("aioli", "mayonnaise", "chipotle_mayo"),
+        allergy_extra_aliases=(
+            "\u0430\u0439\u043e\u043b\u0438",
+            "\u043c\u0430\u0439\u043e\u043d\u0435\u0437",
+            "\u043c\u0430\u0439\u043e",
+            "\u0447\u0438\u043f\u043e\u0442\u043b\u0435 \u043c\u0430\u0439\u043e\u043d\u0435\u0437",
+            "\u0447\u0438\u043f\u043e\u0442\u043b\u0435 \u043c\u0430\u0439\u043e",
+            "aioli",
+            "mayonnaise",
+            "mayo",
+            "chipotle mayo",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="mayonnaise",
+        canonical_name="mayonnaise",
+        trigger_aliases=(
+            "\u0430\u0439\u043e\u043b\u0438",
+            "\u043c\u0430\u0439\u043e\u043d\u0435\u0437",
+            "\u043c\u0430\u0439\u043e",
+            "aioli",
+            "mayonnaise",
+            "mayo",
+        ),
+        ingredient_ids=("aioli", "mayonnaise", "chipotle_mayo"),
+        aliases=(
+            "\u0430\u0439\u043e\u043b\u0438",
+            "\u043c\u0430\u0439\u043e\u043d\u0435\u0437",
+            "\u043c\u0430\u0439\u043e",
+            "\u0447\u0438\u043f\u043e\u0442\u043b\u0435 \u043c\u0430\u0439\u043e\u043d\u0435\u0437",
+            "\u0447\u0438\u043f\u043e\u0442\u043b\u0435 \u043c\u0430\u0439\u043e",
+            "aioli",
+            "mayonnaise",
+            "mayo",
+            "chipotle mayo",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="apple",
+        canonical_name="apple",
+        trigger_aliases=("\u044f\u0431\u043b\u043e\u043a", "\u044f\u0431\u043b\u043e\u0447", "apple", "apples"),
+        ingredient_ids=("apple",),
+        aliases=(
+            "\u044f\u0431\u043b\u043e\u043a\u043e",
+            "\u044f\u0431\u043b\u043e\u043a\u0438",
+            "\u044f\u0431\u043b\u043e\u0447\u043d\u044b\u0439",
+            "apple",
+            "apples",
+        ),
     ),
     FoodExclusionCategory(
         canonical_id="broccoli",
@@ -76,10 +127,49 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
         ),
     ),
     FoodExclusionCategory(
+        canonical_id="citrus",
+        canonical_name="citrus fruit",
+        trigger_aliases=("\u0446\u0438\u0442\u0440\u0443\u0441", "\u0446\u0438\u0442\u0440\u0443\u0441\u043e\u0432", "citrus"),
+        ingredient_ids=("orange", "mandarin", "grapefruit", "lemon_juice", "lime_juice"),
+        aliases=(
+            "\u0446\u0438\u0442\u0440\u0443\u0441",
+            "\u0446\u0438\u0442\u0440\u0443\u0441\u043e\u0432\u044b\u0435",
+            "\u0430\u043f\u0435\u043b\u044c\u0441\u0438\u043d",
+            "\u0430\u043f\u0435\u043b\u044c\u0441\u0438\u043d\u044b",
+            "\u043c\u0430\u043d\u0434\u0430\u0440\u0438\u043d",
+            "\u043c\u0430\u043d\u0434\u0430\u0440\u0438\u043d\u044b",
+            "\u0433\u0440\u0435\u0439\u043f\u0444\u0440\u0443\u0442",
+            "\u043b\u0438\u043c\u043e\u043d\u043d\u044b\u0439 \u0441\u043e\u043a",
+            "\u043b\u0430\u0439\u043c\u043e\u0432\u044b\u0439 \u0441\u043e\u043a",
+            "citrus",
+            "orange",
+            "oranges",
+            "mandarin",
+            "mandarins",
+            "tangerine",
+            "tangerines",
+            "grapefruit",
+            "lemon juice",
+            "lime juice",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="orange",
+        canonical_name="orange",
+        trigger_aliases=("\u0430\u043f\u0435\u043b\u044c\u0441\u0438\u043d", "orange", "oranges"),
+        ingredient_ids=("orange",),
+        aliases=(
+            "\u0430\u043f\u0435\u043b\u044c\u0441\u0438\u043d",
+            "\u0430\u043f\u0435\u043b\u044c\u0441\u0438\u043d\u044b",
+            "orange",
+            "oranges",
+        ),
+    ),
+    FoodExclusionCategory(
         canonical_id="porridge",
         canonical_name="porridge",
-        trigger_aliases=("\u043a\u0430\u0448", "porridge"),
-        ingredient_ids=(),
+        trigger_aliases=("\u043a\u0430\u0448", "\u043e\u0432\u0441\u044f\u043d", "oat", "oats", "porridge"),
+        ingredient_ids=("oats", "oat_groats"),
         aliases=(
             "\u043a\u0430\u0448\u0430",
             "\u043a\u0430\u0448\u0438",
@@ -100,9 +190,50 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
             "\u043a\u0443\u043a\u0443\u0440\u0443\u0437\u043d\u0430\u044f \u043a\u0430\u0448\u0430",
             "\u043a\u0430\u0448\u0430 \u0438\u0437 \u043a\u0438\u043d\u043e\u0430",
             "porridge",
+            "oats",
             "oatmeal",
             "overnight oats",
             "oat porridge",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="fermented_dairy",
+        canonical_name="fermented dairy",
+        trigger_aliases=(
+            "\u043a\u0438\u0441\u043b\u043e\u043c\u043e\u043b",
+            "fermented dairy",
+            "cultured dairy",
+        ),
+        ingredient_ids=(
+            "buttermilk",
+            "greek_yogurt",
+            "lactose_free_yogurt",
+            "kefir",
+            "cottage_cheese",
+            "lactose_free_cottage_cheese",
+            "sour_cream",
+            "creme_fraiche",
+        ),
+        aliases=(
+            "\u043a\u0438\u0441\u043b\u043e\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+            "\u043a\u0438\u0441\u043b\u043e\u043c\u043e\u043b\u043e\u0447\u043a\u0430",
+            "\u043a\u0435\u0444\u0438\u0440",
+            "\u0439\u043e\u0433\u0443\u0440\u0442",
+            "\u0433\u0440\u0435\u0447\u0435\u0441\u043a\u0438\u0439 \u0439\u043e\u0433\u0443\u0440\u0442",
+            "\u0442\u0432\u043e\u0440\u043e\u0433",
+            "\u0441\u043c\u0435\u0442\u0430\u043d\u0430",
+            "\u043a\u0440\u0435\u043c \u0444\u0440\u0435\u0448",
+            "\u043a\u0440\u0435\u043c-\u0444\u0440\u0435\u0448",
+            "fermented dairy",
+            "cultured dairy",
+            "buttermilk",
+            "yogurt",
+            "yoghurt",
+            "greek yogurt",
+            "kefir",
+            "cottage cheese",
+            "sour cream",
+            "creme fraiche",
         ),
     ),
     FoodExclusionCategory(
@@ -119,9 +250,13 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
             "buttermilk",
             "greek_yogurt",
             "lactose_free_yogurt",
+            "kefir",
             "cottage_cheese",
             "lactose_free_cottage_cheese",
+            "cream",
             "cream_cheese",
+            "sour_cream",
+            "creme_fraiche",
             "goat_cheese",
             "american_cheese",
             "processed_cheese",
@@ -129,24 +264,39 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
             "gouda",
             "cheddar",
             "feta",
+            "monterey_jack",
             "mozzarella",
             "parmesan",
+            "pecorino",
             "ricotta",
             "mascarpone",
+            "wensleydale_cheese",
+            "butter",
         ),
         aliases=(
             "\u043c\u043e\u043b\u043e\u043a\u043e",
             "\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+            "\u043c\u043e\u043b\u043e\u0447\u043a\u0430",
             "\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0439",
             "\u043c\u043e\u043b\u043e\u0447\u043d\u0430\u044f",
             "\u043c\u043e\u043b\u043e\u0447\u043d\u043e\u0435",
             "\u0439\u043e\u0433\u0443\u0440\u0442",
+            "\u043a\u0435\u0444\u0438\u0440",
             "\u0442\u0432\u043e\u0440\u043e\u0433",
+            "\u0441\u043b\u0438\u0432\u043a\u0438",
+            "\u0441\u043c\u0435\u0442\u0430\u043d\u0430",
+            "\u0441\u043b\u0438\u0432\u043e\u0447\u043d\u043e\u0435 \u043c\u0430\u0441\u043b\u043e",
             "\u0441\u044b\u0440",
             "milk",
             "dairy",
+            "buttermilk",
             "yogurt",
+            "kefir",
             "cottage cheese",
+            "cream",
+            "sour cream",
+            "creme fraiche",
+            "butter",
             "cheese",
         ),
     ),
@@ -276,29 +426,42 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
         canonical_name="fish",
         trigger_aliases=("\u0440\u044b\u0431", "fish", "salmon", "tuna", "cod"),
         ingredient_ids=(
+            "anchovies",
             "cod_fillet",
+            "cod_liver_canned_drained",
             "fish_sauce",
             "fish_stock",
             "mackerel",
             "salmon",
             "smoked_white_fish",
+            "sprats",
             "tuna",
             "tuna_steak",
+            "trout",
             "white_fish",
         ),
         aliases=(
             "\u0440\u044b\u0431\u0430",
             "\u0440\u044b\u0431\u043d\u044b\u0439",
+            "\u0444\u043e\u0440\u0435\u043b\u044c",
             "\u043b\u043e\u0441\u043e\u0441\u044c",
             "\u0442\u0443\u043d\u0435\u0446",
             "\u0442\u0440\u0435\u0441\u043a\u0430",
             "\u0441\u043a\u0443\u043c\u0431\u0440\u0438\u044f",
+            "\u0448\u043f\u0440\u043e\u0442\u044b",
+            "\u0430\u043d\u0447\u043e\u0443\u0441\u044b",
+            "\u043f\u0435\u0447\u0435\u043d\u044c \u0442\u0440\u0435\u0441\u043a\u0438",
             "\u0431\u0435\u043b\u0430\u044f \u0440\u044b\u0431\u0430",
             "fish",
+            "trout",
             "salmon",
             "tuna",
             "cod",
+            "cod liver",
             "mackerel",
+            "sprats",
+            "anchovy",
+            "anchovies",
             "white fish",
             "fish sauce",
             "fish stock",
@@ -327,16 +490,49 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
             "\u043a\u0430\u043b\u044c\u043c\u0430\u0440",
             "\u0433\u0440\u0435\u0431\u0435\u0448\u043a\u0438",
             "\u043a\u0440\u0430\u0431",
+            "\u043c\u043e\u0440\u0441\u043a\u043e\u0439 \u043c\u0438\u043a\u0441",
             "seafood",
             "shrimp",
             "shrimps",
             "prawn",
             "prawns",
             "mussels",
+            "squid",
             "calamari",
             "scallops",
             "clams",
             "crab",
+        ),
+    ),
+    FoodExclusionCategory(
+        canonical_id="poultry",
+        canonical_name="poultry",
+        trigger_aliases=("\u043f\u0442\u0438\u0446", "poultry"),
+        ingredient_ids=(
+            "chicken_breast",
+            "chicken_breast_cooked",
+            "chicken_broth",
+            "chicken_drumstick",
+            "chicken_ground",
+            "chicken_liver",
+            "chicken_thigh",
+            "chicken_thigh_skinless",
+            "turkey",
+            "turkey_breast_cooked",
+            "turkey_ground",
+            "turkey_or_chicken_breast",
+        ),
+        aliases=(
+            "\u043f\u0442\u0438\u0446\u0430",
+            "\u043f\u0442\u0438\u0446\u044b",
+            "\u043a\u0443\u0440\u0438\u0446\u0430",
+            "\u043a\u0443\u0440\u0438\u043d\u0430\u044f",
+            "\u043a\u0443\u0440\u0438\u043d\u044b\u0439",
+            "\u0438\u043d\u0434\u0435\u0439\u043a\u0430",
+            "\u0438\u043d\u0434\u0435\u0439\u043a\u0438",
+            "poultry",
+            "chicken",
+            "turkey",
         ),
     ),
     FoodExclusionCategory(
@@ -701,7 +897,13 @@ def _apply_restrictions(
         value = restriction.normalized_value
         if restriction.type in {RestrictionType.ALLERGY, RestrictionType.EXCLUDED_FOOD}:
             categories = _matching_exclusion_categories(value)
-            excluded_food_names.update(_expanded_excluded_food_names(value, categories))
+            excluded_food_names.update(
+                _expanded_excluded_food_names(
+                    value,
+                    categories,
+                    include_allergy_extras=restriction.type == RestrictionType.ALLERGY,
+                )
+            )
             for category in categories:
                 excluded_tags.update(category.excluded_tags)
         if "\u043b\u0430\u043a\u0442\u043e\u0437" in value or "lactose" in value:
@@ -783,18 +985,26 @@ def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
 def _expanded_excluded_food_names(
     value: str,
     categories: tuple[FoodExclusionCategory, ...] | None = None,
+    *,
+    include_allergy_extras: bool = False,
 ) -> set[str]:
     names = {_normalize_exclusion_match_text(value)}
     matched_categories = categories if categories is not None else _matching_exclusion_categories(value)
     for category in matched_categories:
-        names.update(
-            _normalize_exclusion_match_text(term)
-            for term in (
-                category.canonical_id,
-                category.canonical_name,
-                *category.ingredient_ids,
-                *category.aliases,
+        terms = (
+            category.canonical_id,
+            category.canonical_name,
+            *category.ingredient_ids,
+            *category.aliases,
+        )
+        if include_allergy_extras:
+            terms = (
+                *terms,
+                *category.allergy_extra_ingredient_ids,
+                *category.allergy_extra_aliases,
             )
+        names.update(
+            _normalize_exclusion_match_text(term) for term in terms
         )
     return {name for name in names if name}
 

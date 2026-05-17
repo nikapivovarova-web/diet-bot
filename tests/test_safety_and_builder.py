@@ -34,7 +34,12 @@ from diet_bot.domain import (
 )
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.recipe_catalog import RecipeTemplate
-from diet_bot.safety import evaluate_safety, is_food_excluded, is_name_excluded
+from diet_bot.safety import (
+    FOOD_EXCLUSION_CATEGORIES,
+    evaluate_safety,
+    is_food_excluded,
+    is_name_excluded,
+)
 from diet_bot.telegram_app import (
     WEEK_PLAN_CANDIDATE_COUNT,
     WEEK_PLAN_DAYS,
@@ -343,16 +348,42 @@ def _safety_for_exclusion(value: str):
     )
 
 
+def _safety_for_restriction(restriction_type: RestrictionType, value: str):
+    return evaluate_safety(
+        profile_with(restrictions=(Restriction(restriction_type, value),))
+    )
+
+
 def _eligible_food_ids_for_exclusion(value: str) -> set[str]:
     safety = _safety_for_exclusion(value)
     return {food.id for food in filter_foods(built_in_foods(), safety)}
+
+
+def _excluded_catalog_food_ids(
+    restriction_type: RestrictionType,
+    value: str,
+    food_ids: set[str],
+) -> set[str]:
+    safety = _safety_for_restriction(restriction_type, value)
+    foods_by_id = {food.id: food for food in built_in_foods()}
+    missing_ids = food_ids - foods_by_id.keys()
+
+    assert not missing_ids
+    return {
+        food_id
+        for food_id in food_ids
+        if is_food_excluded(foods_by_id[food_id], safety.excluded_food_names)
+        or foods_by_id[food_id].has_any_tag(set(safety.excluded_tags))
+    }
 
 
 @pytest.mark.parametrize(
     ("restriction_value", "blocked_food_ids"),
     (
         ("\u044f\u0439\u0446\u0430", {"egg", "egg_white", "egg_white_extra", "egg_yolk", "egg_noodles"}),
+        ("\u044f\u0431\u043b\u043e\u043a\u0438", {"apple"}),
         ("\u0431\u0435\u0437 \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438", {"broccoli"}),
+        ("\u043e\u0432\u0441\u044f\u043d\u043a\u0430", {"oats", "oat_groats"}),
         ("\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b", {"milk", "greek_yogurt", "cottage_cheese"}),
         ("\u043c\u043e\u043b\u043e\u0447\u043a\u0430", {"milk", "greek_yogurt", "cottage_cheese"}),
         ("\u0442\u0432\u043e\u0440\u043e\u0433", {"cottage_cheese", "lactose_free_cottage_cheese"}),
@@ -425,6 +456,167 @@ def test_russian_food_exclusion_aliases_filter_ingredients(
     blocked_food_id: str,
 ) -> None:
     assert blocked_food_id not in _eligible_food_ids_for_exclusion(restriction_value)
+
+
+def test_egg_allergy_blocks_mayonnaise_composites_but_egg_exclusion_stays_soft() -> None:
+    egg_ids = {"egg", "egg_white", "egg_yolk", "egg_noodles"}
+    mayo_ids = {"aioli", "mayonnaise", "chipotle_mayo"}
+
+    allergy_blocked = _excluded_catalog_food_ids(RestrictionType.ALLERGY, "\u044f\u0439\u0446\u0430", egg_ids | mayo_ids)
+    exclusion_blocked = _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u043d\u0435 \u0435\u043c \u044f\u0439\u0446\u0430",
+        egg_ids | mayo_ids,
+    )
+
+    assert allergy_blocked == egg_ids | mayo_ids
+    assert egg_ids <= exclusion_blocked
+    assert mayo_ids.isdisjoint(exclusion_blocked)
+
+
+def test_mayonnaise_exclusion_blocks_mayo_variants() -> None:
+    mayo_ids = {"aioli", "mayonnaise", "chipotle_mayo"}
+
+    assert _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u043d\u0435 \u0435\u043c \u043c\u0430\u0439\u043e\u043d\u0435\u0437",
+        mayo_ids,
+    ) == mayo_ids
+
+
+@pytest.mark.parametrize("restriction_value", ("\u0446\u0438\u0442\u0440\u0443\u0441", "\u0446\u0438\u0442\u0440\u0443\u0441\u043e\u0432\u044b\u0435"))
+def test_citrus_exclusion_blocks_curated_citrus_ids(restriction_value: str) -> None:
+    citrus_ids = {"orange", "mandarin", "grapefruit", "lemon_juice", "lime_juice"}
+
+    assert _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        restriction_value,
+        citrus_ids,
+    ) == citrus_ids
+
+
+def test_orange_exclusion_blocks_orange_without_expanding_to_all_citrus() -> None:
+    citrus_ids = {"orange", "mandarin", "grapefruit", "lemon_juice", "lime_juice"}
+
+    assert _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u0430\u043f\u0435\u043b\u044c\u0441\u0438\u043d\u044b",
+        citrus_ids,
+    ) == {"orange"}
+
+
+def test_fermented_dairy_phrase_blocks_fermented_dairy_variants() -> None:
+    fermented_dairy_ids = {
+        "greek_yogurt",
+        "kefir",
+        "cottage_cheese",
+        "sour_cream",
+        "creme_fraiche",
+    }
+
+    assert _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u043d\u0435 \u0435\u043c \u043a\u0438\u0441\u043b\u043e\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+        fermented_dairy_ids,
+    ) == fermented_dairy_ids
+
+
+def test_dairy_phrase_blocks_broader_dairy_products() -> None:
+    dairy_ids = {
+        "milk",
+        "buttermilk",
+        "greek_yogurt",
+        "kefir",
+        "cottage_cheese",
+        "cream",
+        "sour_cream",
+        "creme_fraiche",
+        "cheddar",
+        "feta",
+        "mozzarella",
+        "parmesan",
+        "ricotta",
+        "butter",
+    }
+
+    assert _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+        dairy_ids,
+    ) == dairy_ids
+
+
+def test_poultry_exclusion_blocks_chicken_and_turkey() -> None:
+    poultry_ids = {"chicken_breast", "chicken_ground", "turkey", "turkey_ground"}
+
+    assert _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u043f\u0442\u0438\u0446\u0430",
+        poultry_ids,
+    ) == poultry_ids
+
+
+def test_fish_and_seafood_exclusions_are_separate_categories() -> None:
+    fish_ids = {"trout", "sprats", "anchovies", "cod_liver_canned_drained"}
+    seafood_ids = {"shrimp", "calamari", "mussels", "seafood_mix"}
+
+    fish_blocked = _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u0440\u044b\u0431\u0430",
+        fish_ids | seafood_ids,
+    )
+    seafood_blocked = _excluded_catalog_food_ids(
+        RestrictionType.EXCLUDED_FOOD,
+        "\u043c\u043e\u0440\u0435\u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+        fish_ids | seafood_ids,
+    )
+
+    assert fish_ids <= fish_blocked
+    assert seafood_ids.isdisjoint(fish_blocked)
+    assert seafood_ids <= seafood_blocked
+    assert fish_ids.isdisjoint(seafood_blocked)
+
+
+def test_catalog_risk_ingredients_are_covered_by_exclusion_taxonomy_or_allowlisted() -> None:
+    risk_ingredient_ids = {
+        "aioli",
+        "mayonnaise",
+        "chipotle_mayo",
+        "orange",
+        "mandarin",
+        "grapefruit",
+        "lemon_juice",
+        "lime_juice",
+        "greek_yogurt",
+        "kefir",
+        "cottage_cheese",
+        "sour_cream",
+        "creme_fraiche",
+        "chicken_breast",
+        "chicken_ground",
+        "turkey",
+        "turkey_ground",
+        "trout",
+        "sprats",
+        "anchovies",
+        "cod_liver_canned_drained",
+        "shrimp",
+        "calamari",
+        "mussels",
+        "seafood_mix",
+    }
+    explicitly_allowlisted_ids: set[str] = set()
+    category_ingredient_ids = {
+        food_id
+        for category in FOOD_EXCLUSION_CATEGORIES
+        for food_id in category.ingredient_ids
+    }
+    catalog_food_ids = {food.id for food in built_in_foods()}
+    missing_from_catalog = risk_ingredient_ids - catalog_food_ids
+    uncovered_ids = risk_ingredient_ids - category_ingredient_ids - explicitly_allowlisted_ids
+
+    assert not missing_from_catalog
+    assert not uncovered_ids
 
 
 def test_food_exclusion_word_boundaries_avoid_false_positives() -> None:
