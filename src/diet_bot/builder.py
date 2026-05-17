@@ -1371,6 +1371,12 @@ def _rank_recipes(
                 current_total,
                 target,
             )
+        if ranking_mode == "protein_floor":
+            macro_penalty += _recipe_projected_protein_floor_shortfall_penalty(
+                projected,
+                current_total,
+                target,
+            )
         energy_penalty = _recipe_projected_energy_penalty(
             projected,
             slot_min_energy,
@@ -1640,6 +1646,28 @@ def _recipe_projected_protein_floor_bonus(
     estimated_protein = estimated.get("protein_g")
     protein_density = estimated_protein / max(1.0, estimated.get("energy_kcal"))
     return min(estimated_protein, protein_gap) / max(1.0, protein_floor) * 30.0 + protein_density * 10.0
+
+
+def _recipe_projected_protein_floor_shortfall_penalty(
+    estimated: NutrientVector | None,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    if estimated is None:
+        return 0.0
+
+    protein_floor = _protein_hard_floor(target)
+    current_protein = current_total.get("protein_g")
+    if current_protein + 0.01 >= protein_floor:
+        return 0.0
+
+    projected_protein = current_protein + estimated.get("protein_g")
+    if projected_protein + 0.01 >= protein_floor:
+        return 0.0
+
+    target_protein = max(1.0, target.get("protein_g"))
+    remaining_gap = protein_floor - projected_protein
+    return min(25.0, remaining_gap / target_protein * 60.0)
 
 
 def _recipe_macro_penalty(recipe: RecipeTemplate, current_total: NutrientVector, target: NutrientVector) -> float:
