@@ -274,11 +274,11 @@ TRY_FREE_TEXT = "🥗 Попробовать бесплатно"
 SUBSCRIBE_MONTH_TEXT = "💳 Подписка на месяц - 799 ₽"
 SUBSCRIBE_CTA_TEXT = "💳 Оформить подписку"
 SUBSCRIPTION_PRICE_RUB = 799
-EXTRA_ONE_DAY_PRICE_RUB = 69
-EXTRA_WEEKLY_PDF_PRICE_RUB = 349
+EXTRA_ONE_DAY_PRICE_RUB = 50
+EXTRA_WEEKLY_PDF_PRICE_RUB = 250
 SUBSCRIPTION_STARS_AMOUNT = 450
-EXTRA_ONE_DAY_STARS_AMOUNT = 40
-EXTRA_WEEKLY_PDF_STARS_AMOUNT = 199
+EXTRA_ONE_DAY_STARS_AMOUNT = 29
+EXTRA_WEEKLY_PDF_STARS_AMOUNT = 141
 TEST_SUBSCRIPTION_STARS_AMOUNT = 1
 TEST_SUBSCRIPTION_PRICE_RUB = 100
 SUBSCRIPTION_PAYMENT_TEXT = (
@@ -367,7 +367,7 @@ WEEK_PLAN_CANDIDATE_COUNT = 4
 WEEK_PDF_STATUS_UPDATE_SECONDS = 4.0
 WEEK_PDF_STATUS_INITIAL_TEXT = (
     "Собираю недельный PDF.\n\n"
-    "Это может занять до минуты. Пожалуйста, не запускайте расчет повторно."
+    "Обычно это занимает около минуты, иногда пару минут. Пожалуйста, не запускайте расчет повторно."
 )
 WEEK_PDF_STATUS_FRAMES = (
     "Собираю недельный PDF.\n\nПодбираю блюда под вашу анкету.",

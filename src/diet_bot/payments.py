@@ -212,12 +212,12 @@ _PAYMENT_PRODUCT_INVOICE_CATALOG: Mapping[
     ),
     (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY): (
         PaymentCurrency.XTR,
-        40,
+        29,
         None,
     ),
     (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF): (
         PaymentCurrency.XTR,
-        199,
+        141,
         None,
     ),
     (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH): (
@@ -227,12 +227,12 @@ _PAYMENT_PRODUCT_INVOICE_CATALOG: Mapping[
     ),
     (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY): (
         PaymentCurrency.RUB,
-        6_900,
+        5_000,
         None,
     ),
     (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF): (
         PaymentCurrency.RUB,
-        34_900,
+        25_000,
         None,
     ),
 }

@@ -53,7 +53,7 @@ No payment webhook or external PDF service env is required in this clean state. 
 
 - Telegram Stars monthly is a true auto-renewing Telegram Stars subscription: production price `450` Stars, smoke price `1` Star, and the subscription behavior still applies in smoke.
 - YooKassa/card monthly is a one-time 30-day access purchase: production price `799 RUB`, smoke price `100 RUB` / `10_000` minor units. Users buy the next period manually.
-- One-day extra and weekly PDF extra are one-time purchases: production prices `69 RUB` / `40` Stars and `349 RUB` / `199` Stars.
+- One-day extra and weekly PDF extra are one-time purchases: production prices `50 RUB` / `29` Stars and `250 RUB` / `141` Stars.
 - The subscriber cabinet exposes cancel/re-enable controls only for Stars subscription renewal. Canceling renewal keeps paid access active until the current period end.
 
 ## Run Telegram Bot Locally

@@ -57,6 +57,7 @@ def test_button_questions_have_options() -> None:
     assert questions["sex"].options == ("👨 Мужчина", "👩 Женщина")
     assert questions["goal"].options == ("⬇️ Похудение", "⚖️ Поддержание", "💪 Набор")
     assert questions["meal_count"].options == ("3", "4", "5")
+    assert questions["cooking_time"].prompt == "Какие рецепты вам больше подходят?"
     assert questions["cooking_time"].options == ("Побыстрее и попроще", "Можно чуть интереснее")
     assert "⚡ Очень высокая" in questions["activity"].options
     assert questions["allergies"].options == ("Нет",)

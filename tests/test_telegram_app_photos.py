@@ -878,8 +878,8 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     assert "4 недельных PDF-рациона" in SUBSCRIPTION_PAYMENT_TEXT
     assert "5 рационов на 1 день" in SUBSCRIPTION_PAYMENT_TEXT
     assert "Разовые покупки" not in SUBSCRIPTION_PAYMENT_TEXT
-    assert "69 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
-    assert "349 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
+    assert "50 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
+    assert "250 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "не является медицинской консультацией" in SUBSCRIPTION_PAYMENT_TEXT
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
@@ -892,6 +892,10 @@ def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
     day_keyboard = _paywall_keyboard(preferred="one_day")
     week_keyboard = _paywall_keyboard(preferred="weekly_pdf")
 
+    assert BUY_EXTRA_ONE_DAY_RU_CARD_TEXT == "🥗 Купить 1 дневной рацион - 50 ₽"
+    assert BUY_EXTRA_ONE_DAY_TEXT == "⭐ Купить 1 дневной рацион - 29 Stars"
+    assert BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT == "📄 Купить недельный PDF - 250 ₽"
+    assert BUY_EXTRA_WEEKLY_PDF_TEXT == "⭐ Купить 1 недельный PDF - 141 Stars"
     assert (day_keyboard.inline_keyboard[0][0].text, day_keyboard.inline_keyboard[0][0].callback_data) == (
         BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
         CALLBACK_PAY_RU_EXTRA_ONE_DAY,
@@ -1091,7 +1095,7 @@ async def test_extra_pre_checkout_without_active_subscription_is_rejected(monkey
             order_id="order_extra",
             nonce="nonce_extra",
             product=PaymentProduct.EXTRA_ONE_DAY,
-            amount=40,
+            amount=29,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1180,7 +1184,7 @@ async def test_duplicate_successful_payment_handler_does_not_grant_twice(monkeyp
             order_id="order_extra_day",
             nonce="nonce_extra_day",
             product=PaymentProduct.EXTRA_ONE_DAY,
-            amount=40,
+            amount=29,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1288,7 +1292,7 @@ async def test_extra_successful_payment_handler_grants_only_with_active_subscrip
             order_id="order_extra_active",
             nonce="nonce_extra_active",
             product=PaymentProduct.EXTRA_WEEKLY_PDF,
-            amount=199,
+            amount=141,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1296,7 +1300,7 @@ async def test_extra_successful_payment_handler_grants_only_with_active_subscrip
     message.successful_payment = _successful_payment_for_order(
         order,
         telegram_charge_id="tg-charge-weekly-extra1",
-        total_amount=199,
+        total_amount=141,
     )
 
     await telegram_app.handle_successful_payment(message)
@@ -1315,7 +1319,7 @@ async def test_extra_successful_payment_handler_without_active_subscription_does
             order_id="order_extra_inactive",
             nonce="nonce_extra_inactive",
             product=PaymentProduct.EXTRA_ONE_DAY,
-            amount=40,
+            amount=29,
         ),
     )
     monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
@@ -1422,7 +1426,7 @@ async def test_admin_chargeback_command_calls_reversal_core_and_returns_redacted
         order_id="order_chargeback_secret",
         charge_id="tg-chargeback-secret",
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         entitlement=telegram_app.Entitlement(
             subscription_period_start=datetime.now(UTC).isoformat(),
             subscription_period_end=(datetime.now(UTC) + timedelta(days=3)).isoformat(),
@@ -1614,7 +1618,7 @@ async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkey
     assert invoice["currency"] == "XTR"
     assert invoice["payload"] == f"diet:order:{order_id}:{nonce}"
     assert order.product == PaymentProduct.EXTRA_ONE_DAY
-    assert invoice["prices"][0].amount == 40
+    assert invoice["prices"][0].amount == 29
     assert invoice["subscription_period"] is None
 
 
@@ -1633,7 +1637,7 @@ async def test_send_extra_weekly_pdf_invoice_link_creates_one_time_stars_invoice
     assert invoice["currency"] == "XTR"
     assert invoice["payload"] == f"diet:order:{order_id}:{nonce}"
     assert order.product == PaymentProduct.EXTRA_WEEKLY_PDF
-    assert invoice["prices"][0].amount == 199
+    assert invoice["prices"][0].amount == 141
     assert invoice["subscription_period"] is None
 
 
@@ -1799,7 +1803,7 @@ async def test_ru_invoice_without_provider_token_shows_unavailable_message(monke
     assert message.bot.invoice_links == []
     sent_text, markup = message.texts[-1]
     assert "FoodBalance: 1 дневной рацион" in sent_text
-    assert "Стоимость: 69 ₽." in sent_text
+    assert "Стоимость: 50 ₽." in sent_text
     assert "YooKassa сейчас недоступна" in sent_text
     assert markup is None
 

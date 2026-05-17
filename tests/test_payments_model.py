@@ -397,8 +397,8 @@ def test_pre_checkout_validation_rejects_wrong_provider_or_product_when_expected
 @pytest.mark.parametrize(
     ("product", "amount"),
     [
-        (PaymentProduct.EXTRA_ONE_DAY, 40),
-        (PaymentProduct.EXTRA_WEEKLY_PDF, 199),
+        (PaymentProduct.EXTRA_ONE_DAY, 29),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 141),
     ],
 )
 def test_pre_checkout_validation_requires_active_subscription_for_extras_without_mutating_entitlement(
@@ -460,7 +460,7 @@ def test_extra_pre_checkout_rejects_when_subscription_expired_after_order_creati
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentCheckoutRepository(
@@ -618,7 +618,7 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
         (
             PaymentProvider.TELEGRAM_STARS,
             PaymentProduct.EXTRA_ONE_DAY,
-            40,
+            29,
             PaymentCurrency.XTR,
             False,
             None,
@@ -626,7 +626,7 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
         (
             PaymentProvider.TELEGRAM_STARS,
             PaymentProduct.EXTRA_WEEKLY_PDF,
-            199,
+            141,
             PaymentCurrency.XTR,
             False,
             None,
@@ -642,7 +642,7 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
         (
             PaymentProvider.YOOKASSA,
             PaymentProduct.EXTRA_ONE_DAY,
-            6_900,
+            5_000,
             PaymentCurrency.RUB,
             False,
             None,
@@ -650,7 +650,7 @@ def test_yookassa_subscription_invoice_metadata_contains_receipt_and_email_flags
         (
             PaymentProvider.YOOKASSA,
             PaymentProduct.EXTRA_WEEKLY_PDF,
-            34_900,
+            25_000,
             PaymentCurrency.RUB,
             False,
             None,
@@ -837,11 +837,11 @@ def test_discounted_order_rejects_catalog_amount_at_pre_checkout_and_success() -
     ("provider", "product", "currency", "amount"),
     [
         (PaymentProvider.TELEGRAM_STARS, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.XTR, 450),
-        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.XTR, 40),
-        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.XTR, 199),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.XTR, 29),
+        (PaymentProvider.TELEGRAM_STARS, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.XTR, 141),
         (PaymentProvider.YOOKASSA, PaymentProduct.SUBSCRIPTION_MONTH, PaymentCurrency.RUB, 79_900),
-        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.RUB, 6_900),
-        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.RUB, 34_900),
+        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_ONE_DAY, PaymentCurrency.RUB, 5_000),
+        (PaymentProvider.YOOKASSA, PaymentProduct.EXTRA_WEEKLY_PDF, PaymentCurrency.RUB, 25_000),
     ],
 )
 def test_product_invoice_metadata_contains_provider_product_currency_and_amount(
@@ -1072,8 +1072,8 @@ def test_create_or_reuse_pending_payment_order_creates_new_pending_order() -> No
 @pytest.mark.parametrize(
     ("product", "amount"),
     [
-        (PaymentProduct.EXTRA_ONE_DAY, 40),
-        (PaymentProduct.EXTRA_WEEKLY_PDF, 199),
+        (PaymentProduct.EXTRA_ONE_DAY, 29),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 141),
     ],
 )
 def test_create_pending_extra_payment_order_requires_active_subscription(
@@ -1225,7 +1225,7 @@ def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.YOOKASSA,
         product=PaymentProduct.EXTRA_WEEKLY_PDF,
-        amount=34_900,
+        amount=25_000,
         currency=PaymentCurrency.RUB,
         now=now,
         has_active_subscription=True,
@@ -1238,7 +1238,7 @@ def test_repeated_payment_order_creation_reuses_active_pending_order() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.YOOKASSA,
         product=PaymentProduct.EXTRA_WEEKLY_PDF,
-        amount=34_900,
+        amount=25_000,
         currency=PaymentCurrency.RUB,
         now=now + timedelta(minutes=1),
         has_active_subscription=True,
@@ -1263,7 +1263,7 @@ def test_expired_pending_payment_order_is_not_reused() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         currency=PaymentCurrency.XTR,
         status=PaymentOrderStatus.PENDING,
         created_at=now - timedelta(hours=1),
@@ -1277,7 +1277,7 @@ def test_expired_pending_payment_order_is_not_reused() -> None:
         delivery_chat_id=2002,
         provider=PaymentProvider.TELEGRAM_STARS,
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         currency=PaymentCurrency.XTR,
         now=now,
         has_active_subscription=True,
@@ -1496,7 +1496,7 @@ def test_extra_successful_payment_does_not_mutate_managed_subscription_state() -
         "order_extra_weekly_state",
         "nonce_extra_weekly_state",
         PaymentProduct.EXTRA_WEEKLY_PDF,
-        amount=199,
+        amount=141,
         expires_at=now + timedelta(minutes=5),
     )
     entitlement = _active_entitlement(now)
@@ -1530,7 +1530,7 @@ def test_duplicate_same_successful_payment_does_not_grant_twice() -> None:
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentLedgerRepository([order])
@@ -1687,8 +1687,8 @@ def test_successful_payment_rejects_wrong_provider_product_currency_or_amount(
 @pytest.mark.parametrize(
     ("product", "amount", "field_name"),
     [
-        (PaymentProduct.EXTRA_ONE_DAY, 40, "extra_one_day_remaining"),
-        (PaymentProduct.EXTRA_WEEKLY_PDF, 199, "extra_weekly_pdf_remaining"),
+        (PaymentProduct.EXTRA_ONE_DAY, 29, "extra_one_day_remaining"),
+        (PaymentProduct.EXTRA_WEEKLY_PDF, 141, "extra_weekly_pdf_remaining"),
     ],
 )
 def test_successful_payment_extras_require_active_subscription_at_success_time(
@@ -1738,7 +1738,7 @@ def test_extra_successful_payment_rejects_when_subscription_expired_after_pre_ch
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         expires_at=success_at + timedelta(minutes=5),
         pre_checkout_approved_at=pre_checkout_at,
     )
@@ -2131,13 +2131,13 @@ def test_duplicate_chargeback_does_not_revoke_newer_subscription() -> None:
     [
         (
             PaymentProduct.EXTRA_ONE_DAY,
-            40,
+            29,
             "extra_one_day_remaining",
             "extra_weekly_pdf_remaining",
         ),
         (
             PaymentProduct.EXTRA_WEEKLY_PDF,
-            199,
+            141,
             "extra_weekly_pdf_remaining",
             "extra_one_day_remaining",
         ),
@@ -2186,7 +2186,7 @@ def test_refund_consumed_extra_records_ignored_reason_without_wrong_quota_change
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentLedgerRepository([order])
@@ -2458,13 +2458,13 @@ def test_duplicate_orphan_reconciliation_does_not_grant_twice() -> None:
     event = _orphan_success_event(
         event_id="evt_orphan_extra1",
         product=PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
     )
     order = _payment_order(
         "order_day1",
         "nonce_day1",
         PaymentProduct.EXTRA_ONE_DAY,
-        amount=40,
+        amount=29,
         expires_at=now + timedelta(minutes=5),
     )
     repository = InMemoryPaymentLedgerRepository([order])

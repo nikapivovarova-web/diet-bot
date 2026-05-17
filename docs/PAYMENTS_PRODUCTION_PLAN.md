@@ -62,8 +62,8 @@ Old folder findings:
 
 - Product: `extra_one_day`.
 - Providers:
-  - Telegram Stars: `40` Stars.
-  - YooKassa/card: `6900` kopecks.
+  - Telegram Stars: `29` Stars.
+  - YooKassa/card: `5000` kopecks.
 - Must be purchasable and applicable only with active paid subscription access, unless a future explicit product decision changes this.
 - Extra quota is separate from monthly quota and is consumed only after monthly one-day quota is exhausted.
 
@@ -71,8 +71,8 @@ Old folder findings:
 
 - Product: `extra_weekly_pdf`.
 - Providers:
-  - Telegram Stars: `199` Stars.
-  - YooKassa/card: `34900` kopecks.
+  - Telegram Stars: `141` Stars.
+  - YooKassa/card: `25000` kopecks.
 - Must be purchasable and applicable only with active paid subscription access, unless a future explicit product decision changes this.
 - Delivery must be Telegram document PDF only. No text fallback weekly ration can satisfy this paid product.
 
