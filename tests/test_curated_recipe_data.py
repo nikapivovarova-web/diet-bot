@@ -95,11 +95,7 @@ HIGH_SIGNAL_NAMED_FOOD_GROUPS = {
     "potato": ({"potato"}, ("\u043a\u0430\u0440\u0442\u043e\u0444", "potato")),
     "avocado": ({"avocado"}, ("\u0430\u0432\u043e\u043a\u0430\u0434\u043e", "avocado")),
 }
-EXPECTED_PRODUCT_DECISION_NAMED_FOOD_GAPS = {
-    ("r171_spagetti_boloneze_s_govyadinoy_i_svininoy", "pork"),
-    ("r575_ogurtsy_s_tuntsovym_kremom", "avocado"),
-    ("r590_risovye_hlebtsy_so_shprotnym_pashtetom", "rice"),
-}
+EXPECTED_PRODUCT_DECISION_NAMED_FOOD_GAPS = set()
 
 
 def _source_recipes() -> list[dict]:
@@ -649,6 +645,153 @@ def test_curated_recipe_named_food_rows_are_structured_with_positive_portions() 
     assert hard_cheese["grams"] == 14.2
     assert tuna["food_id"] == "tuna"
     assert tuna["grams"] == 40.0
+
+
+def test_remaining_recipe_product_decisions_are_resolved() -> None:
+    recipes = {row["recipe_id"]: row for row in _source_recipes()}
+    ingredients = _source_ingredients()
+    ingredients_by_recipe: dict[str, list[dict]] = defaultdict(list)
+    for row in ingredients:
+        ingredients_by_recipe[row["recipe_id"]].append(row)
+    nutrition = {
+        row["recipe_id"]: row
+        for row in json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    }
+    foods = {food.id: food for food in curated_foods()}
+    source_foods = {
+        row["food_id"]: row
+        for row in json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    }
+    runtime_recipes = {recipe.id: recipe for recipe in built_in_recipes()}
+
+    bolognese_id = "r171_spagetti_boloneze_s_govyadinoy_i_svininoy"
+    bolognese = recipes[bolognese_id]
+    bolognese_rows = ingredients_by_recipe[bolognese_id]
+    bolognese_text = "\n".join(
+        [
+            bolognese["title_ru"],
+            bolognese["instructions_ru"],
+            "\n".join(row["raw_text"] for row in bolognese_rows),
+            "\n".join(row["ingredient_name_ru"] for row in bolognese_rows),
+        ]
+    ).casefold()
+    pork_ids = HIGH_SIGNAL_NAMED_FOOD_GROUPS["pork"][0]
+
+    assert "\u0441\u0432\u0438\u043d" not in bolognese_text
+    assert not (pork_ids & {row["food_id"] for row in bolognese_rows})
+    assert runtime_recipes[bolognese_id].ingredients_g["beef_ground"] == 125.0
+    assert "ground_meat" not in runtime_recipes[bolognese_id].ingredients_g
+
+    pork_safety = evaluate_safety(
+        UserProfile(
+            age=32,
+            sex=Sex.FEMALE,
+            height_cm=168,
+            weight_kg=64,
+            goal=Goal.MAINTAIN,
+            activity=ActivityLevel.MODERATE,
+            meal_count=4,
+            restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u0441\u0432\u0438\u043d\u0438\u043d\u0430"),),
+        )
+    )
+    beef_safety = evaluate_safety(
+        UserProfile(
+            age=32,
+            sex=Sex.FEMALE,
+            height_cm=168,
+            weight_kg=64,
+            goal=Goal.MAINTAIN,
+            activity=ActivityLevel.MODERATE,
+            meal_count=4,
+            restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u0433\u043e\u0432\u044f\u0434\u0438\u043d\u0430"),),
+        )
+    )
+    assert not any(
+        is_food_excluded(foods[food_id], pork_safety.excluded_food_names)
+        for food_id in runtime_recipes[bolognese_id].ingredients_g
+    )
+    assert is_food_excluded(foods["beef_ground"], beef_safety.excluded_food_names)
+
+    tuna_cream_id = "r575_ogurtsy_s_tuntsovym_kremom"
+    avocado_row = next(row for row in ingredients_by_recipe[tuna_cream_id] if row["food_id"] == "avocado")
+    assert avocado_row["raw_text"] == "\u0430\u0432\u043e\u043a\u0430\u0434\u043e \u2014 0,5 \u0448\u0442."
+    assert avocado_row["grams"] == 75.0
+    assert avocado_row["is_optional"] is False
+    assert runtime_recipes[tuna_cream_id].ingredients_g["avocado"] == 75.0
+    assert nutrition[tuna_cream_id]["fat_g"] > 10
+
+    avocado_safety = evaluate_safety(
+        UserProfile(
+            age=32,
+            sex=Sex.FEMALE,
+            height_cm=168,
+            weight_kg=64,
+            goal=Goal.MAINTAIN,
+            activity=ActivityLevel.MODERATE,
+            meal_count=4,
+            restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u0430\u0432\u043e\u043a\u0430\u0434\u043e"),),
+        )
+    )
+    assert is_food_excluded(foods["avocado"], avocado_safety.excluded_food_names)
+
+    sprat_crackers_id = "r590_risovye_hlebtsy_so_shprotnym_pashtetom"
+    sprat_crackers = recipes[sprat_crackers_id]
+    cracker_row = next(row for row in ingredients_by_recipe[sprat_crackers_id] if row["food_id"] == "crackers")
+    sprat_cracker_text = "\n".join(
+        [
+            sprat_crackers["title_ru"],
+            sprat_crackers["short_description_ru"],
+            sprat_crackers["instructions_ru"],
+            sprat_crackers["photo_prompt_ru"],
+            cracker_row["raw_text"],
+            cracker_row["ingredient_name_ru"],
+        ]
+    ).casefold()
+
+    assert cracker_row["raw_text"] == "\u0441\u043e\u043b\u0435\u043d\u044b\u0435 \u043a\u0440\u0435\u043a\u0435\u0440\u044b \u2014 100 \u0433"
+    assert "\u043a\u0440\u0435\u043a\u0435\u0440" in sprat_cracker_text
+    assert "\u0440\u0438\u0441" not in sprat_cracker_text
+    assert "\u0445\u043b\u0435\u0431\u0446" not in sprat_cracker_text
+
+    cracker_safety = evaluate_safety(
+        UserProfile(
+            age=32,
+            sex=Sex.FEMALE,
+            height_cm=168,
+            weight_kg=64,
+            goal=Goal.MAINTAIN,
+            activity=ActivityLevel.MODERATE,
+            meal_count=4,
+            restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043a\u0440\u0435\u043a\u0435\u0440\u044b"),),
+        )
+    )
+    rice_safety = evaluate_safety(
+        UserProfile(
+            age=32,
+            sex=Sex.FEMALE,
+            height_cm=168,
+            weight_kg=64,
+            goal=Goal.MAINTAIN,
+            activity=ActivityLevel.MODERATE,
+            meal_count=4,
+            restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u0440\u0438\u0441"),),
+        )
+    )
+    assert is_food_excluded(foods["crackers"], cracker_safety.excluded_food_names)
+    assert not is_food_excluded(foods["crackers"], rice_safety.excluded_food_names)
+
+    nutrient_fields = tuple(source_foods["avocado"]["nutrients_per_100g"])
+    for recipe_id in (bolognese_id, tuna_cream_id, sprat_crackers_id):
+        expected = {field: 0.0 for field in nutrient_fields}
+        for row in ingredients_by_recipe[recipe_id]:
+            if not row.get("food_id") or row.get("grams") is None:
+                continue
+            food = source_foods[row["food_id"]]
+            factor = float(row["grams"]) / 100.0
+            for field in nutrient_fields:
+                expected[field] += float(food["nutrients_per_100g"].get(field, 0.0)) * factor
+        for field in nutrient_fields:
+            assert nutrition[recipe_id][field] == pytest.approx(round(expected[field], 2))
 
 
 def test_high_signal_recipe_mentions_match_positive_structured_ingredients() -> None:
