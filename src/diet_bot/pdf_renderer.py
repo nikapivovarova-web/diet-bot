@@ -268,7 +268,7 @@ def _cover_page(
             story.append(Spacer(1, 1.5 * mm))
 
     story.append(Spacer(1, 7 * mm))
-    story.append(_notice_box("Медицинский дисклеймер", _cover_notice_text(first_plan), styles, doc_width))
+    story.append(_notice_box("Важно", _cover_notice_text(first_plan), styles, doc_width))
     story.append(Spacer(1, 5 * mm))
     story.append(_p(_cover_drinks_note(first_plan), styles["Body"]))
 
@@ -414,9 +414,9 @@ def _transparent_logo_source(path: Path):
 
 def _cover_notice_text(plan: MealPlan) -> str:
     return (
-        "Этот рацион не является медицинским назначением, диагнозом или клинической рекомендацией. "
+        "Рацион носит информационный характер и не заменяет назначение врача, диагноз или лечение. "
         "При заболеваниях, беременности, кормлении грудью, расстройствах пищевого поведения, "
-        "выраженном дефиците или избытке массы тела, а также при плохом самочувствии согласуйте рацион с врачом."
+        "выраженном дефиците или избытке массы тела либо плохом самочувствии согласуйте питание с врачом."
     )
 
 

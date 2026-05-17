@@ -84,7 +84,8 @@ def test_week_pdf_cover_notes_and_summary_labels(tmp_path: Path, sample_week_dat
     reader = PdfReader(str(pdf_path))
     cover_text = _compact_text(reader.pages[0].extract_text() or "")
 
-    assert "Медицинский дисклеймер" in cover_text
+    assert "дисклеймер" not in cover_text.lower()
+    assert "Важно" in cover_text
     assert "Если вы пьете соки, газировку, сладкий чай, энергетики" in cover_text
     assert "учитывайте их отдельно" in cover_text
     assert "ориентировочный расчет" in cover_text
@@ -93,6 +94,22 @@ def test_week_pdf_cover_notes_and_summary_labels(tmp_path: Path, sample_week_dat
     assert cover_text.count("Ваш расчет") == 1
     assert "Рацион" in cover_text
     assert "Блюд" not in cover_text
+
+
+def test_week_pdf_cover_note_stays_before_day_one(
+    tmp_path: Path,
+    sample_week_plans,
+    sample_week_dates,
+) -> None:
+    pdf_path = render_week_plan_pdf(sample_week_plans, sample_week_dates, tmp_path / "cover-page-fit.pdf")
+    reader = PdfReader(str(pdf_path))
+    cover_text = _compact_text(reader.pages[0].extract_text() or "")
+    first_content_text = _compact_text(reader.pages[1].extract_text() or "")
+
+    assert "дисклеймер" not in cover_text.lower()
+    assert "точности порций" in cover_text
+    assert "точности порций" not in first_content_text
+    assert "День 1" in first_content_text
 
 
 def test_week_pdf_keeps_cover_separate_from_day_one(tmp_path: Path, sample_week_dates) -> None:
