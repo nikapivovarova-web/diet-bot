@@ -1024,6 +1024,21 @@ def test_curated_high_bmi_loss_plan_tops_up_protein_when_possible() -> None:
     assert plan.totals.get("energy_kcal") <= plan.targets.targets.get("energy_kcal") * 1.04
 
 
+def test_curated_macro_recovery_keeps_fat_and_carbs_above_soft_floor() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.SIMPLE)
+
+    fat_low_plan = build_one_day_plan(profile, variety_seed=31, recipe_source="curated_only")
+    carb_low_plan = build_one_day_plan(profile, variety_seed=93, recipe_source="curated_only")
+
+    assert fat_low_plan.totals.get("fat_g") >= fat_low_plan.targets.targets.get("fat_g") * 0.85
+    assert carb_low_plan.totals.get("carbohydrate_g") >= (
+        carb_low_plan.targets.targets.get("carbohydrate_g") * 0.85
+    )
+    for plan in (fat_low_plan, carb_low_plan):
+        assert plan.totals.get("energy_kcal") <= plan.targets.targets.get("energy_kcal") * 1.04
+        assert plan.totals.get("protein_g") >= plan.targets.targets.get("protein_g") * 0.95
+
+
 @pytest.mark.slow_pdf_builder
 def test_repeat_generation_changes_recipes() -> None:
     profile = profile_with(weight_kg=75, goal=Goal.GAIN, meal_count=5)

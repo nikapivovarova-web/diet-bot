@@ -75,6 +75,8 @@ FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
 CARBOHYDRATE_TOP_UP_CEILING_MULTIPLIER = 1.18
 CARBOHYDRATE_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.08
 CARBOHYDRATE_RECIPE_HARD_LIMIT_MULTIPLIER = 1.24
+MACRO_RECOVERY_FLOOR_MULTIPLIER = 0.88
+MACRO_RECOVERY_MAX_PASSES = 4
 COLLAPSED_MEAL_MIN_KCAL = 40.0
 COLLAPSED_MEAL_CORE_MIN_KCAL = 25.0
 TINY_GARNISH_MAX_GRAMS = 75.0
@@ -2324,7 +2326,7 @@ def _top_up_if_needed(
     lower_energy = target.get("energy_kcal") * 0.96
     upper_energy = target.get("energy_kcal") * 1.04
     if total.get("energy_kcal") >= lower_energy and not _has_meal_below_min_energy(meals, target):
-        return _increase_existing_protein_if_needed(meals, target, used_grams)
+        return _finish_macro_recovery(meals, candidates, target, used_grams, used_counts, variety_seed)
 
     slots = _meal_energy_slots(len(meals))
     for _ in range(4):
@@ -2333,9 +2335,9 @@ def _top_up_if_needed(
             total = NutrientVector.sum(meal.nutrients for meal in meals)
             total_energy = total.get("energy_kcal")
             if total_energy >= lower_energy and not _has_meal_below_min_energy(meals, target):
-                return _increase_existing_protein_if_needed(meals, target, used_grams)
+                return _finish_macro_recovery(meals, candidates, target, used_grams, used_counts, variety_seed)
             if total_energy >= upper_energy:
-                return _increase_existing_protein_if_needed(meals, target, used_grams)
+                return _finish_macro_recovery(meals, candidates, target, used_grams, used_counts, variety_seed)
 
             meal = meals[meal_index]
             room_energy = min(_meal_energy_room(meal, target, slots[meal_index]), upper_energy - total_energy)
@@ -2402,7 +2404,268 @@ def _top_up_if_needed(
                 break
         if not changed_any:
             break
-    return _increase_existing_portions(meals, target, used_grams)
+    meals = _increase_existing_portions(meals, target, used_grams)
+    return _finish_macro_recovery(meals, candidates, target, used_grams, used_counts, variety_seed)
+
+
+def _finish_macro_recovery(
+    meals: list[Meal],
+    candidates: list[Food],
+    target: NutrientVector,
+    used_grams: dict[str, float],
+    used_counts: Counter[str],
+    variety_seed: int,
+) -> list[Meal]:
+    meals = _recover_low_macro_floors(meals, candidates, target, used_grams, used_counts, variety_seed)
+    return _increase_existing_protein_if_needed(meals, target, used_grams)
+
+
+def _recover_low_macro_floors(
+    meals: list[Meal],
+    candidates: list[Food],
+    target: NutrientVector,
+    used_grams: dict[str, float],
+    used_counts: Counter[str],
+    variety_seed: int,
+) -> list[Meal]:
+    upper_energy = target.get("energy_kcal") * 1.04
+    slots = _meal_energy_slots(len(meals))
+
+    for _ in range(MACRO_RECOVERY_MAX_PASSES):
+        total = NutrientVector.sum(meal.nutrients for meal in meals)
+        nutrient = _lowest_macro_below_recovery_floor(total, target)
+        if nutrient is None or total.get("energy_kcal") >= upper_energy:
+            break
+
+        changed_any = False
+        for meal_index in _meal_indices_by_energy_gap(meals, target):
+            total = NutrientVector.sum(meal.nutrients for meal in meals)
+            if _macro_recovery_gap(total, target, nutrient) <= 0:
+                break
+            room_energy = min(
+                _meal_energy_room(meals[meal_index], target, slots[meal_index]),
+                upper_energy - total.get("energy_kcal"),
+            )
+            if room_energy <= 10:
+                continue
+            if _increase_existing_macro_portion(meals, meal_index, nutrient, target, used_grams, room_energy):
+                changed_any = True
+                break
+            if _add_macro_recovery_portion(
+                meals,
+                candidates,
+                meal_index,
+                nutrient,
+                target,
+                used_grams,
+                used_counts,
+                room_energy,
+                variety_seed,
+            ):
+                changed_any = True
+                break
+        if not changed_any:
+            break
+    return meals
+
+
+def _lowest_macro_below_recovery_floor(total: NutrientVector, target: NutrientVector) -> str | None:
+    gaps = [
+        (_macro_recovery_ratio(total, target, nutrient), nutrient)
+        for nutrient in ("fat_g", "carbohydrate_g")
+        if _macro_recovery_gap(total, target, nutrient) > 0
+    ]
+    if not gaps:
+        return None
+    return min(gaps)[1]
+
+
+def _macro_recovery_gap(total: NutrientVector, target: NutrientVector, nutrient: str) -> float:
+    return max(0.0, target.get(nutrient) * MACRO_RECOVERY_FLOOR_MULTIPLIER - total.get(nutrient))
+
+
+def _macro_recovery_ratio(total: NutrientVector, target: NutrientVector, nutrient: str) -> float:
+    target_value = target.get(nutrient)
+    if target_value <= 0:
+        return 1.0
+    return total.get(nutrient) / target_value
+
+
+def _increase_existing_macro_portion(
+    meals: list[Meal],
+    meal_index: int,
+    nutrient: str,
+    target: NutrientVector,
+    used_grams: dict[str, float],
+    room_energy: float,
+) -> bool:
+    meal = meals[meal_index]
+    slots = _meal_energy_slots(len(meals))
+    portions = list(meal.portions)
+    indexes = sorted(
+        range(len(portions)),
+        key=lambda index: portions[index].food.nutrients_per_100g.get(nutrient),
+        reverse=True,
+    )
+    for portion_index in indexes:
+        total = NutrientVector.sum(current_meal.nutrients for current_meal in meals)
+        gap = _macro_recovery_gap(total, target, nutrient)
+        if gap <= 0:
+            return False
+        portion = portions[portion_index]
+        food = portion.food
+        if food.category not in _macro_recovery_categories(nutrient):
+            continue
+        if not can_top_up_existing_portion(food, portion.grams, meal_slot=slots[meal_index].slot):
+            continue
+        macro_per_g = food.nutrients_per_100g.get(nutrient) / 100
+        energy_per_g = food.nutrients_per_100g.get("energy_kcal") / 100
+        if macro_per_g <= 0 or energy_per_g <= 0:
+            continue
+        room_day = max(0.0, food.max_per_day_g - used_grams[food.id])
+        grams = min(
+            top_up_increment_step(food, _increase_step(food.category)),
+            food.max_per_meal_g - portion.grams,
+            room_day,
+            gap / macro_per_g,
+            room_energy / energy_per_g,
+        )
+        grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
+        grams = _limit_grams_for_fat_ceiling(food, grams, total, target)
+        grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
+        if grams <= 0:
+            continue
+        max_total_for_rounding = min(food.max_per_meal_g, portion.grams + room_day)
+        new_grams = top_up_total_grams(
+            food,
+            portion.grams,
+            grams,
+            meal_slot=slots[meal_index].slot,
+            max_grams=max_total_for_rounding,
+        )
+        added_grams = new_grams - portion.grams
+        if added_grams <= 0:
+            continue
+        portions[portion_index] = FoodPortion(food=food, grams=new_grams)
+        used_grams[food.id] += added_grams
+        meals[meal_index] = Meal(
+            meal.name,
+            tuple(portions),
+            meal.recipe,
+            meal.image_url,
+            meal.image_attribution,
+            meal.source_url,
+            meal.recipe_id,
+            meal.recipe_key,
+        )
+        return True
+    return False
+
+
+def _add_macro_recovery_portion(
+    meals: list[Meal],
+    candidates: list[Food],
+    meal_index: int,
+    nutrient: str,
+    target: NutrientVector,
+    used_grams: dict[str, float],
+    used_counts: Counter[str],
+    room_energy: float,
+    variety_seed: int,
+) -> bool:
+    meal = meals[meal_index]
+    slots = _meal_energy_slots(len(meals))
+    total = NutrientVector.sum(current_meal.nutrients for current_meal in meals)
+    gap = _macro_recovery_gap(total, target, nutrient)
+    if gap <= 0:
+        return False
+    portions = list(meal.portions)
+    food = _select_macro_recovery_food(
+        candidates,
+        nutrient,
+        NutrientVector({"energy_kcal": room_energy, nutrient: gap}),
+        used_grams,
+        used_counts,
+        portions,
+        variety_seed + meal_index,
+    )
+    if food is None:
+        return False
+    macro_per_g = food.nutrients_per_100g.get(nutrient) / 100
+    energy_per_g = food.nutrients_per_100g.get("energy_kcal") / 100
+    if macro_per_g <= 0 or energy_per_g <= 0:
+        return False
+
+    grams = min(
+        _default_portion(food, _macro_recovery_role(nutrient)),
+        food.max_per_meal_g,
+        max(0.0, food.max_per_day_g - used_grams[food.id]),
+        gap / macro_per_g,
+        room_energy / energy_per_g,
+    )
+    grams = _limit_grams_for_protein_ceiling(food, grams, total, target)
+    grams = _limit_grams_for_fat_ceiling(food, grams, total, target)
+    grams = _limit_grams_for_carbohydrate_ceiling(food, grams, total, target)
+    grams = practical_grams(food, grams, meal_slot=slots[meal_index].slot, max_grams=grams, prefer_floor=True)
+    if grams <= 0:
+        return False
+
+    portions.append(food.portion(grams))
+    used_grams[food.id] += grams
+    used_counts[food.id] += 1
+    meals[meal_index] = Meal(
+        meal.name,
+        tuple(portions),
+        meal.recipe,
+        meal.image_url,
+        meal.image_attribution,
+        meal.source_url,
+        meal.recipe_id,
+        meal.recipe_key,
+    )
+    return True
+
+
+def _select_macro_recovery_food(
+    candidates: list[Food],
+    nutrient: str,
+    deficit: NutrientVector,
+    used_grams: dict[str, float],
+    used_counts: Counter[str],
+    portions: list[FoodPortion],
+    variety_seed: int,
+) -> Food | None:
+    existing_ids = {portion.food.id for portion in portions}
+    role = _macro_recovery_role(nutrient)
+    scored = [
+        (
+            _score_food(food, role, deficit, used_grams, used_counts, set())
+            + food.nutrients_per_100g.get(nutrient) / max(1.0, food.nutrients_per_100g.get("energy_kcal")),
+            food,
+        )
+        for food in candidates
+        if food.category in _macro_recovery_categories(nutrient)
+        and food.id not in existing_ids
+        and role in food.roles
+        and used_grams[food.id] < food.max_per_day_g
+    ]
+    scored = [item for item in scored if item[0] > -1000]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0] + _variety_bonus(item[1].id, variety_seed), item[1].id), reverse=True)
+    return scored[0][1]
+
+
+def _macro_recovery_categories(nutrient: str) -> tuple[str, ...]:
+    if nutrient == "fat_g":
+        return ("fat", "nuts_seeds")
+    return ("grains", "fruit", "vegetable")
+
+
+def _macro_recovery_role(nutrient: str) -> MealRole:
+    if nutrient == "fat_g":
+        return MealRole.FAT
+    return MealRole.CARB
 
 
 def _increase_existing_portions(
