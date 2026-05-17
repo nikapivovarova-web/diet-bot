@@ -43,6 +43,7 @@ class RuntimeConfig:
     postgres_statement_timeout_ms: int
     postgres_lock_timeout_ms: int
     postgres_pool_max_size: int
+    weekly_pdf_max_concurrency: int
     public_payments_enabled: bool
     payment_test_prices_enabled: bool
 
@@ -87,6 +88,13 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         _env_value(env, "DIET_BOT_DB_POOL_MAX_SIZE"),
         default=20,
         name="DIET_BOT_DB_POOL_MAX_SIZE",
+    )
+    weekly_pdf_max_concurrency = _parse_bounded_int(
+        _env_value(env, "DIET_BOT_WEEKLY_PDF_MAX_CONCURRENCY"),
+        default=5,
+        minimum=1,
+        maximum=20,
+        name="DIET_BOT_WEEKLY_PDF_MAX_CONCURRENCY",
     )
     public_payments_enabled = _parse_bool_flag(
         _env_value(env, "DIET_BOT_PUBLIC_PAYMENTS_ENABLED"),
@@ -137,6 +145,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         postgres_statement_timeout_ms=postgres_statement_timeout_ms,
         postgres_lock_timeout_ms=postgres_lock_timeout_ms,
         postgres_pool_max_size=postgres_pool_max_size,
+        weekly_pdf_max_concurrency=weekly_pdf_max_concurrency,
         public_payments_enabled=public_payments_enabled,
         payment_test_prices_enabled=payment_test_prices_enabled,
     )
@@ -220,6 +229,29 @@ def _parse_positive_int(raw: str, *, default: int, name: str) -> int:
         raise RuntimeConfigError(f"{name} must be a positive integer.") from exc
     if value <= 0:
         raise RuntimeConfigError(f"{name} must be a positive integer.")
+    return value
+
+
+def _parse_bounded_int(
+    raw: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    name: str,
+) -> int:
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeConfigError(
+            f"{name} must be an integer between {minimum} and {maximum}."
+        ) from exc
+    if value < minimum or value > maximum:
+        raise RuntimeConfigError(
+            f"{name} must be an integer between {minimum} and {maximum}."
+        )
     return value
 
 

@@ -80,6 +80,43 @@ def test_runtime_config_accepts_postgres_pool_max_size() -> None:
     assert config.postgres_pool_max_size == 12
 
 
+def test_runtime_config_defaults_weekly_pdf_max_concurrency_to_five() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "local-token",
+            "DIET_BOT_ALLOW_JSON_STORAGE": "1",
+        },
+    )
+
+    assert config.weekly_pdf_max_concurrency == 5
+
+
+def test_runtime_config_accepts_weekly_pdf_max_concurrency() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "prod-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+            "DIET_BOT_WEEKLY_PDF_MAX_CONCURRENCY": "12",
+        },
+    )
+
+    assert config.weekly_pdf_max_concurrency == 12
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-1", "21", "not-an-int"])
+def test_runtime_config_rejects_invalid_weekly_pdf_max_concurrency(raw_value: str) -> None:
+    with pytest.raises(RuntimeConfigError, match="DIET_BOT_WEEKLY_PDF_MAX_CONCURRENCY"):
+        load_runtime_config(
+            {
+                "DIET_BOT_TOKEN": "prod-token",
+                "DIET_BOT_ENV": "production",
+                "DIET_BOT_DATABASE_URL": "postgresql://diet_bot@db.internal:5432/diet_bot",
+                "DIET_BOT_WEEKLY_PDF_MAX_CONCURRENCY": raw_value,
+            },
+        )
+
+
 @pytest.mark.parametrize("raw_value", ["0", "-1", "not-an-int"])
 def test_runtime_config_rejects_invalid_postgres_pool_max_size(raw_value: str) -> None:
     with pytest.raises(RuntimeConfigError, match="DIET_BOT_DB_POOL_MAX_SIZE"):

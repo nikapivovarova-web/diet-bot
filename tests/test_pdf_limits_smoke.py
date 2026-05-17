@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -115,6 +118,67 @@ async def test_weekly_pdf_size_guard_does_not_consume_limit_or_send_text_fallbac
     assert "Smoke meal" not in sent_text
     assert "Smoke food" not in sent_text
     assert "PDF на неделю: 0" not in sent_text
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_payload_generation_is_capped_by_semaphore(monkeypatch) -> None:
+    plans = tuple(sample_meal_plan() for _ in range(7))
+    max_active = 0
+    active = 0
+    lock = threading.Lock()
+
+    async def fake_animate_week_pdf_status(*_args, **_kwargs) -> None:
+        return None
+
+    def slow_build_week_pdf_payload(*_args):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            return b"%PDF-1.4\n%test", "week.pdf"
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(telegram_app, "_WEEKLY_PDF_SEMAPHORE", asyncio.Semaphore(2))
+    monkeypatch.setattr(telegram_app, "_animate_week_pdf_status", fake_animate_week_pdf_status)
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
+    monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", slow_build_week_pdf_payload)
+
+    results = await asyncio.gather(
+        *(
+            telegram_app._send_week_plan(FakeMessage(102_000 + index), profile_with())
+            for index in range(6)
+        )
+    )
+
+    assert results == [True] * 6
+    assert max_active <= 2
+
+
+@pytest.mark.anyio
+async def test_busy_weekly_pdf_slots_fail_fast_without_consuming_limit(monkeypatch) -> None:
+    chat_id = 101_004
+    message = FakeMessage(chat_id)
+    _save_active_subscription(chat_id, weekly_pdf_remaining=1)
+    busy_semaphore = asyncio.Semaphore(1)
+    await busy_semaphore.acquire()
+
+    monkeypatch.setattr(telegram_app, "_WEEKLY_PDF_SEMAPHORE", busy_semaphore)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
+    assert not sent
+    assert entitlement.monthly_weekly_pdf_remaining == 1
+    assert message.documents == []
+    assert [text for text, _ in message.texts] == [telegram_app.WEEK_PDF_BUSY_TEXT]
 
 
 class FakeMessage:

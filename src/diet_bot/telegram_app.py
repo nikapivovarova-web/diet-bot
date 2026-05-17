@@ -206,6 +206,25 @@ def _parse_optional_int(raw: str | None) -> int | None:
         return None
 
 
+def _configure_weekly_pdf_concurrency(max_concurrency: int) -> None:
+    global WEEKLY_PDF_MAX_CONCURRENCY
+    global _WEEKLY_PDF_SEMAPHORE
+
+    WEEKLY_PDF_MAX_CONCURRENCY = max_concurrency
+    _WEEKLY_PDF_SEMAPHORE = asyncio.Semaphore(max_concurrency)
+
+
+async def _try_acquire_weekly_pdf_slot() -> bool:
+    if _WEEKLY_PDF_SEMAPHORE.locked():
+        return False
+    await _WEEKLY_PDF_SEMAPHORE.acquire()
+    return True
+
+
+def _release_weekly_pdf_slot() -> None:
+    _WEEKLY_PDF_SEMAPHORE.release()
+
+
 def _is_support_chat(chat_id: int) -> bool:
     return SUPPORT_CHAT_ID is not None and chat_id == SUPPORT_CHAT_ID
 
@@ -359,7 +378,11 @@ WEEK_PDF_STATUS_FRAMES = (
 WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FAILURE_TEXT = "PDF не удалось подготовить или отправить. Попробуйте позже."
+WEEK_PDF_BUSY_TEXT = "Сейчас много запросов, попробуйте через пару минут"
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
+WEEKLY_PDF_MAX_CONCURRENCY = DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY
+_WEEKLY_PDF_SEMAPHORE = asyncio.Semaphore(WEEKLY_PDF_MAX_CONCURRENCY)
 DEFAULT_BATCH_TOTAL_UNITS = 6
 DEFAULT_BATCH_SERVING_UNITS = 2
 DEFAULT_BATCH_SERVINGS = DEFAULT_BATCH_TOTAL_UNITS // DEFAULT_BATCH_SERVING_UNITS
@@ -1146,6 +1169,7 @@ def _apply_runtime_config(config: RuntimeConfig) -> None:
     TELEGRAM_PROVIDER_TOKEN = config.telegram_provider_token
     PUBLIC_PAYMENTS_ENABLED = config.public_payments_enabled
     PAYMENT_TEST_PRICES_ENABLED = config.payment_test_prices_enabled
+    _configure_weekly_pdf_concurrency(config.weekly_pdf_max_concurrency)
     SUPPORT_CHAT_ID = config.support_chat_id or DEFAULT_SUPPORT_CHAT_ID
     _RUNTIME_CONFIG_APPLIED = True
 
@@ -1497,22 +1521,32 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
 
 
 async def _send_week_plan_with_access(message: Message, profile: UserProfile) -> bool:
-    consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
-    if not consumption.allowed:
-        await _send_limit_paywall(message, "weekly_pdf")
+    pdf_slot_acquired = await _try_acquire_weekly_pdf_slot()
+    if not pdf_slot_acquired:
+        await message.answer(WEEK_PDF_BUSY_TEXT)
         return False
 
-    recipe_history_entries: list[RecipeHistoryItem] = []
+    consumption: AttemptConsumption | None = None
     try:
+        consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
+        if not consumption.allowed:
+            await _send_limit_paywall(message, "weekly_pdf")
+            return False
+
+        recipe_history_entries: list[RecipeHistoryItem] = []
         sent = await _send_week_plan(
             message,
             profile,
             status_text=_format_entitlement_status(message.chat.id),
             recipe_history_entries=recipe_history_entries,
+            pdf_slot_acquired=True,
         )
     except Exception:
-        _refund_generation_attempt(message.chat.id, consumption)
+        if consumption is not None and consumption.allowed:
+            _refund_generation_attempt(message.chat.id, consumption)
         raise
+    finally:
+        _release_weekly_pdf_slot()
 
     if not sent:
         _refund_generation_attempt(message.chat.id, consumption)
@@ -1597,7 +1631,13 @@ async def _send_week_plan(
     *,
     status_text: str | None = None,
     recipe_history_entries: list[RecipeHistoryItem] | None = None,
+    pdf_slot_acquired: bool = False,
 ) -> bool:
+    owns_pdf_slot = False
+    if not pdf_slot_acquired:
+        await _WEEKLY_PDF_SEMAPHORE.acquire()
+        owns_pdf_slot = True
+
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
     seed_offset = PLAN_SEED_OFFSET_BY_CHAT_ID.setdefault(
@@ -1606,10 +1646,15 @@ async def _send_week_plan(
     )
     seed = seed_offset + count
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
-    status_message = await message.answer(
-        WEEK_PDF_STATUS_INITIAL_TEXT,
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    try:
+        status_message = await message.answer(
+            WEEK_PDF_STATUS_INITIAL_TEXT,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception:
+        if owns_pdf_slot:
+            _release_weekly_pdf_slot()
+        raise
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
     recent_avoidance = _load_recent_recipe_avoidance(chat_id)
     try:
@@ -1674,6 +1719,8 @@ async def _send_week_plan(
         return True
     finally:
         await _stop_week_pdf_status(status_task)
+        if owns_pdf_slot:
+            _release_weekly_pdf_slot()
 
 
 async def _send_week_pdf_document(
