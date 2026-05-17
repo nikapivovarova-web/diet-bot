@@ -96,6 +96,79 @@ HIGH_SIGNAL_NAMED_FOOD_GROUPS = {
     "avocado": ({"avocado"}, ("\u0430\u0432\u043e\u043a\u0430\u0434\u043e", "avocado")),
 }
 EXPECTED_PRODUCT_DECISION_NAMED_FOOD_GAPS = set()
+FORBIDDEN_SINGULAR_RECIPE_COMMANDS = (
+    "отвари",
+    "посоли",
+    "обжарь",
+    "нарежь",
+    "добавь",
+    "смешай",
+    "намажь",
+    "замеси",
+)
+COOKING_FAT_FOOD_IDS = {
+    "avocado_oil",
+    "butter",
+    "canola_oil",
+    "chili_oil",
+    "coconut_oil",
+    "olive_oil",
+    "peanut_oil",
+    "sesame_oil",
+    "vegetable_oil",
+}
+CURATED_RECIPES_WITHOUT_ADDED_OIL_ALLOWED = {
+    "r043_tost_s_yaytsom_indeykoy_i_ovoschami": "the instruction explicitly uses a dry skillet or toaster",
+    "r046_tortilya_rolly_s_bekonom_gribami_i_yaytsom": "bacon is cooked first and leaves rendered fat in the skillet",
+    "r048_burrito_s_chorizo_yaytsom_fasolyu_i_poblano": "sausage or lean mince is browned in a nonstick skillet before eggs are added",
+    "r058_tropicheskaya_yogurtovaya_chasha_s_greypfrutom_i_manda": "жаропрочная describes a microwave-safe bowl, not frying",
+    "r077_kokosovyy_ris_s_yaytsom_ogurtsom_i_arahisom": "egg can be boiled; frying is only an alternate path",
+    "r087_burrito_s_yaichnymi_belkami_shpinatom_i_kartofelem": "hashbrown and egg whites are cooked on a nonstick skillet without added fat",
+    "r088_batat_tost_so_shpinatom_yaytsom_i_ostrym_sousom": "spinach is wilted with water and the egg is cooked in the same nonstick skillet",
+    "r179_myasnaya_lazanya_s_rikottoy_i_tomatami": "sausage and beef render enough fat before the sauce simmers",
+    "r224_zapekanka_s_govyazhim_farshem_tsvetnoy_kapustoy_i_ched": "beef mince is browned directly before vegetables are added",
+    "r279_pryanyy_baklazhannyy_dip_s_morkovnymi_palochkami": "eggplant is steamed in water in a covered nonstick skillet",
+    "r285_tost_iz_batata_s_tuntsom_avokado_i_nori": "only the sesame is pre-toasted; there is no pan-frying step",
+    "r297_yaichnyy_sendvich_s_vetchinoy_i_chedderom": "eggs can be boiled; frying is only an alternate path",
+    "r299_tost_s_yaytsom_bekonom_i_syrom": "bacon renders the cooking fat before the egg is cooked",
+    "r300_omlet_s_bekonom_gaudoy_i_tvorozhnym_syrom": "bacon renders the cooking fat before the omelet is cooked",
+    "r248_barani_kebaby_mergez_s_morkovno_yogurtovym_sousom": "the instruction explicitly uses a dry skillet",
+    "r328_tost_s_rikottoy_persikom_fistashkami_i_medom": "toast is dry-toasted and pistachios are a topping",
+    "r382_farshirovannye_yaytsa_s_avokado_zelenym_lukom_i_bekono": "only bacon is fried, using its own rendered fat",
+    "r385_salatnye_listya_s_kurinoy_grudkoy_avokado_i_bekonom": "only bacon is fried, using its own rendered fat",
+    "r400_salatnye_chashechki_s_krevetkami_i_krabovymi_palochkam": "shrimp can be boiled; frying is only an alternate path",
+    "r406_buterbrod_s_syrom_i_vetchinoy": "the instruction explicitly uses a dry skillet",
+    "r441_omlet_iz_nutovoy_muki_s_brokkoli_i_struchkovoy_fasolyu": "vegetables are stewed in water, not sauteed",
+    "r496_karbonara_s_bekonom_i_slivkami": "bacon renders the cooking fat for the sauce base",
+    "r584_kukuruznye_lepeshki_s_fasolyu": "the instruction explicitly uses a dry skillet",
+    "r599_lavash_s_syrom_i_pomidorom": "the instruction explicitly uses a dry skillet",
+    "r604_lavash_s_humusom_zapechennym_pertsem_i_syrom": "the instruction explicitly uses a dry skillet",
+    "r606_lenivaya_pitstsa_na_lavashe": "the instruction explicitly uses a dry skillet when using the pan option",
+    "r607_syrnye_lepeshki": "the instruction explicitly uses a dry skillet",
+    "r608_goryachiy_buterbrod_s_syrom": "the instruction explicitly uses a dry skillet",
+    "r609_syrnaya_lepeshka_na_skovorode": "the instruction explicitly uses a dry skillet",
+    "r610_bystraya_pitstsa_na_hlebe": "the instruction explicitly uses a dry skillet",
+}
+COOKING_VERB_RE = re.compile(r"жар|обжар|туш|сковород|припуст", re.IGNORECASE)
+
+
+def _standalone_recipe_command_re(commands: tuple[str, ...]) -> re.Pattern[str]:
+    boundary = r"0-9A-Za-zА-Яа-яЁё"
+    return re.compile(
+        rf"(?<![{boundary}])({'|'.join(re.escape(command) for command in commands)})(?![{boundary}])",
+        re.IGNORECASE,
+    )
+
+
+def _recipe_has_cooking_fat(rows: list[dict]) -> bool:
+    for row in rows:
+        ingredient_text = " ".join(
+            str(row.get(field) or "").casefold()
+            for field in ("raw_text", "ingredient_name_ru", "food_id")
+        )
+        if row.get("food_id") in COOKING_FAT_FOOD_IDS or "масло" in ingredient_text:
+            return True
+    return False
 
 
 def _source_recipes() -> list[dict]:
@@ -419,6 +492,66 @@ def test_curated_recipe_instructions_use_regular_salt_wording() -> None:
     recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
 
     assert "кошерн" not in json.dumps(recipes, ensure_ascii=False).lower()
+
+
+def test_curated_recipe_instruction_text_has_no_singular_user_commands() -> None:
+    source_recipes = _source_recipes()
+    runtime_recipes = {
+        recipe.id: recipe
+        for recipe in built_in_recipes()
+        if recipe.id.startswith("r") and "curated" in recipe.tags
+    }
+    command_re = _standalone_recipe_command_re(FORBIDDEN_SINGULAR_RECIPE_COMMANDS)
+
+    source_matches = [
+        (row["recipe_no"], row["title_ru"], match.group(1))
+        for row in source_recipes
+        for match in command_re.finditer(row["instructions_ru"])
+    ]
+    runtime_matches = [
+        (recipe.id, recipe.title, match.group(1))
+        for recipe in runtime_recipes.values()
+        for match in command_re.finditer(recipe.instructions)
+    ]
+
+    assert source_matches == []
+    assert runtime_matches == []
+
+
+def test_curated_recipe_instruction_text_starts_are_capitalized() -> None:
+    recipes = _source_recipes()
+
+    lowercase_starts = [
+        (row["recipe_no"], row["title_ru"], row["instructions_ru"])
+        for row in recipes
+        if re.match(r"^[а-яё]", row["instructions_ru"].strip())
+    ]
+
+    assert lowercase_starts == []
+
+
+def test_curated_recipe_frying_and_stewing_steps_have_oil_or_reason() -> None:
+    recipes = _source_recipes()
+    ingredients_by_recipe: dict[str, list[dict]] = defaultdict(list)
+    for row in _source_ingredients():
+        ingredients_by_recipe[row["recipe_id"]].append(row)
+
+    missing_oil = [
+        (row["recipe_no"], row["recipe_id"], row["title_ru"])
+        for row in recipes
+        if COOKING_VERB_RE.search(row["instructions_ru"])
+        and not _recipe_has_cooking_fat(ingredients_by_recipe[row["recipe_id"]])
+        and row["recipe_id"] not in CURATED_RECIPES_WITHOUT_ADDED_OIL_ALLOWED
+    ]
+    stale_allowlist = sorted(
+        recipe_id
+        for recipe_id in CURATED_RECIPES_WITHOUT_ADDED_OIL_ALLOWED
+        if _recipe_has_cooking_fat(ingredients_by_recipe[recipe_id])
+    )
+
+    assert missing_oil == []
+    assert stale_allowlist == []
+    assert all(CURATED_RECIPES_WITHOUT_ADDED_OIL_ALLOWED.values())
 
 
 def test_curated_recipe_fixes_cover_truncated_soup_and_rye_crackers() -> None:

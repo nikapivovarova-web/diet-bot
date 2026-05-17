@@ -60655,6 +60655,21 @@
     "parse_method": "garnish_default"
   },
   {
+    "recipe_id": "r420_lenivyy_hachapuri_po_adzharski",
+    "recipe_no": 420,
+    "recipe_key": "intake_020",
+    "line_index": 6,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r421_grechka_s_zapechennoy_indeykoy_i_svekolnym_salatom",
     "recipe_no": 421,
     "recipe_key": "intake_021",
@@ -60863,6 +60878,21 @@
     "is_optional": false,
     "conversion_note": "small garnish default",
     "parse_method": "garnish_default"
+  },
+  {
+    "recipe_id": "r422_shpinatnyy_ovsyanoblin_s_semenami_chia",
+    "recipe_no": 422,
+    "recipe_key": "intake_022",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r423_ovsyanaya_kasha_s_tomatami_zelenym_goroshkom_i_rikotto",
@@ -62740,6 +62770,21 @@
     "parse_method": "intake_grams_estimate"
   },
   {
+    "recipe_id": "r443_ovsyanye_blinchiki",
+    "recipe_no": 443,
+    "recipe_key": "intake_043",
+    "line_index": 7,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r444_tvorog_s_ukropom_s_tselnozernovym_hlebom",
     "recipe_no": 444,
     "recipe_key": "intake_044",
@@ -63938,6 +63983,21 @@
     "is_optional": false,
     "conversion_note": "small garnish default",
     "parse_method": "garnish_default"
+  },
+  {
+    "recipe_id": "r452_makarony_s_kuritsey_i_ovoschami_na_skovorode",
+    "recipe_no": 452,
+    "recipe_key": "intake_052",
+    "line_index": 11,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r453_struchkovaya_fasol_s_chesnokom_i_soevym_sousom",
@@ -71275,6 +71335,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r506_yaichnyy_roll_s_vetchinoy",
+    "recipe_no": 506,
+    "recipe_key": "batch2_001",
+    "line_index": 6,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r507_onigiri",
     "recipe_no": 507,
     "recipe_key": "batch2_002",
@@ -71905,6 +71980,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r513_syrniki_na_risovoy_muke",
+    "recipe_no": 513,
+    "recipe_key": "batch2_009",
+    "line_index": 6,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r514_rulet_iz_lavasha_s_tuntsom",
     "recipe_no": 514,
     "recipe_key": "batch2_010",
@@ -72338,6 +72428,21 @@
     "is_optional": true,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r517_lavash_s_kuritsey_i_gribami",
+    "recipe_no": 517,
+    "recipe_key": "batch2_013",
+    "line_index": 10,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r518_kuritsa_s_risom_i_ovoschami_na_skovorode",
@@ -72953,6 +73058,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r522_tefteli_v_tomatnom_souse",
+    "recipe_no": 522,
+    "recipe_key": "batch2_018",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r523_lenivyy_plov_s_kuritsey",
@@ -73720,6 +73840,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r529_chili_s_farshem_i_fasolyu",
+    "recipe_no": 529,
+    "recipe_key": "batch2_025",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r530_svinina_s_kapustoy_na_skovorode",
     "recipe_no": 530,
     "recipe_key": "batch2_026",
@@ -73958,6 +74093,21 @@
     "is_optional": true,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r531_shakshuka_s_nutom",
+    "recipe_no": 531,
+    "recipe_key": "batch2_027",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r532_ris_s_yaytsom_i_ovoschami",
@@ -74258,6 +74408,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r534_karri_s_nutom_i_kartofelem",
+    "recipe_no": 534,
+    "recipe_key": "batch2_030",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r535_ovoschnoe_ragu_s_fasolyu",
@@ -74725,6 +74890,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r538_lenivye_golubtsy",
+    "recipe_no": 538,
+    "recipe_key": "batch2_034",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r539_grechnevaya_lapsha_s_kuritsey_i_ovoschami",
     "recipe_no": 539,
     "recipe_key": "batch2_035",
@@ -75085,6 +75265,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r541_falafel_v_lavashe",
+    "recipe_no": 541,
+    "recipe_key": "batch2_037",
+    "line_index": 10,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r542_kuritsa_teriyaki_s_risom",
     "recipe_no": 542,
     "recipe_key": "batch2_038",
@@ -75203,6 +75398,21 @@
     "is_optional": false,
     "conversion_note": "Добавлена, потому что используется в шаге.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r542_kuritsa_teriyaki_s_risom",
+    "recipe_no": 542,
+    "recipe_key": "batch2_038",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r543_tushenaya_govyadina_s_kartofelem",
@@ -75340,6 +75550,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r543_tushenaya_govyadina_s_kartofelem",
+    "recipe_no": 543,
+    "recipe_key": "batch2_039",
+    "line_index": 10,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r544_kurinoe_karri_s_risom",
     "recipe_no": 544,
     "recipe_key": "batch2_040",
@@ -75458,6 +75683,21 @@
     "is_optional": false,
     "conversion_note": "Добавлена, потому что используется в шаге.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r544_kurinoe_karri_s_risom",
+    "recipe_no": 544,
+    "recipe_key": "batch2_040",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r545_kabachki_farshirovannye_myasom",
@@ -75655,6 +75895,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r546_tushenaya_kapusta_s_myasom",
+    "recipe_no": 546,
+    "recipe_key": "batch2_042",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r547_rizotto_s_kuritsey_i_gribami",
     "recipe_no": 547,
     "recipe_key": "batch2_043",
@@ -75745,6 +76000,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r547_rizotto_s_kuritsey_i_gribami",
+    "recipe_no": 547,
+    "recipe_key": "batch2_043",
+    "line_index": 7,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r548_kurinaya_pechen_s_grechkoy",
     "recipe_no": 548,
     "recipe_key": "batch2_044",
@@ -75833,6 +76103,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r548_kurinaya_pechen_s_grechkoy",
+    "recipe_no": 548,
+    "recipe_key": "batch2_044",
+    "line_index": 7,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r549_tako_s_kuritsey_avokado_i_salsoy",
@@ -75985,6 +76270,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r549_tako_s_kuritsey_avokado_i_salsoy",
+    "recipe_no": 549,
+    "recipe_key": "batch2_045",
+    "line_index": 11,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r550_zapechennyy_kartofel_s_farshem_i_yogurtovym_sousom",
     "recipe_no": 550,
     "recipe_key": "batch2_046",
@@ -76135,6 +76435,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r550_zapechennyy_kartofel_s_farshem_i_yogurtovym_sousom",
+    "recipe_no": 550,
+    "recipe_key": "batch2_046",
+    "line_index": 11,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r551_kurinye_shashlychki_s_arahisovym_sousom",
     "recipe_no": 551,
     "recipe_key": "batch2_047",
@@ -76253,6 +76568,21 @@
     "is_optional": false,
     "conversion_note": "Добавлена, потому что используется в шаге.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r551_kurinye_shashlychki_s_arahisovym_sousom",
+    "recipe_no": 551,
+    "recipe_key": "batch2_047",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r552_meksikanskaya_zapekanka_s_risom_i_fasolyu",
@@ -76388,6 +76718,21 @@
     "is_optional": true,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r552_meksikanskaya_zapekanka_s_risom_i_fasolyu",
+    "recipe_no": 552,
+    "recipe_key": "batch2_048",
+    "line_index": 10,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r553_losos_v_medovo_gorchichnom_souse",
@@ -76750,6 +77095,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r555_kuritsa_po_marokkanski_s_nutom",
+    "recipe_no": 555,
+    "recipe_key": "batch2_051",
+    "line_index": 10,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r556_kartofelnye_nokki",
     "recipe_no": 556,
     "recipe_key": "batch2_052",
@@ -77050,6 +77410,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r558_krevetki_v_kokosovom_karri_s_risom",
+    "recipe_no": 558,
+    "recipe_key": "batch2_054",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r559_ruletiki_iz_baklazhanov_s_myasom_i_syrom",
     "recipe_no": 559,
     "recipe_key": "batch2_055",
@@ -77153,6 +77528,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r559_ruletiki_iz_baklazhanov_s_myasom_i_syrom",
+    "recipe_no": 559,
+    "recipe_key": "batch2_055",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r560_chili_s_govyadinoy_fasolyu_i_shokoladom",
@@ -77275,6 +77665,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r560_chili_s_govyadinoy_fasolyu_i_shokoladom",
+    "recipe_no": 560,
+    "recipe_key": "batch2_056",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r561_kurinyy_burger_bez_bulki",
     "recipe_no": 561,
     "recipe_key": "batch2_057",
@@ -77378,6 +77783,21 @@
     "is_optional": false,
     "conversion_note": "для соуса; Подготовленный соус заменен на базовый ингредиент.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r561_kurinyy_burger_bez_bulki",
+    "recipe_no": 561,
+    "recipe_key": "batch2_057",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r562_rizotto_s_tykvoy_i_tverdym_syrom",
@@ -77603,6 +78023,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r563_koreyskaya_govyadina_s_risom",
+    "recipe_no": 563,
+    "recipe_key": "batch2_059",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r564_enchilada_v_kukuruznyh_tortilyah",
@@ -78055,6 +78490,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r567_kuritsa_v_arahisovo_laymovom_souse_s_risom",
+    "recipe_no": 567,
+    "recipe_key": "batch2_063",
+    "line_index": 11,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r568_kuritsa_po_marokkanski_s_kuragoy",
     "recipe_no": 568,
     "recipe_key": "batch2_064",
@@ -78190,6 +78640,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r568_kuritsa_po_marokkanski_s_kuragoy",
+    "recipe_no": 568,
+    "recipe_key": "batch2_064",
+    "line_index": 10,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r569_pasta_s_tuntsom_olivkami_i_marinovannym_ogurtsom",
     "recipe_no": 569,
     "recipe_key": "batch2_065",
@@ -78293,6 +78758,21 @@
     "is_optional": true,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r569_pasta_s_tuntsom_olivkami_i_marinovannym_ogurtsom",
+    "recipe_no": 569,
+    "recipe_key": "batch2_065",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r570_grechka_s_gribami_soevym_sousom_i_yaytsom",
@@ -78400,6 +78880,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r570_grechka_s_gribami_soevym_sousom_i_yaytsom",
+    "recipe_no": 570,
+    "recipe_key": "batch2_066",
+    "line_index": 8,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r571_kotlety_iz_tuntsa_s_kartofelem",
     "recipe_no": 571,
     "recipe_key": "batch2_067",
@@ -78488,6 +78983,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r571_kotlety_iz_tuntsa_s_kartofelem",
+    "recipe_no": 571,
+    "recipe_key": "batch2_067",
+    "line_index": 7,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r572_tykvennoe_karri_s_kuritsey",
@@ -78610,6 +79120,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r572_tykvennoe_karri_s_kuritsey",
+    "recipe_no": 572,
+    "recipe_key": "batch2_068",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r573_rybnye_tako_s_ogurechno_yablochnoy_salsoy",
     "recipe_no": 573,
     "recipe_key": "batch2_069",
@@ -78728,6 +79253,21 @@
     "is_optional": true,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r573_rybnye_tako_s_ogurechno_yablochnoy_salsoy",
+    "recipe_no": 573,
+    "recipe_key": "batch2_069",
+    "line_index": 9,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r574_hrustyaschie_nutovye_shariki",
@@ -79463,6 +80003,21 @@
     "is_optional": true,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r583_morkovnye_oladi",
+    "recipe_no": 583,
+    "recipe_key": "batch2_079",
+    "line_index": 6,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r584_kukuruznye_lepeshki_s_fasolyu",
@@ -80545,6 +81100,21 @@
     "parse_method": "batch2_grams_estimate"
   },
   {
+    "recipe_id": "r597_mini_blinchiki_iz_kabachka_s_gorbushey",
+    "recipe_no": 597,
+    "recipe_key": "batch2_093",
+    "line_index": 6,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
+  },
+  {
     "recipe_id": "r598_ovsyanka_s_bananom_i_arahisovoy_pastoy",
     "recipe_no": 598,
     "recipe_key": "batch2_094",
@@ -80843,6 +81413,21 @@
     "is_optional": false,
     "conversion_note": "Количество восстановлено редакционно из названия/шага.",
     "parse_method": "batch2_grams_estimate"
+  },
+  {
+    "recipe_id": "r602_kartofelnye_draniki",
+    "recipe_no": 602,
+    "recipe_key": "batch2_098",
+    "line_index": 5,
+    "raw_text": "растительное масло — 5 г для сковороды",
+    "ingredient_name_ru": "растительное масло",
+    "food_id": "vegetable_oil",
+    "grams": 5.0,
+    "quantity_text": "5 г для сковороды",
+    "state": "raw",
+    "is_optional": false,
+    "conversion_note": "editorial polish: added cooking oil for frying/stewing step",
+    "parse_method": "editorial_polish_added_oil"
   },
   {
     "recipe_id": "r603_tortilya_s_fasolyu_i_syrom",
