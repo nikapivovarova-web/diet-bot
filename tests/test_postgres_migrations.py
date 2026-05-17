@@ -202,7 +202,7 @@ def test_migrations_replace_legacy_promo_kind_constraint() -> None:
     assert "kind IN (\n                    'monthly_access',\n                    'discount'," in sql
 
 
-def test_analytics_migration_repairs_existing_events_table_before_indexes() -> None:
+def test_analytics_migration_repairs_existing_events_table_write_columns_before_indexes() -> None:
     from diet_bot import postgres_migrations
 
     migration = next(
@@ -211,20 +211,64 @@ def test_analytics_migration_repairs_existing_events_table_before_indexes() -> N
         if migration.version == "202605170003"
     )
     statements = [_normalize_sql(statement) for statement in migration.statements]
-    repair_statement = (
-        "ALTER TABLE analytics_events "
-        "ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-    )
+    existing_columns = {
+        "id",
+        "user_id",
+        "event_name",
+        "properties_json",
+        "created_at",
+    }
+    missing_columns_before_indexes = []
+    expected_write_columns = {"occurred_at", "chat_id", "source", "campaign", "referral"}
 
-    assert repair_statement in statements
-    repair_index = statements.index(repair_statement)
-    index_indexes = [
+    for statement in statements:
+        if statement.startswith("CREATE TABLE IF NOT EXISTS analytics_events"):
+            continue
+        if statement.startswith("ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS "):
+            match = re.match(
+                r"ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS ([a-z_]+)\b",
+                statement,
+            )
+            assert match is not None, statement
+            existing_columns.add(match.group(1))
+        if statement.startswith("CREATE INDEX IF NOT EXISTS idx_analytics_events_"):
+            missing = expected_write_columns - existing_columns
+            if missing:
+                missing_columns_before_indexes.append((statement, missing))
+
+    assert not missing_columns_before_indexes
+    assert expected_write_columns <= existing_columns
+
+
+def test_analytics_chat_id_repair_runs_when_foundation_migration_already_recorded() -> None:
+    from diet_bot import postgres_migrations
+
+    migrations = list(postgres_migrations.POSTGRES_MIGRATIONS)
+    foundation_index = next(
         index
-        for index, statement in enumerate(statements)
-        if statement.startswith("CREATE INDEX IF NOT EXISTS idx_analytics_events_")
-    ]
-    assert index_indexes
-    assert repair_index < min(index_indexes)
+        for index, migration in enumerate(migrations)
+        if migration.version == "202605170003"
+    )
+    cur = FakeCursor()
+    cur.applied_versions = {
+        migration.version for migration in migrations[: foundation_index + 1]
+    }
+
+    postgres_migrations.run_postgres_migrations(cur)
+
+    repair_statements = (
+        "ALTER TABLE analytics_events "
+        "ADD COLUMN IF NOT EXISTS chat_id BIGINT",
+        "ALTER TABLE analytics_events "
+        "ADD COLUMN IF NOT EXISTS source TEXT",
+        "ALTER TABLE analytics_events "
+        "ADD COLUMN IF NOT EXISTS campaign TEXT",
+        "ALTER TABLE analytics_events "
+        "ADD COLUMN IF NOT EXISTS referral TEXT",
+    )
+    executed_statements = [statement for statement, _params in cur.executed]
+    for repair_statement in repair_statements:
+        assert repair_statement in executed_statements
 
 
 def test_run_postgres_migrations_records_each_version_once() -> None:

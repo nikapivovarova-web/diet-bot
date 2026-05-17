@@ -1580,12 +1580,138 @@ def test_postgres_analytics_first_touch_and_event_round_trip() -> None:
         _cleanup_users(store, user_id)
 
 
+def test_postgres_analytics_migration_repairs_legacy_events_table_without_chat_id() -> None:
+    from diet_bot.postgres_migrations import POSTGRES_MIGRATIONS, SCHEMA_MIGRATIONS_SQL
+
+    schema = f"analytics_repair_{uuid.uuid4().hex}"
+    _create_schema(schema)
+    store = _schema_store(schema)
+    user_id = _unique_user_id()
+    analytics_foundation = next(
+        migration
+        for migration in POSTGRES_MIGRATIONS
+        if migration.version == "202605170003"
+    )
+    try:
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA_MIGRATIONS_SQL.strip())
+                for migration in POSTGRES_MIGRATIONS:
+                    if migration.version == "202605170003":
+                        break
+                    for statement in migration.statements:
+                        cur.execute(statement)
+                    cur.execute(
+                        """
+                        INSERT INTO schema_migrations (version, description)
+                        VALUES (%s, %s)
+                        """,
+                        (migration.version, migration.description),
+                    )
+                cur.execute(
+                    """
+                    CREATE TABLE user_attribution (
+                        user_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                        source TEXT,
+                        campaign TEXT,
+                        referral TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE analytics_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        user_id BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+                        event_name TEXT NOT NULL,
+                        properties_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        CHECK (event_name <> '')
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO schema_migrations (version, description)
+                    VALUES (%s, %s)
+                    """,
+                    (analytics_foundation.version, analytics_foundation.description),
+                )
+
+        store.initialize()
+        event = store.record_analytics_event(
+            user_id=user_id,
+            chat_id=user_id + 1,
+            event_name="weekly_pdf_delivered",
+            properties_json={"format": "weekly_pdf"},
+        )
+
+        with store._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = 'analytics_events'
+                      AND column_name = 'chat_id'
+                    """,
+                    (schema,),
+                )
+                column = cur.fetchone()
+
+        assert column is not None
+        assert column["data_type"] == "bigint"
+        assert event.chat_id == user_id + 1
+    finally:
+        store.close()
+        _drop_schema(schema)
+
+
 def _store(**kwargs: Any):
     from diet_bot.postgres_store import PostgresDietBotStore
 
     store = PostgresDietBotStore(_test_database_url(), **kwargs)
     store.initialize()
     return store
+
+
+def _schema_store(schema: str, **kwargs: Any):
+    from diet_bot.postgres_store import PostgresDietBotStore
+
+    class SchemaPostgresDietBotStore(PostgresDietBotStore):
+        def _configure_connection(self, conn: Any) -> None:
+            from psycopg import sql
+
+            super()._configure_connection(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("SET search_path TO {}").format(sql.Identifier(schema))
+                )
+            conn.commit()
+
+    return SchemaPostgresDietBotStore(_test_database_url(), **kwargs)
+
+
+def _create_schema(schema: str) -> None:
+    import psycopg
+    from psycopg import sql
+
+    with psycopg.connect(_test_database_url(), autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+
+
+def _drop_schema(schema: str) -> None:
+    import psycopg
+    from psycopg import sql
+
+    with psycopg.connect(_test_database_url(), autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
 
 
 def _test_database_url() -> str:

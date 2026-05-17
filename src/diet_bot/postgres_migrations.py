@@ -1135,6 +1135,22 @@ ANALYTICS_FOUNDATION_MIGRATION = PostgresMigration(
         ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
         """,
         """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS chat_id BIGINT
+        """,
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS source TEXT
+        """,
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS campaign TEXT
+        """,
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS referral TEXT
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_user_attribution_source_campaign
             ON user_attribution(source, campaign)
         """,
@@ -1145,6 +1161,38 @@ ANALYTICS_FOUNDATION_MIGRATION = PostgresMigration(
         """
         CREATE INDEX IF NOT EXISTS idx_analytics_events_name_occurred_at
             ON analytics_events(event_name, occurred_at DESC)
+        """,
+    ),
+)
+
+
+ANALYTICS_CHAT_ID_COMPATIBILITY_MIGRATION = PostgresMigration(
+    version="202605170004",
+    description="Repair analytics events chat id column",
+    statements=(
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS chat_id BIGINT
+        """,
+    ),
+)
+
+
+ANALYTICS_WRITE_COLUMNS_COMPATIBILITY_MIGRATION = PostgresMigration(
+    version="202605170005",
+    description="Repair analytics events attribution columns",
+    statements=(
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS source TEXT
+        """,
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS campaign TEXT
+        """,
+        """
+        ALTER TABLE analytics_events
+        ADD COLUMN IF NOT EXISTS referral TEXT
         """,
     ),
 )
@@ -1161,6 +1209,8 @@ POSTGRES_MIGRATIONS = (
     PROMO_KIND_CONSTRAINT_COMPATIBILITY_MIGRATION,
     POSTGRES_LEGACY_LEDGER_COMPATIBILITY_MIGRATION,
     ANALYTICS_FOUNDATION_MIGRATION,
+    ANALYTICS_CHAT_ID_COMPATIBILITY_MIGRATION,
+    ANALYTICS_WRITE_COLUMNS_COMPATIBILITY_MIGRATION,
 )
 
 
