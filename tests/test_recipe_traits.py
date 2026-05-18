@@ -137,6 +137,47 @@ def test_recipe_format_inference(title: str, recipe_id: str, expected: str) -> N
     assert traits.recipe_format == expected
 
 
+@pytest.mark.parametrize(
+    ("recipe_id", "expected"),
+    [
+        ("r021_gribnoy_omlet_s_chedderom_i_petrushkoy", "egg_dish"),
+        ("r004_bananovo_ovsyanye_pankeyki", "dessert"),
+        ("r141_spagetti_s_korolevskimi_krevetkami_harissoy_i_brokkoli", "pasta"),
+        ("r156_farshirovannye_pertsy_s_risom_chernoy_fasolyu_i_syrom", "stuffed"),
+        ("r404_kotlety_iz_indeyki_s_tsukini_i_ovoschami_na_garnir", "cutlet"),
+        ("r493_shaurma_s_falafelem", "wrap"),
+        ("r523_lenivyy_plov_s_kuritsey", "rice_dish"),
+        ("r524_ryba_s_kartofelem_i_limonom", "protein_side"),
+        ("r543_tushenaya_govyadina_s_kartofelem", "stew"),
+        ("r608_goryachiy_buterbrod_s_syrom", "sandwich"),
+    ],
+)
+def test_curated_recipe_format_regressions_from_unknown_clusters(recipe_id: str, expected: str) -> None:
+    recipe_by_id = {recipe.id: recipe for recipe in built_in_recipes()}
+
+    traits = infer_recipe_traits(recipe_by_id[recipe_id])
+
+    assert traits.recipe_format == expected
+
+
+@pytest.mark.parametrize(
+    ("ingredients_g", "expected"),
+    [
+        ({"whole_wheat_pasta": 70, "chicken_breast": 90}, "pasta"),
+        ({"rice_noodles": 70, "shrimp": 90}, "pasta"),
+        ({"lavash": 70, "falafel_prepared": 90}, "wrap"),
+        ({"whole_grain_bread": 70, "ham": 50}, "sandwich"),
+    ],
+)
+def test_recipe_format_uses_safe_ingredient_carriers(
+    ingredients_g: dict[str, float],
+    expected: str,
+) -> None:
+    traits = infer_recipe_traits(_recipe("r590_plain_carrier", ingredients_g=ingredients_g))
+
+    assert traits.recipe_format == expected
+
+
 def test_explicit_trait_tags_override_fallback_inference() -> None:
     recipe = _recipe(
         "r120_chicken_pasta_soup",
@@ -204,4 +245,4 @@ def test_all_curated_recipes_produce_traits_with_broad_unknown_thresholds() -> N
     catalog_size = len(traits)
     assert unknown_counts["protein"] < catalog_size * 0.45
     assert unknown_counts["carb"] < catalog_size * 0.25
-    assert unknown_counts["format"] < catalog_size * 0.50
+    assert unknown_counts["format"] <= 80

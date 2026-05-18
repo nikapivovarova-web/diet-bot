@@ -123,6 +123,11 @@ def infer_recipe_format(recipe: RecipeTemplate) -> str:
     for recipe_format, keywords in _FORMAT_KEYWORDS:
         if _contains_any(text, keywords):
             return recipe_format
+    ingredient_format = _ingredient_carrier_format(recipe.ingredients_g)
+    if ingredient_format:
+        return ingredient_format
+    if _has_protein_side_pattern(recipe):
+        return "protein_side"
     if _clean_value(recipe.slot) == "snack":
         return "snack"
     return UNKNOWN
@@ -187,6 +192,10 @@ def _recipe_text(recipe: RecipeTemplate) -> str:
     )
 
 
+def _recipe_name_text(recipe: RecipeTemplate) -> str:
+    return " ".join((_clean_text(recipe.id), _clean_text(recipe.title)))
+
+
 def _text_family(text: str, keyword_map: tuple[tuple[str, tuple[str, ...]], ...]) -> str | None:
     for family, keywords in keyword_map:
         if _contains_any(text, keywords):
@@ -205,6 +214,26 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
         if keyword in tokens or any(token.startswith(keyword) for token in tokens):
             return True
     return False
+
+
+def _ingredient_carrier_format(ingredients_g: dict[str, float]) -> str | None:
+    ingredients = frozenset(_clean_value(food_id) for food_id in ingredients_g)
+    for recipe_format, exact_ids, keyword_ids in _FORMAT_INGREDIENT_CARRIERS:
+        if ingredients.intersection(exact_ids):
+            return recipe_format
+        if any(keyword in ingredient for ingredient in ingredients for keyword in keyword_ids):
+            return recipe_format
+    return None
+
+
+def _has_protein_side_pattern(recipe: RecipeTemplate) -> bool:
+    if _clean_value(recipe.slot) != "main":
+        return False
+    if infer_primary_protein(recipe) == UNKNOWN:
+        return False
+    if infer_primary_carb(recipe) in {UNKNOWN, "low_carb"}:
+        return False
+    return _contains_any(_recipe_name_text(recipe), _PROTEIN_SIDE_TEXT_KEYWORDS)
 
 
 def _clean_value(value: str | None) -> str:
@@ -535,18 +564,235 @@ _CARB_TEXT_KEYWORDS = (
 )
 
 _FORMAT_KEYWORDS = (
-    ("pasta", ("pasta", "spaghetti", "linguine", "noodle", "orzo", "gnocchi", "nokki", "lazanya", "lasagna")),
-    ("soup", ("soup", "sup", "borsch", "broth")),
-    ("salad", ("salad", "salat")),
-    ("smoothie", ("smoothie", "smuzi", "shake", "sheyk", "lassi")),
-    ("wrap", ("wrap", "roll", "rolly", "burrito", "quesadilla", "kesadilya", "lavash", "tortilla")),
-    ("sandwich", ("sandwich", "sendvich", "burger", "bap")),
+    ("soup", ("soup", "sup", "borsch", "broth", "minestrone", "harira", "shorba", "chowder")),
+    ("stew", ("stew", "ragu", "chili", "karri", "curry", "tushen", "gulyash", "dal", "masala", "bigus")),
+    (
+        "pasta",
+        (
+            "pasta",
+            "spaghetti",
+            "spagetti",
+            "linguine",
+            "lingvini",
+            "noodle",
+            "noodles",
+            "lapsha",
+            "lapshoy",
+            "makarony",
+            "karbonara",
+            "kacho e pepe",
+            "tetratstsini",
+            "lo meyn",
+            "ramen",
+            "udon",
+            "soba",
+            "orzo",
+            "gnocchi",
+            "nokki",
+            "ziti",
+        ),
+    ),
+    ("salad", ("salad", "salat", "tabule", "tabbouleh", "coleslaw", "slaw")),
+    (
+        "egg_dish",
+        (
+            "omelet",
+            "omlet",
+            "frittata",
+            "shakshuk",
+            "menemen",
+            "skrembl",
+            "scramble",
+            "yaytsa",
+            "yaichn",
+            "tamago",
+            "tortilya",
+        ),
+    ),
+    ("smoothie", ("smoothie", "smuzi", "shake", "sheyk", "lassi", "latte", "napitok")),
+    (
+        "wrap",
+        (
+            "wrap",
+            "roll",
+            "rolly",
+            "rulet",
+            "ruletik",
+            "burrito",
+            "quesadilla",
+            "kesadilya",
+            "lavash",
+            "tortilla",
+            "tako",
+            "fajita",
+            "fahit",
+            "shaurm",
+            "enchilad",
+            "pita",
+            "pitoy",
+        ),
+    ),
+    ("sandwich", ("sandwich", "sendvich", "burger", "bap", "bagel", "beygl", "buterbrod")),
     ("toast", ("toast", "tost", "bruschetta", "brusketta", "crostini", "krostini")),
-    ("bowl", ("bowl", "boul", "chasha", "tarelka")),
-    ("bake", ("bake", "baked", "casserole", "zapekan", "maffin", "muffin", "oven")),
-    ("skillet", ("skillet", "hash", "stir fry", "stir_fry", "skovorod", "zharen")),
-    ("stew", ("stew", "ragu", "chili", "karri", "curry")),
+    ("stuffed", ("stuffed", "farshirov", "golubtsy", "dolma", "boats")),
+    (
+        "cutlet",
+        (
+            "cutlet",
+            "cutlets",
+            "kotlet",
+            "patty",
+            "patties",
+            "fritter",
+            "fritters",
+            "frikadel",
+            "teftel",
+            "falafel",
+            "draniki",
+            "zrazy",
+            "oladi",
+        ),
+    ),
+    ("bowl", ("bowl", "boul", "chasha", "tarelka", "poke", "bibimbap", "budda", "buddha")),
+    (
+        "rice_dish",
+        (
+            "risotto",
+            "rizotto",
+            "plov",
+            "pilaf",
+            "dzhambalay",
+            "jambalaya",
+            "paella",
+            "biryani",
+            "kuskus",
+            "couscous",
+            "kedzheri",
+        ),
+    ),
     ("porridge", ("porridge", "oatmeal", "ovsyanka", "kasha", "birher", "congee", "kondzhi")),
-    ("dessert", ("dessert", "pudding", "puding", "parfait", "parfe", "cheesecake", "chizkeyk", "tiramisu")),
+    (
+        "dessert",
+        (
+            "dessert",
+            "desert",
+            "pudding",
+            "puding",
+            "parfait",
+            "parfe",
+            "cheesecake",
+            "chizkeyk",
+            "tiramisu",
+            "pankeyk",
+            "vafl",
+            "krepy",
+            "blin",
+            "granola",
+            "muffin",
+            "maffin",
+            "syrnik",
+            "shokolad",
+            "karamel",
+        ),
+    ),
+    (
+        "bake",
+        (
+            "bake",
+            "baked",
+            "casserole",
+            "zapekan",
+            "zapech",
+            "gratin",
+            "lazanya",
+            "lasagna",
+            "oven",
+            "duhovk",
+            "protivne",
+            "musaka",
+            "pirog",
+            "khachapuri",
+            "hachapuri",
+            "krambl",
+        ),
+    ),
+    (
+        "skillet",
+        (
+            "skillet",
+            "hash",
+            "hesh",
+            "stir fry",
+            "stir_fry",
+            "skovorod",
+            "zharen",
+            "obzhar",
+            "sote",
+            "pulkogi",
+            "kung pao",
+            "mapo",
+            "pisto",
+        ),
+    ),
     ("snack", ("snack", "dip", "chips", "nuts", "orekhi", "semechki", "plate", "kreker", "cracker")),
+)
+
+_FORMAT_INGREDIENT_CARRIERS = (
+    (
+        "pasta",
+        frozenset(
+            {
+                "pasta",
+                "whole_wheat_pasta",
+                "pasta_generic",
+                "spaghetti",
+                "linguine",
+                "orzo",
+                "gnocchi",
+                "egg_noodles",
+                "rice_noodles",
+                "soba_noodles",
+                "udon_noodles",
+            }
+        ),
+        ("pasta", "spaghetti", "linguine", "noodle", "soba", "udon", "orzo", "gnocchi"),
+    ),
+    (
+        "wrap",
+        frozenset({"lavash", "tortilla", "flour_tortilla", "corn_tortilla", "pita", "pitta"}),
+        ("tortilla",),
+    ),
+    (
+        "sandwich",
+        frozenset({"bread", "whole_grain_bread", "rye_bread", "bagel", "english_muffin", "crispbread"}),
+        (),
+    ),
+)
+
+_PROTEIN_SIDE_TEXT_KEYWORDS = (
+    "kurits",
+    "kurin",
+    "chicken",
+    "indeyk",
+    "turkey",
+    "govyad",
+    "beef",
+    "svinin",
+    "pork",
+    "baran",
+    "lamb",
+    "losos",
+    "salmon",
+    "tresk",
+    "cod",
+    "ryba",
+    "fish",
+    "tunets",
+    "tuna",
+    "tofu",
+    "krevet",
+    "shrimp",
+    "kalmar",
+    "calamari",
+    "pechen",
 )
