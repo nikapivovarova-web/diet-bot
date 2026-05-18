@@ -155,6 +155,7 @@ SUBSTANTIVE_BREAD_SIDE_IDS = frozenset(
     {
         "bread",
         "corn_tortilla",
+        "corn_tortilla_extra",
         "lavash",
         "pita",
         "thin_flatbread",
@@ -203,6 +204,42 @@ EXPECTED_FIRST_BATCH_SIDE_INSTRUCTION_TERMS = {
     508: ("\u0445\u043b\u0435\u0431",),
     516: ("\u0445\u043b\u0435\u0431",),
     544: ("\u0440\u0438\u0441",),
+}
+SECOND_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS = frozenset(
+    {
+        103,
+        109,
+        129,
+        151,
+        167,
+        191,
+        234,
+        238,
+        239,
+        457,
+        469,
+        471,
+        483,
+        487,
+        503,
+    }
+)
+EXPECTED_SECOND_BATCH_SIDE_INSTRUCTION_TERMS = {
+    103: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0448\u043f\u0438\u043d\u0430\u0442"),
+    109: ("\u0448\u043f\u0438\u043d\u0430\u0442", "\u0445\u043b\u0435\u0431"),
+    129: ("\u0440\u0438\u0441", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    151: ("\u0440\u0438\u0441", "\u0431\u0430\u0442\u0430\u0442", "\u0448\u043f\u0438\u043d\u0430\u0442"),
+    167: ("\u043a\u0438\u043d\u043e\u0430", "\u043b\u0435\u043f\u0435\u0448", "\u0441\u0430\u043b\u0430\u0442"),
+    191: ("\u0431\u0430\u0442\u0430\u0442", "\u043f\u0435\u0440\u0435\u0446"),
+    234: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0448\u043f\u0438\u043d\u0430\u0442"),
+    238: ("\u0431\u0430\u0442\u0430\u0442", "\u0448\u043f\u0438\u043d\u0430\u0442"),
+    239: ("\u0447\u0435\u0447\u0435\u0432", "\u0431\u0443\u043b\u0433\u0443\u0440", "\u043e\u0433\u0443\u0440"),
+    457: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u043f\u043e\u043c\u0438\u0434"),
+    469: ("\u0433\u0440\u0435\u0447", "\u0441\u0430\u043b\u0430\u0442"),
+    471: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0445\u043b\u0435\u0431"),
+    483: ("\u0440\u0438\u0441", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    487: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0441\u0430\u043b\u0430\u0442"),
+    503: ("\u043c\u0430\u043a\u0430\u0440\u043e\u043d", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
 }
 CURATED_RECIPES_WITHOUT_ADDED_OIL_ALLOWED = {
     "r043_tost_s_yaytsom_indeykoy_i_ovoschami": "the instruction explicitly uses a dry skillet or toaster",
@@ -426,6 +463,150 @@ def test_first_under_composed_main_batch_nutrition_matches_ingredient_vectors() 
     nutrient_fields = tuple(next(iter(foods_by_id.values()))["nutrients_per_100g"])
 
     for recipe_no in sorted(FIRST_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        expected = {field: 0.0 for field in nutrient_fields}
+        ingredient_count = 0
+        for row in ingredients_by_no[recipe_no]:
+            ingredient_count += 1
+            food_id = row.get("food_id")
+            grams = row.get("grams")
+            if not food_id or grams is None:
+                continue
+            food = foods_by_id[food_id]
+            factor = float(grams) / 100.0
+            for field in nutrient_fields:
+                expected[field] += float(food["nutrients_per_100g"].get(field, 0.0)) * factor
+
+        nutrition = nutrition_by_no[recipe_no]
+        assert nutrition["ingredient_count"] == ingredient_count
+        for field in nutrient_fields:
+            assert nutrition[field] == pytest.approx(round(expected[field], 2), abs=0.01)
+
+
+def test_second_under_composed_main_batch_has_substantive_sides() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    ingredients_by_no = _source_ingredients_by_no()
+    failures = []
+
+    for recipe_no in sorted(SECOND_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        recipe = recipes_by_no[recipe_no]
+        rows = ingredients_by_no[recipe_no]
+        title = str(recipe.get("title_ru") or "").casefold()
+        rice_mentioned = _has_audited_food_mention(title, ("\u0440\u0438\u0441",)) or any(
+            row.get("food_id") == "rice"
+            and _has_audited_food_mention(str(row.get("raw_text") or ""), ("\u0440\u0438\u0441",))
+            for row in rows
+        )
+        buckwheat_mentioned = _has_audited_food_mention(title, ("\u0433\u0440\u0435\u0447",)) or any(
+            row.get("food_id") == "buckwheat"
+            and _has_audited_food_mention(str(row.get("raw_text") or ""), ("\u0433\u0440\u0435\u0447",))
+            for row in rows
+        )
+
+        if "\u0431\u0443\u0442\u0435\u0440\u0431\u0440\u043e\u0434" in title or "\u0441\u044d\u043d\u0434\u0432\u0438\u0447" in title:
+            if _ingredient_grams(rows, SUBSTANTIVE_BREAD_SIDE_IDS) < 50.0:
+                failures.append((recipe_no, "sandwich without real bread"))
+        if any(row.get("food_id") in SUBSTANTIVE_BREAD_SIDE_IDS for row in rows):
+            if _ingredient_grams(rows, SUBSTANTIVE_BREAD_SIDE_IDS) < 50.0:
+                failures.append((recipe_no, "bread or flatbread row is missing grams"))
+        if rice_mentioned:
+            if _ingredient_grams(rows, frozenset({"rice"})) < 45.0:
+                failures.append((recipe_no, "rice mention without meaningful rice"))
+        if buckwheat_mentioned:
+            if _ingredient_grams(rows, frozenset({"buckwheat"})) < 45.0:
+                failures.append((recipe_no, "buckwheat mention without meaningful buckwheat"))
+        if not _has_meaningful_main_side(rows):
+            failures.append((recipe_no, "no meaningful carb/veg side"))
+
+    assert failures == []
+
+
+def test_second_under_composed_main_batch_projected_energy_stays_meaningful() -> None:
+    recipes_by_no = _runtime_recipe_by_no()
+    food_by_id = {food.id: food for food in curated_foods()}
+    failures = []
+
+    for recipe_no in sorted(SECOND_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        recipe = recipes_by_no[recipe_no]
+        for slot_ratio in (0.30, 0.25):
+            slot_target_kcal = 2000.0 * slot_ratio
+            projected = _project_recipe_nutrients(recipe, food_by_id, slot_target_kcal, meal_slot="main")
+            assert projected is not None
+            projected_ratio = projected.get("energy_kcal") / slot_target_kcal
+            if projected_ratio < 0.75:
+                failures.append((recipe_no, slot_ratio, round(projected_ratio, 3)))
+
+    assert failures == []
+
+
+def test_second_under_composed_main_batch_title_critical_sides_are_not_tiny() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    ingredients_by_no = _source_ingredients_by_no()
+    side_rules = (
+        ("rice", ("\u0440\u0438\u0441",), frozenset({"rice"}), 45.0),
+        ("buckwheat", ("\u0433\u0440\u0435\u0447",), frozenset({"buckwheat"}), 45.0),
+        ("quinoa", ("\u043a\u0438\u043d\u043e\u0430",), frozenset({"quinoa"}), 45.0),
+        ("potato", ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0430\u0442\u0430\u0442"), SUBSTANTIVE_POTATO_SIDE_IDS, 120.0),
+        (
+            "bread",
+            ("\u0445\u043b\u0435\u0431", "\u043b\u0430\u0432\u0430\u0448", "\u043b\u0435\u043f\u0435\u0448", "\u0442\u043e\u0440\u0442\u0438\u043b"),
+            SUBSTANTIVE_BREAD_SIDE_IDS,
+            50.0,
+        ),
+    )
+    failures = []
+
+    for recipe_no in sorted(SECOND_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        recipe = recipes_by_no[recipe_no]
+        rows = ingredients_by_no[recipe_no]
+        title = str(recipe.get("title_ru") or "")
+        for side_name, stems, food_ids, minimum_grams in side_rules:
+            mentions_side = _has_audited_food_mention(title, stems) or any(
+                row.get("food_id") in food_ids
+                and _has_audited_food_mention(
+                    " ".join(str(row.get(field) or "") for field in ("raw_text", "ingredient_name_ru")),
+                    stems,
+                )
+                for row in rows
+            )
+            if mentions_side and _ingredient_grams(rows, food_ids) < minimum_grams:
+                failures.append((recipe_no, side_name, round(_ingredient_grams(rows, food_ids), 2)))
+
+        if recipe_no == 503:
+            pasta_grams = _ingredient_grams(rows, frozenset({"whole_wheat_pasta"}))
+            has_false_poppy_pasta = any(
+                row.get("food_id") == "poppy_seed"
+                and _has_audited_food_mention(str(row.get("raw_text") or ""), ("\u043c\u0430\u043a\u0430\u0440\u043e\u043d",))
+                for row in rows
+            )
+            if pasta_grams < 50.0 or has_false_poppy_pasta:
+                failures.append((recipe_no, "mac and cheese pasta mapping", pasta_grams))
+
+    assert failures == []
+
+
+def test_second_under_composed_main_batch_instructions_mention_repaired_sides() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    command_re = _standalone_recipe_command_re(FORBIDDEN_SINGULAR_RECIPE_COMMANDS)
+    failures = []
+
+    for recipe_no, expected_terms in sorted(EXPECTED_SECOND_BATCH_SIDE_INSTRUCTION_TERMS.items()):
+        instruction = str(recipes_by_no[recipe_no].get("instructions_ru") or "")
+        lowered = instruction.casefold()
+        missing_terms = [term for term in expected_terms if term not in lowered]
+        if missing_terms:
+            failures.append((recipe_no, tuple(missing_terms)))
+        assert not command_re.search(instruction)
+
+    assert failures == []
+
+
+def test_second_under_composed_main_batch_nutrition_matches_ingredient_vectors() -> None:
+    foods_by_id = _source_foods_by_id()
+    ingredients_by_no = _source_ingredients_by_no()
+    nutrition_by_no = _source_nutrition_by_no()
+    nutrient_fields = tuple(next(iter(foods_by_id.values()))["nutrients_per_100g"])
+
+    for recipe_no in sorted(SECOND_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
         expected = {field: 0.0 for field in nutrient_fields}
         ingredient_count = 0
         for row in ingredients_by_no[recipe_no]:
@@ -1214,7 +1395,7 @@ def test_curated_recipe_ingredient_mapping_avoids_known_false_matches() -> None:
     assert by_no_and_raw[(62, "масло бульонградной косточки — 2,5 мл")]["food_id"] == "vegetable_oil"
     assert by_no_and_raw[(63, "очень спелые бананы — 0,17 шт. / 13,3 г мякоти")]["food_id"] == "banana"
     assert by_no_and_raw[(209, "Вода для арахисового соуса — 30 мл")]["food_id"] == "water"
-    assert by_no_and_raw[(238, "мангольд или кейл — 8 г")]["food_id"] == "kale"
+    assert by_no_and_raw[(238, "шпинат — 70 г")]["food_id"] == "spinach"
     assert by_no_and_raw[(247, "арахисовое масло — 11 мл")]["food_id"] == "peanut_oil"
     assert by_no_and_raw[(247, "азиатское чили-масло — 0,5 мл")]["food_id"] == "chili_oil"
     assert by_no_and_raw[(287, "спелые томаты — 130 г")]["food_id"] == "tomato"
