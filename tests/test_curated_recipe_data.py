@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from openpyxl import load_workbook
 
-from diet_bot.builder import _add_missing_garnishes
+from diet_bot.builder import _add_missing_garnishes, _project_recipe_nutrients
 from diet_bot.builder import build_one_day_plan
 from diet_bot.curated_data import _looks_incomplete_instruction, _recipe_instruction, curated_foods, curated_recipes
 from diet_bot.domain import ActivityLevel, Goal, Restriction, RestrictionType, Sex, UserProfile
@@ -117,6 +117,93 @@ COOKING_FAT_FOOD_IDS = {
     "sesame_oil",
     "vegetable_oil",
 }
+FIRST_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS = frozenset(
+    {
+        106,
+        110,
+        112,
+        114,
+        133,
+        134,
+        135,
+        139,
+        140,
+        243,
+        244,
+        248,
+        451,
+        455,
+        458,
+        464,
+        494,
+        508,
+        516,
+        544,
+    }
+)
+SUBSTANTIVE_GRAIN_SIDE_IDS = frozenset(
+    {
+        "buckwheat",
+        "bulgur",
+        "orzo",
+        "quinoa",
+        "rice",
+        "whole_wheat_pasta",
+    }
+)
+SUBSTANTIVE_BREAD_SIDE_IDS = frozenset(
+    {
+        "bread",
+        "corn_tortilla",
+        "lavash",
+        "pita",
+        "thin_flatbread",
+        "tortilla",
+        "whole_grain_bread",
+    }
+)
+SUBSTANTIVE_POTATO_SIDE_IDS = frozenset({"potato", "sweet_potato"})
+SUBSTANTIVE_VEGETABLE_SIDE_IDS = frozenset(
+    {
+        "bell_pepper",
+        "broccoli",
+        "cabbage",
+        "carrot",
+        "cucumber",
+        "eggplant",
+        "green_beans",
+        "green_peas",
+        "greens",
+        "kale",
+        "lettuce",
+        "mushrooms",
+        "spinach",
+        "tomato",
+        "zucchini",
+    }
+)
+EXPECTED_FIRST_BATCH_SIDE_INSTRUCTION_TERMS = {
+    106: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    110: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    112: ("\u0433\u0440\u0435\u0447",),
+    114: ("\u0440\u0438\u0441", "\u043e\u0433\u0443\u0440"),
+    133: ("\u043a\u0438\u043d\u043e\u0430", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    134: ("\u0431\u0443\u043b\u0433\u0443\u0440", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    135: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    139: ("\u0440\u0438\u0441", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    140: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    243: ("\u0440\u0438\u0441",),
+    244: ("\u0440\u0438\u0441",),
+    248: ("\u043b\u0435\u043f\u0435\u0448", "\u043e\u0433\u0443\u0440"),
+    451: ("\u0433\u0440\u0435\u0447",),
+    455: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0441\u0430\u043b\u0430\u0442"),
+    458: ("\u0433\u0440\u0435\u0447", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    464: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    494: ("\u043a\u0430\u0440\u0442\u043e\u0444", "\u0431\u0440\u043e\u043a\u043a\u043e\u043b"),
+    508: ("\u0445\u043b\u0435\u0431",),
+    516: ("\u0445\u043b\u0435\u0431",),
+    544: ("\u0440\u0438\u0441",),
+}
 CURATED_RECIPES_WITHOUT_ADDED_OIL_ALLOWED = {
     "r043_tost_s_yaytsom_indeykoy_i_ovoschami": "the instruction explicitly uses a dry skillet or toaster",
     "r046_tortilya_rolly_s_bekonom_gribami_i_yaytsom": "bacon is cooked first and leaves rendered fat in the skillet",
@@ -219,6 +306,143 @@ def _runtime_recipe_by_no() -> dict[int, object]:
         for recipe in built_in_recipes()
         if recipe.id.startswith("r") and recipe.id[1:4].isdigit()
     }
+
+
+def _source_recipe_by_no() -> dict[int, dict]:
+    return {int(row["recipe_no"]): row for row in _source_recipes()}
+
+
+def _source_ingredients_by_no() -> dict[int, list[dict]]:
+    rows_by_no: dict[int, list[dict]] = defaultdict(list)
+    for row in _source_ingredients():
+        rows_by_no[int(row["recipe_no"])].append(row)
+    return rows_by_no
+
+
+def _source_nutrition_by_no() -> dict[int, dict]:
+    recipe_no_by_id = {row["recipe_id"]: int(row["recipe_no"]) for row in _source_recipes()}
+    return {
+        recipe_no_by_id[row["recipe_id"]]: row
+        for row in json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    }
+
+
+def _source_foods_by_id() -> dict[str, dict]:
+    return {
+        row["food_id"]: row
+        for row in json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    }
+
+
+def _ingredient_grams(rows: list[dict], food_ids: frozenset[str]) -> float:
+    return sum(float(row.get("grams") or 0.0) for row in rows if row.get("food_id") in food_ids)
+
+
+def _has_meaningful_main_side(rows: list[dict]) -> bool:
+    return (
+        _ingredient_grams(rows, SUBSTANTIVE_GRAIN_SIDE_IDS) >= 45.0
+        or _ingredient_grams(rows, SUBSTANTIVE_BREAD_SIDE_IDS) >= 50.0
+        or _ingredient_grams(rows, SUBSTANTIVE_POTATO_SIDE_IDS) >= 120.0
+        or _ingredient_grams(rows, SUBSTANTIVE_VEGETABLE_SIDE_IDS) >= 100.0
+    )
+
+
+def test_first_under_composed_main_batch_has_substantive_sides() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    ingredients_by_no = _source_ingredients_by_no()
+    failures = []
+
+    for recipe_no in sorted(FIRST_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        recipe = recipes_by_no[recipe_no]
+        rows = ingredients_by_no[recipe_no]
+        title = str(recipe.get("title_ru") or "").casefold()
+        rice_mentioned = _has_audited_food_mention(title, ("\u0440\u0438\u0441",)) or any(
+            row.get("food_id") == "rice"
+            and _has_audited_food_mention(str(row.get("raw_text") or ""), ("\u0440\u0438\u0441",))
+            for row in rows
+        )
+        buckwheat_mentioned = _has_audited_food_mention(title, ("\u0433\u0440\u0435\u0447",)) or any(
+            row.get("food_id") == "buckwheat"
+            and _has_audited_food_mention(str(row.get("raw_text") or ""), ("\u0433\u0440\u0435\u0447",))
+            for row in rows
+        )
+
+        if "\u0431\u0443\u0442\u0435\u0440\u0431\u0440\u043e\u0434" in title or "\u0441\u044d\u043d\u0434\u0432\u0438\u0447" in title:
+            if _ingredient_grams(rows, SUBSTANTIVE_BREAD_SIDE_IDS) < 50.0:
+                failures.append((recipe_no, "sandwich without real bread"))
+        if any(row.get("food_id") in SUBSTANTIVE_BREAD_SIDE_IDS for row in rows):
+            if _ingredient_grams(rows, SUBSTANTIVE_BREAD_SIDE_IDS) < 50.0:
+                failures.append((recipe_no, "bread or flatbread row is missing grams"))
+        if rice_mentioned:
+            if _ingredient_grams(rows, frozenset({"rice"})) < 45.0:
+                failures.append((recipe_no, "rice mention without meaningful rice"))
+        if buckwheat_mentioned:
+            if _ingredient_grams(rows, frozenset({"buckwheat"})) < 45.0:
+                failures.append((recipe_no, "buckwheat mention without meaningful buckwheat"))
+        if not _has_meaningful_main_side(rows):
+            failures.append((recipe_no, "no meaningful carb/veg side"))
+
+    assert failures == []
+
+
+def test_first_under_composed_main_batch_projected_energy_stays_meaningful() -> None:
+    recipes_by_no = _runtime_recipe_by_no()
+    food_by_id = {food.id: food for food in curated_foods()}
+    failures = []
+
+    for recipe_no in sorted(FIRST_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        recipe = recipes_by_no[recipe_no]
+        for slot_ratio in (0.30, 0.25):
+            slot_target_kcal = 2000.0 * slot_ratio
+            projected = _project_recipe_nutrients(recipe, food_by_id, slot_target_kcal, meal_slot="main")
+            assert projected is not None
+            projected_ratio = projected.get("energy_kcal") / slot_target_kcal
+            if projected_ratio < 0.75:
+                failures.append((recipe_no, slot_ratio, round(projected_ratio, 3)))
+
+    assert failures == []
+
+
+def test_first_under_composed_main_batch_instructions_mention_repaired_sides() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    command_re = _standalone_recipe_command_re(FORBIDDEN_SINGULAR_RECIPE_COMMANDS)
+    failures = []
+
+    for recipe_no, expected_terms in sorted(EXPECTED_FIRST_BATCH_SIDE_INSTRUCTION_TERMS.items()):
+        instruction = str(recipes_by_no[recipe_no].get("instructions_ru") or "")
+        lowered = instruction.casefold()
+        missing_terms = [term for term in expected_terms if term not in lowered]
+        if missing_terms:
+            failures.append((recipe_no, tuple(missing_terms)))
+        assert not command_re.search(instruction)
+
+    assert failures == []
+
+
+def test_first_under_composed_main_batch_nutrition_matches_ingredient_vectors() -> None:
+    foods_by_id = _source_foods_by_id()
+    ingredients_by_no = _source_ingredients_by_no()
+    nutrition_by_no = _source_nutrition_by_no()
+    nutrient_fields = tuple(next(iter(foods_by_id.values()))["nutrients_per_100g"])
+
+    for recipe_no in sorted(FIRST_UNDER_COMPOSED_MAIN_BATCH_RECIPE_NOS):
+        expected = {field: 0.0 for field in nutrient_fields}
+        ingredient_count = 0
+        for row in ingredients_by_no[recipe_no]:
+            ingredient_count += 1
+            food_id = row.get("food_id")
+            grams = row.get("grams")
+            if not food_id or grams is None:
+                continue
+            food = foods_by_id[food_id]
+            factor = float(grams) / 100.0
+            for field in nutrient_fields:
+                expected[field] += float(food["nutrients_per_100g"].get(field, 0.0)) * factor
+
+        nutrition = nutrition_by_no[recipe_no]
+        assert nutrition["ingredient_count"] == ingredient_count
+        for field in nutrient_fields:
+            assert nutrition[field] == pytest.approx(round(expected[field], 2), abs=0.01)
 
 
 def _audit_tokens(text: str) -> list[str]:
