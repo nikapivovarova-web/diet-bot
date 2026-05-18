@@ -735,6 +735,31 @@ def test_egg_allergy_excludes_recipes_with_egg_variants() -> None:
     assert egg_ids.isdisjoint(recipe_ingredient_ids(plan))
 
 
+def test_egg_allergy_excludes_mayo_like_recipe_ingredients() -> None:
+    profile = profile_with(
+        restrictions=(Restriction(RestrictionType.ALLERGY, "\u044f\u0439\u0446\u0430"),),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    blocked_ids = {
+        "egg",
+        "egg_yolk",
+        "egg_white",
+        "egg_white_extra",
+        "egg_noodles",
+        "aioli",
+        "mayonnaise",
+        "chipotle_mayo",
+    }
+
+    for seed in range(3):
+        plan = build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only")
+
+        assert len(plan.meals) == 5
+        assert blocked_ids.isdisjoint(food_ids(plan))
+        assert blocked_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+
 def test_broccoli_exclusion_excludes_broccoli_recipes() -> None:
     profile = profile_with(
         restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "\u043d\u0435 \u0435\u043c \u0431\u0440\u043e\u043a\u043a\u043e\u043b\u0438"),),
@@ -811,6 +836,27 @@ def test_dairy_category_exclusion_filters_curated_dairy_recipes() -> None:
     assert len(plan.meals) == 5
     assert dairy_ids.isdisjoint(food_ids(plan))
     assert dairy_ids.isdisjoint(recipe_ingredient_ids(plan))
+
+
+def test_fermented_dairy_exclusion_filters_yogurt_and_kefir_recipes() -> None:
+    profile = profile_with(
+        restrictions=(
+            Restriction(
+                RestrictionType.EXCLUDED_FOOD,
+                "\u043d\u0435 \u0435\u043c \u043a\u0438\u0441\u043b\u043e\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+            ),
+        ),
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+    )
+    blocked_ids = {"greek_yogurt", "lactose_free_yogurt", "kefir", "cottage_cheese"}
+
+    for seed in range(3):
+        plan = build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only")
+
+        assert len(plan.meals) == 5
+        assert blocked_ids.isdisjoint(food_ids(plan))
+        assert blocked_ids.isdisjoint(recipe_ingredient_ids(plan))
 
 
 def test_milk_only_exclusion_keeps_other_dairy_available_in_curated_plan() -> None:
