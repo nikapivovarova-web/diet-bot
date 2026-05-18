@@ -43,6 +43,7 @@ from diet_bot.telegram_app import (  # noqa: E402
     WEEK_PLAN_DAYS,
     _BatchCarryover,
     _apply_batch_carryovers,
+    _candidate_recipe_counts,
     _carryovers_use_avoided_recipes,
     _copy_carryovers,
     _meal_slot,
@@ -102,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         for spec in _profile_specs()
         if args.profile in {"all", spec.key}
     ]
+    exit_code = 0
 
     for index, spec in enumerate(selected_specs):
         if index:
@@ -109,8 +111,14 @@ def main(argv: list[str] | None = None) -> int:
         weeks = tuple(_trace_week(spec.profile, seed) for seed in spec.seeds)
         repeated_core = _recipes_present_in_every_week(weeks, len(spec.seeds))
         _print_profile_report(spec, weeks, recipes_by_id, repeated_core, args)
+        if args.assert_no_repeated_core and repeated_core:
+            print(
+                f"ASSERTION FAILED: Profile {spec.key} has {len(repeated_core)} recipe(s) present in every seed.",
+                file=sys.stderr,
+            )
+            exit_code = 1
 
-    return 0
+    return exit_code
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -120,6 +128,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--max-repeat-lines", type=int, default=12)
     parser.add_argument("--max-selection-points", type=int, default=80)
     parser.add_argument("--seed-limit", type=int, default=None, help="Optional smoke-run cap; default uses the full profile seed range.")
+    parser.add_argument(
+        "--assert-no-repeated-core",
+        action="store_true",
+        help="Exit non-zero when any selected profile has a recipe present in every seed.",
+    )
     return parser.parse_args(argv)
 
 
@@ -208,6 +221,7 @@ def _trace_select_week_day_plan(
     best_score: tuple[float, float, float, int] | None = None
     rejected_plan: MealPlan | None = None
     traces: list[CandidateTrace] = []
+    selectable_options: list[tuple[MealPlan, dict[str, _BatchCarryover], int]] = []
 
     for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
         candidate_seed = seed + candidate_index
@@ -229,14 +243,13 @@ def _trace_select_week_day_plan(
             has_future_week_days,
         )
         selectable = rejection is None
-        score = _weekly_day_selection_score(plan, week_food_ids, candidate_index) if selectable else None
         recipe_ids = tuple(meal.recipe_id or "" for meal in plan.meals)
         traces.append(
             CandidateTrace(
                 candidate_index=candidate_index,
                 seed=candidate_seed,
                 recipe_ids=recipe_ids,
-                score=score,
+                score=None,
                 complete=_week_day_plan_is_complete(plan, profile),
                 selectable=selectable,
                 rejection=rejection,
@@ -248,10 +261,32 @@ def _trace_select_week_day_plan(
         if not selectable:
             rejected_plan = rejected_plan or plan
             continue
-        if best_score is None or score > best_score:
-            best_plan = plan
-            best_carryovers = candidate_carryovers
-            best_score = score
+        selectable_options.append((plan, candidate_carryovers, candidate_index))
+
+    if selectable_options:
+        candidate_recipe_counts = _candidate_recipe_counts(tuple(option[0] for option in selectable_options))
+        scores_by_index = {
+            candidate_index: _weekly_day_selection_score(
+                plan,
+                week_food_ids,
+                candidate_index,
+                week_recipe_ids_for_diversity=avoided_recipe_ids,
+                candidate_recipe_counts=candidate_recipe_counts,
+            )
+            for plan, _, candidate_index in selectable_options
+        }
+        traces = [
+            replace(trace, score=scores_by_index.get(trace.candidate_index))
+            if trace.selectable
+            else trace
+            for trace in traces
+        ]
+        for plan, candidate_carryovers, candidate_index in selectable_options:
+            score = scores_by_index[candidate_index]
+            if best_score is None or score > best_score:
+                best_plan = plan
+                best_carryovers = candidate_carryovers
+                best_score = score
 
     if best_plan is None or best_carryovers is None:
         if rejected_plan is not None:

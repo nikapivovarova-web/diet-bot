@@ -15,6 +15,7 @@ from diet_bot.domain import (
     Sex,
     UserProfile,
 )
+from diet_bot.recipe_traits import RecipeTraits
 from diet_bot.telegram_app import _select_week_day_plan
 
 
@@ -81,6 +82,7 @@ def _selected_plan(
     *,
     seed: int,
     week_food_ids: set[str],
+    week_recipe_ids_for_diversity: set[str] | None = None,
 ) -> MealPlan:
     plan, carryovers = _select_week_day_plan(
         profile,
@@ -89,6 +91,7 @@ def _selected_plan(
         set(),
         week_food_ids,
         {},
+        week_recipe_ids_for_diversity=week_recipe_ids_for_diversity,
     )
 
     assert carryovers == {}
@@ -97,6 +100,24 @@ def _selected_plan(
 
 def _recipe_prefixes(plan: MealPlan) -> set[str]:
     return {str(meal.recipe_id).rsplit("_", 1)[0] for meal in plan.meals}
+
+
+def _traits(recipe_id: str, protein: str, carb: str, recipe_format: str) -> RecipeTraits:
+    return RecipeTraits(
+        recipe_id=recipe_id,
+        recipe_no=None,
+        source_batch="test",
+        source_tag="test",
+        native_slot="main",
+        allowed_meal_slots=frozenset({"main"}),
+        slot_flex_type="native",
+        primary_protein=protein,
+        primary_carb=carb,
+        recipe_format=recipe_format,
+        cooking_effort="simple",
+        active_time_bucket="quick",
+        main_signal="main",
+    )
 
 
 def test_weekly_selector_prefers_calorie_valid_candidate_over_better_ingredient_reuse(
@@ -184,3 +205,53 @@ def test_weekly_selector_uses_ingredient_reuse_to_break_calorie_ties(
     selected = _selected_plan(profile, seed=seed, week_food_ids={"shared_food"})
 
     assert _recipe_prefixes(selected) == {"valid_reuse"}
+
+
+def test_weekly_selector_prefers_less_repeated_traits_before_ingredient_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    seed = 120
+    repeated_traits_better_reuse = _plan(
+        profile,
+        "repeated_traits",
+        target_energy * 0.96,
+        ("shared_food", "shared_food", "shared_food"),
+    )
+    fresh_traits_less_reuse = _plan(
+        profile,
+        "fresh_traits",
+        target_energy * 0.96,
+        ("fresh_a", "fresh_b", "fresh_c"),
+    )
+    weaker_candidates = (
+        _plan(profile, "weak_1", target_energy * 0.80, ("weak_a", "weak_b", "weak_c")),
+        _plan(profile, "weak_2", target_energy * 0.78, ("weak_d", "weak_e", "weak_f")),
+    )
+    trait_map = {
+        "week_anchor": _traits("week_anchor", "fish", "rice", "bowl"),
+        **{
+            f"repeated_traits_{index}": _traits(f"repeated_traits_{index}", "fish", "rice", "bowl")
+            for index in range(3)
+        },
+        **{
+            f"fresh_traits_{index}": _traits(f"fresh_traits_{index}", "poultry", "potato", "skillet")
+            for index in range(3)
+        },
+    }
+    _patch_day_candidates(
+        monkeypatch,
+        (repeated_traits_better_reuse, fresh_traits_less_reuse, *weaker_candidates),
+        seed_start=seed,
+    )
+    monkeypatch.setattr("diet_bot.telegram_app._recipe_traits_by_id", lambda: trait_map, raising=False)
+
+    selected = _selected_plan(
+        profile,
+        seed=seed,
+        week_food_ids={"shared_food"},
+        week_recipe_ids_for_diversity={"week_anchor"},
+    )
+
+    assert _recipe_prefixes(selected) == {"fresh_traits"}

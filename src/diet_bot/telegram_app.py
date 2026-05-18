@@ -7,10 +7,12 @@ import math
 import os
 import random
 import re
+from collections import Counter
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -69,6 +71,8 @@ from .presentation import (
     format_plan_messages,
 )
 from .pdf_renderer import build_week_plan_pdf
+from .recipe_catalog import built_in_recipes
+from .recipe_traits import RecipeTraits, infer_recipe_traits
 from .json_storage import (
     atomic_write_json,
     json_storage_transaction,
@@ -364,6 +368,14 @@ STARS_AUTO_RENEW_FAILED_TEXT = (
 )
 WEEK_PLAN_DAYS = 7
 WEEK_PLAN_CANDIDATE_COUNT = 4
+WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
+WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
+WEEKLY_TRAIT_REPEAT_CAP = 3
+WEEKLY_TRAIT_REPEAT_WEIGHTS = {
+    "primary_protein": 0.018,
+    "primary_carb": 0.012,
+    "recipe_format": 0.014,
+}
 WEEK_PDF_STATUS_UPDATE_SECONDS = 4.0
 WEEK_PDF_STATUS_INITIAL_TEXT = (
     "Собираю недельный PDF.\n\n"
@@ -1990,6 +2002,7 @@ def _build_week_plans(
     plans: list[MealPlan] = []
     week_recipe_ids = set(avoided_recipe_ids)
     week_recipe_keys = set(avoided_recipe_keys)
+    selected_week_recipe_ids: set[str] = set()
     carryovers: dict[str, _BatchCarryover] = {}
     for day_index in range(WEEK_PLAN_DAYS):
         week_food_ids = _week_food_ids(plans)
@@ -2001,11 +2014,14 @@ def _build_week_plans(
             week_food_ids,
             carryovers,
             has_future_week_days=day_index < WEEK_PLAN_DAYS - 1,
+            week_recipe_ids_for_diversity=selected_week_recipe_ids,
         )
         if not _week_day_plan_is_complete(plan, profile):
             return ()
         plans.append(plan)
-        week_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+        selected_ids = {meal.recipe_id for meal in plan.meals if meal.recipe_id}
+        week_recipe_ids.update(selected_ids)
+        selected_week_recipe_ids.update(selected_ids)
         week_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
     if not _week_plans_are_complete(plans, profile):
         return ()
@@ -2021,10 +2037,9 @@ def _select_week_day_plan(
     carryovers: dict[str, "_BatchCarryover"],
     *,
     has_future_week_days: bool = True,
+    week_recipe_ids_for_diversity: set[str] | None = None,
 ) -> tuple[MealPlan, dict[str, "_BatchCarryover"]]:
-    best_plan: MealPlan | None = None
-    best_carryovers: dict[str, _BatchCarryover] | None = None
-    best_score: tuple[float, float, float, int] | None = None
+    candidate_options: list[tuple[MealPlan, dict[str, _BatchCarryover], int]] = []
     rejected_plan: MealPlan | None = None
     for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
         plan = build_one_day_plan(
@@ -2051,27 +2066,35 @@ def _select_week_day_plan(
         ):
             rejected_plan = rejected_plan or plan
             continue
-        score = _weekly_day_selection_score(plan, week_food_ids, candidate_index)
-        if best_score is None or score > best_score:
-            best_plan = plan
-            best_carryovers = candidate_carryovers
-            best_score = score
+        candidate_options.append((plan, candidate_carryovers, candidate_index))
 
-    if best_plan is None or best_carryovers is None:
-        if rejected_plan is not None:
-            return replace(rejected_plan, meals=()), carryovers
-        return (
-            build_one_day_plan(
-                profile,
-                variety_seed=seed,
-                avoided_recipe_ids=avoided_recipe_ids,
-                avoided_recipe_keys=avoided_recipe_keys,
-                recipe_source="curated_only",
-                allow_avoided_recipe_relaxation=False,
+    if candidate_options:
+        candidate_recipe_counts = _candidate_recipe_counts(tuple(option[0] for option in candidate_options))
+        best_plan, best_carryovers, _ = max(
+            candidate_options,
+            key=lambda option: _weekly_day_selection_score(
+                option[0],
+                week_food_ids,
+                option[2],
+                week_recipe_ids_for_diversity=week_recipe_ids_for_diversity,
+                candidate_recipe_counts=candidate_recipe_counts,
             ),
-            carryovers,
         )
-    return best_plan, best_carryovers
+        return best_plan, best_carryovers
+
+    if rejected_plan is not None:
+        return replace(rejected_plan, meals=()), carryovers
+    return (
+        build_one_day_plan(
+            profile,
+            variety_seed=seed,
+            avoided_recipe_ids=avoided_recipe_ids,
+            avoided_recipe_keys=avoided_recipe_keys,
+            recipe_source="curated_only",
+            allow_avoided_recipe_relaxation=False,
+        ),
+        carryovers,
+    )
 
 
 def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) -> bool:
@@ -2142,13 +2165,96 @@ def _weekly_day_selection_score(
     plan: MealPlan,
     week_food_ids: set[str],
     candidate_index: int,
+    *,
+    week_recipe_ids_for_diversity: set[str] | None = None,
+    candidate_recipe_counts: Counter[str] | None = None,
 ) -> tuple[float, float, float, int]:
     in_calorie_band, calorie_gap = _calorie_fit(plan)
+    macro_gap = _macro_balance_gap(plan)
+    diversity_penalty = _weekly_completed_day_diversity_penalty(
+        plan,
+        week_recipe_ids_for_diversity or set(),
+    )
+    candidate_pool_penalty = _completed_candidate_pool_recipe_penalty(plan, candidate_recipe_counts or Counter())
     return (
         1.0 if in_calorie_band else 0.0,
-        -calorie_gap,
+        -(calorie_gap + macro_gap * 0.04 + diversity_penalty + candidate_pool_penalty),
         _ingredient_reuse_score(plan, week_food_ids),
         -candidate_index,
+    )
+
+
+def _candidate_recipe_counts(plans: Sequence[MealPlan]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for plan in plans:
+        counts.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+    return counts
+
+
+def _completed_candidate_pool_recipe_penalty(plan: MealPlan, candidate_recipe_counts: Counter[str]) -> float:
+    if not candidate_recipe_counts:
+        return 0.0
+    penalty = 0.0
+    for meal in plan.meals:
+        if not meal.recipe_id:
+            continue
+        penalty += max(0, candidate_recipe_counts[meal.recipe_id] - 1) * WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY
+    return penalty
+
+
+def _weekly_completed_day_diversity_penalty(plan: MealPlan, week_recipe_ids: set[str]) -> float:
+    if not plan.meals or not week_recipe_ids:
+        return 0.0
+
+    traits_by_id = _recipe_traits_by_id()
+    week_trait_counts = _week_trait_counts(week_recipe_ids, traits_by_id)
+    penalty = 0.0
+    for meal in plan.meals:
+        recipe_id = meal.recipe_id
+        if not recipe_id:
+            continue
+        if recipe_id in week_recipe_ids:
+            penalty += WEEKLY_EXACT_RECIPE_REPEAT_PENALTY
+        traits = traits_by_id.get(recipe_id)
+        if traits is None:
+            continue
+        for trait_name, weight in WEEKLY_TRAIT_REPEAT_WEIGHTS.items():
+            value = getattr(traits, trait_name)
+            if not value:
+                continue
+            repeated = min(week_trait_counts[(trait_name, value)], WEEKLY_TRAIT_REPEAT_CAP)
+            penalty += repeated * weight
+    return penalty
+
+
+def _week_trait_counts(
+    recipe_ids: set[str],
+    traits_by_id: dict[str, RecipeTraits],
+) -> Counter[tuple[str, str]]:
+    counts: Counter[tuple[str, str]] = Counter()
+    for recipe_id in recipe_ids:
+        traits = traits_by_id.get(recipe_id)
+        if traits is None:
+            continue
+        for trait_name in WEEKLY_TRAIT_REPEAT_WEIGHTS:
+            value = getattr(traits, trait_name)
+            if value:
+                counts[(trait_name, value)] += 1
+    return counts
+
+
+@lru_cache(maxsize=1)
+def _recipe_traits_by_id() -> dict[str, RecipeTraits]:
+    return {recipe.id: infer_recipe_traits(recipe) for recipe in built_in_recipes()}
+
+
+def _macro_balance_gap(plan: MealPlan) -> float:
+    total = plan.totals
+    target = plan.targets.targets
+    return (
+        _relative_gap(total, target, "protein_g")
+        + _relative_gap(total, target, "fat_g")
+        + _relative_gap(total, target, "carbohydrate_g")
     )
 
 
@@ -2163,6 +2269,13 @@ def _calorie_fit(plan: MealPlan) -> tuple[bool, float]:
     if energy < lower:
         return False, (lower - energy) / denominator
     return False, (energy - upper) / denominator
+
+
+def _relative_gap(total, target, nutrient: str) -> float:
+    target_value = target.get(nutrient)
+    if target_value <= 0:
+        return 0.0
+    return abs(total.get(nutrient) - target_value) / target_value
 
 
 @dataclass
