@@ -7,6 +7,7 @@ from diet_bot.builder import (
     _build_recipe_plan_for_time,
     _cooking_effort_constraints,
     _meal_energy_slots,
+    _project_recipe_nutrients,
     _rank_recipes,
     _recipe_matches_cooking_effort,
     _recipe_time_bucket,
@@ -369,6 +370,25 @@ def _slot_eligibility(recipe: RecipeTemplate, slot: str):
     )
 
 
+def _curated_recipe(prefix: str) -> RecipeTemplate:
+    return next(recipe for recipe in built_in_recipes() if recipe.id.startswith(f"{prefix}_"))
+
+
+def _profile_a_main_target(slot_index: int) -> tuple[dict[str, Food], NutrientVector, float]:
+    profile = profile_with(meal_count=5, cooking_time=CookingTimePreference.SIMPLE)
+    target = calculate_targets(profile).targets
+    energy_slot = _meal_energy_slots(5)[slot_index]
+    slot_energy_target = target.get("energy_kcal") * energy_slot.target_ratio
+    return {food.id: food for food in built_in_foods()}, target, slot_energy_target
+
+
+def _projected_main_energy_ratio(recipe: RecipeTemplate, slot_index: int) -> float:
+    food_by_id, target, slot_energy_target = _profile_a_main_target(slot_index)
+    projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot="main")
+    assert projected is not None
+    return projected.get("energy_kcal") / slot_energy_target
+
+
 def test_native_slot_recipe_is_eligible_without_flex_penalty() -> None:
     recipe = _slot_recipe("native_main", slot="main", allowed_meal_slots=("main",), slot_flex_type="main_only")
 
@@ -491,6 +511,73 @@ def test_snack_dessert_does_not_fill_main_slot(monkeypatch) -> None:
     )
 
     assert meals == []
+
+
+def test_light_snack_offenders_do_not_fill_main_when_projected_energy_is_too_low() -> None:
+    food_by_id, target, slot_energy_target = _profile_a_main_target(slot_index=1)
+    low_energy_snacks = (
+        _curated_recipe("r387"),
+        _curated_recipe("r400"),
+        _curated_recipe("r399"),
+        _curated_recipe("r256"),
+        _curated_recipe("r333"),
+        _curated_recipe("r277"),
+    )
+
+    for recipe in low_energy_snacks:
+        assert recipe.slot == "snack"
+        assert _recipe_matches_cooking_effort(recipe, _cooking_effort_constraints(CookingTimePreference.SIMPLE))
+        assert _projected_main_energy_ratio(recipe, slot_index=1) < 0.75
+        assert not builder_module._recipe_slot_eligibility(
+            recipe,
+            "main",
+            food_by_id,
+            slot_energy_target,
+            target,
+        ).eligible
+        assert builder_module._recipe_slot_eligibility(
+            recipe,
+            "snack",
+            food_by_id,
+            slot_energy_target,
+            target,
+        ).eligible
+
+
+def test_protein_only_old_mains_do_not_fill_high_energy_main_slot_when_caps_block_energy() -> None:
+    food_by_id, target, slot_energy_target = _profile_a_main_target(slot_index=1)
+    low_energy_mains = (
+        _curated_recipe("r133"),
+        _curated_recipe("r134"),
+        _curated_recipe("r135"),
+        _curated_recipe("r136"),
+    )
+
+    for recipe in low_energy_mains:
+        assert recipe.slot == "main"
+        assert _projected_main_energy_ratio(recipe, slot_index=1) < 0.75
+        assert not builder_module._recipe_slot_eligibility(
+            recipe,
+            "main",
+            food_by_id,
+            slot_energy_target,
+            target,
+        ).eligible
+
+
+def test_genuine_old_full_main_still_qualifies_for_simple_main() -> None:
+    food_by_id, target, slot_energy_target = _profile_a_main_target(slot_index=1)
+    recipe = _curated_recipe("r101")
+
+    assert recipe.slot == "main"
+    assert _projected_main_energy_ratio(recipe, slot_index=1) >= 0.75
+    assert builder_module._recipe_slot_eligibility(
+        recipe,
+        "main",
+        food_by_id,
+        slot_energy_target,
+        target,
+    ).eligible
 
 
 def test_slot_flex_does_not_relax_forbidden_ingredients(monkeypatch) -> None:
@@ -750,7 +837,7 @@ def test_effort_fallback_does_not_relax_allergy_filtered_foods(monkeypatch) -> N
     assert "egg" not in {portion.food.id for meal in meals for portion in meal.portions}
 
 
-def test_simple_main_eligible_coverage_exceeds_audit_baseline() -> None:
+def test_simple_main_projected_energy_guard_keeps_healthy_pool() -> None:
     profile = profile_with()
     target = calculate_targets(profile).targets
     food_by_id = {food.id: food for food in built_in_foods()}
@@ -786,6 +873,6 @@ def test_simple_main_eligible_coverage_exceeds_audit_baseline() -> None:
     legacy_eligible = ranked_main_count([recipe for recipe in simple_curated if not is_imported_intake(recipe)])
     eligible = ranked_main_count(simple_curated)
 
-    assert legacy_eligible >= 70
-    assert eligible >= 86
-    assert eligible - legacy_eligible >= 26
+    assert legacy_eligible >= 50
+    assert eligible >= 125
+    assert eligible - legacy_eligible >= 70
