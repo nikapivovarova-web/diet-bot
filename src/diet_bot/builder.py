@@ -69,7 +69,6 @@ PROTEIN_TOP_UP_CEILING_BUFFER_G = 1.0
 RECIPE_PLAN_CANDIDATE_COUNT = 1
 SLOT_FLEX_PENALTY = 5.0
 EFFORT_FALLBACK_PENALTY = 7.0
-MIN_PROJECTED_MAIN_ENERGY_RATIO = 0.75
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
 FAT_RECIPE_HARD_LIMIT_MULTIPLIER = 1.25
@@ -1226,17 +1225,9 @@ def _recipe_slot_eligibility(
     food_by_id: dict[str, Food],
     slot_energy_target: float,
     target: NutrientVector,
-    *,
-    check_projected_main_energy: bool = True,
 ) -> RecipeSlotEligibility:
     requested_slot = slot.strip().lower()
     native_slot = recipe.slot.strip().lower()
-    if check_projected_main_energy and requested_slot == "main" and not _recipe_projects_enough_main_energy(
-        recipe,
-        food_by_id,
-        slot_energy_target,
-    ):
-        return RecipeSlotEligibility(False)
     if native_slot == requested_slot:
         return RecipeSlotEligibility(True)
 
@@ -1277,26 +1268,6 @@ def _recipe_slot_eligibility(
         return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
 
     return RecipeSlotEligibility(False)
-
-
-def _recipe_projects_enough_main_energy(
-    recipe: RecipeTemplate,
-    food_by_id: dict[str, Food],
-    slot_energy_target: float,
-) -> bool:
-    if slot_energy_target <= 0:
-        return True
-    projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot="main")
-    return _projected_nutrients_meet_main_energy(projected, slot_energy_target)
-
-
-def _projected_nutrients_meet_main_energy(
-    projected: NutrientVector | None,
-    slot_energy_target: float,
-) -> bool:
-    if projected is None:
-        return False
-    return projected.get("energy_kcal") >= slot_energy_target * MIN_PROJECTED_MAIN_ENERGY_RATIO
 
 
 def _recipe_slot_flex_type(recipe: RecipeTemplate) -> str:
@@ -1363,24 +1334,10 @@ def _rank_recipes(
     manage_sodium: bool = False,
 ) -> list[RecipeTemplate]:
     eligible_candidates: list[tuple[RecipeTemplate, RecipeSlotEligibility]] = []
-    projected_by_recipe_id: dict[str, NutrientVector | None] = {}
-    requested_slot = slot.strip().lower()
     for recipe in recipes:
         if recipe.id in used_recipe_ids:
             continue
-        if requested_slot == "main":
-            projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot="main")
-            projected_by_recipe_id[recipe.id] = projected
-            if not _projected_nutrients_meet_main_energy(projected, slot_energy_target):
-                continue
-        eligibility = _recipe_slot_eligibility(
-            recipe,
-            slot,
-            food_by_id,
-            slot_energy_target,
-            target,
-            check_projected_main_energy=False,
-        )
+        eligibility = _recipe_slot_eligibility(recipe, slot, food_by_id, slot_energy_target, target)
         if eligibility.eligible:
             eligible_candidates.append((recipe, eligibility))
     candidates = [recipe for recipe, _ in eligible_candidates]
@@ -1392,9 +1349,7 @@ def _rank_recipes(
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
         seed_score = _seeded_score(recipe.id, variety_seed, index) * 2.0
         nutrient_bonus = _recipe_nutrient_bonus(recipe, current_total, target)
-        projected = projected_by_recipe_id.get(recipe.id)
-        if projected is None and recipe.id not in projected_by_recipe_id:
-            projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=slot)
+        projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=slot)
         macro_bonus = _recipe_projected_macro_gap_bonus(
             projected,
             current_total,
