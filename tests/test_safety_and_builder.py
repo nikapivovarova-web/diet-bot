@@ -342,6 +342,21 @@ def _title_only_excluded_recipes(title_term: str) -> tuple[RecipeTemplate, ...]:
     )
 
 
+def _simple_test_food(
+    food_id: str,
+    name: str,
+    category: str = "grains",
+) -> Food:
+    return Food(
+        id=food_id,
+        name=name,
+        category=category,
+        nutrients_per_100g=NutrientVector({"energy_kcal": 120, "protein_g": 4, "fat_g": 1}),
+        max_per_meal_g=1000,
+        max_per_day_g=3000,
+    )
+
+
 def _safety_for_exclusion(value: str):
     return evaluate_safety(
         profile_with(restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, value),))
@@ -682,6 +697,47 @@ def test_human_category_exclusion_aliases_expand_to_recipe_names() -> None:
     )
 
 
+def test_porridge_exclusion_does_not_filter_plain_rice_ingredients() -> None:
+    safety = _safety_for_exclusion("\u043a\u0430\u0448\u0430")
+    rice = _simple_test_food("rice", "\u0440\u0438\u0441")
+    recipe = RecipeTemplate(
+        id="rice_only_test_recipe",
+        slot="main",
+        title="Rice bowl",
+        ingredients_g={"rice": 120},
+        instructions="Cook the rice.",
+        tags=frozenset({"curated"}),
+        time_text="10 minutes",
+    )
+    eligible_foods = filter_foods([rice], safety)
+
+    assert [food.id for food in eligible_foods] == ["rice"]
+    assert builder_module._resolve_recipe_ingredients(
+        recipe,
+        {food.id: food for food in eligible_foods},
+    ) is not None
+    assert is_name_excluded(
+        "\u0420\u0438\u0441\u043e\u0432\u0430\u044f \u043a\u0430\u0448\u0430",
+        safety.excluded_food_names,
+    )
+
+
+@pytest.mark.parametrize(
+    "restriction_value",
+    (
+        "\u043c\u043e\u043b\u043e\u0447\u043a\u0430",
+        "dairy",
+        "butter",
+    ),
+)
+def test_dairy_and_butter_exclusions_keep_nut_butters_available(restriction_value: str) -> None:
+    eligible_ids = _eligible_food_ids_for_exclusion(restriction_value)
+
+    assert "peanut_butter" in eligible_ids
+    assert "almond_butter" in eligible_ids
+    assert "butter" not in eligible_ids
+
+
 def test_milk_exclusion_does_not_expand_to_all_dairy() -> None:
     eligible_ids = _eligible_food_ids_for_exclusion("\u043c\u043e\u043b\u043e\u043a\u043e")
 
@@ -711,6 +767,53 @@ def test_recipe_title_exclusions_are_applied_after_ingredient_id_pool(monkeypatc
     )
 
     assert meals == []
+
+
+@pytest.mark.parametrize(
+    ("restriction_type", "restriction_value", "title"),
+    (
+        (
+            RestrictionType.ALLERGY,
+            "\u044f\u0439\u0446\u0430",
+            "\u0421\u043a\u0440\u044d\u043c\u0431\u043b \u0431\u0435\u0437 \u044f\u0438\u0446",
+        ),
+        (
+            RestrictionType.EXCLUDED_FOOD,
+            "\u043d\u0435 \u0435\u043c \u044f\u0439\u0446\u0430",
+            "\u0421\u043a\u0440\u044d\u043c\u0431\u043b \u0431\u0435\u0437 \u044f\u0438\u0446",
+        ),
+        (
+            RestrictionType.ALLERGY,
+            "egg",
+            "Egg-free scramble",
+        ),
+    ),
+)
+def test_egg_free_recipe_titles_are_allowed_when_ingredients_are_egg_free(
+    restriction_type: RestrictionType,
+    restriction_value: str,
+    title: str,
+    monkeypatch,
+) -> None:
+    safety = _safety_for_restriction(restriction_type, restriction_value)
+    monkeypatch.setattr(
+        "diet_bot.builder.built_in_recipes",
+        lambda: _title_only_excluded_recipes(title),
+    )
+
+    meals = _build_recipe_plan_for_time(
+        [_high_protein_food()],
+        NutrientVector({"energy_kcal": 1000, "protein_g": 60, "fat_g": 30, "carbohydrate_g": 120}),
+        3,
+        CookingTimePreference.SIMPLE,
+        0,
+        frozenset(),
+        frozenset(),
+        "curated_only",
+        excluded_food_names=safety.excluded_food_names,
+    )
+
+    assert len(meals) == 3
 
 
 def test_apple_allergy_excludes_apple() -> None:

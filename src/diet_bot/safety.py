@@ -849,7 +849,11 @@ PLANT_MILK_EXCEPTIONS = (
 MATCH_EXCEPTIONS_BY_EXCLUDED_NAME = {
     "milk": PLANT_MILK_EXCEPTIONS,
     "\u043c\u043e\u043b\u043e\u043a\u043e": PLANT_MILK_EXCEPTIONS,
+    "butter": ("almond butter", "peanut butter"),
+    "\u0440\u0438\u0441\u043e\u0432\u0430\u044f \u043a\u0430\u0448\u0430": ("\u0440\u0438\u0441",),
 }
+TITLE_NEGATION_BEFORE_TOKENS = frozenset(("\u0431\u0435\u0437", "no", "without"))
+TITLE_NEGATION_AFTER_TOKENS = frozenset(("free",))
 
 
 def evaluate_safety(profile: UserProfile) -> SafetyResult:
@@ -964,6 +968,15 @@ def is_name_excluded(food_name: str, excluded_names: frozenset[str]) -> bool:
     return any(_matches_excluded_name(normalized, name) for name in excluded_names)
 
 
+def is_recipe_title_excluded(recipe_title: str, excluded_names: frozenset[str]) -> bool:
+    normalized = _normalize_exclusion_match_text(recipe_title)
+    return any(
+        _matches_excluded_name(normalized, name)
+        and not _title_match_is_negated(normalized, name)
+        for name in excluded_names
+    )
+
+
 def is_food_excluded(food: Food, excluded_names: frozenset[str]) -> bool:
     normalized_ids = {
         _normalize_exclusion_match_text(food.id),
@@ -1067,6 +1080,25 @@ def _has_match_exception(normalized_food_name: str, normalized_excluded: str) ->
         _normalize_exclusion_match_text(exception)
         for exception in exceptions
     }
+
+
+def _title_match_is_negated(normalized_title: str, excluded_name: str) -> bool:
+    normalized_excluded = _normalize_exclusion_match_text(excluded_name)
+    title_tokens = MATCH_TOKEN_RE.findall(normalized_title)
+    excluded_tokens = MATCH_TOKEN_RE.findall(normalized_excluded)
+    if not title_tokens or not excluded_tokens:
+        return False
+
+    for index in range(0, len(title_tokens) - len(excluded_tokens) + 1):
+        window = title_tokens[index : index + len(excluded_tokens)]
+        if not all(token == expected or token.startswith(expected) for token, expected in zip(window, excluded_tokens)):
+            continue
+        previous_token = title_tokens[index - 1] if index > 0 else ""
+        next_index = index + len(excluded_tokens)
+        next_token = title_tokens[next_index] if next_index < len(title_tokens) else ""
+        if previous_token in TITLE_NEGATION_BEFORE_TOKENS or next_token in TITLE_NEGATION_AFTER_TOKENS:
+            return True
+    return False
 
 
 def _is_latin_exclusion(value: str) -> bool:

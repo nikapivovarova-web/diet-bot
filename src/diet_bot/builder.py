@@ -31,7 +31,7 @@ from .portion_scaling import (
     top_up_total_grams,
 )
 from .recipe_catalog import RecipeTemplate, built_in_recipes
-from .safety import evaluate_safety, is_food_excluded, is_name_excluded
+from .safety import evaluate_safety, is_food_excluded, is_name_excluded, is_recipe_title_excluded
 
 
 RecipeSource = Literal["all", "curated_only"]
@@ -890,7 +890,7 @@ def _recipe_title_uses_excluded_food(
     recipe: RecipeTemplate,
     excluded_food_names: frozenset[str],
 ) -> bool:
-    return bool(excluded_food_names) and is_name_excluded(recipe.title, excluded_food_names)
+    return bool(excluded_food_names) and is_recipe_title_excluded(recipe.title, excluded_food_names)
 
 
 def _instruction_sentence_count(text: str) -> int:
