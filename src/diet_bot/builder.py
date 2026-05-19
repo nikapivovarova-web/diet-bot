@@ -1235,6 +1235,9 @@ def _recipe_slot_eligibility(
     allowed_slots = _recipe_allowed_meal_slots(recipe)
     has_explicit_flex_metadata = _recipe_has_explicit_slot_flex_metadata(recipe)
 
+    if requested_slot in allowed_slots and {native_slot, requested_slot} <= {"breakfast", "snack"}:
+        return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
+
     if flex_type.endswith("_only") or flex_type == "main_only":
         return RecipeSlotEligibility(False)
 

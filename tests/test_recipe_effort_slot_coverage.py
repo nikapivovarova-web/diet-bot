@@ -6,10 +6,14 @@ from diet_bot import builder as builder_module
 from diet_bot.builder import (
     _build_recipe_plan_for_time,
     _cooking_effort_constraints,
+    _cooking_effort_phases,
     _meal_energy_slots,
     _rank_recipes,
     _recipe_matches_cooking_effort,
+    _recipe_slot_eligibility,
+    _recipe_title_uses_excluded_food,
     _recipe_time_bucket,
+    _resolve_recipe_ingredients,
     filter_foods,
 )
 from diet_bot.calculator import calculate_targets
@@ -28,6 +32,37 @@ from diet_bot.domain import (
 )
 from diet_bot.recipe_catalog import RecipeTemplate, built_in_recipes
 from diet_bot.safety import evaluate_safety, is_food_excluded, is_name_excluded
+
+
+REVIEWED_BREAKFAST_FLEX_RECIPE_IDS = (
+    "r595_lavash_s_gorbushey_i_ovoschami",
+    "r596_tortilya_s_gorbushey_i_kukuruzoy",
+    "r581_roll_s_tuntsom_i_kukuruzoy",
+    "r511_sendvich_s_tuntsom",
+    "r508_buterbrody_s_kuritsey_i_ovoschami",
+    "r352_roll_s_krevetkami_avokado_laymom_i_tabasko",
+    "r585_tost_s_sardinami_i_ogurtsom",
+    "r592_tosty_s_seledkoy_i_svekloy",
+    "r587_tosty_so_shprotami_ogurtsom_i_gorchitsey",
+    "r351_ostrye_rolly_s_kuritsey_avokado_i_pechenym_pertsem",
+    "r489_rulet_iz_lavasha_s_humusom",
+    "r580_tost_s_humusom_i_zapechennym_pertsem",
+    "r285_tost_iz_batata_s_tuntsom_avokado_i_nori",
+    "r290_brusketta_s_tomatami_persikom_i_avokado",
+    "r349_yablochnye_sendvichi_s_arahisovoy_pastoy_i_izyumom",
+)
+
+REVIEWED_MAIN_ELIGIBLE_RECIPE_IDS = frozenset(
+    {
+        "r595_lavash_s_gorbushey_i_ovoschami",
+        "r596_tortilya_s_gorbushey_i_kukuruzoy",
+        "r581_roll_s_tuntsom_i_kukuruzoy",
+        "r511_sendvich_s_tuntsom",
+        "r508_buterbrody_s_kuritsey_i_ovoschami",
+        "r352_roll_s_krevetkami_avokado_laymom_i_tabasko",
+        "r351_ostrye_rolly_s_kuritsey_avokado_i_pechenym_pertsem",
+    }
+)
 
 
 def profile_with(**kwargs) -> UserProfile:
@@ -369,6 +404,42 @@ def _slot_eligibility(recipe: RecipeTemplate, slot: str):
     )
 
 
+def _manual_like_profile_b() -> UserProfile:
+    return profile_with(
+        goal=Goal.LOSE,
+        restrictions=(
+            Restriction(RestrictionType.ALLERGY, "яйца"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "кисломолочные продукты"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "каша"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "молочка"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "молоко"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "грибы"),
+        ),
+    )
+
+
+def _slot_target(profile: UserProfile, slot: str) -> tuple[dict[str, Food], NutrientVector, float]:
+    safety = evaluate_safety(profile)
+    targets = calculate_targets(profile)
+    food_by_id = {food.id: food for food in filter_foods(built_in_foods(), safety)}
+    total_energy = targets.targets.get("energy_kcal")
+    energy_slot = next(energy_slot for energy_slot in _meal_energy_slots(profile.meal_count) if energy_slot.slot == slot)
+    return food_by_id, targets.targets, total_energy * energy_slot.target_ratio
+
+
+def _passes_hard_recipe_filters(recipe: RecipeTemplate, profile: UserProfile) -> bool:
+    safety = evaluate_safety(profile)
+    food_by_id = {food.id: food for food in filter_foods(built_in_foods(), safety)}
+    if _resolve_recipe_ingredients(recipe, food_by_id) is None:
+        return False
+    if _recipe_title_uses_excluded_food(recipe, safety.excluded_food_names):
+        return False
+    return any(
+        phase.constraints is None or _recipe_matches_cooking_effort(recipe, phase.constraints)
+        for phase in _cooking_effort_phases(profile.cooking_time)
+    )
+
+
 def test_native_slot_recipe_is_eligible_without_flex_penalty() -> None:
     recipe = _slot_recipe("native_main", slot="main", allowed_meal_slots=("main",), slot_flex_type="main_only")
 
@@ -403,6 +474,71 @@ def test_breakfast_snack_metadata_flexes_between_breakfast_and_snack_with_penalt
     assert breakfast_result.eligible
     assert breakfast_result.penalty > 0
     assert not main_result.eligible
+
+
+def test_explicit_breakfast_slot_extends_reviewed_snack_metadata() -> None:
+    light_main_snack = _slot_recipe(
+        "metadata_breakfast_light_main",
+        slot="snack",
+        allowed_meal_slots=("breakfast", "snack", "main"),
+        slot_flex_type="snack_light_main",
+    )
+    snack_only = _slot_recipe(
+        "metadata_breakfast_snack_only",
+        slot="snack",
+        allowed_meal_slots=("breakfast", "snack"),
+        slot_flex_type="snack_only",
+    )
+
+    light_main_result = _slot_eligibility(light_main_snack, "breakfast")
+    snack_only_result = _slot_eligibility(snack_only, "breakfast")
+
+    assert light_main_result.eligible
+    assert light_main_result.penalty > 0
+    assert snack_only_result.eligible
+    assert snack_only_result.penalty > 0
+
+
+def test_reviewed_snack_recipes_are_breakfast_eligible_for_profile_b_when_hard_filters_pass() -> None:
+    profile = _manual_like_profile_b()
+    food_by_id, target, slot_energy_target = _slot_target(profile, "breakfast")
+    recipe_by_id = {recipe.id: recipe for recipe in built_in_recipes()}
+    hard_valid_ids = []
+
+    for recipe_id in REVIEWED_BREAKFAST_FLEX_RECIPE_IDS:
+        recipe = recipe_by_id[recipe_id]
+        if not _passes_hard_recipe_filters(recipe, profile):
+            continue
+        hard_valid_ids.append(recipe_id)
+        result = _recipe_slot_eligibility(recipe, "breakfast", food_by_id, slot_energy_target, target)
+        assert result.eligible, recipe_id
+
+    assert hard_valid_ids == list(REVIEWED_BREAKFAST_FLEX_RECIPE_IDS)
+
+
+def test_reviewed_breakfast_unlock_preserves_existing_snack_and_main_eligibility() -> None:
+    profile = _manual_like_profile_b()
+    recipe_by_id = {recipe.id: recipe for recipe in built_in_recipes()}
+    snack_food_by_id, snack_target, snack_energy_target = _slot_target(profile, "snack")
+    main_food_by_id, main_target, main_energy_target = _slot_target(profile, "main")
+
+    main_eligible_ids = set()
+    for recipe_id in REVIEWED_BREAKFAST_FLEX_RECIPE_IDS:
+        recipe = recipe_by_id[recipe_id]
+        assert _recipe_slot_eligibility(recipe, "snack", snack_food_by_id, snack_energy_target, snack_target).eligible
+        if _recipe_slot_eligibility(recipe, "main", main_food_by_id, main_energy_target, main_target).eligible:
+            main_eligible_ids.add(recipe_id)
+
+    assert main_eligible_ids == REVIEWED_MAIN_ELIGIBLE_RECIPE_IDS
+
+
+def test_unrestricted_simple_curated_profile_still_builds_complete_day_after_breakfast_unlock() -> None:
+    profile = profile_with(goal=Goal.LOSE)
+
+    plan = builder_module.build_one_day_plan(profile, variety_seed=0, recipe_source="curated_only")
+
+    assert len(plan.meals) == profile.meal_count
+    assert all(meal.recipe_id for meal in plan.meals)
 
 
 def test_main_only_metadata_does_not_flex_even_when_allowed_slots_claim_main() -> None:
