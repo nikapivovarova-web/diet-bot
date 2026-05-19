@@ -68,6 +68,7 @@ PROTEIN_EXCESSIVE_CEILING_MULTIPLIER = 1.50
 PROTEIN_TOP_UP_CEILING_BUFFER_G = 1.0
 RECIPE_PLAN_CANDIDATE_COUNT = 1
 SLOT_FLEX_PENALTY = 5.0
+EXPLICIT_SLOT_FLEX_PENALTY = 0.0
 EFFORT_FALLBACK_PENALTY = 7.0
 FAT_TOP_UP_CEILING_MULTIPLIER = 1.05
 FAT_RECIPE_SOFT_LIMIT_MULTIPLIER = 1.05
@@ -1236,7 +1237,7 @@ def _recipe_slot_eligibility(
     has_explicit_flex_metadata = _recipe_has_explicit_slot_flex_metadata(recipe)
 
     if requested_slot in allowed_slots and {native_slot, requested_slot} <= {"breakfast", "snack"}:
-        return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
+        return RecipeSlotEligibility(True, EXPLICIT_SLOT_FLEX_PENALTY)
 
     if flex_type.endswith("_only") or flex_type == "main_only":
         return RecipeSlotEligibility(False)

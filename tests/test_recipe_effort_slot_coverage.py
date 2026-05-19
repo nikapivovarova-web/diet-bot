@@ -449,7 +449,29 @@ def test_native_slot_recipe_is_eligible_without_flex_penalty() -> None:
     assert result.penalty == 0.0
 
 
-def test_breakfast_snack_metadata_flexes_between_breakfast_and_snack_with_penalty() -> None:
+def test_explicit_allowed_breakfast_flex_has_lower_penalty_than_generic_slot_flex() -> None:
+    explicit_breakfast = _slot_recipe(
+        "explicit_breakfast_flex",
+        slot="snack",
+        allowed_meal_slots=("breakfast", "snack"),
+    )
+    generic_main = _slot_recipe(
+        "generic_main_flex",
+        slot="snack",
+        allowed_meal_slots=("snack", "main"),
+        slot_flex_type="snack_light_main",
+    )
+
+    explicit_result = _slot_eligibility(explicit_breakfast, "breakfast")
+    generic_result = _slot_eligibility(generic_main, "main")
+
+    assert explicit_result.eligible
+    assert generic_result.eligible
+    assert explicit_result.penalty == 0.0
+    assert generic_result.penalty == builder_module.SLOT_FLEX_PENALTY
+
+
+def test_breakfast_snack_metadata_flexes_between_breakfast_and_snack_without_generic_penalty() -> None:
     breakfast = _slot_recipe(
         "breakfast_snack_flex",
         slot="breakfast",
@@ -470,9 +492,9 @@ def test_breakfast_snack_metadata_flexes_between_breakfast_and_snack_with_penalt
     main_result = _slot_eligibility(breakfast, "main")
 
     assert snack_result.eligible
-    assert snack_result.penalty > 0
+    assert snack_result.penalty == 0.0
     assert breakfast_result.eligible
-    assert breakfast_result.penalty > 0
+    assert breakfast_result.penalty == 0.0
     assert not main_result.eligible
 
 
@@ -494,9 +516,9 @@ def test_explicit_breakfast_slot_extends_reviewed_snack_metadata() -> None:
     snack_only_result = _slot_eligibility(snack_only, "breakfast")
 
     assert light_main_result.eligible
-    assert light_main_result.penalty > 0
+    assert light_main_result.penalty == 0.0
     assert snack_only_result.eligible
-    assert snack_only_result.penalty > 0
+    assert snack_only_result.penalty == 0.0
 
 
 def test_reviewed_snack_recipes_are_breakfast_eligible_for_profile_b_when_hard_filters_pass() -> None:
@@ -512,6 +534,7 @@ def test_reviewed_snack_recipes_are_breakfast_eligible_for_profile_b_when_hard_f
         hard_valid_ids.append(recipe_id)
         result = _recipe_slot_eligibility(recipe, "breakfast", food_by_id, slot_energy_target, target)
         assert result.eligible, recipe_id
+        assert result.penalty == 0.0, recipe_id
 
     assert hard_valid_ids == list(REVIEWED_BREAKFAST_FLEX_RECIPE_IDS)
 
@@ -573,7 +596,7 @@ def test_snack_light_main_metadata_uses_existing_main_like_gates() -> None:
     dessert_result = _slot_eligibility(dessert, "main")
 
     assert structured_result.eligible
-    assert structured_result.penalty > 0
+    assert structured_result.penalty == builder_module.SLOT_FLEX_PENALTY
     assert not dessert_result.eligible
 
 
@@ -583,7 +606,7 @@ def test_legacy_snack_as_main_fallback_still_applies_without_explicit_metadata()
     result = _slot_eligibility(legacy_snack, "main")
 
     assert result.eligible
-    assert result.penalty > 0
+    assert result.penalty == builder_module.SLOT_FLEX_PENALTY
 
 
 def test_main_builder_can_use_high_protein_main_like_snack_fallback(monkeypatch) -> None:
