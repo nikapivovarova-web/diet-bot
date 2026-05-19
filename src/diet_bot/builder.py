@@ -66,6 +66,14 @@ PROTEIN_TOP_UP_TARGET_MULTIPLIER = 0.95
 PROTEIN_REASONABLE_CEILING_MULTIPLIER = 1.30
 PROTEIN_EXCESSIVE_CEILING_MULTIPLIER = 1.50
 PROTEIN_TOP_UP_CEILING_BUFFER_G = 1.0
+MAINTENANCE_LIKE_PROTEIN_TARGET_MAX_G = 110.0
+MAINTENANCE_LIKE_MIN_KCAL_PER_PROTEIN = 24.0
+MAINTENANCE_PROTEIN_ENERGY_SHARE_BUFFER = 1.20
+MAINTENANCE_PROTEIN_SHARE_OVERAGE_PENALTY = 24.0
+MAINTENANCE_PROTEIN_COMFORT_CEILING_MULTIPLIER = 1.20
+MAINTENANCE_PROTEIN_COMFORT_OVERAGE_PENALTY = 18.0
+MAINTENANCE_FAT_ENERGY_SHARE_BUFFER = 1.10
+MAINTENANCE_FAT_SHARE_OVERAGE_PENALTY = 24.0
 RECIPE_PLAN_CANDIDATE_COUNT = 1
 SLOT_FLEX_PENALTY = 5.0
 EXPLICIT_SLOT_FLEX_PENALTY = 0.0
@@ -1680,6 +1688,18 @@ def _recipe_projected_protein_floor_bonus(
     if protein_gap <= 0:
         return 0.0
     estimated_protein = estimated.get("protein_g")
+    if _is_maintenance_like_protein_target(target):
+        estimated_protein = min(
+            estimated_protein,
+            _maintenance_projected_protein_fair_share_gap(
+                estimated,
+                current_total,
+                target,
+                protein_floor,
+            ),
+        )
+        if estimated_protein <= 0:
+            return 0.0
     protein_density = estimated_protein / max(1.0, estimated.get("energy_kcal"))
     return min(estimated_protein, protein_gap) / max(1.0, protein_floor) * 30.0 + protein_density * 10.0
 
@@ -1742,11 +1762,79 @@ def _recipe_projected_protein_penalty(
     penalty = 0.0
     if estimated_protein > protein_target * 0.40:
         penalty += (estimated_protein - protein_target * 0.40) / max(1.0, protein_target) * 8.0
+    if _is_maintenance_like_protein_target(target):
+        fair_share_gap = _maintenance_projected_protein_fair_share_gap(
+            estimated,
+            current_total,
+            target,
+            _protein_hard_floor(target),
+        )
+        fair_share_excess = max(0.0, estimated_protein - fair_share_gap)
+        penalty += fair_share_excess / max(1.0, protein_target) * MAINTENANCE_PROTEIN_SHARE_OVERAGE_PENALTY
+        penalty += _maintenance_projected_fat_overage_penalty(estimated, current_total, target)
+        comfort_limit = protein_target * MAINTENANCE_PROTEIN_COMFORT_CEILING_MULTIPLIER
+        if projected_protein > comfort_limit:
+            penalty += (
+                (projected_protein - comfort_limit)
+                / max(1.0, protein_target)
+                * MAINTENANCE_PROTEIN_COMFORT_OVERAGE_PENALTY
+            )
     if projected_protein > soft_limit:
         penalty += (projected_protein - soft_limit) / max(1.0, protein_target) * 16.0
     if projected_protein > hard_limit:
         penalty += (projected_protein - hard_limit) / max(1.0, protein_target) * 45.0
     return penalty
+
+
+def _is_maintenance_like_protein_target(target: NutrientVector) -> bool:
+    protein_target = target.get("protein_g")
+    energy_target = target.get("energy_kcal")
+    if protein_target <= 0 or energy_target <= 0:
+        return False
+    return (
+        protein_target <= MAINTENANCE_LIKE_PROTEIN_TARGET_MAX_G
+        and energy_target / protein_target >= MAINTENANCE_LIKE_MIN_KCAL_PER_PROTEIN
+    )
+
+
+def _maintenance_projected_protein_fair_share_gap(
+    estimated: NutrientVector,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    protein_floor: float,
+) -> float:
+    energy_target = max(1.0, target.get("energy_kcal"))
+    projected_energy = current_total.get("energy_kcal") + estimated.get("energy_kcal")
+    projected_energy_ratio = min(1.0, max(0.0, projected_energy / energy_target))
+    fair_share_target = (
+        protein_floor
+        * projected_energy_ratio
+        * MAINTENANCE_PROTEIN_ENERGY_SHARE_BUFFER
+    )
+    return max(0.0, fair_share_target - current_total.get("protein_g"))
+
+
+def _maintenance_projected_fat_overage_penalty(
+    estimated: NutrientVector,
+    current_total: NutrientVector,
+    target: NutrientVector,
+) -> float:
+    fat_target = target.get("fat_g")
+    energy_target = target.get("energy_kcal")
+    if fat_target <= 0 or energy_target <= 0:
+        return 0.0
+    projected_energy = current_total.get("energy_kcal") + estimated.get("energy_kcal")
+    projected_energy_ratio = min(1.0, max(0.0, projected_energy / energy_target))
+    fair_share_target = (
+        fat_target
+        * projected_energy_ratio
+        * MAINTENANCE_FAT_ENERGY_SHARE_BUFFER
+    )
+    projected_fat = current_total.get("fat_g") + estimated.get("fat_g")
+    if projected_fat <= fat_target * FAT_RECIPE_SOFT_LIMIT_MULTIPLIER:
+        return 0.0
+    fat_excess = max(0.0, projected_fat - fair_share_target)
+    return fat_excess / max(1.0, fat_target) * MAINTENANCE_FAT_SHARE_OVERAGE_PENALTY
 
 
 def _recipe_projected_macro_balance_penalty(

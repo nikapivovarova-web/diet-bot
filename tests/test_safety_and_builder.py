@@ -1858,6 +1858,181 @@ def test_recipe_ranking_prefers_130_percent_protein_candidate_over_150_plus_cand
     assert ranked[0].id == "moderate_recipe"
 
 
+def test_maintenance_protein_floor_ranking_prefers_energy_matched_lower_protein_breakfast() -> None:
+    target = NutrientVector(
+        {
+            "energy_kcal": 2817,
+            "protein_g": 95,
+            "fat_g": 94,
+            "carbohydrate_g": 398,
+            "sodium_mg": 2300,
+        }
+    )
+    high_protein_food = Food(
+        id="maint_high_protein",
+        name="Maintain high protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": 700,
+                "protein_g": 46,
+                "fat_g": 20,
+                "carbohydrate_g": 90,
+                "sodium_mg": 200,
+            }
+        ),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    balanced_food = Food(
+        id="maint_balanced_protein",
+        name="Maintain balanced protein",
+        category="grains",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": 650,
+                "protein_g": 18,
+                "fat_g": 28,
+                "carbohydrate_g": 88,
+                "sodium_mg": 200,
+            }
+        ),
+        roles=frozenset({MealRole.CARB}),
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    recipes = [
+        RecipeTemplate(
+            id="high_protein_breakfast",
+            slot="breakfast",
+            title="High protein breakfast",
+            ingredients_g={"maint_high_protein": 100},
+            instructions="Cook.",
+            tags=frozenset({"curated"}),
+        ),
+        RecipeTemplate(
+            id="balanced_breakfast",
+            slot="breakfast",
+            title="Balanced breakfast",
+            ingredients_g={"maint_balanced_protein": 100},
+            instructions="Cook.",
+            tags=frozenset({"curated"}),
+        ),
+    ]
+
+    ranked = _rank_recipes(
+        recipes,
+        "breakfast",
+        set(),
+        Counter(),
+        Counter(),
+        {food.id: food for food in (high_protein_food, balanced_food)},
+        NutrientVector(),
+        target,
+        704,
+        507,
+        901,
+        0,
+        0,
+        ranking_mode="protein_floor",
+        manage_sodium=True,
+    )
+
+    assert ranked[0].id == "balanced_breakfast"
+
+
+def test_maintenance_protein_penalty_does_not_trade_protein_for_fat_overage() -> None:
+    target = NutrientVector(
+        {
+            "energy_kcal": 2817,
+            "protein_g": 95,
+            "fat_g": 94,
+            "carbohydrate_g": 398,
+            "sodium_mg": 2300,
+        }
+    )
+    current_total = NutrientVector(
+        {
+            "energy_kcal": 1883,
+            "protein_g": 76,
+            "fat_g": 69,
+            "carbohydrate_g": 245,
+            "sodium_mg": 1200,
+        }
+    )
+    high_fat_lower_protein = Food(
+        id="maint_high_fat_lower_protein",
+        name="Maintain high fat lower protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": 677,
+                "protein_g": 26,
+                "fat_g": 38,
+                "carbohydrate_g": 59,
+                "sodium_mg": 400,
+            }
+        ),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    leaner_higher_protein = Food(
+        id="maint_leaner_higher_protein",
+        name="Maintain leaner higher protein",
+        category="protein",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": 677,
+                "protein_g": 34,
+                "fat_g": 20,
+                "carbohydrate_g": 72,
+                "sodium_mg": 400,
+            }
+        ),
+        roles=frozenset({MealRole.PROTEIN}),
+        max_per_meal_g=1000,
+        max_per_day_g=1000,
+    )
+    recipes = [
+        RecipeTemplate(
+            id="high_fat_lower_protein_main",
+            slot="main",
+            title="High fat lower protein main",
+            ingredients_g={"maint_high_fat_lower_protein": 100},
+            instructions="Cook.",
+            tags=frozenset({"curated"}),
+        ),
+        RecipeTemplate(
+            id="leaner_higher_protein_main",
+            slot="main",
+            title="Leaner higher protein main",
+            ingredients_g={"maint_leaner_higher_protein": 100},
+            instructions="Cook.",
+            tags=frozenset({"curated"}),
+        ),
+    ]
+
+    ranked = _rank_recipes(
+        recipes,
+        "main",
+        set(),
+        Counter(),
+        Counter(),
+        {food.id: food for food in (high_fat_lower_protein, leaner_higher_protein)},
+        current_total,
+        target,
+        677,
+        620,
+        760,
+        0,
+        0,
+    )
+
+    assert ranked[0].id == "leaner_higher_protein_main"
+
+
 def test_low_protein_calorie_ranking_prefers_better_kcal_per_protein_candidate() -> None:
     target = NutrientVector({"energy_kcal": 2200, "protein_g": 50, "fat_g": 70, "carbohydrate_g": 330})
     current_total = NutrientVector({"energy_kcal": 1200, "protein_g": 44, "fat_g": 40, "carbohydrate_g": 150})
