@@ -443,6 +443,7 @@ def isolated_telegram_runtime_state(monkeypatch, tmp_path):
         51_034,
         51_035,
         51_036,
+        51_037,
     }
     for chat_id in touched_ids:
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -960,6 +961,27 @@ async def test_foreign_private_callback_is_rejected_without_state_change() -> No
     assert callback.answers == [(PRIVATE_CHAT_CALLBACK_TEXT, True)]
     assert owner_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
     assert foreign_user_id not in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_promo_command_starts_existing_promo_code_flow(monkeypatch) -> None:
+    chat_id = 51_037
+    calls: list[int] = []
+
+    async def fake_start_promo_code_request(message: FakeMessage) -> None:
+        calls.append(message.chat.id)
+        telegram_app.PROMO_CODE_REQUEST_CHAT_IDS.add(message.chat.id)
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_start_promo_code_request",
+        fake_start_promo_code_request,
+    )
+
+    await telegram_app.promo(FakeMessage(chat_id, text="/promo"))
+
+    assert calls == [chat_id]
+    assert chat_id in telegram_app.PROMO_CODE_REQUEST_CHAT_IDS
 
 
 @pytest.mark.anyio
@@ -3277,6 +3299,23 @@ async def test_run_bot_initializes_store_before_polling_when_database_url_exists
         "polling",
         "store.close",
     ]
+
+
+@pytest.mark.anyio
+async def test_set_bot_commands_includes_promo_entry() -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.commands = None
+
+        async def set_my_commands(self, commands) -> None:
+            self.commands = commands
+
+    bot = FakeBot()
+
+    await telegram_app._set_bot_commands(bot)
+
+    descriptions = {command.command: command.description for command in bot.commands}
+    assert descriptions["promo"] == "Ввести промокод"
 
 
 @pytest.mark.anyio

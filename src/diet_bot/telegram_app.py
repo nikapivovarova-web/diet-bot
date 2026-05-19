@@ -540,6 +540,7 @@ TRIAL_SUBSCRIPTION_TEXT = (
 BOT_COMMANDS = (
     BotCommand(command="start", description="Открыть стартовое меню"),
     BotCommand(command="plan", description="Показать мой расчет"),
+    BotCommand(command="promo", description="Ввести промокод"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
 )
 
@@ -585,6 +586,16 @@ async def plan(message: Message) -> None:
         await _send_calculation_options(message, profile)
         return
     await _start_questionnaire(message)
+
+
+@router.message(Command("promo"))
+async def promo(message: Message) -> None:
+    if _is_support_chat(message.chat.id):
+        return
+    if not await ensure_private_chat(message):
+        return
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+    await _start_promo_code_request(message)
 
 
 @router.message(Command("cancel"))
@@ -986,6 +997,9 @@ async def handle_answer(message: Message) -> None:
         return
     if normalized_command == "payment_event":
         await payment_event_reconciliation_command(message)
+        return
+    if normalized_command == "promo":
+        await promo(message)
         return
     if not await ensure_private_chat(message):
         return
