@@ -1563,6 +1563,38 @@ def test_weekly_plan_success_contains_no_empty_days() -> None:
 
 
 @pytest.mark.slow_pdf_builder
+def test_restricted_maintenance_week_seed0_completes_with_sodium_within_limits() -> None:
+    profile = profile_with(
+        goal=Goal.MAINTAIN,
+        cooking_time=CookingTimePreference.SIMPLE,
+        meal_count=5,
+        restrictions=(
+            Restriction(RestrictionType.ALLERGY, "\u044f\u0439\u0446\u0430"),
+            Restriction(
+                RestrictionType.EXCLUDED_FOOD,
+                "\u043a\u0438\u0441\u043b\u043e\u043c\u043e\u043b\u043e\u0447\u043d\u044b\u0435 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u044b",
+            ),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u043a\u0430\u0448\u0430"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u043c\u043e\u043b\u043e\u0447\u043a\u0430"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u043c\u043e\u043b\u043e\u043a\u043e"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "\u0433\u0440\u0438\u0431\u044b"),
+        ),
+    )
+
+    plans = _build_week_plans(profile, 0, set(), set())
+    planned_recipe_ids = recipe_ids(plans)
+
+    assert len(plans) == 7
+    assert [len(plan.meals) for plan in plans] == [5, 5, 5, 5, 5, 5, 5]
+    assert len(planned_recipe_ids) == 35
+    assert len(set(planned_recipe_ids)) == 35
+    assert all(
+        plan.totals.get("sodium_mg") <= plan.targets.targets.get("sodium_mg") + 0.01
+        for plan in plans
+    )
+
+
+@pytest.mark.slow_pdf_builder
 def test_low_weight_simple_weekly_seed101_has_no_collapsed_meals_and_keeps_protein_floor() -> None:
     profile = profile_with(
         goal=Goal.MAINTAIN,

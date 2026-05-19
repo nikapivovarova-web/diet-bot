@@ -16,7 +16,7 @@ from diet_bot.domain import (
     UserProfile,
 )
 from diet_bot.recipe_traits import RecipeTraits
-from diet_bot.telegram_app import _select_week_day_plan
+from diet_bot.telegram_app import WEEK_PLAN_CANDIDATE_COUNT, _select_week_day_plan
 
 
 def _profile() -> UserProfile:
@@ -65,6 +65,14 @@ def _plan(profile: UserProfile, recipe_prefix: str, energy: float, food_ids: tup
             _meal(f"{recipe_prefix}_{index}", food_id, per_meal_energy)
             for index, food_id in enumerate(food_ids)
         ),
+        targets=calculate_targets(profile),
+        safety=SafetyResult(can_generate_plan=True),
+    )
+
+
+def _empty_plan(profile: UserProfile) -> MealPlan:
+    return MealPlan(
+        meals=(),
         targets=calculate_targets(profile),
         safety=SafetyResult(can_generate_plan=True),
     )
@@ -255,3 +263,87 @@ def test_weekly_selector_prefers_less_repeated_traits_before_ingredient_reuse(
     )
 
     assert _recipe_prefixes(selected) == {"fresh_traits"}
+
+
+def test_weekly_selector_rescues_after_normal_window_has_no_complete_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    seed = 20
+    calls: list[int] = []
+    rescue_plan = _plan(profile, "rescued", calculate_targets(profile).targets.get("energy_kcal"), ("a", "b", "c"))
+
+    def day_builder(profile: UserProfile, *, variety_seed: int, **kwargs) -> MealPlan:
+        calls.append(variety_seed)
+        if variety_seed < seed + WEEK_PLAN_CANDIDATE_COUNT:
+            return _empty_plan(profile)
+        return rescue_plan
+
+    monkeypatch.setattr("diet_bot.telegram_app.build_one_day_plan", day_builder)
+
+    selected = _selected_plan(profile, seed=seed, week_food_ids=set())
+
+    assert _recipe_prefixes(selected) == {"rescued"}
+    assert calls == [20, 21, 22, 23, 24, 25, 26, 27]
+
+
+def test_weekly_selector_does_not_rescue_when_normal_window_has_complete_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    seed = 40
+    calls: list[int] = []
+    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    plans = tuple(
+        _plan(profile, f"normal_{index}", target_energy, (f"a{index}", f"b{index}", f"c{index}"))
+        for index in range(WEEK_PLAN_CANDIDATE_COUNT)
+    )
+
+    def day_builder(profile: UserProfile, *, variety_seed: int, **kwargs) -> MealPlan:
+        calls.append(variety_seed)
+        if variety_seed >= seed + WEEK_PLAN_CANDIDATE_COUNT:
+            raise AssertionError("rescue window should not run")
+        return plans[variety_seed - seed]
+
+    monkeypatch.setattr("diet_bot.telegram_app.build_one_day_plan", day_builder)
+
+    _selected_plan(profile, seed=seed, week_food_ids=set())
+
+    assert calls == [40, 41, 42, 43]
+
+
+def test_weekly_selector_rescue_keeps_hard_gate_and_avoidance_rejections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    seed = 80
+    calls: list[int] = []
+    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    blocked_id_plan = _plan(profile, "blocked_id", target_energy, ("a", "b", "c"))
+    blocked_key_plan = _plan(profile, "blocked_key", target_energy, ("d", "e", "f"))
+    valid_plan = _plan(profile, "valid", target_energy, ("g", "h", "i"))
+
+    def day_builder(profile: UserProfile, *, variety_seed: int, **kwargs) -> MealPlan:
+        calls.append(variety_seed)
+        if variety_seed in {seed, seed + 3, seed + 4}:
+            return _empty_plan(profile)
+        if variety_seed in {seed + 1, seed + 5}:
+            return blocked_id_plan
+        if variety_seed == seed + 2:
+            return blocked_key_plan
+        return valid_plan
+
+    monkeypatch.setattr("diet_bot.telegram_app.build_one_day_plan", day_builder)
+
+    plan, carryovers = _select_week_day_plan(
+        profile,
+        seed,
+        {"blocked_id_0"},
+        {"slot:curated:blocked_key_1"},
+        set(),
+        {},
+    )
+
+    assert _recipe_prefixes(plan) == {"valid"}
+    assert carryovers == {}
+    assert calls == [80, 81, 82, 83, 84, 85, 86, 87]

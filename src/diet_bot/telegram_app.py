@@ -368,6 +368,7 @@ STARS_AUTO_RENEW_FAILED_TEXT = (
 )
 WEEK_PLAN_DAYS = 7
 WEEK_PLAN_CANDIDATE_COUNT = 4
+WEEK_PLAN_RESCUE_CANDIDATE_COUNT = 4
 WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
 WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
 WEEKLY_TRAIT_REPEAT_CAP = 3
@@ -2041,32 +2042,44 @@ def _select_week_day_plan(
 ) -> tuple[MealPlan, dict[str, "_BatchCarryover"]]:
     candidate_options: list[tuple[MealPlan, dict[str, _BatchCarryover], int]] = []
     rejected_plan: MealPlan | None = None
-    for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
-        plan = build_one_day_plan(
-            profile,
-            variety_seed=seed + candidate_index,
-            avoided_recipe_ids=avoided_recipe_ids,
-            avoided_recipe_keys=avoided_recipe_keys,
-            recipe_source="curated_only",
-            allow_avoided_recipe_relaxation=False,
-        )
-        candidate_carryovers = _copy_carryovers(carryovers)
-        plan = _apply_batch_carryovers(plan, candidate_carryovers)
-        if _plan_uses_avoided_recipes(plan, avoided_recipe_ids, avoided_recipe_keys):
-            rejected_plan = rejected_plan or plan
-            continue
-        next_avoided_recipe_ids = set(avoided_recipe_ids)
-        next_avoided_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
-        next_avoided_recipe_keys = set(avoided_recipe_keys)
-        next_avoided_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
-        if has_future_week_days and _carryovers_use_avoided_recipes(
-            candidate_carryovers,
-            next_avoided_recipe_ids,
-            next_avoided_recipe_keys,
-        ):
-            rejected_plan = rejected_plan or plan
-            continue
-        candidate_options.append((plan, candidate_carryovers, candidate_index))
+
+    def add_selectable_candidates(candidate_indexes: range) -> None:
+        nonlocal rejected_plan
+        for candidate_index in candidate_indexes:
+            plan = build_one_day_plan(
+                profile,
+                variety_seed=seed + candidate_index,
+                avoided_recipe_ids=avoided_recipe_ids,
+                avoided_recipe_keys=avoided_recipe_keys,
+                recipe_source="curated_only",
+                allow_avoided_recipe_relaxation=False,
+            )
+            candidate_carryovers = _copy_carryovers(carryovers)
+            plan = _apply_batch_carryovers(plan, candidate_carryovers)
+            if not _week_day_plan_is_complete(plan, profile):
+                rejected_plan = rejected_plan or plan
+                continue
+            if _plan_uses_avoided_recipes(plan, avoided_recipe_ids, avoided_recipe_keys):
+                rejected_plan = rejected_plan or plan
+                continue
+            next_avoided_recipe_ids = set(avoided_recipe_ids)
+            next_avoided_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+            next_avoided_recipe_keys = set(avoided_recipe_keys)
+            next_avoided_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
+            if has_future_week_days and _carryovers_use_avoided_recipes(
+                candidate_carryovers,
+                next_avoided_recipe_ids,
+                next_avoided_recipe_keys,
+            ):
+                rejected_plan = rejected_plan or plan
+                continue
+            candidate_options.append((plan, candidate_carryovers, candidate_index))
+
+    add_selectable_candidates(range(WEEK_PLAN_CANDIDATE_COUNT))
+    if not candidate_options:
+        rescue_start = WEEK_PLAN_CANDIDATE_COUNT
+        rescue_stop = rescue_start + WEEK_PLAN_RESCUE_CANDIDATE_COUNT
+        add_selectable_candidates(range(rescue_start, rescue_stop))
 
     if candidate_options:
         candidate_recipe_counts = _candidate_recipe_counts(tuple(option[0] for option in candidate_options))
