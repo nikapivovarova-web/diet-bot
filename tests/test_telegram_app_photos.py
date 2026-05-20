@@ -2794,10 +2794,10 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
     assert "330366" not in command_names
     assert "payment_event" not in command_names
     assert "admin" not in command_names
-    assert "promo" not in command_names
     assert [(command.command, command.description) for command in bot.commands] == [
         ("start", "Открыть стартовое меню"),
         ("plan", "Показать мой расчет"),
+        ("promo", "Ввести промокод"),
         ("cancel", "Отменить текущее действие"),
     ]
     assert "myid" not in command_names
