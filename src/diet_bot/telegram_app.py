@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import random
 import re
-from collections.abc import Sequence
+import time
+from collections import Counter, deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import RLock
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -29,7 +33,22 @@ from aiogram.types import (
     SuccessfulPayment,
 )
 
-from .builder import build_one_day_plan
+from .builder import (
+    CookingEffortConstraints,
+    _RecipePlanCache,
+    _cooking_effort_constraints,
+    _food_by_id_cache_key,
+    _meal_energy_slots,
+    _recipe_matches_cooking_effort_cached,
+    _recipe_memory_key_cached,
+    _recipe_slot_eligibility_cached,
+    _recipe_title_uses_excluded_food,
+    _resolve_recipe_ingredients,
+    build_one_day_plan,
+    filter_foods,
+    recipe_plan_diagnostic_context,
+)
+from .catalog import built_in_foods
 from .calculator import calculate_targets
 from .domain import (
     ActivityLevel,
@@ -41,10 +60,12 @@ from .domain import (
     Goal,
     Meal,
     MealPlan,
+    NutrientVector,
     Restriction,
     RestrictionType,
     Sex,
     UserProfile,
+    normalize_cooking_time_preference,
 )
 from .presentation import (
     format_calculation_summary,
@@ -54,6 +75,9 @@ from .presentation import (
     format_week_shopping_list,
 )
 from .pdf_renderer import build_week_plan_pdf
+from .curated_data import curated_recipes
+from .recipe_catalog import RecipeTemplate, built_in_recipes
+from .recipe_traits import RecipeTraits, infer_recipe_traits
 from .promo_codes import PromoCodeActivation, activate_promo_code
 from .questionnaire import QuestionnaireSession, start_session
 from .safety import evaluate_safety
@@ -91,6 +115,434 @@ SUPPORT_REQUEST_CHAT_IDS: set[int] = set()
 PROMO_CODE_REQUEST_CHAT_IDS: set[int] = set()
 router = Router()
 DEFAULT_SUPPORT_CHAT_ID = -5_271_779_108
+RECENT_RECIPE_HISTORY_DAYS = 28
+RECENT_RECIPE_HISTORY_LIMIT = 140
+RECENT_RECIPE_REDUCED_DAYS = 14
+RECENT_RECIPE_REDUCED_LIMIT = 70
+logger = logging.getLogger(__name__)
+
+
+def _mask_chat_id(chat_id: int) -> str:
+    text = str(chat_id)
+    sign = "-" if text.startswith("-") else ""
+    digits = text[1:] if sign else text
+    if len(digits) <= 4:
+        return f"{sign}...{digits}"
+    return f"{sign}...{digits[-4:]}"
+
+
+def _weekly_pdf_diag(
+    event: str,
+    *,
+    chat_id: int | None = None,
+    elapsed_s: float | None = None,
+    **fields: object,
+) -> None:
+    safe_fields: dict[str, object] = {}
+    if chat_id is not None:
+        safe_fields["chat_id"] = _mask_chat_id(chat_id)
+    if elapsed_s is not None:
+        safe_fields["elapsed_s"] = f"{elapsed_s:.3f}"
+    safe_fields.update(fields)
+    details = " ".join(f"{key}={value}" for key, value in safe_fields.items())
+    logger.warning("weekly_pdf_diag event=%s %s", event, details)
+
+
+@dataclass(frozen=True)
+class _RecentRecipeAvoidance:
+    full_recipe_ids: frozenset[str]
+    full_recipe_keys: frozenset[str]
+    reduced_recipe_ids: frozenset[str]
+    reduced_recipe_keys: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _WeekPlanBuildResult:
+    plans: tuple[MealPlan, ...]
+    avoidance_phase: str
+
+
+@dataclass(frozen=True)
+class _WeeklyPhaseSlotFeasibility:
+    slot: str
+    weekly_required: int
+    available_count: int
+    strict_simple_count: int | None
+    threshold: int
+
+
+@dataclass(frozen=True)
+class _WeeklyPhaseFeasibility:
+    skipped: bool
+    reason: str
+    slot_counts: tuple[_WeeklyPhaseSlotFeasibility, ...]
+
+
+class _WeeklySelectionTimeout(RuntimeError):
+    def __init__(
+        self,
+        *,
+        scope: str,
+        phase: str,
+        elapsed_s: float,
+        timeout_s: float,
+        day_index: int | None = None,
+        candidate_index: int | None = None,
+        stage: str = "selection",
+    ) -> None:
+        self.scope = scope
+        self.phase = phase
+        self.elapsed_s = elapsed_s
+        self.timeout_s = timeout_s
+        self.day_index = day_index
+        self.candidate_index = candidate_index
+        self.stage = stage
+        super().__init__(
+            f"weekly selection {scope} timeout after {elapsed_s:.3f}s "
+            f"(limit {timeout_s:.3f}s, phase={phase}, day={day_index}, "
+            f"candidate={candidate_index}, stage={stage})"
+        )
+
+
+@dataclass
+class _WeeklySelectionGuard:
+    total_started_at: float = field(default_factory=lambda: time.perf_counter())
+    phase_started_at: float = field(default_factory=lambda: time.perf_counter())
+    phase: str = "unknown"
+
+    def begin_phase(self, phase: str) -> None:
+        self.phase = phase
+        self.phase_started_at = time.perf_counter()
+
+    def check(
+        self,
+        *,
+        stage: str,
+        day_index: int | None = None,
+        candidate_index: int | None = None,
+    ) -> None:
+        now = time.perf_counter()
+        total_elapsed_s = now - self.total_started_at
+        total_timeout_s = float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+        if total_timeout_s > 0 and total_elapsed_s > total_timeout_s:
+            raise _WeeklySelectionTimeout(
+                scope="total",
+                phase=self.phase,
+                elapsed_s=total_elapsed_s,
+                timeout_s=total_timeout_s,
+                day_index=day_index,
+                candidate_index=candidate_index,
+                stage=stage,
+            )
+
+        phase_elapsed_s = now - self.phase_started_at
+        phase_timeout_s = _weekly_selection_phase_timeout(self.phase)
+        if phase_timeout_s > 0 and phase_elapsed_s > phase_timeout_s:
+            raise _WeeklySelectionTimeout(
+                scope="phase",
+                phase=self.phase,
+                elapsed_s=phase_elapsed_s,
+                timeout_s=phase_timeout_s,
+                day_index=day_index,
+                candidate_index=candidate_index,
+                stage=stage,
+            )
+
+
+@dataclass
+class _WeeklySelectionScopedGuard:
+    guard: _WeeklySelectionGuard
+    day_index: int | None
+    candidate_index: int | None
+
+    def check(
+        self,
+        *,
+        stage: str,
+        day_index: int | None = None,
+        candidate_index: int | None = None,
+    ) -> None:
+        self.guard.check(
+            stage=stage,
+            day_index=self.day_index if day_index is None else day_index,
+            candidate_index=self.candidate_index if candidate_index is None else candidate_index,
+        )
+
+
+def _weekly_selection_phase_timeout(phase: str) -> float:
+    if phase == "no_recent":
+        return float(WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS)
+    return float(WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS)
+
+
+def _weekly_selection_diag_enabled() -> bool:
+    return os.getenv("DIET_BOT_WEEKLY_SELECTION_DIAG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _weekly_selection_phase_label(phase: str) -> str:
+    if phase == "reduced_recent":
+        return "relaxed_recent"
+    return phase
+
+
+def _weekly_selection_diag(event: str, *, always: bool = False, **fields: object) -> None:
+    if not always and not _weekly_selection_diag_enabled():
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.warning("weekly_selection_diag event=%s %s", event, details)
+
+
+def _recipe_cache_diag_counts(recipe_cache: _RecipePlanCache) -> dict[str, int]:
+    return {
+        "cache_hits": sum(
+            count for name, count in recipe_cache.stats.items() if name.endswith("_hits")
+        ),
+        "cache_misses": sum(
+            count for name, count in recipe_cache.stats.items() if name.endswith("_misses")
+        ),
+    }
+
+
+@dataclass
+class _WeeklyPdfQueueJob:
+    chat_id: int
+    runner: Callable[[], Awaitable[bool]]
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[bool]
+    ready_to_start: bool = False
+
+
+@dataclass(frozen=True)
+class _WeeklyPdfQueueAdmission:
+    future: asyncio.Future[bool] | None
+    duplicate: bool = False
+    starts_immediately: bool = False
+    ahead_count: int = 0
+
+
+class _WeeklyPdfQueueManager:
+    def __init__(self, max_concurrency: int) -> None:
+        self.max_concurrency = max(1, int(max_concurrency))
+        self._queue: deque[_WeeklyPdfQueueJob] = deque()
+        self._queued_chat_ids: set[int] = set()
+        self._active_chat_ids: set[int] = set()
+        self._active_count = 0
+        self._lock = RLock()
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return self._active_count + len(self._queue)
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, int]:
+        queued_count = len(self._queue)
+        return {
+            "queue_active": self._active_count,
+            "queue_queued": queued_count,
+            "queue_pending": self._active_count + queued_count,
+            "queue_max": self.max_concurrency,
+        }
+
+    def has_chat(self, chat_id: int) -> bool:
+        with self._lock:
+            return chat_id in self._queued_chat_ids or chat_id in self._active_chat_ids
+
+    def submit(
+        self,
+        chat_id: int,
+        runner: Callable[[], Awaitable[bool]],
+    ) -> _WeeklyPdfQueueAdmission:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        job = _WeeklyPdfQueueJob(
+            chat_id=chat_id,
+            runner=runner,
+            loop=loop,
+            future=future,
+        )
+
+        with self._lock:
+            if chat_id in self._queued_chat_ids or chat_id in self._active_chat_ids:
+                _weekly_pdf_diag("queue_duplicate", chat_id=chat_id, **self._snapshot_locked())
+                return _WeeklyPdfQueueAdmission(future=None, duplicate=True)
+
+            ahead_count = self._active_count + len(self._queue)
+            starts_immediately = not self._queue and self._active_count < self.max_concurrency
+            job.ready_to_start = starts_immediately
+            self._queue.append(job)
+            self._queued_chat_ids.add(chat_id)
+            jobs_to_start = self._dispatch_locked()
+
+        self._start_jobs(jobs_to_start)
+        _weekly_pdf_diag(
+            "queue_admitted",
+            chat_id=chat_id,
+            starts_immediately=starts_immediately,
+            ahead_count=0 if starts_immediately else ahead_count,
+            **self.snapshot(),
+        )
+        return _WeeklyPdfQueueAdmission(
+            future=future,
+            starts_immediately=starts_immediately,
+            ahead_count=0 if starts_immediately else ahead_count,
+        )
+
+    def _dispatch_locked(self) -> list[_WeeklyPdfQueueJob]:
+        jobs_to_start: list[_WeeklyPdfQueueJob] = []
+        while (
+            self._queue
+            and self._queue[0].ready_to_start
+            and self._active_count < self.max_concurrency
+        ):
+            job = self._queue.popleft()
+            self._queued_chat_ids.discard(job.chat_id)
+            self._active_chat_ids.add(job.chat_id)
+            self._active_count += 1
+            jobs_to_start.append(job)
+        return jobs_to_start
+
+    def mark_ready(self, future: asyncio.Future[bool]) -> None:
+        jobs_to_start: list[_WeeklyPdfQueueJob] = []
+        ready_chat_id: int | None = None
+        with self._lock:
+            for job in self._queue:
+                if job.future is future:
+                    job.ready_to_start = True
+                    ready_chat_id = job.chat_id
+                    jobs_to_start = self._dispatch_locked()
+                    break
+        self._start_jobs(jobs_to_start)
+        if ready_chat_id is not None:
+            _weekly_pdf_diag("queue_ready", chat_id=ready_chat_id, **self.snapshot())
+
+    def cancel(self, future: asyncio.Future[bool]) -> None:
+        jobs_to_start: list[_WeeklyPdfQueueJob] = []
+        with self._lock:
+            remaining: deque[_WeeklyPdfQueueJob] = deque()
+            removed_chat_id: int | None = None
+            for job in self._queue:
+                if job.future is future:
+                    removed_chat_id = job.chat_id
+                    continue
+                remaining.append(job)
+            if removed_chat_id is not None:
+                self._queue = remaining
+                self._queued_chat_ids.discard(removed_chat_id)
+                if not future.done():
+                    future.cancel()
+                jobs_to_start = self._dispatch_locked()
+        self._start_jobs(jobs_to_start)
+        if removed_chat_id is not None:
+            _weekly_pdf_diag("queue_cancelled", chat_id=removed_chat_id, **self.snapshot())
+
+    def _start_jobs(self, jobs: Sequence[_WeeklyPdfQueueJob]) -> None:
+        for job in jobs:
+            job.loop.create_task(self._run_job(job))
+
+    async def _run_job(self, job: _WeeklyPdfQueueJob) -> None:
+        started_at = time.perf_counter()
+        _weekly_pdf_diag("job_start", chat_id=job.chat_id, **self.snapshot())
+        try:
+            result = await job.runner()
+        except Exception as exc:
+            _weekly_pdf_diag(
+                "job_fail",
+                chat_id=job.chat_id,
+                elapsed_s=time.perf_counter() - started_at,
+                error=type(exc).__name__,
+                **self.snapshot(),
+            )
+            if not job.future.done():
+                job.future.set_exception(exc)
+        else:
+            _weekly_pdf_diag(
+                "job_complete",
+                chat_id=job.chat_id,
+                elapsed_s=time.perf_counter() - started_at,
+                result=result,
+                **self.snapshot(),
+            )
+            if not job.future.done():
+                job.future.set_result(result)
+        finally:
+            with self._lock:
+                self._active_chat_ids.discard(job.chat_id)
+                self._active_count = max(0, self._active_count - 1)
+                jobs_to_start = self._dispatch_locked()
+            self._start_jobs(jobs_to_start)
+            _weekly_pdf_diag("job_released", chat_id=job.chat_id, **self.snapshot())
+
+
+def _configure_weekly_pdf_concurrency(max_concurrency: int) -> None:
+    global WEEKLY_PDF_MAX_CONCURRENCY
+    global WEEK_PDF_QUEUE_MANAGER
+
+    WEEKLY_PDF_MAX_CONCURRENCY = max(1, int(max_concurrency))
+    WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
+
+
+@dataclass
+class _WeeklyRecipeTraitLookup:
+    recipes_by_id: Mapping[str, RecipeTemplate] = field(default_factory=dict)
+    precomputed_traits_by_id: Mapping[str, RecipeTraits] = field(default_factory=dict)
+    traits_by_id: dict[str, RecipeTraits] = field(default_factory=dict)
+    stats: Counter[str] = field(default_factory=Counter)
+
+    @classmethod
+    def from_recipes(cls, recipes: Sequence[RecipeTemplate]) -> "_WeeklyRecipeTraitLookup":
+        return cls(recipes_by_id={recipe.id: recipe for recipe in recipes})
+
+    @classmethod
+    def from_traits(cls, traits_by_id: Mapping[str, RecipeTraits]) -> "_WeeklyRecipeTraitLookup":
+        return cls(precomputed_traits_by_id=dict(traits_by_id))
+
+    def get(self, recipe_id: str) -> RecipeTraits | None:
+        if recipe_id in self.traits_by_id:
+            self.stats["weekly_trait_lookup_hits"] += 1
+            return self.traits_by_id[recipe_id]
+
+        self.stats["weekly_trait_lookup_misses"] += 1
+        traits = self.precomputed_traits_by_id.get(recipe_id)
+        if traits is not None:
+            self.stats["weekly_trait_lookup_precomputed"] += 1
+            self.traits_by_id[recipe_id] = traits
+            return traits
+
+        recipe = self.recipes_by_id.get(recipe_id)
+        if recipe is None:
+            self.stats["weekly_trait_lookup_missing"] += 1
+            return None
+
+        self.stats["weekly_trait_lookup_inferred"] += 1
+        traits = infer_recipe_traits(recipe)
+        self.traits_by_id[recipe_id] = traits
+        return traits
+
+
+_RecipeTraitLookupSource = Mapping[str, RecipeTraits] | _WeeklyRecipeTraitLookup
+
+
+@dataclass(frozen=True)
+class RecipeHistoryItem:
+    recipe_id: str | None = None
+    recipe_key: str | None = None
+    meal_slot: str | None = None
+    ration_kind: RationKind | None = None
+    day_index: int | None = None
+    meal_index: int | None = None
+    user_id: int | None = None
+    generation_id: int | None = None
+    generated_at: datetime | None = None
+
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
@@ -179,6 +631,33 @@ SUBSCRIBER_ONE_DAY_PLAN_TEXT = "Получить рацион на 1 день"
 SUBSCRIBER_WEEK_PLAN_PDF_TEXT = "Получить рацион на неделю PDF"
 WEEK_PLAN_DAYS = 7
 WEEK_PLAN_CANDIDATE_COUNT = 4
+WEEK_PLAN_RESCUE_CANDIDATE_COUNT = 4
+WEEKLY_RECENT_FEASIBILITY_POOL_MULTIPLIER = 5
+WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS = 8.0
+WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS = 60.0
+WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS = 90.0
+WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
+WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
+WEEKLY_TRAIT_REPEAT_CAP = 3
+WEEKLY_TRAIT_REPEAT_WEIGHTS = {
+    "primary_protein": 0.018,
+    "primary_carb": 0.012,
+    "recipe_format": 0.014,
+}
+PDF_MONTH_NAMES_RU = {
+    1: "\u044f\u043d\u0432\u0430\u0440\u044f",
+    2: "\u0444\u0435\u0432\u0440\u0430\u043b\u044f",
+    3: "\u043c\u0430\u0440\u0442\u0430",
+    4: "\u0430\u043f\u0440\u0435\u043b\u044f",
+    5: "\u043c\u0430\u044f",
+    6: "\u0438\u044e\u043d\u044f",
+    7: "\u0438\u044e\u043b\u044f",
+    8: "\u0430\u0432\u0433\u0443\u0441\u0442\u0430",
+    9: "\u0441\u0435\u043d\u0442\u044f\u0431\u0440\u044f",
+    10: "\u043e\u043a\u0442\u044f\u0431\u0440\u044f",
+    11: "\u043d\u043e\u044f\u0431\u0440\u044f",
+    12: "\u0434\u0435\u043a\u0430\u0431\u0440\u044f",
+}
 WEEK_PDF_STATUS_UPDATE_SECONDS = 4.0
 WEEK_PDF_STATUS_INITIAL_TEXT = (
     "Собираю недельный PDF.\n\n"
@@ -193,6 +672,13 @@ WEEK_PDF_STATUS_FRAMES = (
 WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
+WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
+WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0444\u0430\u0439\u043b \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e PDF \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
+TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
+WEEKLY_PDF_MAX_CONCURRENCY = DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY
+WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
 DEFAULT_BATCH_TOTAL_UNITS = 6
 DEFAULT_BATCH_SERVING_UNITS = 2
 DEFAULT_BATCH_SERVINGS = DEFAULT_BATCH_TOTAL_UNITS // DEFAULT_BATCH_SERVING_UNITS
@@ -940,25 +1426,131 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
 
 
 async def _send_week_plan_with_access(message: Message, profile: UserProfile) -> bool:
-    consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
-    if not consumption.allowed:
+    chat_id = message.chat.id
+    if WEEK_PDF_QUEUE_MANAGER.has_chat(chat_id):
+        _weekly_pdf_diag("queue_duplicate_precheck", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
+        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
+        return False
+
+    if not _weekly_pdf_attempt_available(chat_id):
+        _weekly_pdf_diag("access_denied_no_weekly_pdf_attempt", chat_id=chat_id)
         await _send_limit_paywall(message, "weekly_pdf")
         return False
 
+    queued_status_message: Message | None = None
+
+    async def run_weekly_pdf_job() -> bool:
+        return await _send_week_plan_after_queue_admission(
+            message,
+            profile,
+            initial_status_message=queued_status_message,
+        )
+
+    admission = WEEK_PDF_QUEUE_MANAGER.submit(chat_id, run_weekly_pdf_job)
+    if admission.duplicate:
+        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
+        return False
+
+    if admission.future is None:
+        return False
+
+    if not admission.starts_immediately:
+        try:
+            queued_status_message = await message.answer(
+                _week_pdf_queue_status_text(admission.ahead_count),
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except asyncio.CancelledError:
+            WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
+            raise
+        except Exception:
+            WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
+            raise
+        WEEK_PDF_QUEUE_MANAGER.mark_ready(admission.future)
+
     try:
+        return await admission.future
+    except asyncio.CancelledError:
+        _weekly_pdf_diag("queue_wait_cancelled", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
+        WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
+        raise
+
+
+async def _send_week_plan_after_queue_admission(
+    message: Message,
+    profile: UserProfile,
+    *,
+    initial_status_message: Message | None = None,
+) -> bool:
+    consumption: AttemptConsumption | None = None
+    try:
+        consume_started_at = time.perf_counter()
+        _weekly_pdf_diag("consume_attempt_start", chat_id=message.chat.id)
+        consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
+        _weekly_pdf_diag(
+            "consume_attempt_end",
+            chat_id=message.chat.id,
+            elapsed_s=time.perf_counter() - consume_started_at,
+            allowed=consumption.allowed,
+            source=consumption.source,
+        )
+        if not consumption.allowed:
+            await _send_limit_paywall(message, "weekly_pdf")
+            return False
+
+        recipe_history_entries: list[RecipeHistoryItem] = []
         sent = await _send_week_plan(
             message,
             profile,
             status_text=_format_entitlement_status(message.chat.id),
+            recipe_history_entries=recipe_history_entries,
+            pdf_slot_acquired=True,
+            initial_status_message=initial_status_message,
         )
     except Exception:
-        _refund_generation_attempt(message.chat.id, consumption)
+        if consumption is not None and consumption.allowed:
+            _refund_generation_attempt(message.chat.id, consumption)
         raise
 
     if not sent:
         _refund_generation_attempt(message.chat.id, consumption)
+    else:
+        _complete_generation_attempt(message.chat.id, consumption)
+        _record_successful_generation_history(
+            message.chat.id,
+            consumption,
+            recipe_history_entries,
+        )
     return sent
 
+def _weekly_pdf_attempt_available(chat_id: int) -> bool:
+    return _dry_run_generation_attempt(chat_id, "weekly_pdf").allowed
+
+def _week_pdf_queue_status_text(ahead_count: int) -> str:
+    normalized_ahead_count = max(0, int(ahead_count))
+    wait_minutes = _week_pdf_queue_wait_minutes(normalized_ahead_count)
+    return (
+        "Не переживайте, файл генерируется.\n\n"
+        f"Сейчас перед вами {_ru_plural(normalized_ahead_count, 'человек', 'человека', 'человек')}, "
+        f"примерное ожидание {_ru_plural(wait_minutes, 'минута', 'минуты', 'минут')}."
+    )
+
+def _week_pdf_queue_wait_minutes(ahead_count: int) -> int:
+    concurrency = max(1, WEEKLY_PDF_MAX_CONCURRENCY)
+    batches_before_start = max(1, math.ceil(max(1, ahead_count) / concurrency))
+    return max(1, math.ceil((batches_before_start * WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS) / 60))
+
+def _ru_plural(value: int, one: str, few: str, many: str) -> str:
+    absolute = abs(value)
+    if 11 <= absolute % 100 <= 14:
+        word = many
+    elif absolute % 10 == 1:
+        word = one
+    elif 2 <= absolute % 10 <= 4:
+        word = few
+    else:
+        word = many
+    return f"{value} {word}"
 
 async def _send_plan(
     message: Message,
@@ -1021,6 +1613,9 @@ async def _send_week_plan(
     profile: UserProfile,
     *,
     status_text: str | None = None,
+    recipe_history_entries: list[RecipeHistoryItem] | None = None,
+    pdf_slot_acquired: bool = False,
+    initial_status_message: Message | None = None,
 ) -> bool:
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
@@ -1030,23 +1625,48 @@ async def _send_week_plan(
     )
     seed = seed_offset + count
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
-    status_message = await message.answer(
-        WEEK_PDF_STATUS_INITIAL_TEXT,
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if initial_status_message is None:
+        status_message = await message.answer(
+            WEEK_PDF_STATUS_INITIAL_TEXT,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        status_message = initial_status_message
+        await _edit_week_pdf_status(status_message, WEEK_PDF_STATUS_INITIAL_TEXT)
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
-    _load_chat_history(chat_id)
-    recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
-    recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
+    recent_avoidance = _load_recent_recipe_avoidance(chat_id)
+    _weekly_pdf_diag(
+        "recent_avoidance_loaded",
+        chat_id=chat_id,
+        full_ids=len(recent_avoidance.full_recipe_ids),
+        full_keys=len(recent_avoidance.full_recipe_keys),
+        reduced_ids=len(recent_avoidance.reduced_recipe_ids),
+        reduced_keys=len(recent_avoidance.reduced_recipe_keys),
+    )
     try:
-        plans = await asyncio.to_thread(
-            _build_week_plans,
+        selection_started_at = time.perf_counter()
+        _weekly_pdf_diag("selection_start", chat_id=chat_id, seed=seed)
+        build_result = await asyncio.to_thread(
+            _build_week_plans_with_recent_fallback,
             profile,
             seed,
-            recent_recipe_ids,
-            recent_recipe_keys,
+            recent_avoidance,
         )
+        _weekly_pdf_diag(
+            "selection_end",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - selection_started_at,
+            phase=build_result.avoidance_phase,
+            days=len(build_result.plans),
+            meals=sum(len(plan.meals) for plan in build_result.plans),
+        )
+        plans = build_result.plans
         plan_dates = _week_plan_dates()
+
+        if not _week_plans_are_complete(plans, profile):
+            await _stop_week_pdf_status(status_task)
+            await _edit_week_pdf_status(status_message, WEEK_PDF_FAILURE_TEXT)
+            return False
 
         first_plan = plans[0]
         if not first_plan.safety.can_generate_plan:
@@ -1066,7 +1686,13 @@ async def _send_week_plan(
             return False
 
         try:
-            pdf_data, pdf_filename = await asyncio.to_thread(_build_week_pdf_payload, plans, plan_dates)
+            pdf_data, pdf_filename = await asyncio.to_thread(
+                _build_week_pdf_payload,
+                plans,
+                plan_dates,
+                chat_id,
+            )
+            _validate_week_pdf_payload_size(pdf_data, pdf_filename)
             await _stop_week_pdf_status(status_task)
             await _edit_week_pdf_status(status_message, WEEK_PDF_UPLOAD_TEXT)
             await _send_week_pdf_document(
@@ -1077,15 +1703,20 @@ async def _send_week_plan(
             )
         except Exception:
             await _stop_week_pdf_status(status_task)
-            await _edit_week_pdf_status(status_message, WEEK_PDF_FALLBACK_TEXT)
-            await message.answer("Не удалось создать PDF-файл, отправляю рацион текстом.")
-            await _send_week_plan_as_text(message, plans, plan_dates, status_text=status_text)
-            return True
+            await _edit_week_pdf_status(status_message, WEEK_PDF_FAILURE_TEXT)
+            return False
 
         await _edit_week_pdf_status(status_message, WEEK_PDF_DONE_TEXT)
 
-        for plan_result in plans:
-            _remember_recipes(chat_id, plan_result)
+        if recipe_history_entries is not None:
+            for day_index, plan_result in enumerate(plans):
+                recipe_history_entries.extend(
+                    _recipe_history_items_from_plan(
+                        plan_result,
+                        "weekly_pdf",
+                        day_index=day_index,
+                    )
+                )
         return True
     finally:
         await _stop_week_pdf_status(status_task)
@@ -1101,23 +1732,87 @@ async def _send_week_pdf_document(
     caption = "Готово - ваш рацион на неделю в PDF."
     if status_text:
         caption = f"{caption}\n\n{status_text}"
-    await message.answer_document(
-        document=BufferedInputFile(pdf_data, filename=pdf_filename),
-        caption=caption,
-        reply_markup=_after_plan_keyboard(message.chat.id),
+    upload_started_at = time.perf_counter()
+    _weekly_pdf_diag(
+        "telegram_upload_start",
+        chat_id=message.chat.id,
+        bytes=len(pdf_data),
+        filename=pdf_filename,
+    )
+    try:
+        await message.answer_document(
+            document=BufferedInputFile(pdf_data, filename=pdf_filename),
+            caption=caption,
+            reply_markup=_after_plan_keyboard(message.chat.id),
+        )
+    except Exception as exc:
+        _weekly_pdf_diag(
+            "telegram_upload_fail",
+            chat_id=message.chat.id,
+            elapsed_s=time.perf_counter() - upload_started_at,
+            error=type(exc).__name__,
+        )
+        raise
+    _weekly_pdf_diag(
+        "telegram_upload_end",
+        chat_id=message.chat.id,
+        elapsed_s=time.perf_counter() - upload_started_at,
     )
 
 
 def _build_week_pdf_payload(
     plans: Sequence[MealPlan],
     plan_dates: Sequence[date],
+    chat_id: int | None = None,
 ) -> tuple[bytes, str]:
-    pdf_path = Path(build_week_plan_pdf(plans, plan_dates))
+    render_started_at = time.perf_counter()
+    _weekly_pdf_diag("render_start", chat_id=chat_id, days=len(plans))
     try:
-        return pdf_path.read_bytes(), pdf_path.name
+        pdf_path = Path(build_week_plan_pdf(plans, plan_dates))
+    except Exception as exc:
+        _weekly_pdf_diag(
+            "render_fail",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - render_started_at,
+            error=type(exc).__name__,
+        )
+        raise
+    _weekly_pdf_diag(
+        "render_end",
+        chat_id=chat_id,
+        elapsed_s=time.perf_counter() - render_started_at,
+        temp_pdf=pdf_path.name,
+    )
+    read_started_at = time.perf_counter()
+    _weekly_pdf_diag("temp_pdf_read_start", chat_id=chat_id, temp_pdf=pdf_path.name)
+    try:
+        pdf_data = pdf_path.read_bytes()
+        _weekly_pdf_diag(
+            "temp_pdf_read_end",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - read_started_at,
+            bytes=len(pdf_data),
+        )
+        return pdf_data, _week_pdf_download_filename(plan_dates)
+    except Exception as exc:
+        _weekly_pdf_diag(
+            "temp_pdf_read_fail",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - read_started_at,
+            error=type(exc).__name__,
+        )
+        raise
     finally:
+        delete_started_at = time.perf_counter()
+        _weekly_pdf_diag("temp_pdf_delete_start", chat_id=chat_id, temp_pdf=pdf_path.name)
         with suppress(OSError):
             pdf_path.unlink()
+        _weekly_pdf_diag(
+            "temp_pdf_delete_end",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - delete_started_at,
+            exists=pdf_path.exists(),
+        )
 
 
 async def _animate_week_pdf_status(message: Message, status_message: Message) -> None:
@@ -1169,29 +1864,725 @@ async def _send_week_plan_as_text(
     await _send_text_chunks(message, shopping_list, _after_plan_keyboard(message.chat.id))
 
 
+def _week_pdf_download_filename(plan_dates: Sequence[date]) -> str:
+    if not plan_dates:
+        return "FoodBalance_рацион_на_неделю.pdf"
+    return f"FoodBalance_рацион_на_неделю_{_week_pdf_date_range(plan_dates)}.pdf"
+
+def _week_pdf_date_range(plan_dates: Sequence[date]) -> str:
+    first_date = plan_dates[0]
+    last_date = plan_dates[-1]
+    first_month = PDF_MONTH_NAMES_RU[first_date.month]
+    last_month = PDF_MONTH_NAMES_RU[last_date.month]
+    if first_date.year == last_date.year and first_date.month == last_date.month:
+        return f"{first_date:%d}-{last_date:%d}_{first_month}_{first_date:%Y}"
+    if first_date.year == last_date.year:
+        return f"{first_date:%d}_{first_month}-{last_date:%d}_{last_month}_{first_date:%Y}"
+    return f"{first_date:%d}_{first_month}_{first_date:%Y}-{last_date:%d}_{last_month}_{last_date:%Y}"
+
+def _validate_week_pdf_payload_size(pdf_data: bytes, pdf_filename: str) -> None:
+    if len(pdf_data) <= TELEGRAM_DOCUMENT_MAX_BYTES:
+        return
+    raise ValueError(
+        f"Weekly PDF {pdf_filename!r} is {len(pdf_data)} bytes; "
+        f"Telegram document limit is {TELEGRAM_DOCUMENT_MAX_BYTES} bytes."
+    )
+
+def _weekly_phase_feasibility(
+    profile: UserProfile,
+    avoided_recipe_ids: set[str],
+    avoided_recipe_keys: set[str],
+    *,
+    phase: str,
+    recipe_cache: _RecipePlanCache,
+) -> _WeeklyPhaseFeasibility:
+    phase_label = _weekly_selection_phase_label(phase)
+    _weekly_selection_diag(
+        "phase_feasibility_start",
+        phase=phase_label,
+        raw_phase=phase,
+        avoided_ids=len(avoided_recipe_ids),
+        avoided_keys=len(avoided_recipe_keys),
+    )
+    if phase == "no_recent":
+        result = _WeeklyPhaseFeasibility(
+            skipped=False,
+            reason="no_recent_not_gated",
+            slot_counts=(),
+        )
+        _weekly_selection_diag(
+            "phase_feasibility_end",
+            phase=phase_label,
+            raw_phase=phase,
+            skipped=result.skipped,
+            reason=result.reason,
+            slot_counts="",
+        )
+        return result
+
+    safety = evaluate_safety(profile)
+    if not safety.can_generate_plan:
+        result = _WeeklyPhaseFeasibility(
+            skipped=True,
+            reason="safety_cannot_generate",
+            slot_counts=(),
+        )
+        _weekly_selection_diag(
+            "phase_feasibility_end",
+            phase=phase_label,
+            raw_phase=phase,
+            skipped=result.skipped,
+            reason=result.reason,
+            slot_counts="",
+        )
+        return result
+
+    targets = calculate_targets(profile)
+    candidate_foods = filter_foods(built_in_foods(), safety)
+    if not candidate_foods:
+        result = _WeeklyPhaseFeasibility(
+            skipped=True,
+            reason="no_safe_foods",
+            slot_counts=(),
+        )
+        _weekly_selection_diag(
+            "phase_feasibility_end",
+            phase=phase_label,
+            raw_phase=phase,
+            skipped=result.skipped,
+            reason=result.reason,
+            slot_counts="",
+        )
+        return result
+
+    food_by_id = {food.id: food for food in candidate_foods}
+    food_cache_key = _food_by_id_cache_key(food_by_id)
+    base_recipes = _weekly_phase_feasible_base_recipes(
+        food_by_id,
+        food_cache_key,
+        avoided_recipe_ids,
+        avoided_recipe_keys,
+        safety.excluded_food_names,
+        recipe_cache,
+    )
+    slots = _meal_energy_slots(profile.meal_count)
+    slot_counts_by_name = Counter(slot.slot for slot in slots)
+    strict_simple_constraints = None
+    if normalize_cooking_time_preference(profile.cooking_time) == CookingTimePreference.SIMPLE:
+        strict_simple_constraints = _cooking_effort_constraints(CookingTimePreference.SIMPLE)
+
+    total_energy = targets.targets.get("energy_kcal")
+    feasibility_counts: list[_WeeklyPhaseSlotFeasibility] = []
+    for slot_name in slot_counts_by_name:
+        matching_slots = [slot for slot in slots if slot.slot == slot_name]
+        available_counts: list[int] = []
+        strict_counts: list[int] = []
+        for energy_slot in matching_slots:
+            available_count, strict_count = _weekly_phase_slot_candidate_counts(
+                base_recipes,
+                slot=energy_slot.slot,
+                slot_energy_target=total_energy * energy_slot.target_ratio,
+                target=targets.targets,
+                food_by_id=food_by_id,
+                food_cache_key=food_cache_key,
+                avoided_recipe_keys=avoided_recipe_keys,
+                strict_simple_constraints=strict_simple_constraints,
+                recipe_cache=recipe_cache,
+            )
+            available_counts.append(available_count)
+            if strict_simple_constraints is not None:
+                strict_counts.append(strict_count)
+
+        weekly_required = slot_counts_by_name[slot_name] * WEEK_PLAN_DAYS
+        if strict_simple_constraints is not None:
+            threshold = (
+                weekly_required
+                * WEEKLY_RECENT_FEASIBILITY_POOL_MULTIPLIER
+            )
+            strict_simple_count: int | None = min(strict_counts) if strict_counts else 0
+        else:
+            threshold = weekly_required
+            strict_simple_count = None
+
+        feasibility_counts.append(
+            _WeeklyPhaseSlotFeasibility(
+                slot=slot_name,
+                weekly_required=weekly_required,
+                available_count=min(available_counts) if available_counts else 0,
+                strict_simple_count=strict_simple_count,
+                threshold=threshold,
+            )
+        )
+
+    skipped_count = next(
+        (
+            count
+            for count in feasibility_counts
+            if _weekly_phase_slot_gating_count(count) < count.threshold
+        ),
+        None,
+    )
+    if skipped_count is None:
+        result = _WeeklyPhaseFeasibility(
+            skipped=False,
+            reason="feasible",
+            slot_counts=tuple(feasibility_counts),
+        )
+    else:
+        result = _WeeklyPhaseFeasibility(
+            skipped=True,
+            reason=(
+                "slot_pool_below_threshold:"
+                f"{skipped_count.slot}:"
+                f"{_weekly_phase_slot_gating_count(skipped_count)}"
+                f"<{skipped_count.threshold}"
+            ),
+            slot_counts=tuple(feasibility_counts),
+        )
+
+    _weekly_selection_diag(
+        "phase_feasibility_end",
+        phase=phase_label,
+        raw_phase=phase,
+        skipped=result.skipped,
+        reason=result.reason,
+        slot_counts=_weekly_phase_feasibility_counts_summary(result.slot_counts),
+    )
+    return result
+
+def _weekly_phase_feasible_base_recipes(
+    food_by_id: dict[str, Food],
+    food_cache_key: str,
+    avoided_recipe_ids: set[str],
+    avoided_recipe_keys: set[str],
+    excluded_food_names: frozenset[str],
+    recipe_cache: _RecipePlanCache,
+) -> tuple[RecipeTemplate, ...]:
+    recipes: list[RecipeTemplate] = []
+    for recipe in built_in_recipes():
+        if "curated" not in recipe.tags:
+            continue
+        if recipe.id in avoided_recipe_ids:
+            continue
+        if _recipe_memory_key_cached(recipe, recipe_cache=recipe_cache) in avoided_recipe_keys:
+            continue
+        if _recipe_title_uses_excluded_food(recipe, excluded_food_names):
+            continue
+        if (
+            _resolve_recipe_ingredients(
+                recipe,
+                food_by_id,
+                recipe_cache=recipe_cache,
+                food_cache_key=food_cache_key,
+            )
+            is None
+        ):
+            continue
+        recipes.append(recipe)
+    return tuple(recipes)
+
+def _weekly_phase_slot_candidate_counts(
+    recipes: tuple[RecipeTemplate, ...],
+    *,
+    slot: str,
+    slot_energy_target: float,
+    target: NutrientVector,
+    food_by_id: dict[str, Food],
+    food_cache_key: str,
+    avoided_recipe_keys: set[str],
+    strict_simple_constraints: CookingEffortConstraints | None,
+    recipe_cache: _RecipePlanCache,
+) -> tuple[int, int]:
+    available_count = 0
+    strict_simple_count = 0
+    for recipe in recipes:
+        if _recipe_memory_key_cached(recipe, slot, recipe_cache=recipe_cache) in avoided_recipe_keys:
+            continue
+        eligibility = _recipe_slot_eligibility_cached(
+            recipe,
+            slot,
+            food_by_id,
+            slot_energy_target,
+            target,
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
+        )
+        if not eligibility.eligible:
+            continue
+        available_count += 1
+        if strict_simple_constraints is not None and _recipe_matches_cooking_effort_cached(
+            recipe,
+            strict_simple_constraints,
+            recipe_cache,
+        ):
+            strict_simple_count += 1
+    return available_count, strict_simple_count
+
+def _weekly_phase_slot_gating_count(count: _WeeklyPhaseSlotFeasibility) -> int:
+    if count.strict_simple_count is not None:
+        return count.strict_simple_count
+    return count.available_count
+
+def _weekly_phase_feasibility_counts_summary(
+    counts: Sequence[_WeeklyPhaseSlotFeasibility],
+) -> str:
+    return ";".join(
+        (
+            f"{count.slot}:required={count.weekly_required},"
+            f"available={count.available_count},"
+            f"strict_simple={count.strict_simple_count},"
+            f"threshold={count.threshold}"
+        )
+        for count in counts
+    )
+
+def _load_recent_recipe_avoidance(
+    chat_id: int,
+    *,
+    now: datetime | None = None,
+) -> _RecentRecipeAvoidance:
+    del now
+    _load_chat_history(chat_id)
+    return _recent_recipe_avoidance_from_legacy_chat_history(chat_id)
+
+def _build_week_plans_with_recent_fallback(
+    profile: UserProfile,
+    seed: int,
+    recent_avoidance: _RecentRecipeAvoidance,
+) -> _WeekPlanBuildResult:
+    guard = _WeeklySelectionGuard()
+    recipe_cache = _RecipePlanCache()
+    timed_out = False
+    for phase, avoided_recipe_ids, avoided_recipe_keys in _weekly_recent_avoidance_phases(
+        recent_avoidance
+    ):
+        guard.begin_phase(phase)
+        _weekly_selection_diag(
+            "phase_start",
+            phase=_weekly_selection_phase_label(phase),
+            raw_phase=phase,
+            seed=seed,
+            avoided_ids=len(avoided_recipe_ids),
+            avoided_keys=len(avoided_recipe_keys),
+        )
+        avoided_recipe_id_set = set(avoided_recipe_ids)
+        avoided_recipe_key_set = set(avoided_recipe_keys)
+        feasibility = _weekly_phase_feasibility(
+            profile,
+            avoided_recipe_id_set,
+            avoided_recipe_key_set,
+            phase=phase,
+            recipe_cache=recipe_cache,
+        )
+        if feasibility.skipped:
+            _weekly_selection_diag(
+                "phase_end",
+                phase=_weekly_selection_phase_label(phase),
+                raw_phase=phase,
+                complete=False,
+                days=0,
+                meals=0,
+                skipped=True,
+                reason=feasibility.reason,
+                **_recipe_cache_diag_counts(recipe_cache),
+            )
+            continue
+        try:
+            plans = _build_week_plans(
+                profile,
+                seed,
+                avoided_recipe_id_set,
+                avoided_recipe_key_set,
+                selection_phase=phase,
+                selection_guard=guard,
+                recipe_cache=recipe_cache,
+            )
+        except _WeeklySelectionTimeout as exc:
+            timed_out = True
+            _weekly_selection_diag(
+                "timeout",
+                always=True,
+                scope=exc.scope,
+                phase=_weekly_selection_phase_label(exc.phase),
+                raw_phase=exc.phase,
+                elapsed_s=f"{exc.elapsed_s:.3f}",
+                timeout_s=f"{exc.timeout_s:.3f}",
+                day_index=exc.day_index,
+                candidate_index=exc.candidate_index,
+                stage=exc.stage,
+                **_recipe_cache_diag_counts(recipe_cache),
+            )
+            if exc.scope == "total":
+                return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+            continue
+        _weekly_selection_diag(
+            "phase_end",
+            phase=_weekly_selection_phase_label(phase),
+            raw_phase=phase,
+            complete=_week_plans_are_complete(plans, profile),
+            days=len(plans),
+            meals=sum(len(plan.meals) for plan in plans),
+            **_recipe_cache_diag_counts(recipe_cache),
+        )
+        if _week_plans_are_complete(plans, profile):
+            if phase != "full_recent" and (
+                recent_avoidance.full_recipe_ids or recent_avoidance.full_recipe_keys
+            ):
+                logger.info(
+                    "Weekly generation relaxed recent recipe avoidance: "
+                    "phase=%s full_ids=%s full_keys=%s kept_ids=%s kept_keys=%s",
+                    phase,
+                    len(recent_avoidance.full_recipe_ids),
+                    len(recent_avoidance.full_recipe_keys),
+                    len(avoided_recipe_ids),
+                    len(avoided_recipe_keys),
+                )
+            return _WeekPlanBuildResult(plans=plans, avoidance_phase=phase)
+
+        if avoided_recipe_ids or avoided_recipe_keys:
+            logger.info(
+                "Weekly generation could not satisfy recent recipe avoidance: "
+                "phase=%s avoided_ids=%s avoided_keys=%s",
+                phase,
+                len(avoided_recipe_ids),
+                len(avoided_recipe_keys),
+            )
+
+    total_timeout_s = float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+    if timed_out or (
+        total_timeout_s > 0 and time.perf_counter() - guard.total_started_at > total_timeout_s
+    ):
+        return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+    return _WeekPlanBuildResult(plans=(), avoidance_phase="failed")
+
+def _weekly_recent_avoidance_phases(
+    recent_avoidance: _RecentRecipeAvoidance,
+) -> tuple[tuple[str, frozenset[str], frozenset[str]], ...]:
+    full = (recent_avoidance.full_recipe_ids, recent_avoidance.full_recipe_keys)
+    reduced = (
+        recent_avoidance.reduced_recipe_ids,
+        recent_avoidance.reduced_recipe_keys,
+    )
+    empty = (frozenset(), frozenset())
+    if not (full[0] or full[1]):
+        return (("no_recent", empty[0], empty[1]),)
+
+    phases: list[tuple[str, frozenset[str], frozenset[str]]] = [
+        ("full_recent", full[0], full[1])
+    ]
+    if (reduced[0] or reduced[1]) and reduced != full:
+        phases.append(("reduced_recent", reduced[0], reduced[1]))
+    phases.append(("no_recent", empty[0], empty[1]))
+    return tuple(phases)
+
+def _recent_recipe_avoidance_from_legacy_chat_history(chat_id: int) -> _RecentRecipeAvoidance:
+    recent_ids = _bounded_recent_strings(
+        RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []),
+        RECENT_RECIPE_HISTORY_LIMIT,
+    )
+    recent_keys = _bounded_recent_strings(
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []),
+        RECENT_RECIPE_HISTORY_LIMIT,
+    )
+    reduced_ids = _bounded_recent_strings(recent_ids, RECENT_RECIPE_REDUCED_LIMIT)
+    reduced_keys = _bounded_recent_strings(recent_keys, RECENT_RECIPE_REDUCED_LIMIT)
+    return _RecentRecipeAvoidance(
+        full_recipe_ids=frozenset(recent_ids),
+        full_recipe_keys=frozenset(recent_keys),
+        reduced_recipe_ids=frozenset(reduced_ids),
+        reduced_recipe_keys=frozenset(reduced_keys),
+    )
+
+def _recipe_history_ids(items: Sequence[RecipeHistoryItem]) -> frozenset[str]:
+    return frozenset(item.recipe_id for item in items if item.recipe_id)
+
+def _recipe_history_keys(items: Sequence[RecipeHistoryItem]) -> frozenset[str]:
+    return frozenset(item.recipe_key for item in items if item.recipe_key)
+
+def _recipe_history_generated_at(item: RecipeHistoryItem) -> datetime | None:
+    generated_at = item.generated_at
+    if generated_at is None:
+        return None
+    if generated_at.tzinfo is None:
+        return generated_at.replace(tzinfo=UTC)
+    return generated_at.astimezone(UTC)
+
+def _bounded_recent_strings(values: Sequence[object], limit: int) -> tuple[str, ...]:
+    bounded_limit = max(0, int(limit))
+    if bounded_limit == 0:
+        return ()
+    return tuple(str(value) for value in values if value)[-bounded_limit:]
+
+def _recent_history_now(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(UTC)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=UTC)
+    return now.astimezone(UTC)
+
+def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) -> bool:
+    return len(plans) == WEEK_PLAN_DAYS and all(_week_day_plan_is_complete(plan, profile) for plan in plans)
+
+def _week_day_plan_is_complete(plan: MealPlan, profile: UserProfile) -> bool:
+    return plan.safety.can_generate_plan and len(plan.meals) == _expected_meal_count(profile)
+
+
+def _expected_meal_count(profile: UserProfile) -> int:
+    return min(5, max(3, profile.meal_count))
+
+
+def _plan_uses_avoided_recipes(
+    plan: MealPlan,
+    avoided_recipe_ids: set[str],
+    avoided_recipe_keys: set[str],
+) -> bool:
+    return any(
+        (meal.recipe_id is not None and meal.recipe_id in avoided_recipe_ids)
+        or (meal.recipe_key is not None and meal.recipe_key in avoided_recipe_keys)
+        for meal in plan.meals
+    )
+
+def _carryovers_use_avoided_recipes(
+    carryovers: dict[str, "_BatchCarryover"],
+    avoided_recipe_ids: set[str],
+    avoided_recipe_keys: set[str],
+) -> bool:
+    return any(
+        (carryover.meal.recipe_id is not None and carryover.meal.recipe_id in avoided_recipe_ids)
+        or (carryover.meal.recipe_key is not None and carryover.meal.recipe_key in avoided_recipe_keys)
+        for carryover in carryovers.values()
+    )
+
+def _macro_balance_gap(plan: MealPlan) -> float:
+    total = plan.totals
+    target = plan.targets.targets
+    return (
+        _relative_gap(total, target, "protein_g")
+        + _relative_gap(total, target, "fat_g")
+        + _relative_gap(total, target, "carbohydrate_g")
+    )
+
+
+def _calorie_fit(plan: MealPlan) -> tuple[bool, float]:
+    energy = plan.totals.get("energy_kcal")
+    target = plan.targets.targets.get("energy_kcal")
+    lower, upper = plan.targets.calorie_bounds
+    denominator = max(target, 1.0)
+
+    if lower <= energy <= upper:
+        return True, abs(energy - target) / denominator
+    if energy < lower:
+        return False, (lower - energy) / denominator
+    return False, (energy - upper) / denominator
+
+
+def _relative_gap(total: NutrientVector, target: NutrientVector, nutrient: str) -> float:
+    target_value = target.get(nutrient)
+    if target_value <= 0:
+        return 0.0
+    return abs(total.get(nutrient) - target_value) / target_value
+
+
+def _weekly_day_selection_score(
+    plan: MealPlan,
+    week_food_ids: set[str],
+    candidate_index: int,
+    *,
+    week_recipe_ids_for_diversity: set[str] | None = None,
+    candidate_recipe_counts: Counter[str] | None = None,
+    recipe_trait_lookup: _RecipeTraitLookupSource | None = None,
+) -> tuple[float, float, float, int]:
+    in_calorie_band, calorie_gap = _calorie_fit(plan)
+    macro_gap = _macro_balance_gap(plan)
+    diversity_penalty = _weekly_completed_day_diversity_penalty(
+        plan,
+        week_recipe_ids_for_diversity or set(),
+        recipe_trait_lookup=recipe_trait_lookup,
+    )
+    candidate_pool_penalty = _completed_candidate_pool_recipe_penalty(plan, candidate_recipe_counts or Counter())
+    return (
+        1.0 if in_calorie_band else 0.0,
+        -(calorie_gap + macro_gap * 0.04 + diversity_penalty + candidate_pool_penalty),
+        _ingredient_reuse_score(plan, week_food_ids),
+        -candidate_index,
+    )
+
+def _candidate_recipe_counts(plans: Sequence[MealPlan]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for plan in plans:
+        counts.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+    return counts
+
+def _completed_candidate_pool_recipe_penalty(plan: MealPlan, candidate_recipe_counts: Counter[str]) -> float:
+    if not candidate_recipe_counts:
+        return 0.0
+    penalty = 0.0
+    for meal in plan.meals:
+        if not meal.recipe_id:
+            continue
+        penalty += max(0, candidate_recipe_counts[meal.recipe_id] - 1) * WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY
+    return penalty
+
+def _weekly_completed_day_diversity_penalty(
+    plan: MealPlan,
+    week_recipe_ids: set[str],
+    *,
+    recipe_trait_lookup: _RecipeTraitLookupSource | None = None,
+) -> float:
+    if not plan.meals or not week_recipe_ids:
+        return 0.0
+
+    traits_by_id = recipe_trait_lookup or _recipe_traits_by_id()
+    week_trait_counts = _week_trait_counts(week_recipe_ids, traits_by_id)
+    penalty = 0.0
+    for meal in plan.meals:
+        recipe_id = meal.recipe_id
+        if not recipe_id:
+            continue
+        if recipe_id in week_recipe_ids:
+            penalty += WEEKLY_EXACT_RECIPE_REPEAT_PENALTY
+        traits = _recipe_traits_for_id(recipe_id, traits_by_id)
+        if traits is None:
+            continue
+        for trait_name, weight in WEEKLY_TRAIT_REPEAT_WEIGHTS.items():
+            value = getattr(traits, trait_name)
+            if not value:
+                continue
+            repeated = min(week_trait_counts[(trait_name, value)], WEEKLY_TRAIT_REPEAT_CAP)
+            penalty += repeated * weight
+    return penalty
+
+def _week_trait_counts(
+    recipe_ids: set[str],
+    traits_by_id: _RecipeTraitLookupSource,
+) -> Counter[tuple[str, str]]:
+    counts: Counter[tuple[str, str]] = Counter()
+    for recipe_id in recipe_ids:
+        traits = _recipe_traits_for_id(recipe_id, traits_by_id)
+        if traits is None:
+            continue
+        for trait_name in WEEKLY_TRAIT_REPEAT_WEIGHTS:
+            value = getattr(traits, trait_name)
+            if value:
+                counts[(trait_name, value)] += 1
+    return counts
+
+def _recipe_traits_for_id(
+    recipe_id: str,
+    traits_by_id: _RecipeTraitLookupSource,
+) -> RecipeTraits | None:
+    return traits_by_id.get(recipe_id)
+
+def _recipe_traits_by_id() -> dict[str, RecipeTraits]:
+    return {recipe.id: infer_recipe_traits(recipe) for recipe in built_in_recipes()}
+
+def _recipe_history_items_from_plan(
+    plan_result: MealPlan,
+    ration_kind: RationKind,
+    *,
+    day_index: int | None = None,
+) -> list[RecipeHistoryItem]:
+    return [
+        RecipeHistoryItem(
+            recipe_id=meal.recipe_id,
+            recipe_key=meal.recipe_key,
+            meal_slot=_meal_slot(meal),
+            ration_kind=ration_kind,
+            day_index=day_index,
+            meal_index=meal_index,
+        )
+        for meal_index, meal in enumerate(plan_result.meals)
+        if meal.recipe_id and meal.recipe_key
+    ]
+
+def _remember_recipe_history_items(
+    chat_id: int,
+    entries: Sequence[RecipeHistoryItem],
+) -> None:
+    if not entries:
+        return
+    id_history = RECENT_RECIPE_IDS_BY_CHAT_ID.setdefault(chat_id, [])
+    key_history = RECENT_RECIPE_KEYS_BY_CHAT_ID.setdefault(chat_id, [])
+    id_history.extend(entry.recipe_id for entry in entries if entry.recipe_id)
+    key_history.extend(entry.recipe_key for entry in entries if entry.recipe_key)
+    if len(id_history) > RECENT_RECIPE_LIMIT:
+        del id_history[:-RECENT_RECIPE_LIMIT]
+    if len(key_history) > RECENT_RECIPE_LIMIT:
+        del key_history[:-RECENT_RECIPE_LIMIT]
+    _save_chat_history(chat_id)
+
+def _history_generation_id(consumption: AttemptConsumption) -> int | None:
+    del consumption
+    return None
+
 def _build_week_plans(
     profile: UserProfile,
     seed: int,
     avoided_recipe_ids: set[str],
     avoided_recipe_keys: set[str],
+    *,
+    recipe_trait_lookup: _RecipeTraitLookupSource | None = None,
+    selection_phase: str = "unknown",
+    selection_guard: _WeeklySelectionGuard | None = None,
+    recipe_cache: _RecipePlanCache | None = None,
 ) -> tuple[MealPlan, ...]:
     plans: list[MealPlan] = []
     week_recipe_ids = set(avoided_recipe_ids)
     week_recipe_keys = set(avoided_recipe_keys)
+    selected_week_recipe_ids: set[str] = set()
     carryovers: dict[str, _BatchCarryover] = {}
+    if recipe_cache is None:
+        recipe_cache = _RecipePlanCache()
+    if recipe_trait_lookup is None:
+        recipe_trait_lookup = _WeeklyRecipeTraitLookup.from_recipes(curated_recipes())
     for day_index in range(WEEK_PLAN_DAYS):
+        if selection_guard is not None:
+            selection_guard.check(stage="before_day", day_index=day_index)
         week_food_ids = _week_food_ids(plans)
+        day_seed = seed + day_index * WEEK_PLAN_CANDIDATE_COUNT
+        day_started_at = time.perf_counter()
+        _weekly_selection_diag(
+            "day_start",
+            phase=_weekly_selection_phase_label(selection_phase),
+            raw_phase=selection_phase,
+            day_index=day_index,
+            seed=day_seed,
+            avoided_ids=len(week_recipe_ids),
+            avoided_keys=len(week_recipe_keys),
+        )
         plan, carryovers = _select_week_day_plan(
             profile,
-            seed + day_index * WEEK_PLAN_CANDIDATE_COUNT,
+            day_seed,
             week_recipe_ids,
             week_recipe_keys,
             week_food_ids,
             carryovers,
+            has_future_week_days=day_index < WEEK_PLAN_DAYS - 1,
+            week_recipe_ids_for_diversity=selected_week_recipe_ids,
+            recipe_cache=recipe_cache,
+            recipe_trait_lookup=recipe_trait_lookup,
+            selection_phase=selection_phase,
+            day_index=day_index,
+            selection_guard=selection_guard,
         )
+        _weekly_selection_diag(
+            "day_end",
+            phase=_weekly_selection_phase_label(selection_phase),
+            raw_phase=selection_phase,
+            day_index=day_index,
+            elapsed_s=f"{time.perf_counter() - day_started_at:.3f}",
+            complete=_week_day_plan_is_complete(plan, profile),
+            meals=len(plan.meals),
+        )
+        if not _week_day_plan_is_complete(plan, profile):
+            return ()
         plans.append(plan)
-        week_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+        selected_ids = {meal.recipe_id for meal in plan.meals if meal.recipe_id}
+        week_recipe_ids.update(selected_ids)
+        selected_week_recipe_ids.update(selected_ids)
         week_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
+    if not _week_plans_are_complete(plans, profile):
+        return ()
     return tuple(plans)
 
 
@@ -1202,38 +2593,151 @@ def _select_week_day_plan(
     avoided_recipe_keys: set[str],
     week_food_ids: set[str],
     carryovers: dict[str, "_BatchCarryover"],
+    *,
+    has_future_week_days: bool = True,
+    week_recipe_ids_for_diversity: set[str] | None = None,
+    recipe_cache: _RecipePlanCache | None = None,
+    recipe_trait_lookup: _RecipeTraitLookupSource | None = None,
+    selection_phase: str = "unknown",
+    day_index: int | None = None,
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[MealPlan, dict[str, "_BatchCarryover"]]:
-    best_plan: MealPlan | None = None
-    best_carryovers: dict[str, _BatchCarryover] | None = None
-    best_score: tuple[float, int] | None = None
-    for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
-        plan = build_one_day_plan(
+    candidate_options: list[tuple[MealPlan, dict[str, _BatchCarryover], int]] = []
+    rejected_plan: MealPlan | None = None
+
+    def add_selectable_candidates(candidate_indexes: range) -> None:
+        nonlocal rejected_plan
+        for candidate_index in candidate_indexes:
+            if selection_guard is not None:
+                selection_guard.check(
+                    stage="before_candidate",
+                    day_index=day_index,
+                    candidate_index=candidate_index,
+                )
+            candidate_seed = seed + candidate_index
+            candidate_phase = (
+                "rescue"
+                if candidate_index >= WEEK_PLAN_CANDIDATE_COUNT
+                else _weekly_selection_phase_label(selection_phase)
+            )
+            candidate_started_at = time.perf_counter()
+            _weekly_selection_diag(
+                "candidate_start",
+                phase=candidate_phase,
+                recent_phase=_weekly_selection_phase_label(selection_phase),
+                raw_phase=selection_phase,
+                day_index=day_index,
+                candidate_index=candidate_index,
+                seed=candidate_seed,
+                avoided_ids=len(avoided_recipe_ids),
+                avoided_keys=len(avoided_recipe_keys),
+            )
+            with recipe_plan_diagnostic_context(
+                phase=candidate_phase,
+                recent_phase=_weekly_selection_phase_label(selection_phase),
+                raw_phase=selection_phase,
+                day_index=day_index,
+                candidate_index=candidate_index,
+                seed=candidate_seed,
+            ):
+                candidate_selection_guard = (
+                    _WeeklySelectionScopedGuard(selection_guard, day_index, candidate_index)
+                    if selection_guard is not None
+                    else None
+                )
+                plan = build_one_day_plan(
+                    profile,
+                    variety_seed=candidate_seed,
+                    avoided_recipe_ids=avoided_recipe_ids,
+                    avoided_recipe_keys=avoided_recipe_keys,
+                    recipe_source="curated_only",
+                    allow_avoided_recipe_relaxation=False,
+                    recipe_cache=recipe_cache,
+                    selection_guard=candidate_selection_guard,
+                )
+            candidate_carryovers = _copy_carryovers(carryovers)
+            plan = _apply_batch_carryovers(plan, candidate_carryovers)
+            complete = _week_day_plan_is_complete(plan, profile)
+            used_avoided = _plan_uses_avoided_recipes(plan, avoided_recipe_ids, avoided_recipe_keys)
+            _weekly_selection_diag(
+                "candidate_end",
+                phase=candidate_phase,
+                recent_phase=_weekly_selection_phase_label(selection_phase),
+                raw_phase=selection_phase,
+                day_index=day_index,
+                candidate_index=candidate_index,
+                seed=candidate_seed,
+                elapsed_s=f"{time.perf_counter() - candidate_started_at:.3f}",
+                complete=complete,
+                meals=len(plan.meals),
+                recipe_count=len({meal.recipe_id for meal in plan.meals if meal.recipe_id}),
+                used_avoided=used_avoided,
+            )
+            if selection_guard is not None:
+                selection_guard.check(
+                    stage="after_candidate",
+                    day_index=day_index,
+                    candidate_index=candidate_index,
+                )
+            if not complete:
+                rejected_plan = rejected_plan or plan
+                continue
+            if used_avoided:
+                rejected_plan = rejected_plan or plan
+                continue
+            next_avoided_recipe_ids = set(avoided_recipe_ids)
+            next_avoided_recipe_ids.update(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+            next_avoided_recipe_keys = set(avoided_recipe_keys)
+            next_avoided_recipe_keys.update(meal.recipe_key for meal in plan.meals if meal.recipe_key)
+            if has_future_week_days and _carryovers_use_avoided_recipes(
+                candidate_carryovers,
+                next_avoided_recipe_ids,
+                next_avoided_recipe_keys,
+            ):
+                rejected_plan = rejected_plan or plan
+                continue
+            candidate_options.append((plan, candidate_carryovers, candidate_index))
+
+    add_selectable_candidates(range(WEEK_PLAN_CANDIDATE_COUNT))
+    if not candidate_options:
+        rescue_start = WEEK_PLAN_CANDIDATE_COUNT
+        rescue_stop = rescue_start + WEEK_PLAN_RESCUE_CANDIDATE_COUNT
+        add_selectable_candidates(range(rescue_start, rescue_stop))
+
+    if candidate_options:
+        candidate_recipe_counts = _candidate_recipe_counts(tuple(option[0] for option in candidate_options))
+        best_plan, best_carryovers, _ = max(
+            candidate_options,
+            key=lambda option: _weekly_day_selection_score(
+                option[0],
+                week_food_ids,
+                option[2],
+                week_recipe_ids_for_diversity=week_recipe_ids_for_diversity,
+                candidate_recipe_counts=candidate_recipe_counts,
+                recipe_trait_lookup=recipe_trait_lookup,
+            ),
+        )
+        return best_plan, best_carryovers
+
+    if rejected_plan is not None:
+        return replace(rejected_plan, meals=()), carryovers
+    return (
+        build_one_day_plan(
             profile,
-            variety_seed=seed + candidate_index,
+            variety_seed=seed,
             avoided_recipe_ids=avoided_recipe_ids,
             avoided_recipe_keys=avoided_recipe_keys,
             recipe_source="curated_only",
-        )
-        candidate_carryovers = _copy_carryovers(carryovers)
-        plan = _apply_batch_carryovers(plan, candidate_carryovers)
-        score = (_ingredient_reuse_score(plan, week_food_ids), -candidate_index)
-        if best_score is None or score > best_score:
-            best_plan = plan
-            best_carryovers = candidate_carryovers
-            best_score = score
-
-    if best_plan is None or best_carryovers is None:
-        return (
-            build_one_day_plan(
-                profile,
-                variety_seed=seed,
-                avoided_recipe_ids=avoided_recipe_ids,
-                avoided_recipe_keys=avoided_recipe_keys,
-                recipe_source="curated_only",
+            allow_avoided_recipe_relaxation=False,
+            recipe_cache=recipe_cache,
+            selection_guard=(
+                _WeeklySelectionScopedGuard(selection_guard, day_index, None)
+                if selection_guard is not None
+                else None
             ),
-            carryovers,
-        )
-    return best_plan, best_carryovers
+        ),
+        carryovers,
+    )
 
 
 def _copy_carryovers(carryovers: dict[str, "_BatchCarryover"]) -> dict[str, "_BatchCarryover"]:
@@ -1400,15 +2904,10 @@ def _format_week_day_header(day_index: int, plan_date: date) -> str:
 
 
 def _remember_recipes(chat_id: int, plan_result) -> None:
-    id_history = RECENT_RECIPE_IDS_BY_CHAT_ID.setdefault(chat_id, [])
-    key_history = RECENT_RECIPE_KEYS_BY_CHAT_ID.setdefault(chat_id, [])
-    id_history.extend(meal.recipe_id for meal in plan_result.meals if meal.recipe_id)
-    key_history.extend(meal.recipe_key for meal in plan_result.meals if meal.recipe_key)
-    if len(id_history) > RECENT_RECIPE_LIMIT:
-        del id_history[:-RECENT_RECIPE_LIMIT]
-    if len(key_history) > RECENT_RECIPE_LIMIT:
-        del key_history[:-RECENT_RECIPE_LIMIT]
-    _save_chat_history(chat_id)
+    _remember_recipe_history_items(
+        chat_id,
+        _recipe_history_items_from_plan(plan_result, "one_day"),
+    )
 
 
 def _load_chat_history(chat_id: int) -> None:
@@ -1973,6 +3472,38 @@ def _format_test_access_status(entitlement: Entitlement) -> str:
     return "\n".join(lines)
 
 
+def _dry_run_generation_attempt(chat_id: int, ration_kind: RationKind) -> AttemptConsumption:
+    if chat_id in TESTER_CHAT_IDS:
+        return AttemptConsumption(True, ration_kind, "test_access")
+    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
+    entitlement = _copy_entitlement_for_dry_run(entitlements.get(chat_id, Entitlement()))
+    if _is_free_preview_mode(chat_id, entitlement):
+        entitlement = _free_preview_entitlement(entitlement)
+    return _consume_entitlement_for_ration(entitlement, ration_kind)
+
+
+def _copy_entitlement_for_dry_run(entitlement: Entitlement) -> Entitlement:
+    return replace(entitlement, processed_payment_charge_ids=list(entitlement.processed_payment_charge_ids))
+
+
+def _free_preview_entitlement(entitlement: Entitlement) -> Entitlement:
+    return replace(
+        entitlement,
+        subscription_period_start=None,
+        subscription_period_end=None,
+        monthly_one_day_remaining=0,
+        monthly_weekly_pdf_remaining=0,
+        extra_one_day_remaining=0,
+        extra_weekly_pdf_remaining=0,
+        test_access_enabled=False,
+    )
+
+
+def _consume_entitlement_for_ration(entitlement: Entitlement, ration_kind: RationKind) -> AttemptConsumption:
+    if ration_kind == "weekly_pdf":
+        return consume_weekly_pdf_attempt(entitlement)
+    return consume_one_day_attempt(entitlement)
+
 def _consume_generation_attempt(chat_id: int, ration_kind: RationKind) -> AttemptConsumption:
     if chat_id in TESTER_CHAT_IDS:
         return AttemptConsumption(True, ration_kind, "test_access")
@@ -2011,6 +3542,17 @@ def _refund_generation_attempt(chat_id: int, consumption: AttemptConsumption) ->
     entitlements[chat_id] = entitlement
     save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
 
+
+def _record_successful_generation_history(
+    chat_id: int,
+    consumption: AttemptConsumption,
+    entries: Sequence[RecipeHistoryItem],
+) -> None:
+    if consumption.allowed:
+        _remember_recipe_history_items(chat_id, entries)
+
+def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
+    del chat_id, consumption
 
 def _entitlement_for_chat(chat_id: int) -> Entitlement:
     entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
