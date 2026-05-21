@@ -64,6 +64,7 @@ from .builder import (
     recipe_plan_diagnostic_context,
 )
 from .calculator import calculate_targets
+from .catalog import built_in_foods
 from .domain import (
     ActivityLevel,
     BatchPrep,
@@ -733,6 +734,8 @@ WEEKLY_TRAIT_REPEAT_WEIGHTS = {
     "primary_carb": 0.012,
     "recipe_format": 0.014,
 }
+
+
 @dataclass
 class _WeeklyRecipeTraitLookup:
     recipes_by_id: Mapping[str, RecipeTemplate] = field(default_factory=dict)

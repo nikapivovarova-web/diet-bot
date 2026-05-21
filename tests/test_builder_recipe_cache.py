@@ -283,8 +283,8 @@ def test_lactose_free_milk_substitution_is_visible_in_portions_shopping_and_pdf_
     shopping = build_shopping_list_for_meals((meal,))
 
     assert milk_food.id == "lactose_free_milk"
-    assert "\u0431\u0435\u0437\u043b\u0430\u043a\u0442\u043e\u0437" in milk_food.name.casefold()
-    assert "\u0431\u0435\u0437\u043b\u0430\u043a\u0442\u043e\u0437" in format_ingredient(milk_portion).casefold()
+    assert "безлактоз" in milk_food.name.casefold()
+    assert "безлактоз" in format_ingredient(milk_portion).casefold()
     assert [item.food_name for item in shopping] == [milk_food.name]
 
 
