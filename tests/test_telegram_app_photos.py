@@ -3112,11 +3112,11 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
         assert len(message.documents) == 1
         document = message.documents[0]["document"]
         assert isinstance(document, BufferedInputFile)
-        assert document.filename == "week.pdf"
+        assert document.filename == "FoodBalance_рацион_на_неделю_08-14_мая_2026.pdf"
         assert document.data == b"%PDF-1.4\n%test\n%%EOF\n"
         assert message.documents[0]["reply_markup"] is not None
         assert not pdf_path.exists()
-        assert message.texts[0][0].startswith("Собираю недельный PDF")
+        assert message.texts[0][0].startswith("Собираю ваш недельный PDF")
         assert message.edits
         assert message.edits[-1][0] == "Готово. PDF отправлен ниже."
         assert message.bot.chat_actions

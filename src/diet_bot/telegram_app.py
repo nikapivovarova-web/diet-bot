@@ -8,12 +8,13 @@ import os
 import random
 import re
 import time
-from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections import Counter, deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import RLock
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -181,6 +182,32 @@ RECENT_RECIPE_HISTORY_LIMIT = 140
 RECENT_RECIPE_REDUCED_DAYS = 14
 RECENT_RECIPE_REDUCED_LIMIT = 70
 logger = logging.getLogger(__name__)
+
+
+def _mask_chat_id(chat_id: int) -> str:
+    text = str(chat_id)
+    sign = "-" if text.startswith("-") else ""
+    digits = text[1:] if sign else text
+    if len(digits) <= 4:
+        return f"{sign}...{digits}"
+    return f"{sign}...{digits[-4:]}"
+
+
+def _weekly_pdf_diag(
+    event: str,
+    *,
+    chat_id: int | None = None,
+    elapsed_s: float | None = None,
+    **fields: object,
+) -> None:
+    safe_fields: dict[str, object] = {}
+    if chat_id is not None:
+        safe_fields["chat_id"] = _mask_chat_id(chat_id)
+    if elapsed_s is not None:
+        safe_fields["elapsed_s"] = f"{elapsed_s:.3f}"
+    safe_fields.update(fields)
+    details = " ".join(f"{key}={value}" for key, value in safe_fields.items())
+    logger.warning("weekly_pdf_diag event=%s %s", event, details)
 
 
 @dataclass(frozen=True)
@@ -372,23 +399,186 @@ def _parse_optional_int(raw: str | None) -> int | None:
         return None
 
 
+@dataclass
+class _WeeklyPdfQueueJob:
+    chat_id: int
+    runner: Callable[[], Awaitable[bool]]
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[bool]
+    ready_to_start: bool = False
+
+
+@dataclass(frozen=True)
+class _WeeklyPdfQueueAdmission:
+    future: asyncio.Future[bool] | None
+    duplicate: bool = False
+    starts_immediately: bool = False
+    ahead_count: int = 0
+
+
+class _WeeklyPdfQueueManager:
+    def __init__(self, max_concurrency: int) -> None:
+        self.max_concurrency = max(1, int(max_concurrency))
+        self._queue: deque[_WeeklyPdfQueueJob] = deque()
+        self._queued_chat_ids: set[int] = set()
+        self._active_chat_ids: set[int] = set()
+        self._active_count = 0
+        self._lock = RLock()
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return self._active_count + len(self._queue)
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, int]:
+        queued_count = len(self._queue)
+        return {
+            "queue_active": self._active_count,
+            "queue_queued": queued_count,
+            "queue_pending": self._active_count + queued_count,
+            "queue_max": self.max_concurrency,
+        }
+
+    def has_chat(self, chat_id: int) -> bool:
+        with self._lock:
+            return chat_id in self._queued_chat_ids or chat_id in self._active_chat_ids
+
+    def submit(
+        self,
+        chat_id: int,
+        runner: Callable[[], Awaitable[bool]],
+    ) -> _WeeklyPdfQueueAdmission:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        job = _WeeklyPdfQueueJob(
+            chat_id=chat_id,
+            runner=runner,
+            loop=loop,
+            future=future,
+        )
+
+        with self._lock:
+            if chat_id in self._queued_chat_ids or chat_id in self._active_chat_ids:
+                _weekly_pdf_diag("queue_duplicate", chat_id=chat_id, **self._snapshot_locked())
+                return _WeeklyPdfQueueAdmission(future=None, duplicate=True)
+
+            ahead_count = self._active_count + len(self._queue)
+            starts_immediately = not self._queue and self._active_count < self.max_concurrency
+            job.ready_to_start = starts_immediately
+            self._queue.append(job)
+            self._queued_chat_ids.add(chat_id)
+            jobs_to_start = self._dispatch_locked()
+
+        self._start_jobs(jobs_to_start)
+        _weekly_pdf_diag(
+            "queue_admitted",
+            chat_id=chat_id,
+            starts_immediately=starts_immediately,
+            ahead_count=0 if starts_immediately else ahead_count,
+            **self.snapshot(),
+        )
+        return _WeeklyPdfQueueAdmission(
+            future=future,
+            starts_immediately=starts_immediately,
+            ahead_count=0 if starts_immediately else ahead_count,
+        )
+
+    def _dispatch_locked(self) -> list[_WeeklyPdfQueueJob]:
+        jobs_to_start: list[_WeeklyPdfQueueJob] = []
+        while (
+            self._queue
+            and self._queue[0].ready_to_start
+            and self._active_count < self.max_concurrency
+        ):
+            job = self._queue.popleft()
+            self._queued_chat_ids.discard(job.chat_id)
+            self._active_chat_ids.add(job.chat_id)
+            self._active_count += 1
+            jobs_to_start.append(job)
+        return jobs_to_start
+
+    def mark_ready(self, future: asyncio.Future[bool]) -> None:
+        jobs_to_start: list[_WeeklyPdfQueueJob] = []
+        ready_chat_id: int | None = None
+        with self._lock:
+            for job in self._queue:
+                if job.future is future:
+                    job.ready_to_start = True
+                    ready_chat_id = job.chat_id
+                    jobs_to_start = self._dispatch_locked()
+                    break
+        self._start_jobs(jobs_to_start)
+        if ready_chat_id is not None:
+            _weekly_pdf_diag("queue_ready", chat_id=ready_chat_id, **self.snapshot())
+
+    def cancel(self, future: asyncio.Future[bool]) -> None:
+        jobs_to_start: list[_WeeklyPdfQueueJob] = []
+        with self._lock:
+            remaining: deque[_WeeklyPdfQueueJob] = deque()
+            removed_chat_id: int | None = None
+            for job in self._queue:
+                if job.future is future:
+                    removed_chat_id = job.chat_id
+                    continue
+                remaining.append(job)
+            if removed_chat_id is not None:
+                self._queue = remaining
+                self._queued_chat_ids.discard(removed_chat_id)
+                if not future.done():
+                    future.cancel()
+                jobs_to_start = self._dispatch_locked()
+        self._start_jobs(jobs_to_start)
+        if removed_chat_id is not None:
+            _weekly_pdf_diag("queue_cancelled", chat_id=removed_chat_id, **self.snapshot())
+
+    def _start_jobs(self, jobs: Sequence[_WeeklyPdfQueueJob]) -> None:
+        for job in jobs:
+            job.loop.create_task(self._run_job(job))
+
+    async def _run_job(self, job: _WeeklyPdfQueueJob) -> None:
+        started_at = time.perf_counter()
+        _weekly_pdf_diag("job_start", chat_id=job.chat_id, **self.snapshot())
+        try:
+            result = await job.runner()
+        except Exception as exc:
+            _weekly_pdf_diag(
+                "job_fail",
+                chat_id=job.chat_id,
+                elapsed_s=time.perf_counter() - started_at,
+                error=type(exc).__name__,
+                **self.snapshot(),
+            )
+            if not job.future.done():
+                job.future.set_exception(exc)
+        else:
+            _weekly_pdf_diag(
+                "job_complete",
+                chat_id=job.chat_id,
+                elapsed_s=time.perf_counter() - started_at,
+                result=result,
+                **self.snapshot(),
+            )
+            if not job.future.done():
+                job.future.set_result(result)
+        finally:
+            with self._lock:
+                self._active_chat_ids.discard(job.chat_id)
+                self._active_count = max(0, self._active_count - 1)
+                jobs_to_start = self._dispatch_locked()
+            self._start_jobs(jobs_to_start)
+            _weekly_pdf_diag("job_released", chat_id=job.chat_id, **self.snapshot())
+
+
 def _configure_weekly_pdf_concurrency(max_concurrency: int) -> None:
     global WEEKLY_PDF_MAX_CONCURRENCY
-    global _WEEKLY_PDF_SEMAPHORE
+    global WEEK_PDF_QUEUE_MANAGER
 
-    WEEKLY_PDF_MAX_CONCURRENCY = max_concurrency
-    _WEEKLY_PDF_SEMAPHORE = asyncio.Semaphore(max_concurrency)
-
-
-async def _try_acquire_weekly_pdf_slot() -> bool:
-    if _WEEKLY_PDF_SEMAPHORE.locked():
-        return False
-    await _WEEKLY_PDF_SEMAPHORE.acquire()
-    return True
-
-
-def _release_weekly_pdf_slot() -> None:
-    _WEEKLY_PDF_SEMAPHORE.release()
+    WEEKLY_PDF_MAX_CONCURRENCY = max(1, int(max_concurrency))
+    WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
 
 
 def _is_support_chat(chat_id: int) -> bool:
@@ -583,25 +773,41 @@ class _WeeklyRecipeTraitLookup:
 
 _RecipeTraitLookupSource = Mapping[str, RecipeTraits] | _WeeklyRecipeTraitLookup
 
+
+PDF_MONTH_NAMES_RU = {
+    1: "января",
+    2: "февраля",
+    3: "марта",
+    4: "апреля",
+    5: "мая",
+    6: "июня",
+    7: "июля",
+    8: "августа",
+    9: "сентября",
+    10: "октября",
+    11: "ноября",
+    12: "декабря",
+}
 WEEK_PDF_STATUS_UPDATE_SECONDS = 4.0
 WEEK_PDF_STATUS_INITIAL_TEXT = (
-    "Собираю недельный PDF.\n\n"
-    "Обычно это занимает около минуты, иногда пару минут. Пожалуйста, не запускайте расчет повторно."
+    "Собираю ваш недельный PDF.\n\n"
+    "Обычно это занимает 1-3 минуты. Можно закрыть Telegram - я пришлю файл сюда, когда он будет готов."
 )
 WEEK_PDF_STATUS_FRAMES = (
-    "Собираю недельный PDF.\n\nПодбираю блюда под вашу анкету.",
-    "Собираю недельный PDF..\n\nПроверяю аллергии, ограничения и исключенные продукты.",
-    "Собираю недельный PDF...\n\nСчитаю КБЖУ, витамины и минералы.",
-    "Собираю недельный PDF....\n\nГотовлю рецепты, список продуктов и файл.",
+    "PDF собирается.\n\nПодбираю блюда под вашу анкету. Файл придет сюда автоматически.",
+    "PDF собирается.\n\nПроверяю аллергии, ограничения и исключенные продукты.",
+    "PDF собирается.\n\nСчитаю КБЖУ, витамины и минералы.",
+    "PDF собирается.\n\nОформляю рецепты, список продуктов и сам файл.",
 )
 WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FAILURE_TEXT = "PDF не удалось подготовить или отправить. Попробуйте позже."
-WEEK_PDF_BUSY_TEXT = "Сейчас много запросов, попробуйте через пару минут"
+WEEK_PDF_ALREADY_RUNNING_TEXT = "Не переживайте, файл уже генерируется. Я пришлю PDF сюда, когда он будет готов."
+WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
 WEEKLY_PDF_MAX_CONCURRENCY = DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY
-_WEEKLY_PDF_SEMAPHORE = asyncio.Semaphore(WEEKLY_PDF_MAX_CONCURRENCY)
+WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
 DEFAULT_BATCH_TOTAL_UNITS = 6
 DEFAULT_BATCH_SERVING_UNITS = 2
 DEFAULT_BATCH_SERVINGS = DEFAULT_BATCH_TOTAL_UNITS // DEFAULT_BATCH_SERVING_UNITS
@@ -1754,14 +1960,74 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
 
 
 async def _send_week_plan_with_access(message: Message, profile: UserProfile) -> bool:
-    pdf_slot_acquired = await _try_acquire_weekly_pdf_slot()
-    if not pdf_slot_acquired:
-        await message.answer(WEEK_PDF_BUSY_TEXT)
+    chat_id = message.chat.id
+    if WEEK_PDF_QUEUE_MANAGER.has_chat(chat_id):
+        _weekly_pdf_diag("queue_duplicate_precheck", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
+        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
         return False
 
+    if not _weekly_pdf_attempt_available(chat_id):
+        _weekly_pdf_diag("access_denied_no_weekly_pdf_attempt", chat_id=chat_id)
+        await _send_limit_paywall(message, "weekly_pdf")
+        return False
+
+    queued_status_message: Message | None = None
+
+    async def run_weekly_pdf_job() -> bool:
+        return await _send_week_plan_after_queue_admission(
+            message,
+            profile,
+            initial_status_message=queued_status_message,
+        )
+
+    admission = WEEK_PDF_QUEUE_MANAGER.submit(chat_id, run_weekly_pdf_job)
+    if admission.duplicate:
+        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
+        return False
+
+    if admission.future is None:
+        return False
+
+    if not admission.starts_immediately:
+        try:
+            queued_status_message = await message.answer(
+                _week_pdf_queue_status_text(admission.ahead_count),
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except asyncio.CancelledError:
+            WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
+            raise
+        except Exception:
+            WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
+            raise
+        WEEK_PDF_QUEUE_MANAGER.mark_ready(admission.future)
+
+    try:
+        return await admission.future
+    except asyncio.CancelledError:
+        _weekly_pdf_diag("queue_wait_cancelled", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
+        WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
+        raise
+
+
+async def _send_week_plan_after_queue_admission(
+    message: Message,
+    profile: UserProfile,
+    *,
+    initial_status_message: Message | None = None,
+) -> bool:
     consumption: AttemptConsumption | None = None
     try:
+        consume_started_at = time.perf_counter()
+        _weekly_pdf_diag("consume_attempt_start", chat_id=message.chat.id)
         consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
+        _weekly_pdf_diag(
+            "consume_attempt_end",
+            chat_id=message.chat.id,
+            elapsed_s=time.perf_counter() - consume_started_at,
+            allowed=consumption.allowed,
+            source=consumption.source,
+        )
         if not consumption.allowed:
             await _send_limit_paywall(message, "weekly_pdf")
             return False
@@ -1773,13 +2039,12 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
             status_text=_format_entitlement_status(message.chat.id),
             recipe_history_entries=recipe_history_entries,
             pdf_slot_acquired=True,
+            initial_status_message=initial_status_message,
         )
     except Exception:
         if consumption is not None and consumption.allowed:
             _refund_generation_attempt(message.chat.id, consumption)
         raise
-    finally:
-        _release_weekly_pdf_slot()
 
     if not sent:
         _refund_generation_attempt(message.chat.id, consumption)
@@ -1791,6 +2056,39 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
             recipe_history_entries,
         )
     return sent
+
+
+def _weekly_pdf_attempt_available(chat_id: int) -> bool:
+    return _dry_run_generation_attempt(chat_id, "weekly_pdf").allowed
+
+
+def _week_pdf_queue_status_text(ahead_count: int) -> str:
+    normalized_ahead_count = max(0, int(ahead_count))
+    wait_minutes = _week_pdf_queue_wait_minutes(normalized_ahead_count)
+    return (
+        "Не переживайте, файл генерируется.\n\n"
+        f"Сейчас перед вами {_ru_plural(normalized_ahead_count, 'человек', 'человека', 'человек')}, "
+        f"примерное ожидание {_ru_plural(wait_minutes, 'минута', 'минуты', 'минут')}."
+    )
+
+
+def _week_pdf_queue_wait_minutes(ahead_count: int) -> int:
+    concurrency = max(1, WEEKLY_PDF_MAX_CONCURRENCY)
+    batches_before_start = max(1, math.ceil(max(1, ahead_count) / concurrency))
+    return max(1, math.ceil((batches_before_start * WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS) / 60))
+
+
+def _ru_plural(value: int, one: str, few: str, many: str) -> str:
+    absolute = abs(value)
+    if 11 <= absolute % 100 <= 14:
+        word = many
+    elif absolute % 10 == 1:
+        word = one
+    elif 2 <= absolute % 10 <= 4:
+        word = few
+    else:
+        word = many
+    return f"{value} {word}"
 
 
 async def _send_plan(
@@ -1865,12 +2163,8 @@ async def _send_week_plan(
     status_text: str | None = None,
     recipe_history_entries: list[RecipeHistoryItem] | None = None,
     pdf_slot_acquired: bool = False,
+    initial_status_message: Message | None = None,
 ) -> bool:
-    owns_pdf_slot = False
-    if not pdf_slot_acquired:
-        await _WEEKLY_PDF_SEMAPHORE.acquire()
-        owns_pdf_slot = True
-
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
     seed_offset = PLAN_SEED_OFFSET_BY_CHAT_ID.setdefault(
@@ -1879,23 +2173,40 @@ async def _send_week_plan(
     )
     seed = seed_offset + count
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
-    try:
+    if initial_status_message is None:
         status_message = await message.answer(
             WEEK_PDF_STATUS_INITIAL_TEXT,
             reply_markup=ReplyKeyboardRemove(),
         )
-    except Exception:
-        if owns_pdf_slot:
-            _release_weekly_pdf_slot()
-        raise
+    else:
+        status_message = initial_status_message
+        await _edit_week_pdf_status(status_message, WEEK_PDF_STATUS_INITIAL_TEXT)
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
     recent_avoidance = _load_recent_recipe_avoidance(chat_id)
+    _weekly_pdf_diag(
+        "recent_avoidance_loaded",
+        chat_id=chat_id,
+        full_ids=len(recent_avoidance.full_recipe_ids),
+        full_keys=len(recent_avoidance.full_recipe_keys),
+        reduced_ids=len(recent_avoidance.reduced_recipe_ids),
+        reduced_keys=len(recent_avoidance.reduced_recipe_keys),
+    )
     try:
+        selection_started_at = time.perf_counter()
+        _weekly_pdf_diag("selection_start", chat_id=chat_id, seed=seed)
         build_result = await asyncio.to_thread(
             _build_week_plans_with_recent_fallback,
             profile,
             seed,
             recent_avoidance,
+        )
+        _weekly_pdf_diag(
+            "selection_end",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - selection_started_at,
+            phase=build_result.avoidance_phase,
+            days=len(build_result.plans),
+            meals=sum(len(plan.meals) for plan in build_result.plans),
         )
         plans = build_result.plans
         plan_dates = _week_plan_dates()
@@ -1923,7 +2234,12 @@ async def _send_week_plan(
             return False
 
         try:
-            pdf_data, pdf_filename = await asyncio.to_thread(_build_week_pdf_payload, plans, plan_dates)
+            pdf_data, pdf_filename = await asyncio.to_thread(
+                _build_week_pdf_payload,
+                plans,
+                plan_dates,
+                chat_id,
+            )
             _validate_week_pdf_payload_size(pdf_data, pdf_filename)
             await _stop_week_pdf_status(status_task)
             await _edit_week_pdf_status(status_message, WEEK_PDF_UPLOAD_TEXT)
@@ -1952,8 +2268,6 @@ async def _send_week_plan(
         return True
     finally:
         await _stop_week_pdf_status(status_task)
-        if owns_pdf_slot:
-            _release_weekly_pdf_slot()
 
 
 async def _send_week_pdf_document(
@@ -1966,23 +2280,105 @@ async def _send_week_pdf_document(
     caption = "Готово - ваш рацион на неделю в PDF."
     if status_text:
         caption = f"{caption}\n\n{status_text}"
-    await message.answer_document(
-        document=BufferedInputFile(pdf_data, filename=pdf_filename),
-        caption=caption,
-        reply_markup=_after_plan_keyboard(message.chat.id),
+    upload_started_at = time.perf_counter()
+    _weekly_pdf_diag(
+        "telegram_upload_start",
+        chat_id=message.chat.id,
+        bytes=len(pdf_data),
+        filename=pdf_filename,
+    )
+    try:
+        await message.answer_document(
+            document=BufferedInputFile(pdf_data, filename=pdf_filename),
+            caption=caption,
+            reply_markup=_after_plan_keyboard(message.chat.id),
+        )
+    except Exception as exc:
+        _weekly_pdf_diag(
+            "telegram_upload_fail",
+            chat_id=message.chat.id,
+            elapsed_s=time.perf_counter() - upload_started_at,
+            error=type(exc).__name__,
+        )
+        raise
+    _weekly_pdf_diag(
+        "telegram_upload_end",
+        chat_id=message.chat.id,
+        elapsed_s=time.perf_counter() - upload_started_at,
     )
 
 
 def _build_week_pdf_payload(
     plans: Sequence[MealPlan],
     plan_dates: Sequence[date],
+    chat_id: int | None = None,
 ) -> tuple[bytes, str]:
-    pdf_path = Path(build_week_plan_pdf(plans, plan_dates))
+    render_started_at = time.perf_counter()
+    _weekly_pdf_diag("render_start", chat_id=chat_id, days=len(plans))
     try:
-        return pdf_path.read_bytes(), pdf_path.name
+        pdf_path = Path(build_week_plan_pdf(plans, plan_dates))
+    except Exception as exc:
+        _weekly_pdf_diag(
+            "render_fail",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - render_started_at,
+            error=type(exc).__name__,
+        )
+        raise
+    _weekly_pdf_diag(
+        "render_end",
+        chat_id=chat_id,
+        elapsed_s=time.perf_counter() - render_started_at,
+        temp_pdf=pdf_path.name,
+    )
+    read_started_at = time.perf_counter()
+    _weekly_pdf_diag("temp_pdf_read_start", chat_id=chat_id, temp_pdf=pdf_path.name)
+    try:
+        pdf_data = pdf_path.read_bytes()
+        _weekly_pdf_diag(
+            "temp_pdf_read_end",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - read_started_at,
+            bytes=len(pdf_data),
+        )
+        return pdf_data, _week_pdf_download_filename(plan_dates)
+    except Exception as exc:
+        _weekly_pdf_diag(
+            "temp_pdf_read_fail",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - read_started_at,
+            error=type(exc).__name__,
+        )
+        raise
     finally:
+        delete_started_at = time.perf_counter()
+        _weekly_pdf_diag("temp_pdf_delete_start", chat_id=chat_id, temp_pdf=pdf_path.name)
         with suppress(OSError):
             pdf_path.unlink()
+        _weekly_pdf_diag(
+            "temp_pdf_delete_end",
+            chat_id=chat_id,
+            elapsed_s=time.perf_counter() - delete_started_at,
+            exists=pdf_path.exists(),
+        )
+
+
+def _week_pdf_download_filename(plan_dates: Sequence[date]) -> str:
+    if not plan_dates:
+        return "FoodBalance_рацион_на_неделю.pdf"
+    return f"FoodBalance_рацион_на_неделю_{_week_pdf_date_range(plan_dates)}.pdf"
+
+
+def _week_pdf_date_range(plan_dates: Sequence[date]) -> str:
+    first_date = plan_dates[0]
+    last_date = plan_dates[-1]
+    first_month = PDF_MONTH_NAMES_RU[first_date.month]
+    last_month = PDF_MONTH_NAMES_RU[last_date.month]
+    if first_date.year == last_date.year and first_date.month == last_date.month:
+        return f"{first_date:%d}-{last_date:%d}_{first_month}_{first_date:%Y}"
+    if first_date.year == last_date.year:
+        return f"{first_date:%d}_{first_month}-{last_date:%d}_{last_month}_{first_date:%Y}"
+    return f"{first_date:%d}_{first_month}_{first_date:%Y}-{last_date:%d}_{last_month}_{last_date:%Y}"
 
 
 def _validate_week_pdf_payload_size(pdf_data: bytes, pdf_filename: str) -> None:
@@ -5287,6 +5683,65 @@ def _format_test_access_status(entitlement: Entitlement) -> str:
     return "\n".join(lines)
 
 
+def _dry_run_generation_attempt(chat_id: int, ration_kind: RationKind) -> AttemptConsumption:
+    if chat_id in TESTER_CHAT_IDS:
+        return AttemptConsumption(True, ration_kind, "test_access")
+
+    store = _runtime_store()
+    store_dry_run = (
+        getattr(store, "dry_run_generation_attempt", None)
+        if store is not None
+        else None
+    )
+    if callable(store_dry_run):
+        return store_dry_run(chat_id, ration_kind)
+
+    entitlement = _load_entitlement_for_chat(chat_id)
+    return _simulate_generation_attempt(chat_id, ration_kind, entitlement)
+
+
+def _simulate_generation_attempt(
+    chat_id: int,
+    ration_kind: RationKind,
+    entitlement: Entitlement,
+) -> AttemptConsumption:
+    entitlement_preview = _copy_entitlement_for_dry_run(entitlement)
+    entitlement_preview.expire_if_needed()
+    if _is_free_preview_mode(chat_id, entitlement_preview):
+        entitlement_preview = _free_preview_entitlement(entitlement_preview)
+    return _consume_entitlement_for_ration(entitlement_preview, ration_kind)
+
+
+def _copy_entitlement_for_dry_run(entitlement: Entitlement) -> Entitlement:
+    return replace(
+        entitlement,
+        processed_payment_charge_ids=list(entitlement.processed_payment_charge_ids),
+    )
+
+
+def _free_preview_entitlement(entitlement: Entitlement) -> Entitlement:
+    return replace(
+        entitlement,
+        subscription_period_start=None,
+        subscription_period_end=None,
+        monthly_one_day_remaining=0,
+        monthly_weekly_pdf_remaining=0,
+        extra_one_day_remaining=0,
+        extra_weekly_pdf_remaining=0,
+        test_access_enabled=False,
+        processed_payment_charge_ids=list(entitlement.processed_payment_charge_ids),
+    )
+
+
+def _consume_entitlement_for_ration(
+    entitlement: Entitlement,
+    ration_kind: RationKind,
+) -> AttemptConsumption:
+    if ration_kind == "weekly_pdf":
+        return consume_weekly_pdf_attempt(entitlement)
+    return consume_one_day_attempt(entitlement)
+
+
 def _consume_generation_attempt(chat_id: int, ration_kind: RationKind) -> AttemptConsumption:
     if chat_id in TESTER_CHAT_IDS:
         return AttemptConsumption(True, ration_kind, "test_access")
@@ -5294,29 +5749,14 @@ def _consume_generation_attempt(chat_id: int, ration_kind: RationKind) -> Attemp
     store = _runtime_store()
     entitlement = _load_entitlement_for_chat(chat_id)
     if _is_free_preview_mode(chat_id, entitlement):
-        preview_entitlement = replace(
-            entitlement,
-            subscription_period_start=None,
-            subscription_period_end=None,
-            monthly_one_day_remaining=0,
-            monthly_weekly_pdf_remaining=0,
-            extra_one_day_remaining=0,
-            extra_weekly_pdf_remaining=0,
-            test_access_enabled=False,
-        )
-        if ration_kind == "weekly_pdf":
-            consumption = consume_weekly_pdf_attempt(preview_entitlement)
-        else:
-            consumption = consume_one_day_attempt(preview_entitlement)
+        preview_entitlement = _free_preview_entitlement(entitlement)
+        consumption = _consume_entitlement_for_ration(preview_entitlement, ration_kind)
         entitlement.free_trial_used = preview_entitlement.free_trial_used
         _save_entitlement_for_chat(chat_id, entitlement)
         return consumption
     if store is not None:
         return store.consume_generation_attempt(chat_id, ration_kind)
-    elif ration_kind == "weekly_pdf":
-        consumption = consume_weekly_pdf_attempt(entitlement)
-    else:
-        consumption = consume_one_day_attempt(entitlement)
+    consumption = _consume_entitlement_for_ration(entitlement, ration_kind)
     _save_entitlement_for_chat(chat_id, entitlement)
     return consumption
 

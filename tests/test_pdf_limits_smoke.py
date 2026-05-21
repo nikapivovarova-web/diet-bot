@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -30,11 +29,16 @@ def isolated_telegram_state(monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "WEEK_PDF_STATUS_UPDATE_SECONDS", 60.0)
+    monkeypatch.setattr(telegram_app, "_RUNTIME_CONFIG_APPLIED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", False, raising=False)
+    monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", False, raising=False)
+    telegram_app._configure_weekly_pdf_concurrency(telegram_app.DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY)
     yield
     telegram_app.PLAN_COUNT_BY_CHAT_ID.clear()
     telegram_app.PLAN_SEED_OFFSET_BY_CHAT_ID.clear()
     telegram_app.RECENT_RECIPE_IDS_BY_CHAT_ID.clear()
     telegram_app.RECENT_RECIPE_KEYS_BY_CHAT_ID.clear()
+    telegram_app._configure_weekly_pdf_concurrency(telegram_app.DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY)
 
 
 @pytest.mark.anyio
@@ -57,6 +61,76 @@ async def test_weekly_pdf_limit_is_consumed_after_successful_delivery(monkeypatc
     assert sent
     assert entitlement.monthly_weekly_pdf_remaining == 0
     assert len(message.documents) == 1
+
+
+def test_weekly_pdf_preview_does_not_save_or_spend_json_entitlement(monkeypatch) -> None:
+    chat_id = 101_016
+    _save_active_subscription(chat_id, weekly_pdf_remaining=1)
+    before = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id].to_dict()
+
+    def fail_save_entitlements(*_args, **_kwargs) -> None:
+        raise AssertionError("weekly PDF preview must not save entitlements")
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app, "save_entitlements", fail_save_entitlements)
+
+    assert telegram_app._weekly_pdf_attempt_available(chat_id) is True
+
+    after = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id].to_dict()
+    assert after == before
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_free_preview_with_extra_limit_shows_paywall_without_queue(monkeypatch) -> None:
+    chat_id = 101_017
+    message = FakeMessage(chat_id)
+    entitlement = Entitlement(extra_weekly_pdf_remaining=1)
+    telegram_app.grant_test_access(entitlement, now=datetime(2026, 5, 10, tzinfo=UTC))
+    telegram_app.set_test_access_enabled(entitlement, False)
+    telegram_app.save_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE, {chat_id: entitlement})
+
+    def fail_queue_submit(*_args, **_kwargs):
+        raise AssertionError("free-preview weekly PDF must not enter the queue")
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", None)
+    monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_queue_submit)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    saved = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
+    assert sent is False
+    assert message.texts
+    assert message.documents == []
+    assert saved.extra_weekly_pdf_remaining == 1
+    assert telegram_app.WEEK_PDF_QUEUE_MANAGER.pending_count == 0
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_runtime_preview_is_read_only_and_delivery_consumes_once(monkeypatch) -> None:
+    chat_id = 101_018
+    message = FakeMessage(chat_id)
+    entitlement = _active_subscription_entitlement(weekly_pdf_remaining=1)
+    store = CountingRuntimeStore(entitlement)
+
+    async def fake_send_week_plan(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram_app, "_RUNTIME_STORE", store)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    assert telegram_app._weekly_pdf_attempt_available(chat_id) is True
+    assert store.saved == []
+    assert store.consumed == []
+    assert entitlement.monthly_weekly_pdf_remaining == 1
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    assert sent is True
+    assert store.saved == []
+    assert store.consumed == [(chat_id, "weekly_pdf")]
+    assert store.completed == [(chat_id, "weekly_pdf")]
+    assert entitlement.monthly_weekly_pdf_remaining == 0
 
 
 @pytest.mark.anyio
@@ -121,39 +195,31 @@ async def test_weekly_pdf_size_guard_does_not_consume_limit_or_send_text_fallbac
 
 
 @pytest.mark.anyio
-async def test_weekly_pdf_payload_generation_is_capped_by_semaphore(monkeypatch) -> None:
-    plans = tuple(sample_meal_plan() for _ in range(7))
+async def test_weekly_pdf_queue_uses_configured_worker_concurrency(monkeypatch) -> None:
     max_active = 0
     active = 0
     lock = threading.Lock()
 
-    async def fake_animate_week_pdf_status(*_args, **_kwargs) -> None:
-        return None
-
-    def slow_build_week_pdf_payload(*_args):
+    async def slow_send_week_plan(*_args, **_kwargs) -> bool:
         nonlocal active, max_active
         with lock:
             active += 1
             max_active = max(max_active, active)
         try:
-            time.sleep(0.05)
-            return b"%PDF-1.4\n%test", "week.pdf"
+            await asyncio.sleep(0.05)
+            return True
         finally:
             with lock:
                 active -= 1
 
-    monkeypatch.setattr(telegram_app, "_WEEKLY_PDF_SEMAPHORE", asyncio.Semaphore(2))
-    monkeypatch.setattr(telegram_app, "_animate_week_pdf_status", fake_animate_week_pdf_status)
-    monkeypatch.setattr(
-        telegram_app,
-        "_build_week_plans_with_recent_fallback",
-        lambda *_args: _week_plan_build_result(plans),
-    )
-    monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", slow_build_week_pdf_payload)
+    telegram_app._configure_weekly_pdf_concurrency(2)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", slow_send_week_plan)
+    for index in range(6):
+        _save_active_subscription(102_000 + index, weekly_pdf_remaining=1)
 
     results = await asyncio.gather(
         *(
-            telegram_app._send_week_plan(FakeMessage(102_000 + index), profile_with())
+            telegram_app._send_week_plan_with_access(FakeMessage(102_000 + index), profile_with())
             for index in range(6)
         )
     )
@@ -163,22 +229,288 @@ async def test_weekly_pdf_payload_generation_is_capped_by_semaphore(monkeypatch)
 
 
 @pytest.mark.anyio
-async def test_busy_weekly_pdf_slots_fail_fast_without_consuming_limit(monkeypatch) -> None:
-    chat_id = 101_004
-    message = FakeMessage(chat_id)
-    _save_active_subscription(chat_id, weekly_pdf_remaining=1)
-    busy_semaphore = asyncio.Semaphore(1)
-    await busy_semaphore.acquire()
+async def test_weekly_pdf_starts_immediately_when_worker_slot_is_free(monkeypatch) -> None:
+    first_chat_id = 101_011
+    second_chat_id = 101_012
+    first_message = FakeMessage(first_chat_id)
+    second_message = FakeMessage(second_chat_id)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_jobs = asyncio.Event()
 
-    monkeypatch.setattr(telegram_app, "_WEEKLY_PDF_SEMAPHORE", busy_semaphore)
+    async def controlled_send_week_plan(message, *_args, **_kwargs) -> bool:
+        if message.chat.id == first_chat_id:
+            first_started.set()
+        if message.chat.id == second_chat_id:
+            second_started.set()
+        await release_jobs.wait()
+        return True
+
+    telegram_app._configure_weekly_pdf_concurrency(2)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", controlled_send_week_plan)
+    _save_active_subscription(first_chat_id, weekly_pdf_remaining=1)
+    _save_active_subscription(second_chat_id, weekly_pdf_remaining=1)
+
+    first_task = asyncio.create_task(telegram_app._send_week_plan_with_access(first_message, profile_with()))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    second_task = asyncio.create_task(telegram_app._send_week_plan_with_access(second_message, profile_with()))
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+
+    assert second_message.texts == []
+
+    release_jobs.set()
+    assert await first_task is True
+    assert await second_task is True
+
+
+@pytest.mark.anyio
+async def test_busy_weekly_pdf_slots_enqueue_next_user_without_consuming_waiting_limit(monkeypatch) -> None:
+    first_chat_id = 101_004
+    second_chat_id = 101_005
+    first_message = FakeMessage(first_chat_id)
+    second_message = FakeMessage(second_chat_id)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    started_chat_ids: list[int] = []
+
+    async def controlled_send_week_plan(message, *_args, **_kwargs) -> bool:
+        started_chat_ids.append(message.chat.id)
+        if message.chat.id == first_chat_id:
+            first_started.set()
+            await release_first.wait()
+        if message.chat.id == second_chat_id:
+            second_started.set()
+        return True
+
+    telegram_app._configure_weekly_pdf_concurrency(1)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", controlled_send_week_plan)
+    _save_active_subscription(first_chat_id, weekly_pdf_remaining=1)
+    _save_active_subscription(second_chat_id, weekly_pdf_remaining=1)
+
+    first_task = asyncio.create_task(telegram_app._send_week_plan_with_access(first_message, profile_with()))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    second_task = asyncio.create_task(telegram_app._send_week_plan_with_access(second_message, profile_with()))
+    await asyncio.sleep(0)
+
+    waiting_entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[second_chat_id]
+    assert waiting_entitlement.monthly_weekly_pdf_remaining == 1
+    assert second_message.documents == []
+    assert second_message.texts
+    assert "Не переживайте, файл генерируется." in second_message.texts[-1][0]
+    assert "перед вами 1 человек" in second_message.texts[-1][0]
+    assert not second_started.is_set()
+
+    release_first.set()
+    assert await first_task is True
+    assert await second_task is True
+    assert started_chat_ids == [first_chat_id, second_chat_id]
+    delivered_entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[second_chat_id]
+    assert delivered_entitlement.monthly_weekly_pdf_remaining == 0
+
+
+@pytest.mark.anyio
+async def test_queued_weekly_pdf_waits_until_queue_status_message_is_sent(monkeypatch) -> None:
+    first_chat_id = 101_009
+    second_chat_id = 101_010
+    first_message = FakeMessage(first_chat_id)
+    second_message = SlowQueueStatusMessage(second_chat_id)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def controlled_send_week_plan(message, *_args, **_kwargs) -> bool:
+        if message.chat.id == first_chat_id:
+            first_started.set()
+            await release_first.wait()
+        if message.chat.id == second_chat_id:
+            second_started.set()
+        return True
+
+    telegram_app._configure_weekly_pdf_concurrency(1)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", controlled_send_week_plan)
+    _save_active_subscription(first_chat_id, weekly_pdf_remaining=1)
+    _save_active_subscription(second_chat_id, weekly_pdf_remaining=1)
+
+    first_task = asyncio.create_task(telegram_app._send_week_plan_with_access(first_message, profile_with()))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    second_task = asyncio.create_task(telegram_app._send_week_plan_with_access(second_message, profile_with()))
+    await asyncio.wait_for(second_message.queue_status_answer_started.wait(), timeout=1)
+
+    release_first.set()
+    assert await first_task is True
+    await asyncio.sleep(0.02)
+    assert not second_started.is_set()
+
+    second_message.allow_queue_status_answer.set()
+    assert await second_task is True
+    assert second_started.is_set()
+
+
+@pytest.mark.anyio
+async def test_queued_weekly_pdf_cancelled_during_queue_status_message_cleans_queue(monkeypatch) -> None:
+    first_chat_id = 101_013
+    second_chat_id = 101_014
+    third_chat_id = 101_015
+    first_message = FakeMessage(first_chat_id)
+    second_message = SlowQueueStatusMessage(second_chat_id)
+    third_message = FakeMessage(third_chat_id)
+    first_started = asyncio.Event()
+    third_started = asyncio.Event()
+    release_first = asyncio.Event()
+    started_chat_ids: list[int] = []
+
+    async def controlled_send_week_plan(message, *_args, **_kwargs) -> bool:
+        started_chat_ids.append(message.chat.id)
+        if message.chat.id == first_chat_id:
+            first_started.set()
+            await release_first.wait()
+        if message.chat.id == third_chat_id:
+            third_started.set()
+        return True
+
+    telegram_app._configure_weekly_pdf_concurrency(1)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", controlled_send_week_plan)
+    _save_active_subscription(first_chat_id, weekly_pdf_remaining=1)
+    _save_active_subscription(second_chat_id, weekly_pdf_remaining=1)
+    _save_active_subscription(third_chat_id, weekly_pdf_remaining=1)
+
+    first_task = asyncio.create_task(telegram_app._send_week_plan_with_access(first_message, profile_with()))
+    second_task = None
+    third_task = None
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        second_task = asyncio.create_task(telegram_app._send_week_plan_with_access(second_message, profile_with()))
+        await asyncio.wait_for(second_message.queue_status_answer_started.wait(), timeout=1)
+
+        second_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second_task
+
+        assert not telegram_app.WEEK_PDF_QUEUE_MANAGER.has_chat(second_chat_id)
+        assert telegram_app.WEEK_PDF_QUEUE_MANAGER.pending_count == 1
+
+        release_first.set()
+        assert await first_task is True
+        assert telegram_app.WEEK_PDF_QUEUE_MANAGER.pending_count == 0
+
+        third_task = asyncio.create_task(telegram_app._send_week_plan_with_access(third_message, profile_with()))
+        await asyncio.wait_for(third_started.wait(), timeout=1)
+        assert await third_task is True
+        assert third_message.texts == []
+        assert started_chat_ids == [first_chat_id, third_chat_id]
+    finally:
+        release_first.set()
+        cleanup_tasks = [first_task]
+        if second_task is not None:
+            cleanup_tasks.append(second_task)
+        if third_task is not None:
+            cleanup_tasks.append(third_task)
+        for task in cleanup_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+
+@pytest.mark.anyio
+async def test_second_weekly_pdf_request_from_same_chat_does_not_start_second_job(monkeypatch) -> None:
+    chat_id = 101_006
+    first_message = FakeMessage(chat_id)
+    second_message = FakeMessage(chat_id)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    started_chat_ids: list[int] = []
+
+    async def controlled_send_week_plan(message, *_args, **_kwargs) -> bool:
+        started_chat_ids.append(message.chat.id)
+        first_started.set()
+        await release_first.wait()
+        return True
+
+    telegram_app._configure_weekly_pdf_concurrency(1)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", controlled_send_week_plan)
+    _save_active_subscription(chat_id, weekly_pdf_remaining=2)
+
+    first_task = asyncio.create_task(telegram_app._send_week_plan_with_access(first_message, profile_with()))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    duplicate_sent = await telegram_app._send_week_plan_with_access(second_message, profile_with())
+    entitlement_after_duplicate = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
+
+    assert duplicate_sent is False
+    assert entitlement_after_duplicate.monthly_weekly_pdf_remaining == 1
+    assert len(started_chat_ids) == 1
+    assert second_message.texts == [(telegram_app.WEEK_PDF_ALREADY_RUNNING_TEXT, None)]
+
+    release_first.set()
+    assert await first_task is True
+    assert started_chat_ids == [chat_id]
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_without_limit_shows_paywall_and_does_not_enter_queue(monkeypatch) -> None:
+    chat_id = 101_007
+    message = FakeMessage(chat_id)
+    calls = 0
+
+    async def fake_send_week_plan(*_args, **_kwargs) -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    telegram_app._configure_weekly_pdf_concurrency(1)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+    _save_active_subscription(chat_id, weekly_pdf_remaining=0)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    assert sent is False
+    assert calls == 0
+    assert message.texts
+    assert telegram_app.WEEK_PDF_QUEUE_MANAGER.pending_count == 0
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_send_failure_refunds_consumed_limit(monkeypatch) -> None:
+    chat_id = 101_008
+    message = FailingDocumentMessage(chat_id)
+    _save_active_subscription(chat_id, weekly_pdf_remaining=1)
+    plans = tuple(sample_meal_plan() for _ in range(7))
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
+    monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", lambda *_args: (b"%PDF-1.4\n%test", "week.pdf"))
 
     sent = await telegram_app._send_week_plan_with_access(message, profile_with())
 
     entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
-    assert not sent
+    assert sent is False
     assert entitlement.monthly_weekly_pdf_remaining == 1
-    assert message.documents == []
-    assert [text for text, _ in message.texts] == [telegram_app.WEEK_PDF_BUSY_TEXT]
+    assert len(message.document_attempts) == 1
+
+
+def test_weekly_pdf_payload_uses_human_readable_download_filename(monkeypatch, tmp_path) -> None:
+    internal_pdf_path = tmp_path / "foodbalance-week-2026-05-20-ab12cd34.pdf"
+    internal_pdf_path.write_bytes(b"%PDF-1.4\n%test")
+    plan_dates = tuple(date(2026, 5, 20) + timedelta(days=offset) for offset in range(7))
+
+    monkeypatch.setattr(telegram_app, "build_week_plan_pdf", lambda *_args: internal_pdf_path)
+
+    pdf_data, filename = telegram_app._build_week_pdf_payload(
+        tuple(sample_meal_plan() for _ in range(7)),
+        plan_dates,
+    )
+
+    assert pdf_data == b"%PDF-1.4\n%test"
+    assert filename == "FoodBalance_рацион_на_неделю_20-26_мая_2026.pdf"
+    assert not internal_pdf_path.exists()
 
 
 class FakeMessage:
@@ -200,6 +532,29 @@ class FakeMessage:
 
     async def answer_document(self, **kwargs) -> None:
         self.documents.append(kwargs)
+
+
+class FailingDocumentMessage(FakeMessage):
+    def __init__(self, chat_id: int) -> None:
+        super().__init__(chat_id)
+        self.document_attempts = []
+
+    async def answer_document(self, **kwargs) -> None:
+        self.document_attempts.append(kwargs)
+        raise RuntimeError("telegram send failed")
+
+
+class SlowQueueStatusMessage(FakeMessage):
+    def __init__(self, chat_id: int) -> None:
+        super().__init__(chat_id)
+        self.queue_status_answer_started = asyncio.Event()
+        self.allow_queue_status_answer = asyncio.Event()
+
+    async def answer(self, text, reply_markup=None):
+        if text.startswith("Не переживайте, файл генерируется."):
+            self.queue_status_answer_started.set()
+            await self.allow_queue_status_answer.wait()
+        return await super().answer(text, reply_markup=reply_markup)
 
 
 class FakeSentMessage:
@@ -234,15 +589,66 @@ def profile_with(**kwargs) -> UserProfile:
 
 
 def _save_active_subscription(chat_id: int, *, weekly_pdf_remaining: int) -> Entitlement:
+    entitlement = _active_subscription_entitlement(
+        charge_id=f"charge-{chat_id}",
+        weekly_pdf_remaining=weekly_pdf_remaining,
+    )
+    entitlements = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)
+    entitlements[chat_id] = entitlement
+    telegram_app.save_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE, entitlements)
+    return entitlement
+
+
+def _active_subscription_entitlement(
+    *,
+    charge_id: str = "charge-active",
+    weekly_pdf_remaining: int,
+) -> Entitlement:
     entitlement = Entitlement()
     telegram_app.apply_subscription_payment(
         entitlement,
-        f"charge-{chat_id}",
+        charge_id,
         now=datetime(2026, 5, 10, tzinfo=UTC),
     )
     entitlement.monthly_weekly_pdf_remaining = weekly_pdf_remaining
-    telegram_app.save_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE, {chat_id: entitlement})
     return entitlement
+
+
+class CountingRuntimeStore:
+    def __init__(self, entitlement: Entitlement) -> None:
+        self.entitlement = entitlement
+        self.loaded: list[int] = []
+        self.saved: list[tuple[int, Entitlement]] = []
+        self.consumed: list[tuple[int, str]] = []
+        self.completed: list[tuple[int, str]] = []
+        self.refunded: list[tuple[int, str]] = []
+        self.analytics_events: list[dict[str, object]] = []
+
+    def get_entitlement(self, user_id: int) -> Entitlement:
+        self.loaded.append(user_id)
+        return self.entitlement
+
+    def save_entitlement(self, user_id: int, entitlement: Entitlement) -> None:
+        self.saved.append((user_id, entitlement))
+
+    def consume_generation_attempt(self, user_id: int, ration_kind: str):
+        self.consumed.append((user_id, ration_kind))
+        if ration_kind != "weekly_pdf":
+            raise AssertionError(f"unexpected ration kind: {ration_kind}")
+        consumption = telegram_app.consume_weekly_pdf_attempt(self.entitlement)
+        if consumption.allowed:
+            object.__setattr__(consumption, "_postgres_generation_id", len(self.consumed))
+        return consumption
+
+    def complete_generation_attempt(self, user_id: int, consumption, **_kwargs) -> None:
+        self.completed.append((user_id, consumption.ration_kind))
+
+    def refund_generation_attempt(self, user_id: int, consumption, **_kwargs) -> None:
+        self.refunded.append((user_id, consumption.ration_kind))
+
+    def record_analytics_event(self, **kwargs):
+        self.analytics_events.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.analytics_events), **kwargs)
 
 
 def sample_meal_plan() -> MealPlan:
