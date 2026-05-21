@@ -1086,18 +1086,19 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(telegram_app, "build_week_plan_pdf", fake_build_week_plan_pdf)
     message = FakeMessage(chat_id)
     try:
-        await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(message, profile_with())
 
+        assert sent
         assert len(message.documents) == 1
         document = message.documents[0]["document"]
         assert isinstance(document, BufferedInputFile)
-        assert document.filename == "week.pdf"
+        assert document.filename == telegram_app._week_pdf_download_filename(_week_plan_dates())
         assert document.data == b"%PDF-1.4\n%test\n%%EOF\n"
         assert message.documents[0]["reply_markup"] is not None
         assert not pdf_path.exists()
-        assert message.texts[0][0].startswith("Собираю недельный PDF")
+        assert "PDF" in message.texts[0][0]
         assert message.edits
-        assert message.edits[-1][0] == "Готово. PDF отправлен ниже."
+        assert message.edits[-1][0] == telegram_app.WEEK_PDF_DONE_TEXT
         assert message.bot.chat_actions
         assert not any("День 1" in text for text, _ in message.texts[1:])
     finally:
@@ -1108,7 +1109,7 @@ async def test_week_plan_sends_pdf_document(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_week_plan_falls_back_to_text_when_pdf_fails(monkeypatch, tmp_path) -> None:
+async def test_week_plan_pdf_failure_does_not_send_text_fallback(monkeypatch, tmp_path) -> None:
     chat_id = 92_002
 
     def failing_build_week_plan_pdf(plans, plan_dates):
@@ -1119,15 +1120,16 @@ async def test_week_plan_falls_back_to_text_when_pdf_fails(monkeypatch, tmp_path
     monkeypatch.setattr(telegram_app, "build_week_plan_pdf", failing_build_week_plan_pdf)
     message = FakeMessage(chat_id)
     try:
-        await _send_week_plan(message, profile_with())
+        sent = await _send_week_plan(message, profile_with())
 
         sent_text = "\n".join(text for text, _ in message.texts)
+        assert not sent
         assert message.documents == []
         assert message.edits
-        assert message.edits[-1][0] == "PDF не удалось собрать. Отправляю рацион текстом."
+        assert message.edits[-1][0] == telegram_app.WEEK_PDF_FAILURE_TEXT
         assert "PDF" in sent_text
-        assert "День 1" in sent_text
-        assert "Общий список покупок" in sent_text
+        assert "\u0414\u0435\u043d\u044c 1" not in sent_text
+        assert "\u041e\u0431\u0449\u0438\u0439 \u0441\u043f\u0438\u0441\u043e\u043a \u043f\u043e\u043a\u0443\u043f\u043e\u043a" not in sent_text
     finally:
         PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)

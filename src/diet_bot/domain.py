@@ -25,6 +25,8 @@ class ActivityLevel(StrEnum):
 
 
 class CookingTimePreference(StrEnum):
+    SIMPLE = "simple"
+    INTERESTING = "interesting"
     QUICK = "quick"
     MEDIUM = "medium"
     LONG = "long"
@@ -74,7 +76,7 @@ class UserProfile:
     goal: Goal
     activity: ActivityLevel
     meal_count: int = 4
-    cooking_time: CookingTimePreference = CookingTimePreference.LONG
+    cooking_time: CookingTimePreference = CookingTimePreference.SIMPLE
     restrictions: tuple["Restriction", ...] = ()
     conditions: tuple[ConditionCode, ...] = ()
     allow_lactose_free_dairy: bool = True
@@ -223,3 +225,59 @@ class ShoppingItem:
 
 def normalize_text(value: str) -> str:
     return value.strip().lower().replace("ё", "е")
+
+
+def normalize_cooking_time_preference(
+    value: object | None,
+    *,
+    strict: bool = False,
+) -> CookingTimePreference:
+    if value is None:
+        if strict:
+            raise ValueError("Cooking effort preference is required.")
+        return CookingTimePreference.SIMPLE
+
+    raw = value.value if isinstance(value, CookingTimePreference) else str(value)
+    normalized = normalize_text(raw).replace("–", "-").replace("—", "-")
+    normalized = " ".join(normalized.split())
+    compact = normalized.replace(" ", "")
+
+    simple_values = {
+        "simple",
+        "quick",
+        "medium",
+        "1",
+        "2",
+    }
+    interesting_values = {
+        "interesting",
+        "long",
+        "3",
+    }
+
+    if not normalized:
+        if strict:
+            raise ValueError("Cooking effort preference is required.")
+        return CookingTimePreference.SIMPLE
+    if (
+        normalized in simple_values
+        or "побыстр" in normalized
+        or "попроще" in normalized
+        or "до 15" in normalized
+        or "до15" in compact
+        or "15-30" in normalized
+        or "15-30" in compact
+    ):
+        return CookingTimePreference.SIMPLE
+    if (
+        normalized in interesting_values
+        or "интересн" in normalized
+        or "более 30" in normalized
+        or "больше 30" in normalized
+        or "более30" in compact
+        or "больше30" in compact
+    ):
+        return CookingTimePreference.INTERESTING
+    if strict:
+        raise ValueError("Unknown cooking effort preference.")
+    return CookingTimePreference.SIMPLE

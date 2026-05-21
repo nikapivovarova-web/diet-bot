@@ -4,13 +4,18 @@ from pathlib import Path
 
 from diet_bot.builder import _add_missing_garnishes
 from diet_bot.builder import build_one_day_plan
-from diet_bot.curated_data import _looks_incomplete_instruction, curated_foods, curated_recipes
+from diet_bot.curated_data import _cis_friendly_ingredient, _looks_incomplete_instruction, curated_foods, curated_recipes
 from diet_bot.domain import ActivityLevel, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, NutrientVector
 from diet_bot.recipe_catalog import built_in_recipes
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
+LEGACY_CURATED_RECIPE_COUNT = 400
+DOCX_RECIPE_COUNT = 55
+TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + DOCX_RECIPE_COUNT
+DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
+DOCX_RECIPE_NOS = frozenset(range(611, 666))
 
 
 def test_curated_recipe_data_has_full_calculation_coverage() -> None:
@@ -18,8 +23,8 @@ def test_curated_recipe_data_has_full_calculation_coverage() -> None:
     ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
 
     curated = curated_recipes()
-    assert len(curated) == 400
-    assert len(curated_foods()) >= 330
+    assert len(curated) == TOTAL_CURATED_RECIPE_COUNT
+    assert len(curated_foods()) >= 334
     assert all(recipe.instructions.rstrip().endswith(".") for recipe in curated)
     assert {row["calculation_status"] for row in nutrition} == {"ok"}
     assert all(row["unmatched_ingredient_count"] == 0 for row in nutrition)
@@ -63,7 +68,7 @@ def test_gnocchi_recipe_uses_gnocchi_ingredient_name() -> None:
 def test_curated_recipe_data_has_local_photos() -> None:
     recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
 
-    assert len(recipes) == 400
+    assert len(recipes) == TOTAL_CURATED_RECIPE_COUNT
     assert all(recipe.get("image_url") for recipe in recipes)
     missing = [
         recipe["recipe_id"]
@@ -87,13 +92,14 @@ def test_curated_recipe_fixes_cover_truncated_soup_and_rye_crackers() -> None:
     crackers = recipes["r331_rzhanye_krekery_s_tykvennymi_semechkami"]
 
     assert "овощной бульон и кокосовое молоко" in soup.instructions
-    assert soup.instructions.endswith("кокосовыми сливками.")
+    assert soup.instructions.endswith("кокосовых сливок.")
     assert crackers.ingredients_g["rye_flour"] == 8.0
     assert crackers.ingredients_g["wheat_flour"] == 9.0
     assert foods["rye_flour"].name == "ржаная мука"
     assert "ржаную муку" in crackers.instructions
-    assert "раскатайте очень тонким пластом" in crackers.instructions
-    assert "выпекайте 60-90 минут" in crackers.instructions
+    assert "Раскатайте как можно тоньше" in crackers.instructions
+    assert "Выпекайте 45 минут" in crackers.instructions
+    assert "пеките еще 45 минут" in crackers.instructions
 
 
 def test_curated_recipe_source_json_has_complete_soup_and_rye_crackers() -> None:
@@ -121,6 +127,42 @@ def test_curated_recipe_source_json_has_no_truncated_instructions() -> None:
     ]
 
     assert truncated == []
+
+
+def test_docx_recipe_batch_r611_r665_has_required_rows_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+
+    docx_rows = [row for row in recipes if int(row["recipe_no"]) in DOCX_RECIPE_NOS]
+    docx_ids = {row["recipe_id"] for row in docx_rows}
+    nutrition_ids = {row["recipe_id"] for row in nutrition}
+    ingredient_counts = Counter(row["recipe_id"] for row in ingredients if row["recipe_id"] in docx_ids)
+
+    assert len(docx_rows) == DOCX_RECIPE_COUNT
+    assert {int(row["recipe_no"]) for row in docx_rows} == DOCX_RECIPE_NOS
+    assert {row["recipe_no"] for row in recipes if 401 <= int(row["recipe_no"]) <= 610} == set()
+    assert all(str(row["recipe_key"]).startswith(DOCX_RECIPE_KEY_PREFIX) for row in docx_rows)
+    assert all(row["recipe_id"] in nutrition_ids for row in docx_rows)
+    assert all(ingredient_counts[row["recipe_id"]] >= 4 for row in docx_rows)
+    assert all(row.get("instructions_ru", "").strip().endswith(".") for row in docx_rows)
+    assert all(row.get("image_url") == f"recipe_photos/r{row['recipe_no']}.jpg" for row in docx_rows)
+    assert all((DATA_DIR / row["image_url"]).exists() for row in docx_rows)
+
+
+def test_docx_recipe_batch_r611_r665_foods_are_resolved() -> None:
+    foods = {food.id for food in curated_foods()}
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    missing_foods = sorted(
+        {
+            normalized_food_id
+            for row in ingredients
+            if 611 <= int(row.get("recipe_no") or 0) <= 665
+            if (normalized_food_id := _cis_friendly_ingredient(row)[0]) not in foods
+        }
+    )
+
+    assert missing_foods == []
 
 
 def test_curated_recipe_titles_match_corrected_main_ingredients() -> None:
@@ -186,7 +228,7 @@ def test_bare_animal_main_gets_deficit_based_garnish() -> None:
     lunch_ids = {portion.food.id for portion in meals[1].portions}
 
     assert any(portion.food.category == "vegetable" and portion.grams >= 80 for portion in meals[1].portions)
-    assert lunch_ids & {"potato", "sweet_potato", "rice", "bulgur", "quinoa", "whole_wheat_pasta", "orzo"}
+    assert lunch_ids & {"potato", "sweet_potato", "rice", "bulgur", "quinoa", "whole_wheat_pasta", "orzo", "buckwheat"}
     assert "Гарнир:" in meals[1].recipe
 
 
