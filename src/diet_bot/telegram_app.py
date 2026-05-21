@@ -81,6 +81,8 @@ from .recipe_traits import RecipeTraits, infer_recipe_traits
 from .promo_codes import PromoCodeActivation, activate_promo_code
 from .questionnaire import QuestionnaireSession, start_session
 from .safety import evaluate_safety
+from .entitlement_service import EntitlementService
+from .entitlement_storage import EntitlementStorageError, JsonEntitlementStore
 from .subscriptions import (
     MONTHLY_ONE_DAY_LIMIT,
     MONTHLY_WEEKLY_PDF_LIMIT,
@@ -119,6 +121,24 @@ RECENT_RECIPE_HISTORY_LIMIT = 140
 RECENT_RECIPE_REDUCED_DAYS = 14
 RECENT_RECIPE_REDUCED_LIMIT = 70
 logger = logging.getLogger(__name__)
+ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить доступ. Попробуйте позже."
+
+
+def _entitlement_service() -> EntitlementService:
+    return EntitlementService(JsonEntitlementStore(SUBSCRIPTIONS_STATE_FILE))
+
+
+def _validate_entitlement_storage() -> None:
+    try:
+        JsonEntitlementStore(SUBSCRIPTIONS_STATE_FILE).load_all()
+    except EntitlementStorageError as exc:
+        raise RuntimeError(
+            f"Entitlement state is invalid at {SUBSCRIPTIONS_STATE_FILE}: {exc}",
+        ) from exc
+
+
+async def _send_entitlement_storage_error(message: Message) -> None:
+    await message.answer(ENTITLEMENT_STORAGE_ERROR_TEXT)
 
 
 def _mask_chat_id(chat_id: int) -> str:
@@ -868,10 +888,20 @@ async def secret_access_command(message: Message) -> None:
             await message.answer("Команда для выдачи доступа доступна только администратору.")
             return
         if action == "revoke":
-            _revoke_test_access_for_chat(target_chat_id)
+            try:
+                _revoke_test_access_for_chat(target_chat_id)
+            except EntitlementStorageError:
+                logger.exception("Failed to revoke test access due to entitlement storage error")
+                await _send_entitlement_storage_error(message)
+                return
             await message.answer(f"Тестовый доступ отключен для chat_id {target_chat_id}.")
             return
-        entitlement = _grant_test_access_to_chat(target_chat_id)
+        try:
+            entitlement = _grant_test_access_to_chat(target_chat_id)
+        except EntitlementStorageError:
+            logger.exception("Failed to grant test access due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return
         test_access_end = entitlement.test_access_end_datetime()
         until_text = f" до {test_access_end:%d.%m.%Y}" if test_access_end else ""
         await message.answer(
@@ -880,7 +910,12 @@ async def secret_access_command(message: Message) -> None:
         return
 
     if action == "enable":
-        enabled, _ = _set_test_access_mode(message.chat.id, True)
+        try:
+            enabled, _ = _set_test_access_mode(message.chat.id, True)
+        except EntitlementStorageError:
+            logger.exception("Failed to enable test access due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return
         if enabled:
             await message.answer("Тестовый платный режим включен.")
         else:
@@ -888,7 +923,12 @@ async def secret_access_command(message: Message) -> None:
         return
 
     if action == "disable":
-        disabled, _ = _set_test_access_mode(message.chat.id, False)
+        try:
+            disabled, _ = _set_test_access_mode(message.chat.id, False)
+        except EntitlementStorageError:
+            logger.exception("Failed to disable test access due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return
         if disabled:
             await message.answer("Тестовый режим выключен. Сейчас вы видите бесплатный сценарий.")
         else:
@@ -905,7 +945,13 @@ async def secret_access_command(message: Message) -> None:
         )
         return
 
-    await message.answer(_format_test_access_command_status(message.chat.id))
+    try:
+        status_text = _format_test_access_command_status(message.chat.id)
+    except EntitlementStorageError:
+        logger.exception("Failed to read test access status due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
+    await message.answer(status_text)
 
 
 @router.callback_query()
@@ -1067,11 +1113,22 @@ async def handle_successful_payment(message: Message) -> None:
     if payment is None:
         return
 
-    result = _apply_successful_payment(message.chat.id, payment)
+    try:
+        result = _apply_successful_payment(message.chat.id, payment)
+    except EntitlementStorageError:
+        logger.exception("Failed to apply payment due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
     if result.duplicate:
+        try:
+            duplicate_status_text = _format_entitlement_status(message.chat.id)
+        except EntitlementStorageError:
+            logger.exception("Failed to render duplicate payment status due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return
         await message.answer(
             "Этот платеж уже был обработан. Текущие остатки:\n\n"
-            f"{_format_entitlement_status(message.chat.id)}",
+            f"{duplicate_status_text}",
             reply_markup=_payment_result_keyboard(message.chat.id, result),
         )
         return
@@ -1082,11 +1139,16 @@ async def handle_successful_payment(message: Message) -> None:
         )
         return
 
-    status_text = (
-        _subscriber_cabinet_text(message.chat.id)
-        if result.grant == "subscription" or _has_active_paid_access(message.chat.id)
-        else _format_entitlement_status(message.chat.id)
-    )
+    try:
+        status_text = (
+            _subscriber_cabinet_text(message.chat.id)
+            if result.grant == "subscription" or _has_active_paid_access(message.chat.id)
+            else _format_entitlement_status(message.chat.id)
+        )
+    except EntitlementStorageError:
+        logger.exception("Failed to render payment status due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
     await message.answer(
         _payment_success_text(result) + "\n\n" + status_text,
         reply_markup=_payment_result_keyboard(message.chat.id, result),
@@ -1214,6 +1276,7 @@ async def run_bot() -> None:
     token = os.getenv("DIET_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.")
+    _validate_entitlement_storage()
     bot = Bot(token)
     await _set_bot_commands(bot)
     dispatcher = create_dispatcher()
@@ -1261,7 +1324,12 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
         await message.answer(PROMO_CODE_EMPTY_TEXT)
         return
 
-    activation = _activate_promo_code_for_chat(message.chat.id, text)
+    try:
+        activation = _activate_promo_code_for_chat(message.chat.id, text)
+    except EntitlementStorageError:
+        logger.exception("Failed to activate promo entitlement due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
     if activation.activated:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
         await message.answer(
@@ -1410,7 +1478,12 @@ async def _send_calculation_report(
 
 
 async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
-    consumption = _consume_generation_attempt(message.chat.id, "one_day")
+    try:
+        consumption = _consume_generation_attempt(message.chat.id, "one_day")
+    except EntitlementStorageError:
+        logger.exception("Failed to consume trial entitlement due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
     if not consumption.allowed:
         await _send_limit_paywall(message, "one_day")
         return
@@ -1434,7 +1507,12 @@ async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
 
 
 async def _send_one_day_plan_with_access(message: Message, profile: UserProfile) -> bool:
-    consumption = _consume_generation_attempt(message.chat.id, "one_day")
+    try:
+        consumption = _consume_generation_attempt(message.chat.id, "one_day")
+    except EntitlementStorageError:
+        logger.exception("Failed to consume one-day entitlement due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return False
     if not consumption.allowed:
         await _send_limit_paywall(message, "one_day")
         return False
@@ -1461,7 +1539,15 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
         await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
         return False
 
-    if not _weekly_pdf_attempt_available(chat_id):
+    try:
+        weekly_pdf_available = _weekly_pdf_attempt_available(chat_id)
+    except EntitlementStorageError:
+        logger.exception("Failed to check weekly PDF entitlement due to entitlement storage error")
+        _weekly_pdf_diag("access_error_entitlement_storage", chat_id=chat_id)
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if not weekly_pdf_available:
         _weekly_pdf_diag("access_denied_no_weekly_pdf_attempt", chat_id=chat_id)
         await _send_limit_paywall(message, "weekly_pdf")
         return False
@@ -1515,7 +1601,12 @@ async def _send_week_plan_after_queue_admission(
     try:
         consume_started_at = time.perf_counter()
         _weekly_pdf_diag("consume_attempt_start", chat_id=message.chat.id)
-        consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
+        try:
+            consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
+        except EntitlementStorageError:
+            logger.exception("Failed to consume weekly PDF entitlement due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return False
         _weekly_pdf_diag(
             "consume_attempt_end",
             chat_id=message.chat.id,
@@ -3185,7 +3276,12 @@ async def _send_payments_disabled_notice(message: Message) -> None:
 
 
 async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
-    entitlement = _entitlement_for_chat(message.chat.id)
+    try:
+        entitlement = _entitlement_for_chat(message.chat.id)
+    except EntitlementStorageError:
+        logger.exception("Failed to check active subscription due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return True
     if not entitlement.is_subscription_active():
         return False
     await message.answer(
@@ -3196,7 +3292,12 @@ async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
 
 
 async def _send_extra_purchase_subscription_notice_if_needed(message: Message) -> bool:
-    entitlement = _entitlement_for_chat(message.chat.id)
+    try:
+        entitlement = _entitlement_for_chat(message.chat.id)
+    except EntitlementStorageError:
+        logger.exception("Failed to check extra purchase subscription due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return True
     if entitlement.is_subscription_active() and not _is_free_preview_mode(message.chat.id, entitlement):
         return False
     await message.answer(
@@ -3344,27 +3445,21 @@ def _is_valid_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> bool:
 
 
 def _apply_successful_payment(chat_id: int, payment: SuccessfulPayment) -> PaymentApplication:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
+    service = _entitlement_service()
     charge_id = payment.telegram_payment_charge_id
     payload = payment.invoice_payload
 
     if payload in {PAYLOAD_SUBSCRIPTION_MONTH, PAYLOAD_RU_SUBSCRIPTION_MONTH}:
-        result = apply_subscription_payment(
-            entitlement,
+        return service.apply_subscription_payment(
+            chat_id,
             charge_id,
             subscription_expiration_timestamp=getattr(payment, "subscription_expiration_date", None),
         )
-    elif payload in {PAYLOAD_EXTRA_ONE_DAY, PAYLOAD_RU_EXTRA_ONE_DAY}:
-        result = apply_extra_one_day_payment(entitlement, charge_id)
-    elif payload in {PAYLOAD_EXTRA_WEEKLY_PDF, PAYLOAD_RU_EXTRA_WEEKLY_PDF}:
-        result = apply_extra_weekly_pdf_payment(entitlement, charge_id)
-    else:
-        return PaymentApplication(False)
-
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return result
+    if payload in {PAYLOAD_EXTRA_ONE_DAY, PAYLOAD_RU_EXTRA_ONE_DAY}:
+        return service.apply_extra_one_day_payment(chat_id, charge_id)
+    if payload in {PAYLOAD_EXTRA_WEEKLY_PDF, PAYLOAD_RU_EXTRA_WEEKLY_PDF}:
+        return service.apply_extra_weekly_pdf_payment(chat_id, charge_id)
+    return PaymentApplication(False)
 
 
 def _payment_success_text(result: PaymentApplication) -> str:
@@ -3382,11 +3477,7 @@ def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeAct
     if not activation.activated:
         return activation
 
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    apply_subscription_payment(entitlement, f"promo:{activation.code}")
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _entitlement_service().apply_subscription_payment(chat_id, f"promo:{activation.code}")
     return activation
 
 
@@ -3448,30 +3539,15 @@ def _grant_test_access_to_chat(
     *,
     now: datetime | None = None,
 ) -> Entitlement:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    grant_test_access(entitlement, now=now)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return entitlement
+    return _entitlement_service().grant_test_access(chat_id, now=now)
 
 
 def _revoke_test_access_for_chat(chat_id: int) -> Entitlement:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    revoke_test_access(entitlement)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return entitlement
+    return _entitlement_service().revoke_test_access(chat_id)
 
 
 def _set_test_access_mode(chat_id: int, enabled: bool) -> tuple[bool, Entitlement]:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    changed = set_test_access_enabled(entitlement, enabled)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return changed, entitlement
+    return _entitlement_service().set_test_access_enabled(chat_id, enabled)
 
 
 def _has_test_access(chat_id: int, entitlement: Entitlement | None = None) -> bool:
@@ -3529,11 +3605,13 @@ def _format_test_access_status(entitlement: Entitlement) -> str:
 def _dry_run_generation_attempt(chat_id: int, ration_kind: RationKind) -> AttemptConsumption:
     if chat_id in TESTER_CHAT_IDS:
         return AttemptConsumption(True, ration_kind, "test_access")
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = _copy_entitlement_for_dry_run(entitlements.get(chat_id, Entitlement()))
-    if _is_free_preview_mode(chat_id, entitlement):
-        entitlement = _free_preview_entitlement(entitlement)
-    return _consume_entitlement_for_ration(entitlement, ration_kind)
+    service = _entitlement_service()
+    entitlement = service.peek_entitlement(chat_id)
+    return service.dry_run_ration(
+        chat_id,
+        ration_kind,
+        free_preview=_is_free_preview_mode(chat_id, entitlement),
+    )
 
 
 def _copy_entitlement_for_dry_run(entitlement: Entitlement) -> Entitlement:
@@ -3562,39 +3640,17 @@ def _consume_generation_attempt(chat_id: int, ration_kind: RationKind) -> Attemp
     if chat_id in TESTER_CHAT_IDS:
         return AttemptConsumption(True, ration_kind, "test_access")
 
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    if _is_free_preview_mode(chat_id, entitlement):
-        preview_entitlement = replace(
-            entitlement,
-            subscription_period_start=None,
-            subscription_period_end=None,
-            monthly_one_day_remaining=0,
-            monthly_weekly_pdf_remaining=0,
-            extra_one_day_remaining=0,
-            extra_weekly_pdf_remaining=0,
-            test_access_enabled=False,
-        )
-        if ration_kind == "weekly_pdf":
-            consumption = consume_weekly_pdf_attempt(preview_entitlement)
-        else:
-            consumption = consume_one_day_attempt(preview_entitlement)
-        entitlement.free_trial_used = preview_entitlement.free_trial_used
-    elif ration_kind == "weekly_pdf":
-        consumption = consume_weekly_pdf_attempt(entitlement)
-    else:
-        consumption = consume_one_day_attempt(entitlement)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return consumption
+    service = _entitlement_service()
+    entitlement = service.peek_entitlement(chat_id)
+    return service.consume_ration(
+        chat_id,
+        ration_kind,
+        free_preview=_is_free_preview_mode(chat_id, entitlement),
+    )
 
 
 def _refund_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    refund_attempt(entitlement, consumption)
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
+    _entitlement_service().refund_generation_attempt(chat_id, consumption)
 
 
 def _record_successful_generation_history(
@@ -3609,12 +3665,7 @@ def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) 
     del chat_id, consumption
 
 def _entitlement_for_chat(chat_id: int) -> Entitlement:
-    entitlements = load_entitlements(SUBSCRIPTIONS_STATE_FILE)
-    entitlement = entitlements.get(chat_id, Entitlement())
-    entitlement.expire_if_needed()
-    entitlements[chat_id] = entitlement
-    save_entitlements(SUBSCRIPTIONS_STATE_FILE, entitlements)
-    return entitlement
+    return _entitlement_service().get_entitlement(chat_id)
 
 
 def _format_entitlement_status(chat_id: int) -> str:

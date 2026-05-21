@@ -678,6 +678,34 @@ async def test_disabled_payments_blocks_stars_callback(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "callback_data",
+    [
+        CALLBACK_PAY_TELEGRAM_STARS,
+        CALLBACK_BUY_EXTRA_ONE_DAY,
+    ],
+)
+async def test_payment_invoice_callback_fails_closed_when_entitlement_storage_is_corrupt(
+    monkeypatch,
+    tmp_path,
+    callback_data,
+) -> None:
+    subscriptions_path = tmp_path / "subscriptions.json"
+    subscriptions_path.write_text("{corrupt", encoding="utf-8")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage()
+    callback = FakeCallback(callback_data, message)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [None]
+    assert message.texts == [(telegram_app.ENTITLEMENT_STORAGE_ERROR_TEXT, None)]
+    assert message.bot.invoice_links == []
+
+
+@pytest.mark.anyio
 async def test_disabled_payments_blocks_rub_provider_callback(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", False, raising=False)
     monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")

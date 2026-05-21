@@ -104,6 +104,24 @@ async def test_weekly_pdf_free_preview_with_extra_limit_shows_paywall_without_qu
 
 
 @pytest.mark.anyio
+async def test_weekly_pdf_storage_error_shows_notice_without_queue(monkeypatch) -> None:
+    chat_id = 101_018
+    message = FakeMessage(chat_id)
+    telegram_app.SUBSCRIPTIONS_STATE_FILE.write_text("{corrupt", encoding="utf-8")
+
+    def fail_queue_submit(*_args, **_kwargs):
+        raise AssertionError("weekly PDF must not enter the queue when entitlement state is corrupt")
+
+    monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_queue_submit)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    assert sent is False
+    assert message.documents == []
+    assert message.texts[-1] == (telegram_app.ENTITLEMENT_STORAGE_ERROR_TEXT, None)
+
+
+@pytest.mark.anyio
 async def test_weekly_pdf_render_failure_does_not_consume_limit_or_send_text_fallback(monkeypatch) -> None:
     chat_id = 101_002
     message = FakeMessage(chat_id)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -105,33 +104,15 @@ class PaymentApplication:
 
 
 def load_entitlements(path: Path) -> dict[int, Entitlement]:
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    entitlements: dict[int, Entitlement] = {}
-    for chat_id, data in raw.items():
-        if not isinstance(data, dict):
-            continue
-        try:
-            parsed_chat_id = int(chat_id)
-        except (TypeError, ValueError):
-            continue
-        entitlements[parsed_chat_id] = Entitlement.from_dict(data)
-    return entitlements
+    from .entitlement_storage import JsonEntitlementStore
+
+    return JsonEntitlementStore(path).load_all()
 
 
 def save_entitlements(path: Path, entitlements: dict[int, Entitlement]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        str(chat_id): entitlement.to_dict()
-        for chat_id, entitlement in sorted(entitlements.items())
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .entitlement_storage import JsonEntitlementStore
+
+    JsonEntitlementStore(path).save_all(entitlements)
 
 
 def consume_one_day_attempt(
@@ -226,7 +207,7 @@ def apply_subscription_payment(
     now: datetime | None = None,
     subscription_expiration_timestamp: int | None = None,
 ) -> PaymentApplication:
-    if _is_duplicate_charge(entitlement, charge_id):
+    if has_processed_charge_id(entitlement, charge_id):
         return PaymentApplication(False, "subscription", duplicate=True)
 
     start = _normalize_now(now)
@@ -239,23 +220,23 @@ def apply_subscription_payment(
     entitlement.subscription_period_end = _format_datetime(end)
     entitlement.monthly_one_day_remaining = MONTHLY_ONE_DAY_LIMIT
     entitlement.monthly_weekly_pdf_remaining = MONTHLY_WEEKLY_PDF_LIMIT
-    _remember_charge_id(entitlement, charge_id)
+    record_processed_charge_id(entitlement, charge_id)
     return PaymentApplication(True, "subscription")
 
 
 def apply_extra_one_day_payment(entitlement: Entitlement, charge_id: str) -> PaymentApplication:
-    if _is_duplicate_charge(entitlement, charge_id):
+    if has_processed_charge_id(entitlement, charge_id):
         return PaymentApplication(False, "extra_one_day", duplicate=True)
     entitlement.extra_one_day_remaining += 1
-    _remember_charge_id(entitlement, charge_id)
+    record_processed_charge_id(entitlement, charge_id)
     return PaymentApplication(True, "extra_one_day")
 
 
 def apply_extra_weekly_pdf_payment(entitlement: Entitlement, charge_id: str) -> PaymentApplication:
-    if _is_duplicate_charge(entitlement, charge_id):
+    if has_processed_charge_id(entitlement, charge_id):
         return PaymentApplication(False, "extra_weekly_pdf", duplicate=True)
     entitlement.extra_weekly_pdf_remaining += 1
-    _remember_charge_id(entitlement, charge_id)
+    record_processed_charge_id(entitlement, charge_id)
     return PaymentApplication(True, "extra_weekly_pdf")
 
 
@@ -295,12 +276,13 @@ def _parse_datetime(value: str | None) -> datetime | None:
     return _normalize_now(parsed)
 
 
-def _is_duplicate_charge(entitlement: Entitlement, charge_id: str) -> bool:
+def has_processed_charge_id(entitlement: Entitlement, charge_id: str) -> bool:
     return bool(charge_id and charge_id in entitlement.processed_payment_charge_ids)
 
 
-def _remember_charge_id(entitlement: Entitlement, charge_id: str) -> None:
-    if not charge_id:
-        return
+def record_processed_charge_id(entitlement: Entitlement, charge_id: str) -> bool:
+    if not charge_id or has_processed_charge_id(entitlement, charge_id):
+        return False
     entitlement.processed_payment_charge_ids.append(charge_id)
     entitlement.processed_payment_charge_ids = entitlement.processed_payment_charge_ids[-PROCESSED_CHARGE_ID_LIMIT:]
+    return True
