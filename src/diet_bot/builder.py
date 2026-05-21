@@ -213,6 +213,7 @@ SNACK_BASE_ROTATION = (
     "lactose_free_yogurt",
 )
 RECIPE_SUBSTITUTIONS = {
+    "milk": "lactose_free_milk",
     "greek_yogurt": "lactose_free_yogurt",
     "cottage_cheese": "lactose_free_cottage_cheese",
     "whole_grain_bread": "corn_tortilla",

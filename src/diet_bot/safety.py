@@ -247,6 +247,7 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
         ),
         ingredient_ids=(
             "milk",
+            "lactose_free_milk",
             "buttermilk",
             "greek_yogurt",
             "lactose_free_yogurt",
