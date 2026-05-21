@@ -109,6 +109,23 @@ from diet_bot.telegram_app import (
 from diet_bot.questionnaire import start_session
 
 
+def _set_payments_enabled_from_env(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", telegram_app._payments_enabled_from_env(), raising=False)
+
+
+def _set_support_chat_id_from_env(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", telegram_app._support_chat_id_from_env(), raising=False)
+
+
+def _button_callbacks(markup) -> list[str | None]:
+    return [button.callback_data for row in markup.inline_keyboard for button in row]
+
+
+@pytest.fixture(autouse=True)
+def _enable_payments_for_existing_payment_ui_tests(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", True, raising=False)
+
+
 def test_photo_input_resolves_curated_local_photo() -> None:
     photo_path = next((DATA_DIR / "recipe_photos").glob("*.jpg"))
     meal = Meal(
@@ -298,6 +315,44 @@ async def test_support_message_without_config_exits_support_mode(monkeypatch, tm
 
 
 @pytest.mark.anyio
+async def test_support_chat_missing_does_not_use_default_fallback(monkeypatch, tmp_path) -> None:
+    chat_id = 80_104
+    monkeypatch.delenv("DIET_BOT_SUPPORT_CHAT_ID", raising=False)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _set_support_chat_id_from_env(monkeypatch)
+    SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
+    message = FakeMessage(chat_id, text="Need help")
+    try:
+        await handle_answer(message)
+
+        assert telegram_app.SUPPORT_CHAT_ID is None
+        assert chat_id not in SUPPORT_REQUEST_CHAT_IDS
+        assert message.bot.sent_messages == []
+        assert message.texts[-1][1] is not None
+    finally:
+        SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_support_chat_configured_from_env_still_receives_messages(monkeypatch, tmp_path) -> None:
+    chat_id = 80_105
+    support_chat_id = -100_555_222
+    monkeypatch.setenv("DIET_BOT_SUPPORT_CHAT_ID", str(support_chat_id))
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _set_support_chat_id_from_env(monkeypatch)
+    SUPPORT_REQUEST_CHAT_IDS.add(chat_id)
+    message = FakeMessage(chat_id, text="Need help")
+    try:
+        await handle_answer(message)
+
+        assert telegram_app.SUPPORT_CHAT_ID == support_chat_id
+        assert message.bot.sent_messages[0]["chat_id"] == support_chat_id
+        assert chat_id not in SUPPORT_REQUEST_CHAT_IDS
+    finally:
+        SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
 async def test_support_chat_ignores_regular_messages(monkeypatch, tmp_path) -> None:
     support_chat_id = -5_271_779_108
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
@@ -433,6 +488,31 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     ]
 
 
+def test_default_payments_disabled_hides_payment_buttons(monkeypatch) -> None:
+    monkeypatch.delenv("DIET_BOT_PAYMENTS_ENABLED", raising=False)
+    _set_payments_enabled_from_env(monkeypatch)
+    payment_callbacks = {
+        CALLBACK_SUBSCRIBE,
+        CALLBACK_PAY_RU_CARD,
+        CALLBACK_PAY_TELEGRAM_STARS,
+        CALLBACK_PAY_RU_EXTRA_ONE_DAY,
+        CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF,
+        CALLBACK_BUY_EXTRA_ONE_DAY,
+        CALLBACK_BUY_EXTRA_WEEKLY_PDF,
+    }
+
+    markups = [
+        telegram_app._start_keyboard(),
+        _trial_subscription_keyboard(),
+        _subscription_payment_keyboard(),
+        _paywall_keyboard(preferred="one_day"),
+        _paywall_keyboard(preferred="weekly_pdf"),
+    ]
+
+    for markup in markups:
+        assert payment_callbacks.isdisjoint(_button_callbacks(markup))
+
+
 def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
     day_keyboard = _paywall_keyboard(preferred="one_day")
     week_keyboard = _paywall_keyboard(preferred="weekly_pdf")
@@ -514,7 +594,8 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     ]
 
 
-def test_pre_checkout_validates_payload_currency_and_amount() -> None:
+def test_pre_checkout_validates_payload_currency_and_amount(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
     valid_query = SimpleNamespace(
         invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
         currency="XTR",
@@ -580,6 +661,50 @@ async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice() -> N
     assert invoice["payload"] == PAYLOAD_EXTRA_ONE_DAY
     assert invoice["prices"][0].amount == 35
     assert invoice["subscription_period"] is None
+
+
+@pytest.mark.anyio
+async def test_disabled_payments_blocks_stars_callback(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", False, raising=False)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage()
+    callback = FakeCallback(CALLBACK_PAY_TELEGRAM_STARS, message)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [None]
+    assert message.bot.invoice_links == []
+    assert message.texts
+
+
+@pytest.mark.anyio
+async def test_disabled_payments_blocks_rub_provider_callback(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", False, raising=False)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage()
+    callback = FakeCallback(CALLBACK_PAY_RU_CARD, message)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [None]
+    assert message.bot.invoice_links == []
+    assert message.texts
+
+
+@pytest.mark.anyio
+async def test_enabled_payments_without_provider_blocks_rub_provider_invoice(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage()
+    callback = FakeCallback(CALLBACK_PAY_RU_CARD, message)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [None]
+    assert message.bot.invoice_links == []
+    assert message.texts
 
 
 @pytest.mark.anyio
