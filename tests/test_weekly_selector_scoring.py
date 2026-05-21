@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import json
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
 import pytest
 
+import diet_bot.builder as builder
+import diet_bot.telegram_app as telegram_app
 from diet_bot.calculator import calculate_targets
 from diet_bot.domain import (
     ActivityLevel,
@@ -15,11 +22,19 @@ from diet_bot.domain import (
     Sex,
     UserProfile,
 )
+from diet_bot.recipe_catalog import RecipeTemplate
 from diet_bot.recipe_traits import RecipeTraits
 from diet_bot.telegram_app import WEEK_PLAN_CANDIDATE_COUNT, _select_week_day_plan
+from diet_bot.validation import validate_plan
 
 
-def _profile() -> UserProfile:
+_WeeklySignature = tuple[
+    tuple[tuple[str | None, ...], tuple[str | None, ...], tuple[float, ...]],
+    ...,
+]
+
+
+def _profile(*, meal_count: int = 3) -> UserProfile:
     return UserProfile(
         age=32,
         sex=Sex.MALE,
@@ -27,7 +42,7 @@ def _profile() -> UserProfile:
         weight_kg=86,
         goal=Goal.MAINTAIN,
         activity=ActivityLevel.MODERATE,
-        meal_count=3,
+        meal_count=meal_count,
         cooking_time=CookingTimePreference.SIMPLE,
     )
 
@@ -58,7 +73,7 @@ def _meal(recipe_id: str, food_id: str, energy: float) -> Meal:
     )
 
 
-def _plan(profile: UserProfile, recipe_prefix: str, energy: float, food_ids: tuple[str, str, str]) -> MealPlan:
+def _plan(profile: UserProfile, recipe_prefix: str, energy: float, food_ids: tuple[str, ...]) -> MealPlan:
     per_meal_energy = energy / len(food_ids)
     return MealPlan(
         meals=tuple(
@@ -110,6 +125,20 @@ def _recipe_prefixes(plan: MealPlan) -> set[str]:
     return {str(meal.recipe_id).rsplit("_", 1)[0] for meal in plan.meals}
 
 
+def _weekly_signature(
+    plans: tuple[MealPlan, ...],
+) -> _WeeklySignature:
+    nutrient_keys = ("energy_kcal", "protein_g", "fat_g", "carbohydrate_g")
+    return tuple(
+        (
+            tuple(meal.recipe_id for meal in plan.meals),
+            tuple(meal.recipe_key for meal in plan.meals),
+            tuple(round(plan.totals.get(key), 6) for key in nutrient_keys),
+        )
+        for plan in plans
+    )
+
+
 def _traits(recipe_id: str, protein: str, carb: str, recipe_format: str) -> RecipeTraits:
     return RecipeTraits(
         recipe_id=recipe_id,
@@ -125,6 +154,54 @@ def _traits(recipe_id: str, protein: str, carb: str, recipe_format: str) -> Reci
         cooking_effort="simple",
         active_time_bucket="quick",
         main_signal="main",
+    )
+
+
+def _recipe_template(recipe_id: str, slot: str) -> RecipeTemplate:
+    return RecipeTemplate(
+        id=recipe_id,
+        slot=slot,
+        title=f"{slot} recipe {recipe_id}",
+        ingredients_g={"egg": 100},
+        instructions="Cook gently.",
+        tags=frozenset({"curated"}),
+        cooking_effort="simple",
+        active_time_min=10,
+    )
+
+
+def _recipes_for_feasibility_pool(
+    *,
+    breakfast_count: int,
+    main_count: int,
+    snack_count: int = 0,
+) -> tuple[RecipeTemplate, ...]:
+    return (
+        tuple(
+            _recipe_template(f"pool_breakfast_{index}", "breakfast")
+            for index in range(breakfast_count)
+        )
+        + tuple(_recipe_template(f"pool_main_{index}", "main") for index in range(main_count))
+        + tuple(
+            _recipe_template(f"pool_snack_{index}", "snack")
+            for index in range(snack_count)
+        )
+    )
+
+
+def _complete_week(profile: UserProfile, prefix: str = "week") -> tuple[MealPlan, ...]:
+    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    return tuple(
+        _plan(
+            profile,
+            f"{prefix}_{day_index}",
+            target_energy,
+            tuple(
+                f"{prefix}_{day_index}_{meal_index}"
+                for meal_index in range(profile.meal_count)
+            ),
+        )
+        for day_index in range(telegram_app.WEEK_PLAN_DAYS)
     )
 
 
@@ -265,6 +342,382 @@ def test_weekly_selector_prefers_less_repeated_traits_before_ingredient_reuse(
     assert _recipe_prefixes(selected) == {"fresh_traits"}
 
 
+def test_scoped_weekly_trait_lookup_preserves_weekly_plan_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    seed = 310
+    candidates_by_seed: dict[int, MealPlan] = {}
+    trait_map: dict[str, RecipeTraits] = {}
+    proteins = ("fish", "poultry", "egg", "plant_protein")
+    carbs = ("rice", "potato", "bread", "grain")
+    formats = ("bowl", "skillet", "wrap", "salad")
+
+    for day_index in range(telegram_app.WEEK_PLAN_DAYS):
+        for candidate_index in range(WEEK_PLAN_CANDIDATE_COUNT):
+            plan_seed = seed + day_index * WEEK_PLAN_CANDIDATE_COUNT + candidate_index
+            prefix = f"day{day_index}_candidate{candidate_index}"
+            plan = _plan(
+                profile,
+                prefix,
+                target_energy * (0.94 + candidate_index * 0.005),
+                (
+                    f"food_{day_index}_{candidate_index}_a",
+                    f"food_{day_index}_{candidate_index}_b",
+                    f"food_{day_index}_{candidate_index}_c",
+                ),
+            )
+            candidates_by_seed[plan_seed] = plan
+            for meal_index, meal in enumerate(plan.meals):
+                recipe_id = str(meal.recipe_id)
+                trait_map[recipe_id] = _traits(
+                    recipe_id,
+                    proteins[(day_index + candidate_index + meal_index) % len(proteins)],
+                    carbs[(day_index + candidate_index + meal_index) % len(carbs)],
+                    formats[(day_index + candidate_index + meal_index) % len(formats)],
+                )
+
+    def day_builder(profile: UserProfile, *, variety_seed: int, **kwargs) -> MealPlan:
+        return candidates_by_seed[variety_seed]
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", day_builder)
+    monkeypatch.setattr(telegram_app, "_recipe_traits_by_id", lambda: trait_map, raising=False)
+
+    baseline = telegram_app._build_week_plans(
+        profile,
+        seed,
+        set(),
+        set(),
+        recipe_trait_lookup=trait_map,
+    )
+    scoped_lookup = telegram_app._WeeklyRecipeTraitLookup.from_traits(trait_map)
+    scoped = telegram_app._build_week_plans(
+        profile,
+        seed,
+        set(),
+        set(),
+        recipe_trait_lookup=scoped_lookup,
+    )
+
+    assert _weekly_signature(scoped) == _weekly_signature(baseline)
+    assert scoped_lookup.stats["weekly_trait_lookup_hits"] > 0
+    assert scoped_lookup.stats["weekly_trait_lookup_misses"] > 0
+
+
+def test_build_one_day_plan_checks_selection_guard_before_heavy_candidate_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+
+    class GuardTrip(RuntimeError):
+        pass
+
+    class Guard:
+        def __init__(self) -> None:
+            self.stages: list[str] = []
+
+        def check(self, *, stage: str, **_kwargs: object) -> None:
+            self.stages.append(stage)
+            if stage == "before_ranking_mode":
+                raise GuardTrip(stage)
+
+    def fail_if_heavy_candidate_runs(*_args: object, **_kwargs: object) -> list[Meal]:
+        raise AssertionError("selection guard should run before heavy candidate work")
+
+    guard = Guard()
+    monkeypatch.setattr(builder, "_build_recipe_plan", fail_if_heavy_candidate_runs)
+
+    with pytest.raises(GuardTrip):
+        builder.build_one_day_plan(
+            profile,
+            variety_seed=101,
+            recipe_source="curated_only",
+            selection_guard=guard,
+        )
+
+    assert "before_ranking_mode" in guard.stages
+
+
+def test_recent_phase_with_insufficient_slot_pool_is_skipped_before_week_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    recipes = tuple(
+        _recipe_template(f"thin_breakfast_{index}", "breakfast")
+        for index in range(3)
+    ) + tuple(_recipe_template(f"thin_main_{index}", "main") for index in range(3))
+    build_calls: list[str] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del seed, avoided_recipe_ids, avoided_recipe_keys
+        build_calls.append(selection_phase)
+        if selection_phase == "full_recent":
+            raise AssertionError("hopeless recent phase should be skipped before week build")
+        return _complete_week(profile, "no_recent")
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        910,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_recipe"}),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "no_recent"
+    assert build_calls == ["no_recent"]
+
+
+def test_recent_phase_with_feasible_slot_pool_is_not_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    recipes = tuple(
+        _recipe_template(f"wide_breakfast_{index}", "breakfast")
+        for index in range(55)
+    ) + tuple(_recipe_template(f"wide_main_{index}", "main") for index in range(105))
+    build_calls: list[str] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del seed, avoided_recipe_ids, avoided_recipe_keys
+        build_calls.append(selection_phase)
+        return _complete_week(profile, selection_phase)
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        930,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_recipe"}),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "full_recent"
+    assert build_calls == ["full_recent"]
+
+
+def test_recent_phase_with_pool_above_five_week_buffer_below_seven_is_not_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile(meal_count=5)
+    recipes = _recipes_for_feasibility_pool(
+        breakfast_count=98,
+        main_count=98,
+        snack_count=75,
+    )
+    build_calls: list[str] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del seed, avoided_recipe_ids, avoided_recipe_keys
+        build_calls.append(selection_phase)
+        return _complete_week(profile, selection_phase)
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        940,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_recipe"}),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "full_recent"
+    assert build_calls == ["full_recent"]
+
+
+def test_recent_phase_with_pool_at_exact_five_week_buffer_is_not_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile(meal_count=5)
+    snack_weekly_required = 14
+    snack_threshold = (
+        snack_weekly_required
+        * telegram_app.WEEKLY_RECENT_FEASIBILITY_POOL_MULTIPLIER
+    )
+    recipes = _recipes_for_feasibility_pool(
+        breakfast_count=98,
+        main_count=98,
+        snack_count=snack_threshold,
+    )
+    build_calls: list[str] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del seed, avoided_recipe_ids, avoided_recipe_keys
+        build_calls.append(selection_phase)
+        return _complete_week(profile, selection_phase)
+
+    assert snack_threshold == 70
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        945,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_recipe"}),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "full_recent"
+    assert build_calls == ["full_recent"]
+
+
+def test_recent_phase_with_pool_below_five_week_buffer_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile(meal_count=5)
+    recipes = _recipes_for_feasibility_pool(
+        breakfast_count=98,
+        main_count=98,
+        snack_count=69,
+    )
+    build_calls: list[str] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del seed, avoided_recipe_ids, avoided_recipe_keys
+        build_calls.append(selection_phase)
+        if selection_phase == "full_recent":
+            raise AssertionError("slot pool below five-week buffer should be skipped")
+        return _complete_week(profile, "no_recent")
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        950,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_recipe"}),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "no_recent"
+    assert build_calls == ["no_recent"]
+
+
+def test_recent_fallback_reuses_recipe_cache_without_changing_weekly_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    seed = 720
+    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    recent_ids = {"recent_full", "recent_reduced"}
+    recent_keys = {
+        "breakfast:curated:recent_full",
+        "breakfast:curated:recent_reduced",
+    }
+    caches_seen: list[object] = []
+
+    def day_builder(
+        profile: UserProfile,
+        *,
+        variety_seed: int,
+        avoided_recipe_ids: set[str] | frozenset[str] | None = None,
+        avoided_recipe_keys: set[str] | frozenset[str] | None = None,
+        recipe_cache: object | None = None,
+        **_kwargs: object,
+    ) -> MealPlan:
+        if recipe_cache is not None:
+            caches_seen.append(recipe_cache)
+        if recent_ids & set(avoided_recipe_ids or ()):
+            return _empty_plan(profile)
+        if recent_keys & set(avoided_recipe_keys or ()):
+            return _empty_plan(profile)
+        prefix = f"seed{variety_seed}"
+        return _plan(
+            profile,
+            prefix,
+            target_energy,
+            (
+                f"food_{variety_seed}_a",
+                f"food_{variety_seed}_b",
+                f"food_{variety_seed}_c",
+            ),
+        )
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", day_builder)
+
+    baseline = telegram_app._build_week_plans(profile, seed, set(), set())
+    caches_seen.clear()
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        seed,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_full"}),
+            full_recipe_keys=frozenset({"breakfast:curated:recent_full"}),
+            reduced_recipe_ids=frozenset({"recent_reduced"}),
+            reduced_recipe_keys=frozenset({"breakfast:curated:recent_reduced"}),
+        ),
+    )
+
+    assert result.avoidance_phase == "no_recent"
+    assert _weekly_signature(result.plans) == _weekly_signature(baseline)
+    assert len({id(cache) for cache in caches_seen}) == 1
+
+
 def test_weekly_selector_rescues_after_normal_window_has_no_complete_day(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -347,3 +800,114 @@ def test_weekly_selector_rescue_keeps_hard_gate_and_avoidance_rejections(
     assert _recipe_prefixes(plan) == {"valid"}
     assert carryovers == {}
     assert calls == [80, 81, 82, 83, 84, 85, 86, 87]
+
+
+def test_weekly_selection_timeout_stops_unproductive_recent_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    seed = 600
+    calls: list[int] = []
+    clock = {"now": 0.0}
+
+    def fake_perf_counter() -> float:
+        return clock["now"]
+
+    def day_builder(profile: UserProfile, *, variety_seed: int, **kwargs) -> MealPlan:
+        calls.append(variety_seed)
+        clock["now"] += 1.0
+        return _empty_plan(profile)
+
+    monkeypatch.setattr(telegram_app.time, "perf_counter", fake_perf_counter)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 3.0, raising=False)
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", day_builder)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        seed,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_full"}),
+            full_recipe_keys=frozenset({"breakfast:curated:recent_full"}),
+            reduced_recipe_ids=frozenset({"recent_reduced"}),
+            reduced_recipe_keys=frozenset({"breakfast:curated:recent_reduced"}),
+        ),
+    )
+
+    assert result.plans == ()
+    assert result.avoidance_phase == "timeout"
+    assert len(calls) <= 4
+
+
+def test_live_seed_604374606_local_state_weekly_selection_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = Path(__file__).resolve().parents[1] / ".diet_bot_state" / "history.json"
+    if not state_path.exists():
+        pytest.skip("local live QA state is not available")
+
+    raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+    chat_id = 498196878
+    raw_chat_state = raw_state.get(str(chat_id))
+    if not isinstance(raw_chat_state, dict) or not isinstance(raw_chat_state.get("profile"), dict):
+        pytest.skip("local live QA profile is not available")
+
+    profile = telegram_app._profile_from_dict(raw_chat_state["profile"])
+    assert profile is not None
+
+    monkeypatch.setattr(telegram_app, "STATE_FILE", state_path)
+    feasibility_events: list[dict[str, object]] = []
+
+    def capture_weekly_selection_diag(
+        event: str,
+        *,
+        always: bool = False,
+        **fields: object,
+    ) -> None:
+        del always
+        if event in {"phase_feasibility_start", "phase_feasibility_end"}:
+            feasibility_events.append({"event": event, **fields})
+
+    monkeypatch.setattr(telegram_app, "_weekly_selection_diag", capture_weekly_selection_diag)
+    recent_avoidance = telegram_app._load_recent_recipe_avoidance(chat_id, now=datetime.now(UTC))
+
+    started_at = time.perf_counter()
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        604374606,
+        recent_avoidance,
+    )
+    elapsed_s = time.perf_counter() - started_at
+
+    skipped_phases = {
+        event.get("raw_phase")
+        for event in feasibility_events
+        if event.get("event") == "phase_feasibility_end" and event.get("skipped") is True
+    }
+    checked_recent_phases = {
+        event.get("raw_phase")
+        for event in feasibility_events
+        if event.get("event") == "phase_feasibility_end"
+        and event.get("raw_phase") in {"full_recent", "reduced_recent"}
+    }
+    planned_recipe_ids = [
+        meal.recipe_id
+        for plan in result.plans
+        for meal in plan.meals
+        if meal.recipe_id
+    ]
+    validation_errors = [
+        error
+        for plan in result.plans
+        for error in validate_plan(plan).errors
+    ]
+
+    assert elapsed_s < float(telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+    assert "full_recent" in checked_recent_phases
+    assert skipped_phases.isdisjoint({"full_recent", "reduced_recent"})
+    assert result.avoidance_phase != "timeout"
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert len(planned_recipe_ids) == profile.meal_count * telegram_app.WEEK_PLAN_DAYS
+    assert len(set(planned_recipe_ids)) == len(planned_recipe_ids)
+    assert validation_errors == []

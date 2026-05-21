@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 from diet_bot.builder import _add_missing_garnishes, _project_recipe_nutrients
 from diet_bot.builder import build_one_day_plan
 from diet_bot.curated_data import _looks_incomplete_instruction, _recipe_instruction, curated_foods, curated_recipes
-from diet_bot.domain import ActivityLevel, Goal, Restriction, RestrictionType, Sex, UserProfile
+from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Restriction, RestrictionType, Sex, UserProfile
 from diet_bot.domain import Meal, NutrientVector
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.safety import evaluate_safety, is_food_excluded
@@ -21,8 +21,11 @@ LEGACY_CURATED_RECIPE_COUNT = 400
 BATCH1_INTAKE_RECIPE_COUNT = 105
 BATCH2_INTAKE_RECIPE_COUNT = 105
 INTAKE_RECIPE_COUNT = BATCH1_INTAKE_RECIPE_COUNT + BATCH2_INTAKE_RECIPE_COUNT
-TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT
+DOCX_RECIPE_COUNT = 55
+TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT + DOCX_RECIPE_COUNT
 INTAKE_RECIPE_KEY_PREFIXES = ("intake_", "batch2_")
+DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
+NEW_DOCX_RECIPE_NOS = frozenset(range(655, 666))
 AUDIT_TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
 HIGH_SIGNAL_NAMED_FOOD_GROUPS = {
     "tuna": ({"tuna", "tuna_steak"}, ("\u0442\u0443\u043d\u0446", "tuna")),
@@ -295,6 +298,15 @@ def _recipe_has_cooking_fat(rows: list[dict]) -> bool:
     return False
 
 
+def _recipe_tags(row: dict, *fields: str) -> set[str]:
+    return {
+        tag.strip()
+        for field in fields
+        for tag in str(row.get(field, "")).split(",")
+        if tag.strip()
+    }
+
+
 def _source_recipes() -> list[dict]:
     return json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
 
@@ -326,6 +338,18 @@ def _imported_recipe_rows() -> list[dict]:
 
 def _imported_recipe_ids() -> set[str]:
     return {row["recipe_id"] for row in _imported_recipe_rows()}
+
+
+def _docx_recipe_rows() -> list[dict]:
+    return [
+        row
+        for row in _source_recipes()
+        if str(row.get("recipe_key", "")).startswith(DOCX_RECIPE_KEY_PREFIX)
+    ]
+
+
+def _docx_recipe_ids() -> set[str]:
+    return {row["recipe_id"] for row in _docx_recipe_rows()}
 
 
 def _is_imported_intake_recipe_id(recipe_id: str | None) -> bool:
@@ -787,6 +811,243 @@ def test_cleaned_intake_recipes_are_imported_with_required_metadata() -> None:
     assert all(row["cooking_effort"] in {"simple", "interesting"} for row in imported)
     assert all(row["instructions_ru"].strip().endswith(".") for row in imported)
     assert all(ingredients_by_recipe[row["recipe_id"]] > 0 for row in imported)
+
+
+def test_docx_recipe_import_has_required_metadata_and_local_photos() -> None:
+    recipes = _source_recipes()
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    ingredients = _source_ingredients()
+    docx_rows = _docx_recipe_rows()
+    docx_ids = {row["recipe_id"] for row in docx_rows}
+    nutrition_ids = {row["recipe_id"] for row in nutrition}
+    ingredient_counts = Counter(row["recipe_id"] for row in ingredients if row["recipe_id"] in docx_ids)
+
+    assert len(docx_rows) == DOCX_RECIPE_COUNT
+    assert len({row["recipe_key"] for row in docx_rows}) == DOCX_RECIPE_COUNT
+    assert len({row["recipe_id"] for row in recipes}) == len(recipes)
+    assert docx_ids <= nutrition_ids
+    assert {row["calculation_status"] for row in nutrition if row["recipe_id"] in docx_ids} == {"ok"}
+    assert {row["recipe_no"] for row in docx_rows} == set(
+        range(LEGACY_CURATED_RECIPE_COUNT + INTAKE_RECIPE_COUNT + 1, TOTAL_CURATED_RECIPE_COUNT + 1)
+    )
+    assert all(row["slot"] in {"breakfast", "main", "snack"} for row in docx_rows)
+    assert all(row["meal_slot"] == row["slot"] for row in docx_rows)
+    assert all(row["cooking_effort"] in {"simple", "interesting"} for row in docx_rows)
+    assert all(row["active_time_min"] > 0 for row in docx_rows)
+    assert all(row["instructions_ru"].strip().endswith(".") for row in docx_rows)
+    assert all(ingredient_counts[row["recipe_id"]] >= 4 for row in docx_rows)
+    assert all(row.get("photo_prompt_ru") for row in docx_rows)
+    assert all(not row.get("coverage_priority") for row in docx_rows)
+    assert all(
+        row.get("image_url")
+        and str(row["image_url"]).startswith("recipe_photos/")
+        and (DATA_DIR / row["image_url"]).exists()
+        for row in docx_rows
+    )
+
+
+def test_new_docx_recipe_batch_has_expected_ids_foods_and_openable_photos() -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    recipes = [row for row in _docx_recipe_rows() if int(row["recipe_no"]) in NEW_DOCX_RECIPE_NOS]
+    ingredients = _source_ingredients()
+    foods_by_id = _source_foods_by_id()
+    recipe_ids = {row["recipe_id"] for row in recipes}
+    ingredient_rows = [row for row in ingredients if row["recipe_id"] in recipe_ids]
+
+    assert {int(row["recipe_no"]) for row in recipes} == NEW_DOCX_RECIPE_NOS
+    assert all(row["recipe_id"].startswith(f"r{int(row['recipe_no']):03d}_") for row in recipes)
+    assert len({row["recipe_id"] for row in recipes}) == len(recipes)
+    assert len({row["recipe_no"] for row in recipes}) == len(recipes)
+    assert len({row["recipe_key"] for row in recipes}) == len(recipes)
+    assert {row["food_id"] for row in ingredient_rows} <= set(foods_by_id)
+
+    for row in recipes:
+        image_path = DATA_DIR / row["image_url"]
+        assert image_path.suffix.lower() == ".jpg"
+        assert image_path.exists()
+        with pil_image.open(image_path) as image:
+            image.verify()
+            assert image.format == "JPEG"
+
+
+def test_docx_recipe_text_has_no_known_source_artifacts_or_typos() -> None:
+    docx_rows = _docx_recipe_rows()
+    joined = json.dumps(docx_rows, ensure_ascii=False).casefold()
+
+    assert len(docx_rows) == DOCX_RECIPE_COUNT
+    for typo in ("бульонм", "точнони", "отлиовсяное", "распечатать", "фото готовки"):
+        assert typo not in joined
+
+
+def test_docx_hypertension_friendly_recipes_stay_below_sodium_threshold() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    nutrition_by_no = _source_nutrition_by_no()
+    max_sodium_mg = 600.0
+
+    high_sodium_tagged = [
+        (recipe_no, row["recipe_id"], nutrition["sodium_mg"])
+        for recipe_no, row in recipes_by_no.items()
+        if str(row.get("recipe_key", "")).startswith(DOCX_RECIPE_KEY_PREFIX)
+        and "hypertension_friendly" in _recipe_tags(row, "tags", "restriction_tags")
+        and float(nutrition_by_no[recipe_no].get("sodium_mg") or 0.0) > max_sodium_mg
+        for nutrition in (nutrition_by_no[recipe_no],)
+    ]
+
+    assert high_sodium_tagged == []
+
+
+def test_docx_easy_light_recipes_stay_below_light_energy_threshold() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    nutrition_by_no = _source_nutrition_by_no()
+    max_light_energy_kcal = 600.0
+
+    high_energy_tagged = [
+        (recipe_no, row["recipe_id"], nutrition["energy_kcal"])
+        for recipe_no, row in recipes_by_no.items()
+        if str(row.get("recipe_key", "")).startswith(DOCX_RECIPE_KEY_PREFIX)
+        and "easy_light" in _recipe_tags(row, "tags", "restriction_tags")
+        and float(nutrition_by_no[recipe_no].get("energy_kcal") or 0.0) > max_light_energy_kcal
+        for nutrition in (nutrition_by_no[recipe_no],)
+    ]
+
+    assert high_energy_tagged == []
+
+
+def test_docx_lactose_free_pesto_recipes_use_dairy_free_pesto_source() -> None:
+    recipes_by_no = _source_recipe_by_no()
+    ingredients_by_no = _source_ingredients_by_no()
+    dairy_free_pesto_food_ids = {"dairy_free_pesto", "vegan_pesto"}
+
+    unsupported_lactose_free_pesto = []
+    for recipe_no, row in recipes_by_no.items():
+        if not str(row.get("recipe_key", "")).startswith(DOCX_RECIPE_KEY_PREFIX):
+            continue
+        if "lactose_free" not in _recipe_tags(row, "tags", "restriction_tags"):
+            continue
+        food_ids = {ingredient["food_id"] for ingredient in ingredients_by_no[recipe_no]}
+        if "pesto" in food_ids and not food_ids & dairy_free_pesto_food_ids:
+            unsupported_lactose_free_pesto.append((recipe_no, row["recipe_id"], sorted(food_ids)))
+
+    assert unsupported_lactose_free_pesto == []
+
+
+def test_docx_recipe_restriction_tags_match_ingredient_rows() -> None:
+    docx_rows = _docx_recipe_rows()
+    ingredients_by_recipe: dict[str, list[dict]] = defaultdict(list)
+    for row in _source_ingredients():
+        if row["recipe_id"] in _docx_recipe_ids():
+            ingredients_by_recipe[row["recipe_id"]].append(row)
+
+    banned_by_tag = {
+        "lactose_free": {"milk", "greek_yogurt", "kefir", "sour_cream", "cream", "cream_cheese", "cheddar", "mozzarella", "butter"},
+        "egg_free": {"egg", "egg_white", "egg_white_extra", "egg_yolk", "egg_noodles", "mayonnaise", "aioli"},
+        "nut_free": {
+            "almond_butter",
+            "brazil_nuts",
+            "mixed_nuts",
+            "nuts_mix",
+            "peanut_butter",
+            "peanuts",
+            "pecans",
+            "pine_nuts",
+            "pesto",
+            "walnuts",
+        },
+        "mushroom_free": {"mushrooms", "shiitake"},
+        "cilantro_free": {"cilantro"},
+    }
+
+    mismatches = []
+    for row in docx_rows:
+        tags = {tag.strip() for tag in str(row.get("restriction_tags", "")).split(",") if tag.strip()}
+        food_ids = {ingredient["food_id"] for ingredient in ingredients_by_recipe[row["recipe_id"]]}
+        for tag, banned_ids in banned_by_tag.items():
+            if tag in tags and food_ids & banned_ids:
+                mismatches.append((row["recipe_id"], tag, sorted(food_ids & banned_ids)))
+
+    assert mismatches == []
+
+
+def test_docx_recipes_do_not_dominate_regular_generation() -> None:
+    docx_ids = _docx_recipe_ids()
+    profile = UserProfile(
+        age=32,
+        sex=Sex.FEMALE,
+        height_cm=168,
+        weight_kg=68,
+        goal=Goal.MAINTAIN,
+        activity=ActivityLevel.MODERATE,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    meals = [
+        meal
+        for seed in range(12)
+        for meal in build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only").meals
+    ]
+    docx_meals = [meal for meal in meals if meal.recipe_id in docx_ids]
+
+    assert docx_meals
+    assert len(docx_meals) / len(meals) <= 0.25
+
+
+def test_new_docx_recipes_do_not_dominate_regular_generation() -> None:
+    new_docx_ids = {
+        row["recipe_id"]
+        for row in _docx_recipe_rows()
+        if int(row["recipe_no"]) in NEW_DOCX_RECIPE_NOS
+    }
+    profile = UserProfile(
+        age=32,
+        sex=Sex.FEMALE,
+        height_cm=168,
+        weight_kg=68,
+        goal=Goal.MAINTAIN,
+        activity=ActivityLevel.MODERATE,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    meals = [
+        meal
+        for seed in range(12)
+        for meal in build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only").meals
+    ]
+    new_docx_meals = [meal for meal in meals if meal.recipe_id in new_docx_ids]
+
+    assert len(new_docx_meals) / len(meals) <= 0.12
+
+
+def test_docx_recipes_add_hard_filter_options_without_taking_over() -> None:
+    docx_ids = _docx_recipe_ids()
+    profile = UserProfile(
+        age=32,
+        sex=Sex.FEMALE,
+        height_cm=168,
+        weight_kg=68,
+        goal=Goal.LOSE,
+        activity=ActivityLevel.MODERATE,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+        restrictions=(
+            Restriction(RestrictionType.ALLERGY, "яйца"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "молоко"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "орехи"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "грибы"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "кинза"),
+        ),
+    )
+
+    meals = [
+        meal
+        for seed in range(12)
+        for meal in build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only").meals
+    ]
+    docx_count = sum(1 for meal in meals if meal.recipe_id in docx_ids)
+
+    assert docx_count > 0
+    assert docx_count < len(meals)
 
 
 def test_batch2_curated_recipe_runtime_loads_metadata_fields() -> None:

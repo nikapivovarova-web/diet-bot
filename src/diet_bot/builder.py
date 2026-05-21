@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Literal, Protocol
+import time
 
 from .calculator import calculate_targets
 from .catalog import built_in_foods
@@ -38,6 +43,60 @@ RecipeSource = Literal["all", "curated_only"]
 TimeBucket = Literal["quick", "medium", "long"]
 RecipeRankingMode = Literal["balanced", "protein_floor"]
 logger = logging.getLogger(__name__)
+_RECIPE_PLAN_DIAGNOSTIC_CONTEXT: ContextVar[Mapping[str, object] | None] = ContextVar(
+    "recipe_plan_diagnostic_context",
+    default=None,
+)
+
+
+class _SelectionGuard(Protocol):
+    def check(
+        self,
+        *,
+        stage: str,
+        day_index: int | None = None,
+        candidate_index: int | None = None,
+    ) -> None:
+        ...
+
+
+def _check_selection_guard(selection_guard: _SelectionGuard | None, stage: str) -> None:
+    if selection_guard is not None:
+        selection_guard.check(stage=stage)
+
+
+def _recipe_plan_diagnostics_enabled() -> bool:
+    return os.getenv("DIET_BOT_WEEKLY_SELECTION_DIAG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@contextmanager
+def recipe_plan_diagnostic_context(**fields: object):
+    if not _recipe_plan_diagnostics_enabled():
+        yield
+        return
+
+    current = dict(_RECIPE_PLAN_DIAGNOSTIC_CONTEXT.get() or {})
+    current.update(fields)
+    token = _RECIPE_PLAN_DIAGNOSTIC_CONTEXT.set(current)
+    try:
+        yield
+    finally:
+        _RECIPE_PLAN_DIAGNOSTIC_CONTEXT.reset(token)
+
+
+def _recipe_plan_diag(event: str, **fields: object) -> None:
+    if not _recipe_plan_diagnostics_enabled():
+        return
+
+    payload = dict(_RECIPE_PLAN_DIAGNOSTIC_CONTEXT.get() or {})
+    payload.update(fields)
+    details = " ".join(f"{key}={value}" for key, value in payload.items())
+    logger.warning("weekly_selection_diag event=%s %s", event, details)
 
 PRIORITY_NUTRIENTS = {
     "energy_kcal": 1.0,
@@ -75,6 +134,13 @@ MAINTENANCE_PROTEIN_COMFORT_OVERAGE_PENALTY = 18.0
 MAINTENANCE_FAT_ENERGY_SHARE_BUFFER = 1.10
 MAINTENANCE_FAT_SHARE_OVERAGE_PENALTY = 24.0
 RECIPE_PLAN_CANDIDATE_COUNT = 1
+CONTROLLED_RECIPE_WINDOW_SIZE = 8
+CONTROLLED_RECIPE_SCORE_DELTA = 1.75
+CONTROLLED_RECIPE_MAX_EXTRA_ENERGY_GAP = 0.06
+CONTROLLED_RECIPE_MAX_EXTRA_PROTEIN_GAP = 0.05
+CONTROLLED_RECIPE_SODIUM_WORSE_MULTIPLIER = 1.25
+CONTROLLED_RECIPE_SODIUM_WORSE_BUFFER_MG = 120.0
+CONTROLLED_RECIPE_SLOT_SODIUM_MULTIPLIER = 1.35
 SLOT_FLEX_PENALTY = 5.0
 EXPLICIT_SLOT_FLEX_PENALTY = 0.0
 EFFORT_FALLBACK_PENALTY = 7.0
@@ -95,7 +161,6 @@ CALORIE_RECOVERY_BASE_MAX_PROTEIN_PER_100G = 8.0
 SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
     "несколько этап",
     "ваф",
-    "блендер",
     "комбайн",
     "грил",
     "аэрогрил",
@@ -103,7 +168,6 @@ SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
     "фритюр",
     "several stages",
     "waffle",
-    "blender",
     "food processor",
     "processor",
     "grill",
@@ -111,6 +175,49 @@ SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS = (
     "fryer",
 )
 SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS = SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS
+SIMPLE_COOKING_CONTEXTUAL_BLENDER_KEYWORDS = ("блендер", "blender")
+SIMPLE_COOKING_BLENDER_SIMPLE_ACTIVE_MINUTES = 15
+SIMPLE_COOKING_BLENDER_COMPLEX_CONTEXT_KEYWORDS = (
+    "замороз",
+    "фермент",
+    "расстой",
+    "freez",
+    "ferment",
+    "proof",
+)
+SIMPLE_COOKING_PASSIVE_WAITING_KEYWORDS = (
+    "на ночь",
+    "ночь",
+    "холодиль",
+    "охлад",
+    "охлаж",
+    "замоч",
+    "насто",
+    "overnight",
+    "chill",
+    "refrigerat",
+    "soak",
+)
+SIMPLE_COOKING_ACTIVE_COOKING_KEYWORDS = (
+    "вар",
+    "жар",
+    "обжар",
+    "запек",
+    "выпек",
+    "туш",
+    "кип",
+    "грил",
+    "bake",
+    "boil",
+    "broil",
+    "fry",
+    "grill",
+    "roast",
+    "saute",
+    "sauté",
+    "simmer",
+    "stew",
+)
 SIMPLE_COOKING_PANTRY_INGREDIENT_IDS = frozenset(
     {
         "black_pepper",
@@ -162,6 +269,59 @@ class CookingEffortPhase:
 class RecipeSlotEligibility:
     eligible: bool
     penalty: float = 0.0
+
+
+_RecipeKey = tuple[str, int]
+_TargetCacheKey = tuple[tuple[str, float], ...]
+_FoodByIdCacheKey = str
+
+
+@dataclass
+class _RecipePlanCache:
+    resolved_ingredients: dict[tuple[_RecipeKey, _FoodByIdCacheKey], tuple[tuple[Food, float], ...] | None] = field(default_factory=dict)
+    projected_nutrients: dict[tuple[_RecipeKey, _FoodByIdCacheKey, float, str], NutrientVector | None] = field(default_factory=dict)
+    slot_eligibility: dict[tuple[_RecipeKey, str, _FoodByIdCacheKey, float, _TargetCacheKey], RecipeSlotEligibility] = field(default_factory=dict)
+    recipe_formats: dict[_RecipeKey, str] = field(default_factory=dict)
+    recipe_memory_keys: dict[tuple[_RecipeKey, str | None], str] = field(default_factory=dict)
+    time_buckets: dict[_RecipeKey, TimeBucket] = field(default_factory=dict)
+    cooking_effort_matches: dict[tuple[_RecipeKey, CookingEffortConstraints], bool] = field(default_factory=dict)
+    stats: Counter[str] = field(default_factory=Counter)
+
+
+def _recipe_cache_key(recipe: RecipeTemplate) -> _RecipeKey:
+    return (recipe.id, id(recipe))
+
+
+def _food_by_id_cache_key(food_by_id: dict[str, Food]) -> _FoodByIdCacheKey:
+    digest = hashlib.blake2b(digest_size=16)
+    for food in sorted(food_by_id.values(), key=lambda item: item.id):
+        digest.update(food.id.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(food.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(food.category.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(repr(float(food.max_per_meal_g)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(repr(float(food.max_per_day_g)).encode("ascii"))
+        digest.update(b"\0")
+        for role in sorted(str(role) for role in food.roles):
+            digest.update(role.encode("utf-8"))
+            digest.update(b"\0")
+        for tag in sorted(food.tags):
+            digest.update(tag.encode("utf-8"))
+            digest.update(b"\0")
+        for nutrient, value in _target_cache_key(food.nutrients_per_100g):
+            digest.update(nutrient.encode("utf-8"))
+            digest.update(b"=")
+            digest.update(repr(value).encode("ascii"))
+            digest.update(b"\0")
+        digest.update(b"\1")
+    return digest.hexdigest()
+
+
+def _target_cache_key(target: NutrientVector) -> _TargetCacheKey:
+    return tuple(sorted((key, float(value)) for key, value in target.amounts.items()))
 
 
 MEAL_ENERGY_PROFILES: dict[int, tuple[MealEnergySlot, ...]] = {
@@ -380,6 +540,14 @@ class MealSpec:
     roles: tuple[MealRole, ...]
 
 
+@dataclass(frozen=True)
+class _RankedRecipeCandidate:
+    recipe: RecipeTemplate
+    score: float
+    projected: NutrientVector | None
+    rank: int
+
+
 def build_one_day_plan(
     profile: UserProfile,
     foods: list[Food] | None = None,
@@ -388,29 +556,35 @@ def build_one_day_plan(
     avoided_recipe_keys: set[str] | frozenset[str] | None = None,
     recipe_source: RecipeSource = "all",
     allow_avoided_recipe_relaxation: bool = True,
+    recipe_cache: _RecipePlanCache | None = None,
+    selection_guard: _SelectionGuard | None = None,
 ) -> MealPlan:
-    safety = evaluate_safety(profile)
-    targets = calculate_targets(profile)
-    if not safety.can_generate_plan:
-        return MealPlan(meals=(), targets=targets, safety=safety)
-
-    candidates = filter_foods(foods or built_in_foods(), safety)
-    if not candidates:
-        return MealPlan(meals=(), targets=targets, safety=safety)
-
-    recipe_meals = _build_recipe_plan_for_time(
-        candidates,
-        targets.targets,
-        profile.meal_count,
-        profile.cooking_time,
-        variety_seed,
-        avoided_recipe_ids or frozenset(),
-        avoided_recipe_keys or frozenset(),
-        recipe_source,
-        excluded_food_names=safety.excluded_food_names,
-        manage_sodium=bool(safety.excluded_food_names),
+    plan_started_at = time.perf_counter()
+    _recipe_plan_diag(
+        "build_one_day_plan_start",
+        seed=variety_seed,
+        meal_count=profile.meal_count,
+        recipe_source=recipe_source,
     )
-    if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
+    try:
+        _check_selection_guard(selection_guard, "build_one_day_plan_start")
+        safety = evaluate_safety(profile)
+        targets = calculate_targets(profile)
+        if not safety.can_generate_plan:
+            return MealPlan(meals=(), targets=targets, safety=safety)
+
+        food_filter_started_at = time.perf_counter()
+        _recipe_plan_diag("food_filter_start")
+        candidates = filter_foods(foods or built_in_foods(), safety)
+        _recipe_plan_diag(
+            "food_filter_end",
+            elapsed_s=f"{time.perf_counter() - food_filter_started_at:.3f}",
+            food_count=len(candidates),
+        )
+        if not candidates:
+            return MealPlan(meals=(), targets=targets, safety=safety)
+
+        _check_selection_guard(selection_guard, "before_recipe_plan_primary")
         recipe_meals = _build_recipe_plan_for_time(
             candidates,
             targets.targets,
@@ -418,66 +592,96 @@ def build_one_day_plan(
             profile.cooking_time,
             variety_seed,
             avoided_recipe_ids or frozenset(),
-            frozenset(),
+            avoided_recipe_keys or frozenset(),
             recipe_source,
             excluded_food_names=safety.excluded_food_names,
             manage_sodium=bool(safety.excluded_food_names),
+            recipe_cache=recipe_cache,
+            selection_guard=selection_guard,
         )
-    if not recipe_meals and allow_avoided_recipe_relaxation and (avoided_recipe_ids or avoided_recipe_keys):
-        recipe_meals = _build_recipe_plan_for_time(
-            candidates,
-            targets.targets,
-            profile.meal_count,
-            profile.cooking_time,
-            variety_seed,
-            frozenset(),
-            frozenset(),
-            recipe_source,
-            excluded_food_names=safety.excluded_food_names,
-            manage_sodium=bool(safety.excluded_food_names),
-        )
-    if recipe_meals:
-        return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
-    if recipe_source == "curated_only":
-        return MealPlan(meals=(), targets=targets, safety=safety)
-
-    used_grams: dict[str, float] = defaultdict(float)
-    used_counts: Counter[str] = Counter()
-    used_categories: Counter[str] = Counter()
-    running_total = NutrientVector()
-    meals: list[Meal] = []
-
-    for spec in _meal_specs(profile.meal_count):
-        portions: list[FoodPortion] = []
-        meal_categories: set[str] = set()
-        for role in spec.roles:
-            deficit = targets.targets.minus(running_total).clipped_positive()
-            food = _select_food(
-                candidates=candidates,
-                role=role,
-                deficit=deficit,
-                used_grams=used_grams,
-                used_counts=used_counts,
-                meal_categories=meal_categories,
-                variety_seed=variety_seed,
+        if not recipe_meals and (avoided_recipe_ids or avoided_recipe_keys):
+            _check_selection_guard(selection_guard, "before_retry_without_recent_keys")
+            recipe_meals = _build_recipe_plan_for_time(
+                candidates,
+                targets.targets,
+                profile.meal_count,
+                profile.cooking_time,
+                variety_seed,
+                avoided_recipe_ids or frozenset(),
+                frozenset(),
+                recipe_source,
+                excluded_food_names=safety.excluded_food_names,
+                manage_sodium=bool(safety.excluded_food_names),
+                recipe_cache=recipe_cache,
+                selection_guard=selection_guard,
             )
-            if food is None:
-                continue
-            grams = _portion_for(food, role, deficit, used_grams)
-            if grams <= 0:
-                continue
-            portion = food.portion(grams)
-            portions.append(portion)
-            used_grams[food.id] += grams
-            used_counts[food.id] += 1
-            used_categories[food.category] += 1
-            meal_categories.add(food.category)
-            running_total = running_total.plus(portion.nutrients)
-        meals.append(Meal(spec.name, tuple(portions), recipe_for(spec.name, tuple(portions))))
+        if not recipe_meals and allow_avoided_recipe_relaxation and (avoided_recipe_ids or avoided_recipe_keys):
+            _check_selection_guard(selection_guard, "before_retry_without_recent_avoidance")
+            recipe_meals = _build_recipe_plan_for_time(
+                candidates,
+                targets.targets,
+                profile.meal_count,
+                profile.cooking_time,
+                variety_seed,
+                frozenset(),
+                frozenset(),
+                recipe_source,
+                excluded_food_names=safety.excluded_food_names,
+                manage_sodium=bool(safety.excluded_food_names),
+                recipe_cache=recipe_cache,
+                selection_guard=selection_guard,
+            )
+        if recipe_meals:
+            return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
+        if recipe_source == "curated_only":
+            return MealPlan(meals=(), targets=targets, safety=safety)
 
-    meals = _top_up_if_needed(meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
-    _ensure_hard_nutrition_floors(meals, targets.targets)
-    return MealPlan(meals=tuple(meals), targets=targets, safety=safety)
+        _check_selection_guard(selection_guard, "before_food_fallback")
+        used_grams: dict[str, float] = defaultdict(float)
+        used_counts: Counter[str] = Counter()
+        used_categories: Counter[str] = Counter()
+        running_total = NutrientVector()
+        meals: list[Meal] = []
+
+        for spec in _meal_specs(profile.meal_count):
+            _check_selection_guard(selection_guard, "food_fallback_meal")
+            portions: list[FoodPortion] = []
+            meal_categories: set[str] = set()
+            for role in spec.roles:
+                deficit = targets.targets.minus(running_total).clipped_positive()
+                food = _select_food(
+                    candidates=candidates,
+                    role=role,
+                    deficit=deficit,
+                    used_grams=used_grams,
+                    used_counts=used_counts,
+                    meal_categories=meal_categories,
+                    variety_seed=variety_seed,
+                )
+                if food is None:
+                    continue
+                grams = _portion_for(food, role, deficit, used_grams)
+                if grams <= 0:
+                    continue
+                portion = food.portion(grams)
+                portions.append(portion)
+                used_grams[food.id] += grams
+                used_counts[food.id] += 1
+                used_categories[food.category] += 1
+                meal_categories.add(food.category)
+                running_total = running_total.plus(portion.nutrients)
+            meals.append(Meal(spec.name, tuple(portions), recipe_for(spec.name, tuple(portions))))
+
+        meals = _top_up_if_needed(meals, candidates, targets.targets, used_grams, used_counts, variety_seed)
+        _ensure_hard_nutrition_floors(meals, targets.targets)
+        return MealPlan(meals=tuple(meals), targets=targets, safety=safety)
+    finally:
+        _recipe_plan_diag(
+            "build_one_day_plan_end",
+            seed=variety_seed,
+            recipe_source=recipe_source,
+            elapsed_s=f"{time.perf_counter() - plan_started_at:.3f}",
+        )
 
 
 def _build_recipe_plan_for_time(
@@ -491,10 +695,15 @@ def _build_recipe_plan_for_time(
     recipe_source: RecipeSource,
     excluded_food_names: frozenset[str] = frozenset(),
     manage_sodium: bool = False,
+    recipe_cache: _RecipePlanCache | None = None,
+    selection_guard: _SelectionGuard | None = None,
 ) -> list[Meal]:
     preference = normalize_cooking_time_preference(cooking_time)
+    _check_selection_guard(selection_guard, "before_effort_phase_loop")
     for effort_phase in _cooking_effort_phases(preference):
+        _check_selection_guard(selection_guard, "before_effort_phase")
         for allowed_time_buckets in _time_filter_attempts(effort_phase.time_preference):
+            _check_selection_guard(selection_guard, "before_time_bucket_attempt")
             meals = _build_recipe_plan_candidates_for_attempt(
                 candidates,
                 target,
@@ -507,6 +716,8 @@ def _build_recipe_plan_for_time(
                 effort_phase,
                 excluded_food_names,
                 manage_sodium,
+                recipe_cache,
+                selection_guard,
             )
             if meals:
                 if effort_phase.fallback_penalty > 0:
@@ -518,6 +729,7 @@ def _build_recipe_plan_for_time(
                     )
                 return meals
 
+        _check_selection_guard(selection_guard, "before_unfiltered_time_attempt")
         meals = _build_recipe_plan_candidates_for_attempt(
             candidates,
             target,
@@ -530,6 +742,8 @@ def _build_recipe_plan_for_time(
             effort_phase,
             excluded_food_names,
             manage_sodium,
+            recipe_cache,
+            selection_guard,
         )
         if meals:
             if effort_phase.fallback_penalty > 0:
@@ -556,11 +770,16 @@ def _build_recipe_plan_candidates_for_attempt(
     effort_phase: CookingEffortPhase,
     excluded_food_names: frozenset[str] = frozenset(),
     manage_sodium: bool = False,
+    recipe_cache: _RecipePlanCache | None = None,
+    selection_guard: _SelectionGuard | None = None,
 ) -> list[Meal]:
     meal_candidates: list[list[Meal]] = []
     seen_signatures: set[tuple[str | None, ...]] = set()
+    _check_selection_guard(selection_guard, "before_ranking_mode_loop")
     for ranking_mode in ("balanced", "protein_floor"):
+        _check_selection_guard(selection_guard, "before_ranking_mode")
         for candidate_index in range(RECIPE_PLAN_CANDIDATE_COUNT):
+            _check_selection_guard(selection_guard, "before_candidate_attempt")
             seed = variety_seed + candidate_index
             meals = _build_recipe_plan(
                 candidates,
@@ -575,6 +794,8 @@ def _build_recipe_plan_candidates_for_attempt(
                 ranking_mode,
                 excluded_food_names,
                 manage_sodium,
+                recipe_cache,
+                selection_guard,
             )
             if not meals:
                 continue
@@ -606,23 +827,44 @@ def _build_recipe_plan(
     ranking_mode: RecipeRankingMode = "balanced",
     excluded_food_names: frozenset[str] = frozenset(),
     manage_sodium: bool = False,
+    recipe_cache: _RecipePlanCache | None = None,
+    selection_guard: _SelectionGuard | None = None,
 ) -> list[Meal]:
     food_by_id = {food.id: food for food in candidates}
-    recipes = [
-        recipe
-        for recipe in built_in_recipes()
-        if _resolve_recipe_ingredients(recipe, food_by_id) is not None
-        and recipe.id not in avoided_recipe_ids
-        and _recipe_memory_key(recipe) not in avoided_recipe_keys
-        and (recipe_source != "curated_only" or "curated" in recipe.tags)
-        and (allowed_time_buckets is None or _recipe_time_bucket(recipe) in allowed_time_buckets)
-        and (
-            effort_phase is None
-            or effort_phase.constraints is None
-            or _recipe_matches_cooking_effort(recipe, effort_phase.constraints)
-        )
-        and not _recipe_title_uses_excluded_food(recipe, excluded_food_names)
-    ]
+    food_cache_key = _food_by_id_cache_key(food_by_id) if recipe_cache is not None else None
+    recipes: list[RecipeTemplate] = []
+    _check_selection_guard(selection_guard, "before_recipe_filter")
+    for recipe_index, recipe in enumerate(built_in_recipes()):
+        if recipe_index % 32 == 0:
+            _check_selection_guard(selection_guard, "recipe_filter")
+        if (
+            _resolve_recipe_ingredients(
+                recipe,
+                food_by_id,
+                recipe_cache=recipe_cache,
+                food_cache_key=food_cache_key,
+            )
+            is not None
+            and recipe.id not in avoided_recipe_ids
+            and _recipe_memory_key_cached(recipe, recipe_cache=recipe_cache) not in avoided_recipe_keys
+            and (recipe_source != "curated_only" or "curated" in recipe.tags)
+            and (
+                allowed_time_buckets is None
+                or _recipe_time_bucket_cached(recipe, recipe_cache) in allowed_time_buckets
+            )
+            and (
+                effort_phase is None
+                or effort_phase.constraints is None
+                or _recipe_matches_cooking_effort_cached(
+                    recipe,
+                    effort_phase.constraints,
+                    recipe_cache,
+                )
+            )
+            and not _recipe_title_uses_excluded_food(recipe, excluded_food_names)
+        ):
+            recipes.append(recipe)
+    _check_selection_guard(selection_guard, "after_recipe_filter")
     if not recipes:
         return []
 
@@ -633,14 +875,17 @@ def _build_recipe_plan(
     meals: list[Meal] = []
     total_energy = target.get("energy_kcal")
     slots = _meal_energy_slots(meal_count)
+    selected_recipe_counts: Counter[str] = Counter()
 
+    _check_selection_guard(selection_guard, "before_slot_loop")
     for index, energy_slot in enumerate(slots):
+        _check_selection_guard(selection_guard, "before_slot")
         slot = energy_slot.slot
         slot_energy_target = total_energy * energy_slot.target_ratio
         current_total = NutrientVector.sum(meal.nutrients for meal in meals)
         selected_recipe: RecipeTemplate | None = None
         selected_portions: tuple[FoodPortion, ...] = tuple()
-        for recipe in _rank_recipes(
+        ranked_candidates = _rank_recipe_candidates(
             recipes,
             slot,
             used_recipe_ids,
@@ -657,8 +902,38 @@ def _build_recipe_plan(
             ranking_mode,
             effort_phase,
             manage_sodium,
-        ):
-            resolved = _resolve_recipe_ingredients(recipe, food_by_id)
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
+            selection_guard=selection_guard,
+        )
+        _check_selection_guard(selection_guard, "after_ranking")
+        window_recipe = _select_ranked_recipe_from_window(
+            ranked_candidates,
+            used_recipe_counts=selected_recipe_counts,
+            used_food_ids=used_food_ids,
+            used_formats=used_formats,
+            current_total=current_total,
+            target=target,
+            slot_energy_target=slot_energy_target,
+            variety_seed=variety_seed,
+            index=index,
+            recipe_cache=recipe_cache,
+        )
+        ranked_recipes = [candidate.recipe for candidate in ranked_candidates]
+        if window_recipe is not None:
+            ranked_recipes = [
+                window_recipe,
+                *(recipe for recipe in ranked_recipes if recipe.id != window_recipe.id),
+            ]
+        for ranked_recipe_index, recipe in enumerate(ranked_recipes):
+            if ranked_recipe_index % 32 == 0:
+                _check_selection_guard(selection_guard, "ranked_recipe_selection")
+            resolved = _resolve_recipe_ingredients(
+                recipe,
+                food_by_id,
+                recipe_cache=recipe_cache,
+                food_cache_key=food_cache_key,
+            )
             if resolved is None:
                 continue
             base_energy = NutrientVector.sum(food.portion(grams).nutrients for food, grams in resolved).get("energy_kcal")
@@ -674,7 +949,8 @@ def _build_recipe_plan(
         recipe = selected_recipe
         portions = selected_portions
         used_recipe_ids.add(recipe.id)
-        used_formats[_recipe_format(recipe)] += 1
+        selected_recipe_counts[recipe.id] += 1
+        used_formats[_recipe_format_cached(recipe, recipe_cache)] += 1
         for portion in portions:
             used_food_ids[portion.food.id] += 1
             used_grams[portion.food.id] += portion.grams
@@ -687,7 +963,7 @@ def _build_recipe_plan(
                 image_attribution=recipe.image_attribution,
                 source_url=recipe.source_url,
                 recipe_id=recipe.id,
-                recipe_key=_recipe_memory_key(recipe, slot),
+                recipe_key=_recipe_memory_key_cached(recipe, slot, recipe_cache=recipe_cache),
             )
         )
 
@@ -870,9 +1146,27 @@ def _recipe_matches_cooking_effort(
     return True
 
 
+def _recipe_matches_cooking_effort_cached(
+    recipe: RecipeTemplate,
+    cooking_time: CookingEffortConstraints,
+    recipe_cache: _RecipePlanCache | None = None,
+) -> bool:
+    if recipe_cache is None:
+        return _recipe_matches_cooking_effort(recipe, cooking_time)
+    key = (_recipe_cache_key(recipe), cooking_time)
+    if key in recipe_cache.cooking_effort_matches:
+        recipe_cache.stats["cooking_effort_hits"] += 1
+        return recipe_cache.cooking_effort_matches[key]
+    recipe_cache.stats["cooking_effort_misses"] += 1
+    matches = _recipe_matches_cooking_effort(recipe, cooking_time)
+    recipe_cache.cooking_effort_matches[key] = matches
+    return matches
+
+
 def _recipe_effort_fallback_penalty(
     recipe: RecipeTemplate,
     effort_phase: CookingEffortPhase | None,
+    recipe_cache: _RecipePlanCache | None = None,
 ) -> float:
     if effort_phase is None or effort_phase.fallback_penalty <= 0:
         return 0.0
@@ -884,7 +1178,7 @@ def _recipe_effort_fallback_penalty(
         return 0.0
     if declared_effort == "interesting":
         return effort_phase.fallback_penalty
-    if _recipe_matches_cooking_effort(recipe, strict_constraints):
+    if _recipe_matches_cooking_effort_cached(recipe, strict_constraints, recipe_cache):
         return 0.0
     return effort_phase.fallback_penalty
 
@@ -916,8 +1210,39 @@ def _recipe_effort_ingredient_count(recipe: RecipeTemplate) -> int:
 def _has_complex_cooking_technique(recipe: RecipeTemplate) -> bool:
     title_and_time = " ".join((recipe.title, recipe.time_text)).lower()
     instructions = recipe.instructions.lower()
-    return any(_text_contains_keyword(title_and_time, keyword) for keyword in SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS) or any(
-        _text_contains_keyword(instructions, keyword) for keyword in SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS
+    has_complex_keyword = any(
+        _text_contains_keyword(title_and_time, keyword) for keyword in SIMPLE_COOKING_COMPLEXITY_TITLE_KEYWORDS
+    ) or any(
+        _text_contains_keyword(instructions, keyword)
+        for keyword in SIMPLE_COOKING_COMPLEXITY_INSTRUCTION_KEYWORDS
+    )
+    if has_complex_keyword:
+        return True
+    return _has_unsimple_blender_context(recipe, title_and_time, instructions)
+
+
+def _has_unsimple_blender_context(
+    recipe: RecipeTemplate,
+    title_and_time: str,
+    instructions: str,
+) -> bool:
+    if not _mentions_contextual_blender(title_and_time, instructions):
+        return False
+    if _declared_recipe_cooking_effort(recipe) == "interesting":
+        return True
+    if any(
+        _text_contains_keyword(title_and_time, keyword) or _text_contains_keyword(instructions, keyword)
+        for keyword in SIMPLE_COOKING_BLENDER_COMPLEX_CONTEXT_KEYWORDS
+    ):
+        return True
+    active_minutes = _recipe_active_minutes(recipe)
+    return active_minutes is None or active_minutes > SIMPLE_COOKING_BLENDER_SIMPLE_ACTIVE_MINUTES
+
+
+def _mentions_contextual_blender(title_and_time: str, instructions: str) -> bool:
+    return any(
+        _text_contains_keyword(title_and_time, keyword) or _text_contains_keyword(instructions, keyword)
+        for keyword in SIMPLE_COOKING_CONTEXTUAL_BLENDER_KEYWORDS
     )
 
 
@@ -949,10 +1274,30 @@ def _recipe_time_bucket(recipe: RecipeTemplate) -> TimeBucket:
     return "long"
 
 
+def _recipe_time_bucket_cached(
+    recipe: RecipeTemplate,
+    recipe_cache: _RecipePlanCache | None = None,
+) -> TimeBucket:
+    if recipe_cache is None:
+        return _recipe_time_bucket(recipe)
+    key = _recipe_cache_key(recipe)
+    if key in recipe_cache.time_buckets:
+        recipe_cache.stats["time_bucket_hits"] += 1
+        return recipe_cache.time_buckets[key]
+    recipe_cache.stats["time_bucket_misses"] += 1
+    bucket = _recipe_time_bucket(recipe)
+    recipe_cache.time_buckets[key] = bucket
+    return bucket
+
+
 def _recipe_active_minutes(recipe: RecipeTemplate) -> float | None:
     if recipe.active_time_min is not None:
         return float(recipe.active_time_min)
-    return _parse_active_minutes(recipe.time_text)
+    parsed_minutes = _parse_active_minutes(recipe.time_text)
+    passive_minutes = _passive_waiting_active_minutes(recipe, parsed_minutes)
+    if passive_minutes is not None:
+        return passive_minutes
+    return parsed_minutes
 
 
 def _parse_active_minutes(time_text: str) -> float | None:
@@ -974,6 +1319,61 @@ def _parse_active_minutes(time_text: str) -> float | None:
     if hour_matches:
         return max(float(value.replace(",", ".")) * 60 for value in hour_matches)
 
+    return None
+
+
+def _passive_waiting_active_minutes(
+    recipe: RecipeTemplate,
+    parsed_minutes: float | None,
+) -> float | None:
+    if parsed_minutes is None or parsed_minutes <= _cooking_effort_constraints(CookingTimePreference.SIMPLE).max_active_minutes:
+        return None
+    title_and_time = " ".join((recipe.title, recipe.time_text)).lower()
+    instructions = recipe.instructions.lower()
+    if not _mentions_passive_waiting(title_and_time, instructions):
+        return None
+    simple_constraints = _cooking_effort_constraints(CookingTimePreference.SIMPLE)
+    if _recipe_effort_ingredient_count(recipe) > simple_constraints.max_ingredients:
+        return None
+    if _instruction_sentence_count(recipe.instructions) > simple_constraints.max_instruction_sentences:
+        return None
+    if _has_active_cooking_signal(instructions):
+        return None
+
+    short_minutes = _short_active_minutes_from_passive_time_text(recipe.time_text)
+    if short_minutes is not None:
+        return short_minutes
+    sentence_count = max(1, _instruction_sentence_count(recipe.instructions))
+    return float(min(SIMPLE_COOKING_BLENDER_SIMPLE_ACTIVE_MINUTES, max(5, sentence_count * 3)))
+
+
+def _mentions_passive_waiting(title_and_time: str, instructions: str) -> bool:
+    return any(
+        _text_contains_keyword(title_and_time, keyword) or _text_contains_keyword(instructions, keyword)
+        for keyword in SIMPLE_COOKING_PASSIVE_WAITING_KEYWORDS
+    )
+
+
+def _has_active_cooking_signal(instructions: str) -> bool:
+    return any(
+        _text_contains_keyword(instructions, keyword)
+        for keyword in SIMPLE_COOKING_ACTIVE_COOKING_KEYWORDS
+    )
+
+
+def _short_active_minutes_from_passive_time_text(time_text: str) -> float | None:
+    normalized = time_text.lower().replace("–", "-").replace("—", "-")
+    hour_minute_matches = re.findall(
+        r"(\d+(?:[,.]\d+)?)\s*(?:час\w*|ч|hour\w*|hrs|hr|h)\s*(?:(\d+)\s*(?:мин\w*|minute\w*|mins|min|m))?",
+        normalized,
+    )
+    minute_values = [
+        float(minutes)
+        for hours, minutes in hour_minute_matches
+        if minutes and float(hours.replace(",", ".")) >= 1
+    ]
+    if minute_values:
+        return max(minute_values)
     return None
 
 
@@ -1229,12 +1629,47 @@ def _recipe_is_eligible_for_slot(
     return _recipe_slot_eligibility(recipe, slot, food_by_id, slot_energy_target, target).eligible
 
 
+def _recipe_slot_eligibility_cached(
+    recipe: RecipeTemplate,
+    slot: str,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    target: NutrientVector,
+    *,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
+) -> RecipeSlotEligibility:
+    if recipe_cache is None:
+        return _recipe_slot_eligibility(recipe, slot, food_by_id, slot_energy_target, target)
+    if food_cache_key is None:
+        food_cache_key = _food_by_id_cache_key(food_by_id)
+    key = (_recipe_cache_key(recipe), slot, food_cache_key, float(slot_energy_target), _target_cache_key(target))
+    if key in recipe_cache.slot_eligibility:
+        recipe_cache.stats["slot_eligibility_hits"] += 1
+        return recipe_cache.slot_eligibility[key]
+    recipe_cache.stats["slot_eligibility_misses"] += 1
+    eligibility = _recipe_slot_eligibility(
+        recipe,
+        slot,
+        food_by_id,
+        slot_energy_target,
+        target,
+        recipe_cache=recipe_cache,
+        food_cache_key=food_cache_key,
+    )
+    recipe_cache.slot_eligibility[key] = eligibility
+    return eligibility
+
+
 def _recipe_slot_eligibility(
     recipe: RecipeTemplate,
     slot: str,
     food_by_id: dict[str, Food],
     slot_energy_target: float,
     target: NutrientVector,
+    *,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
 ) -> RecipeSlotEligibility:
     requested_slot = slot.strip().lower()
     native_slot = recipe.slot.strip().lower()
@@ -1261,7 +1696,14 @@ def _recipe_slot_eligibility(
             native_slot == "snack"
             and requested_slot == "main"
             and requested_slot in allowed_slots
-            and _snack_recipe_can_fill_main_slot(recipe, food_by_id, slot_energy_target, target)
+            and _snack_recipe_can_fill_main_slot(
+                recipe,
+                food_by_id,
+                slot_energy_target,
+                target,
+                recipe_cache=recipe_cache,
+                food_cache_key=food_cache_key,
+            )
         ):
             return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
         return RecipeSlotEligibility(False)
@@ -1276,7 +1718,14 @@ def _recipe_slot_eligibility(
     if (
         not has_explicit_flex_metadata
         and requested_slot == "main"
-        and _snack_recipe_can_fill_main_slot(recipe, food_by_id, slot_energy_target, target)
+        and _snack_recipe_can_fill_main_slot(
+            recipe,
+            food_by_id,
+            slot_energy_target,
+            target,
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
+        )
     ):
         return RecipeSlotEligibility(True, SLOT_FLEX_PENALTY)
 
@@ -1306,6 +1755,9 @@ def _snack_recipe_can_fill_main_slot(
     food_by_id: dict[str, Food],
     slot_energy_target: float,
     target: NutrientVector,
+    *,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
 ) -> bool:
     if recipe.slot != "snack":
         return False
@@ -1319,7 +1771,14 @@ def _snack_recipe_can_fill_main_slot(
     if not ingredients & MAIN_LIKE_SNACK_STRUCTURE_IDS:
         return False
 
-    projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot="main")
+    projected = _project_recipe_nutrients(
+        recipe,
+        food_by_id,
+        slot_energy_target,
+        meal_slot="main",
+        recipe_cache=recipe_cache,
+        food_cache_key=food_cache_key,
+    )
     if projected is None:
         return False
     protein = projected.get("protein_g")
@@ -1328,7 +1787,7 @@ def _snack_recipe_can_fill_main_slot(
     return protein >= protein_floor and protein_density >= 0.035
 
 
-def _rank_recipes(
+def _rank_recipe_candidates(
     recipes: list[RecipeTemplate],
     slot: str,
     used_recipe_ids: set[str],
@@ -1345,24 +1804,69 @@ def _rank_recipes(
     ranking_mode: RecipeRankingMode = "balanced",
     effort_phase: CookingEffortPhase | None = None,
     manage_sodium: bool = False,
-) -> list[RecipeTemplate]:
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
+    selection_guard: _SelectionGuard | None = None,
+) -> tuple[_RankedRecipeCandidate, ...]:
+    ranking_started_at = time.perf_counter()
+    _recipe_plan_diag(
+        "ranking_start",
+        slot=slot,
+        meal_index=index,
+        ranking_mode=ranking_mode,
+        recipe_count=len(recipes),
+        seed=variety_seed,
+    )
+    if recipe_cache is not None and food_cache_key is None:
+        food_cache_key = _food_by_id_cache_key(food_by_id)
     eligible_candidates: list[tuple[RecipeTemplate, RecipeSlotEligibility]] = []
-    for recipe in recipes:
+    _check_selection_guard(selection_guard, "before_eligibility_filter")
+    for recipe_index, recipe in enumerate(recipes):
+        if recipe_index % 32 == 0:
+            _check_selection_guard(selection_guard, "eligibility_filter")
         if recipe.id in used_recipe_ids:
             continue
-        eligibility = _recipe_slot_eligibility(recipe, slot, food_by_id, slot_energy_target, target)
+        eligibility = _recipe_slot_eligibility_cached(
+            recipe,
+            slot,
+            food_by_id,
+            slot_energy_target,
+            target,
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
+        )
         if eligibility.eligible:
             eligible_candidates.append((recipe, eligibility))
     candidates = [recipe for recipe, _ in eligible_candidates]
     if not candidates:
-        return []
+        _recipe_plan_diag(
+            "ranking_end",
+            slot=slot,
+            meal_index=index,
+            ranking_mode=ranking_mode,
+            recipe_count=len(recipes),
+            eligible_count=0,
+            ranked_count=0,
+            elapsed_s=f"{time.perf_counter() - ranking_started_at:.3f}",
+            seed=variety_seed,
+        )
+        return tuple()
     eligibility_by_recipe_id = {recipe.id: eligibility for recipe, eligibility in eligible_candidates}
+    projected_by_recipe_id: dict[str, NutrientVector | None] = {}
+    score_by_recipe_id: dict[str, float] = {}
 
     def score(recipe: RecipeTemplate) -> float:
         overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
         seed_score = _seeded_score(recipe.id, variety_seed, index) * 2.0
         nutrient_bonus = _recipe_nutrient_bonus(recipe, current_total, target)
-        projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=slot)
+        projected = _project_recipe_nutrients(
+            recipe,
+            food_by_id,
+            slot_energy_target,
+            meal_slot=slot,
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
+        )
         macro_bonus = _recipe_projected_macro_gap_bonus(
             projected,
             current_total,
@@ -1375,6 +1879,8 @@ def _rank_recipes(
             slot_energy_target,
             current_total,
             target,
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
         )
         if ranking_mode == "protein_floor":
             seed_score = _seeded_score(recipe.id, variety_seed, index) * 0.25
@@ -1386,8 +1892,8 @@ def _rank_recipes(
         rotation_bonus = _recipe_rotation_bonus(recipe, slot, variety_seed, index)
         curated_bonus = 1.15 if "curated" in recipe.tags else 0.0
         slot_flex_penalty = eligibility_by_recipe_id[recipe.id].penalty
-        effort_penalty = _recipe_effort_fallback_penalty(recipe, effort_phase)
-        format_penalty = used_formats[_recipe_format(recipe)] * 0.85
+        effort_penalty = _recipe_effort_fallback_penalty(recipe, effort_phase, recipe_cache)
+        format_penalty = used_formats[_recipe_format_cached(recipe, recipe_cache)] * 0.85
         macro_penalty = _recipe_macro_penalty(recipe, current_total, target)
         macro_penalty += _recipe_projected_protein_penalty(
             projected,
@@ -1428,7 +1934,7 @@ def _rank_recipes(
             slot_max_energy,
             slot_energy_target,
         )
-        return (
+        total_score = (
             seed_score
             + nutrient_bonus
             + macro_bonus
@@ -1442,8 +1948,294 @@ def _rank_recipes(
             - macro_penalty
             - energy_penalty
         )
+        projected_by_recipe_id[recipe.id] = projected
+        score_by_recipe_id[recipe.id] = total_score
+        return total_score
 
-    return sorted(candidates, key=score, reverse=True)
+    _check_selection_guard(selection_guard, "before_recipe_score")
+    scored_candidates: list[tuple[RecipeTemplate, float]] = []
+    for candidate_index, recipe in enumerate(candidates):
+        if candidate_index % 32 == 0:
+            _check_selection_guard(selection_guard, "recipe_score")
+        scored_candidates.append((recipe, score(recipe)))
+    ranked_recipes = [
+        recipe
+        for recipe, _score in sorted(
+            scored_candidates,
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    ranked = tuple(
+        _RankedRecipeCandidate(
+            recipe=recipe,
+            score=score_by_recipe_id[recipe.id],
+            projected=projected_by_recipe_id.get(recipe.id),
+            rank=rank,
+        )
+        for rank, recipe in enumerate(ranked_recipes)
+    )
+    _recipe_plan_diag(
+        "ranking_end",
+        slot=slot,
+        meal_index=index,
+        ranking_mode=ranking_mode,
+        recipe_count=len(recipes),
+        eligible_count=len(candidates),
+        ranked_count=len(ranked),
+        elapsed_s=f"{time.perf_counter() - ranking_started_at:.3f}",
+        seed=variety_seed,
+    )
+    return ranked
+
+
+def _rank_recipes(
+    recipes: list[RecipeTemplate],
+    slot: str,
+    used_recipe_ids: set[str],
+    used_food_ids: Counter[str],
+    used_formats: Counter[str],
+    food_by_id: dict[str, Food],
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+    slot_min_energy: float,
+    slot_max_energy: float,
+    variety_seed: int,
+    index: int,
+    ranking_mode: RecipeRankingMode = "balanced",
+    effort_phase: CookingEffortPhase | None = None,
+    manage_sodium: bool = False,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
+    selection_guard: _SelectionGuard | None = None,
+) -> list[RecipeTemplate]:
+    return [
+        candidate.recipe
+        for candidate in _rank_recipe_candidates(
+            recipes,
+            slot,
+            used_recipe_ids,
+            used_food_ids,
+            used_formats,
+            food_by_id,
+            current_total,
+            target,
+            slot_energy_target,
+            slot_min_energy,
+            slot_max_energy,
+            variety_seed,
+            index,
+            ranking_mode,
+            effort_phase,
+            manage_sodium,
+            recipe_cache=recipe_cache,
+            food_cache_key=food_cache_key,
+            selection_guard=selection_guard,
+        )
+    ]
+
+
+def _select_ranked_recipe_from_window(
+    ranked: tuple[_RankedRecipeCandidate, ...],
+    *,
+    used_recipe_counts: Counter[str],
+    used_food_ids: Counter[str],
+    used_formats: Counter[str],
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+    variety_seed: int,
+    index: int,
+    recipe_cache: _RecipePlanCache | None = None,
+) -> RecipeTemplate | None:
+    if not ranked:
+        return None
+
+    top = ranked[0]
+    window = tuple(
+        candidate
+        for candidate in ranked[:CONTROLLED_RECIPE_WINDOW_SIZE]
+        if _ranked_recipe_candidate_passes_window_guard(
+            candidate,
+            top,
+            current_total=current_total,
+            target=target,
+            slot_energy_target=slot_energy_target,
+        )
+    )
+    if len(window) < 2:
+        return top.recipe
+
+    selected = max(
+        window,
+        key=lambda candidate: _ranked_recipe_window_selection_score(
+            candidate,
+            top,
+            used_recipe_counts=used_recipe_counts,
+            used_food_ids=used_food_ids,
+            used_formats=used_formats,
+            current_total=current_total,
+            target=target,
+            slot_energy_target=slot_energy_target,
+            variety_seed=variety_seed,
+            index=index,
+            recipe_cache=recipe_cache,
+        ),
+    )
+    return selected.recipe
+
+
+def _ranked_recipe_candidate_passes_window_guard(
+    candidate: _RankedRecipeCandidate,
+    top: _RankedRecipeCandidate,
+    *,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+) -> bool:
+    if candidate.rank == 0:
+        return True
+    if candidate.projected is None or top.projected is None:
+        return False
+    if top.score - candidate.score > CONTROLLED_RECIPE_SCORE_DELTA:
+        return False
+
+    candidate_energy_gap = _slot_projected_relative_gap(candidate.projected, slot_energy_target, "energy_kcal")
+    top_energy_gap = _slot_projected_relative_gap(top.projected, slot_energy_target, "energy_kcal")
+    if candidate_energy_gap > top_energy_gap + CONTROLLED_RECIPE_MAX_EXTRA_ENERGY_GAP:
+        return False
+
+    candidate_protein_gap = _total_projected_relative_gap(candidate.projected, current_total, target, "protein_g")
+    top_protein_gap = _total_projected_relative_gap(top.projected, current_total, target, "protein_g")
+    if candidate_protein_gap > top_protein_gap + CONTROLLED_RECIPE_MAX_EXTRA_PROTEIN_GAP:
+        return False
+
+    if not _ranked_recipe_candidate_passes_sodium_guard(
+        candidate.projected,
+        top.projected,
+        current_total=current_total,
+        target=target,
+        slot_energy_target=slot_energy_target,
+    ):
+        return False
+    return True
+
+
+def _slot_projected_relative_gap(projected: NutrientVector, slot_target: float, nutrient: str) -> float:
+    if slot_target <= 0:
+        return 0.0
+    return abs(projected.get(nutrient) - slot_target) / slot_target
+
+
+def _total_projected_relative_gap(
+    projected: NutrientVector,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    nutrient: str,
+) -> float:
+    target_value = target.get(nutrient)
+    if target_value <= 0:
+        return 0.0
+    return abs(current_total.get(nutrient) + projected.get(nutrient) - target_value) / target_value
+
+
+def _ranked_recipe_candidate_passes_sodium_guard(
+    projected: NutrientVector,
+    top_projected: NutrientVector,
+    *,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+) -> bool:
+    sodium_limit = target.get("sodium_mg")
+    if sodium_limit <= 0:
+        return True
+
+    candidate_sodium = projected.get("sodium_mg")
+    top_sodium = top_projected.get("sodium_mg")
+    allowed_sodium = max(
+        top_sodium * CONTROLLED_RECIPE_SODIUM_WORSE_MULTIPLIER,
+        top_sodium + CONTROLLED_RECIPE_SODIUM_WORSE_BUFFER_MG,
+    )
+    if candidate_sodium > allowed_sodium:
+        return False
+
+    target_energy = max(1.0, target.get("energy_kcal"))
+    slot_sodium_budget = sodium_limit * min(1.0, max(0.05, slot_energy_target / target_energy))
+    if (
+        candidate_sodium > slot_sodium_budget * CONTROLLED_RECIPE_SLOT_SODIUM_MULTIPLIER
+        and candidate_sodium > top_sodium + CONTROLLED_RECIPE_SODIUM_WORSE_BUFFER_MG
+    ):
+        return False
+
+    candidate_total_sodium = current_total.get("sodium_mg") + candidate_sodium
+    top_total_sodium = current_total.get("sodium_mg") + top_sodium
+    return (
+        candidate_total_sodium <= sodium_limit
+        or candidate_total_sodium <= top_total_sodium + CONTROLLED_RECIPE_SODIUM_WORSE_BUFFER_MG
+    )
+
+
+def _ranked_recipe_window_selection_score(
+    candidate: _RankedRecipeCandidate,
+    top: _RankedRecipeCandidate,
+    *,
+    used_recipe_counts: Counter[str],
+    used_food_ids: Counter[str],
+    used_formats: Counter[str],
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+    variety_seed: int,
+    index: int,
+    recipe_cache: _RecipePlanCache | None,
+) -> tuple[int, float, float, int]:
+    recipe = candidate.recipe
+    selected_count = used_recipe_counts[recipe.id]
+    score_gap = max(0.0, top.score - candidate.score)
+    normalized_gap = score_gap / max(0.01, CONTROLLED_RECIPE_SCORE_DELTA)
+    format_count = used_formats[_recipe_format_cached(recipe, recipe_cache)]
+    ingredient_overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
+    variety_score = _seeded_score(f"window:{recipe.id}", variety_seed, index)
+    sodium_pressure = _ranked_recipe_window_sodium_pressure(
+        candidate.projected,
+        current_total=current_total,
+        target=target,
+        slot_energy_target=slot_energy_target,
+    )
+    pressure_score = (
+        variety_score
+        - normalized_gap * 0.65
+        - sodium_pressure
+        - min(3, format_count) * 0.08
+        - min(4, ingredient_overlap) * 0.03
+        - candidate.rank * 0.02
+    )
+    return (-selected_count, pressure_score, candidate.score, -candidate.rank)
+
+
+def _ranked_recipe_window_sodium_pressure(
+    projected: NutrientVector | None,
+    *,
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+) -> float:
+    sodium_limit = target.get("sodium_mg")
+    if sodium_limit <= 0 or projected is None:
+        return 0.0
+
+    pressure = 0.0
+    projected_total = current_total.get("sodium_mg") + projected.get("sodium_mg")
+    if projected_total > sodium_limit:
+        pressure += min(1.2, (projected_total - sodium_limit) / sodium_limit * 8.0)
+
+    target_energy = max(1.0, target.get("energy_kcal"))
+    slot_sodium_budget = sodium_limit * min(1.0, max(0.05, slot_energy_target / target_energy))
+    if projected.get("sodium_mg") > slot_sodium_budget:
+        pressure += min(0.6, (projected.get("sodium_mg") - slot_sodium_budget) / sodium_limit * 4.0)
+    return pressure
 
 
 def _recipe_format(recipe: RecipeTemplate) -> str:
@@ -1470,6 +2262,22 @@ def _recipe_format(recipe: RecipeTemplate) -> str:
     if "перекус" in title or "snack" in recipe_id:
         return "snack"
     return "simple"
+
+
+def _recipe_format_cached(
+    recipe: RecipeTemplate,
+    recipe_cache: _RecipePlanCache | None = None,
+) -> str:
+    if recipe_cache is None:
+        return _recipe_format(recipe)
+    key = _recipe_cache_key(recipe)
+    if key in recipe_cache.recipe_formats:
+        recipe_cache.stats["recipe_format_hits"] += 1
+        return recipe_cache.recipe_formats[key]
+    recipe_cache.stats["recipe_format_misses"] += 1
+    recipe_format = _recipe_format(recipe)
+    recipe_cache.recipe_formats[key] = recipe_format
+    return recipe_format
 
 
 def _recipe_memory_key(recipe: RecipeTemplate, slot_override: str | None = None) -> str:
@@ -1508,6 +2316,24 @@ def _recipe_memory_key(recipe: RecipeTemplate, slot_override: str | None = None)
     vegetables = sorted(ingredients & {"broccoli", "tomato", "cucumber", "bell_pepper", "spinach"})
     vegetable_key = "-".join(vegetables[:2])
     return f"main:{protein}:{carb}:{vegetable_key}:{recipe_format}"
+
+
+def _recipe_memory_key_cached(
+    recipe: RecipeTemplate,
+    slot_override: str | None = None,
+    *,
+    recipe_cache: _RecipePlanCache | None = None,
+) -> str:
+    if recipe_cache is None:
+        return _recipe_memory_key(recipe, slot_override)
+    key = (_recipe_cache_key(recipe), slot_override)
+    if key in recipe_cache.recipe_memory_keys:
+        recipe_cache.stats["recipe_memory_key_hits"] += 1
+        return recipe_cache.recipe_memory_keys[key]
+    recipe_cache.stats["recipe_memory_key_misses"] += 1
+    memory_key = _recipe_memory_key(recipe, slot_override)
+    recipe_cache.recipe_memory_keys[key] = memory_key
+    return memory_key
 
 
 def _first_present(ingredients: set[str], options: tuple[str, ...]) -> str:
@@ -1624,6 +2450,8 @@ def _recipe_low_protein_calorie_recovery_bonus(
     slot_energy_target: float,
     current_total: NutrientVector,
     target: NutrientVector,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
 ) -> float:
     if not _is_low_protein_calorie_recovery_target(target):
         return 0.0
@@ -1641,11 +2469,13 @@ def _recipe_low_protein_calorie_recovery_bonus(
     kcal_per_protein = energy / max(1.0, protein)
     bonus = min(1.8, kcal_per_protein / max(1.0, target_kcal_per_protein)) * 2.8
 
-    resolved_foods = [
-        food
-        for food_id in recipe.ingredients_g
-        if (food := _resolve_recipe_food(food_id, food_by_id)) is not None
-    ]
+    resolved = _resolve_recipe_ingredients(
+        recipe,
+        food_by_id,
+        recipe_cache=recipe_cache,
+        food_cache_key=food_cache_key,
+    )
+    resolved_foods = [food for food, _ in resolved] if resolved is not None else []
     if any(_is_calorie_recovery_base(food) for food in resolved_foods):
         bonus += 1.2
     if any(food.category in {"protein", "dairy", "nuts_seeds"} for food in resolved_foods):
@@ -1974,8 +2804,17 @@ def _project_recipe_energy(
     food_by_id: dict[str, Food],
     slot_energy_target: float,
     meal_slot: str | None = None,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
 ) -> float | None:
-    projected = _project_recipe_nutrients(recipe, food_by_id, slot_energy_target, meal_slot=meal_slot)
+    projected = _project_recipe_nutrients(
+        recipe,
+        food_by_id,
+        slot_energy_target,
+        meal_slot=meal_slot,
+        recipe_cache=recipe_cache,
+        food_cache_key=food_cache_key,
+    )
     if projected is None:
         return None
     return projected.get("energy_kcal")
@@ -1986,15 +2825,52 @@ def _project_recipe_nutrients(
     food_by_id: dict[str, Food],
     slot_energy_target: float,
     meal_slot: str | None = None,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
 ) -> NutrientVector | None:
-    resolved: list[tuple[Food, float]] = []
-    base_energy = 0.0
-    for food_id, grams in recipe.ingredients_g.items():
-        food = _resolve_recipe_food(food_id, food_by_id)
-        if food is None:
-            return None
-        resolved.append((food, grams))
-        base_energy += food.nutrients_per_100g.get("energy_kcal") * grams / 100
+    if recipe_cache is None:
+        return _project_recipe_nutrients_uncached(recipe, food_by_id, slot_energy_target, meal_slot)
+    if food_cache_key is None:
+        food_cache_key = _food_by_id_cache_key(food_by_id)
+    normalized_slot = meal_slot or ""
+    key = (_recipe_cache_key(recipe), food_cache_key, float(slot_energy_target), normalized_slot)
+    if key in recipe_cache.projected_nutrients:
+        recipe_cache.stats["projected_nutrients_hits"] += 1
+        return recipe_cache.projected_nutrients[key]
+    recipe_cache.stats["projected_nutrients_misses"] += 1
+    projected = _project_recipe_nutrients_uncached(
+        recipe,
+        food_by_id,
+        slot_energy_target,
+        meal_slot,
+        recipe_cache=recipe_cache,
+        food_cache_key=food_cache_key,
+    )
+    recipe_cache.projected_nutrients[key] = projected
+    return projected
+
+
+def _project_recipe_nutrients_uncached(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    slot_energy_target: float,
+    meal_slot: str | None = None,
+    *,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
+) -> NutrientVector | None:
+    resolved = _resolve_recipe_ingredients(
+        recipe,
+        food_by_id,
+        recipe_cache=recipe_cache,
+        food_cache_key=food_cache_key,
+    )
+    if resolved is None:
+        return None
+    base_energy = sum(
+        food.nutrients_per_100g.get("energy_kcal") * grams / 100
+        for food, grams in resolved
+    )
 
     scale = _recipe_scale(slot_energy_target, base_energy)
     return NutrientVector.sum(
@@ -2012,6 +2888,27 @@ def _project_recipe_nutrients(
 
 
 def _resolve_recipe_ingredients(
+    recipe: RecipeTemplate,
+    food_by_id: dict[str, Food],
+    *,
+    recipe_cache: _RecipePlanCache | None = None,
+    food_cache_key: _FoodByIdCacheKey | None = None,
+) -> tuple[tuple[Food, float], ...] | None:
+    if recipe_cache is not None:
+        if food_cache_key is None:
+            food_cache_key = _food_by_id_cache_key(food_by_id)
+        key = (_recipe_cache_key(recipe), food_cache_key)
+        if key in recipe_cache.resolved_ingredients:
+            recipe_cache.stats["resolved_ingredients_hits"] += 1
+            return recipe_cache.resolved_ingredients[key]
+        recipe_cache.stats["resolved_ingredients_misses"] += 1
+        resolved = _resolve_recipe_ingredients_uncached(recipe, food_by_id)
+        recipe_cache.resolved_ingredients[key] = resolved
+        return resolved
+    return _resolve_recipe_ingredients_uncached(recipe, food_by_id)
+
+
+def _resolve_recipe_ingredients_uncached(
     recipe: RecipeTemplate,
     food_by_id: dict[str, Food],
 ) -> tuple[tuple[Food, float], ...] | None:
