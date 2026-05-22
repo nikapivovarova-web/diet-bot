@@ -144,12 +144,12 @@ def test_recipe_format_inference(title: str, recipe_id: str, expected: str) -> N
         ("r004_bananovo_ovsyanye_pankeyki", "dessert"),
         ("r141_spagetti_s_korolevskimi_krevetkami_harissoy_i_brokkoli", "pasta"),
         ("r156_farshirovannye_pertsy_s_risom_chernoy_fasolyu_i_syrom", "stuffed"),
-        ("r404_kotlety_iz_indeyki_s_tsukini_i_ovoschami_na_garnir", "cutlet"),
-        ("r493_shaurma_s_falafelem", "wrap"),
-        ("r523_lenivyy_plov_s_kuritsey", "rice_dish"),
-        ("r524_ryba_s_kartofelem_i_limonom", "protein_side"),
-        ("r543_tushenaya_govyadina_s_kartofelem", "stew"),
-        ("r608_goryachiy_buterbrod_s_syrom", "sandwich"),
+        ("r625_sytnye_ovsyanye_oladi_s_lukom", "cutlet"),
+        ("r611_lavash_s_kuritsey_i_nutovoy_pastoy", "wrap"),
+        ("r102_kurinaya_dzhambalayya_s_chorizo", "rice_dish"),
+        ("r622_fasol_s_indeykoy_i_ovoschami", "protein_side"),
+        ("r621_ragu_iz_chechevitsy_s_ovoschami", "stew"),
+        ("r632_postnyy_sendvich_s_nutom_i_avokado", "sandwich"),
     ],
 )
 def test_curated_recipe_format_regressions_from_unknown_clusters(recipe_id: str, expected: str) -> None:
@@ -225,11 +225,15 @@ def test_all_curated_recipes_produce_traits_with_broad_unknown_thresholds() -> N
     curated_recipes = [recipe for recipe in built_in_recipes() if "curated" in recipe.tags]
 
     traits = [infer_recipe_traits(recipe) for recipe in curated_recipes]
+    recipe_nos = {trait.recipe_no for trait in traits}
 
-    assert len(traits) >= 600
+    assert len(traits) == 455
+    assert set(range(1, 401)) <= recipe_nos
+    assert recipe_nos.isdisjoint(set(range(401, 611)))
+    assert set(range(611, 666)) <= recipe_nos
     assert Counter(trait.source_batch for trait in traits) == {
         "r001-r400": 400,
-        "r401-r610": len(traits) - 400,
+        "r611+": 55,
     }
 
     unknown_counts = Counter(
