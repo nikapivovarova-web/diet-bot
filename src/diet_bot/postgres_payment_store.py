@@ -149,6 +149,9 @@ class PostgresPaymentStore:
         now: datetime | None = None,
         subscription_expiration_timestamp: int | None = None,
         grant_entitlement: GrantEntitlementInTransaction | None = None,
+        event: PaymentEvent | None = None,
+        duplicate_event: PaymentEvent | None = None,
+        rejected_event: PaymentEvent | None = None,
     ) -> RecordedPaymentCharge:
         with self._connect() as conn:
             with conn.transaction():
@@ -169,7 +172,11 @@ class PostgresPaymentStore:
                     if order.status != ORDER_STATUS_PENDING:
                         existing = self._find_existing_charge_cur(cur, charge)
                         if existing is not None:
+                            if duplicate_event is not None:
+                                self._record_event_cur(cur, duplicate_event)
                             return RecordedPaymentCharge(existing, inserted=False, reason="duplicate_charge")
+                        if duplicate_event is not None:
+                            self._record_event_cur(cur, duplicate_event)
                         return RecordedPaymentCharge(charge, inserted=False, reason="order_not_payable")
                     mismatch = _payment_context_mismatch_reason(
                         order,
@@ -180,10 +187,20 @@ class PostgresPaymentStore:
                     )
                     if mismatch is not None:
                         self._mark_order_cur(cur, order.order_id, ORDER_STATUS_FAILED, reason=mismatch)
+                        if rejected_event is not None:
+                            self._record_event_cur(cur, rejected_event)
                         return RecordedPaymentCharge(charge, inserted=False, reason=mismatch)
                     recorded = self._record_charge_cur(cur, charge)
                     if not recorded.inserted:
-                        return recorded
+                        if duplicate_event is not None:
+                            self._record_event_cur(cur, duplicate_event)
+                        return RecordedPaymentCharge(
+                            recorded.charge,
+                            inserted=False,
+                            reason=recorded.reason or "duplicate_charge",
+                        )
+                    if event is not None:
+                        self._record_event_cur(cur, event)
                     order = self._mark_order_cur(cur, order.order_id, ORDER_STATUS_PAID)
                     grant = grant_entitlement or (
                         lambda callback_cur, callback_order, callback_charge: _grant_entitlement_cur(

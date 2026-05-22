@@ -62,6 +62,11 @@ class RuntimeConfig:
         issues = list(self.config_errors)
         if self.storage_backend == "postgres" and not self.database_url:
             issues.append("DIET_BOT_DATABASE_URL is required for postgres storage.")
+        if self.payments_enabled:
+            if self.storage_backend != "postgres":
+                issues.append("Payments require Postgres storage backend.")
+            if not self.database_url:
+                issues.append("DIET_BOT_DATABASE_URL is required when payments are enabled.")
         if is_production_environment(self.environment):
             if not self.database_url:
                 issues.append("DIET_BOT_DATABASE_URL is required in production.")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from .payments import (
@@ -59,12 +60,16 @@ class PaymentService:
         nonce_factory: Callable[[], str] | None = None,
         event_id_factory: Callable[[], str] | None = None,
         grant_entitlement: GrantEntitlement | None = None,
+        now_factory: Callable[[], datetime] | None = None,
+        order_ttl: timedelta | None = timedelta(minutes=30),
     ) -> None:
         self._repository = repository
         self._order_id_factory = order_id_factory or (lambda: f"order_{uuid.uuid4().hex}")
         self._nonce_factory = nonce_factory or (lambda: f"nonce_{secrets.token_urlsafe(12)}")
         self._event_id_factory = event_id_factory or (lambda: f"event_{uuid.uuid4().hex}")
         self._grant_entitlement = grant_entitlement
+        self._now_factory = now_factory or (lambda: datetime.now(UTC))
+        self._order_ttl = order_ttl
 
     def create_order(
         self,
@@ -86,15 +91,19 @@ class PaymentService:
             amount=expected.amount if amount is None else int(amount),
             currency=expected.currency if currency is None else str(currency),
             nonce=self._nonce_factory(),
+            created_at=self._now_factory(),
         )
         return self._repository.create_order(order)
+
+    def mark_order_failed(self, order_id: str, reason: str | None = None) -> PaymentOrder:
+        return self._repository.mark_order_failed(order_id, reason)
 
     def validate_order_payment(
         self,
         payload: str,
         *,
         user_id: int,
-        chat_id: int,
+        chat_id: int | None,
         provider: str,
         amount: int,
         currency: str,
@@ -114,7 +123,7 @@ class PaymentService:
             return PaymentValidationResult(False, order, "nonce_mismatch")
         if int(order.user_id) != int(user_id):
             return PaymentValidationResult(False, order, "user_mismatch")
-        if int(order.chat_id) != int(chat_id):
+        if chat_id is not None and int(order.chat_id) != int(chat_id):
             return PaymentValidationResult(False, order, "chat_mismatch")
         if order.provider != provider:
             return PaymentValidationResult(False, order, "provider_mismatch")
@@ -122,8 +131,12 @@ class PaymentService:
             return PaymentValidationResult(False, order, "amount_mismatch")
         if order.currency != currency:
             return PaymentValidationResult(False, order, "currency_mismatch")
-        if require_pending and order.status != ORDER_STATUS_PENDING:
-            return PaymentValidationResult(False, order, "order_not_pending")
+        if require_pending:
+            if order.status != ORDER_STATUS_PENDING:
+                return PaymentValidationResult(False, order, "order_not_pending")
+            if self._order_expired(order):
+                failed = self._repository.mark_order_failed(order.order_id, "order_expired")
+                return PaymentValidationResult(False, failed, "order_expired")
         return PaymentValidationResult(True, order)
 
     def handle_successful_payment(
@@ -197,6 +210,48 @@ class PaymentService:
             currency=currency,
             raw_payload=event_payload,
         )
+        transactional_recorder = getattr(self._repository, "record_successful_payment_and_grant_entitlement", None)
+        if callable(transactional_recorder) and self._grant_entitlement is None:
+            recorded = transactional_recorder(
+                order_id=order.order_id,
+                provider=provider,
+                telegram_payment_charge_id=telegram_payment_charge_id,
+                provider_payment_charge_id=provider_payment_charge_id,
+                amount=amount,
+                currency=currency,
+                product=order.product,
+                raw_payload=event_payload,
+                subscription_expiration_timestamp=event_payload.get("subscription_expiration_date"),
+                event=self._event(
+                    event_type=EVENT_SUCCESSFUL_PAYMENT_RECEIVED,
+                    order_id=order.order_id,
+                    provider=provider,
+                    telegram_payment_charge_id=telegram_payment_charge_id,
+                    provider_payment_charge_id=provider_payment_charge_id,
+                    payload=event_payload,
+                ),
+                duplicate_event=self._event(
+                    event_type=EVENT_SUCCESSFUL_PAYMENT_DUPLICATE,
+                    order_id=order.order_id,
+                    provider=provider,
+                    telegram_payment_charge_id=telegram_payment_charge_id,
+                    provider_payment_charge_id=provider_payment_charge_id,
+                    payload=event_payload,
+                ),
+                rejected_event=self._event(
+                    event_type=EVENT_SUCCESSFUL_PAYMENT_REJECTED,
+                    order_id=order.order_id,
+                    provider=provider,
+                    telegram_payment_charge_id=telegram_payment_charge_id,
+                    provider_payment_charge_id=provider_payment_charge_id,
+                    payload=event_payload,
+                ),
+            )
+            if not recorded.inserted:
+                duplicate = recorded.reason in {"duplicate_charge", "order_not_payable"}
+                return PaymentHandlingResult(False, order.product if duplicate else None, duplicate, recorded.reason)
+            return PaymentHandlingResult(True, order.product)
+
         recorded = self._repository.record_charge(charge)
         if not recorded.inserted:
             self._repository.record_event(
@@ -251,6 +306,18 @@ class PaymentService:
             provider_payment_charge_id=_optional_text(provider_payment_charge_id),
             payload=dict(payload),
         )
+
+    def _order_expired(self, order: PaymentOrder) -> bool:
+        if self._order_ttl is None:
+            return False
+        created_at = order.created_at or order.updated_at
+        if created_at is None:
+            return False
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        else:
+            created_at = created_at.astimezone(UTC)
+        return created_at + self._order_ttl < self._now_factory()
 
 
 def _event_key(
