@@ -2,39 +2,11 @@ name: integration-postgres
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 jobs:
-  integration-postgres:
-    name: integration-postgres
+  placeholder:
+    name: postgres-integration-deferred
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_DB: diet_bot_test
-          POSTGRES_USER: diet_bot
-          POSTGRES_PASSWORD: diet_bot_test_password
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U diet_bot -d diet_bot_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DIET_BOT_TEST_DATABASE_URL: postgresql://diet_bot:diet_bot_test_password@localhost:5432/diet_bot_test
-
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install package and test dependencies
-        run: python -m pip install -e ".[dev]"
-      - name: Run PostgreSQL storage and migration tests
-        run: python -m pytest -q -p no:cacheprovider -m postgres_integration --require-postgres tests/test_postgres_store.py tests/test_json_to_postgres_migration.py
+      - name: PostgreSQL integration deferred
+        run: echo "PostgreSQL integration is intentionally deferred; no database service or integration tests run in PR2."

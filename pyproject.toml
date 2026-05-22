@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 diet-bot-telegram = "diet_bot.telegram_app:main"
+diet-bot-healthcheck = "diet_bot.healthcheck:main"
 
 [project.optional-dependencies]
 dev = [
