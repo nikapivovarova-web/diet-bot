@@ -36,6 +36,33 @@ class PostgresEntitlementStore:
                 with conn.cursor() as cur:
                     run_entitlement_schema_migrations(cur)
 
+    def validate_schema(self) -> None:
+        expected_tables = {
+            "schema_migrations",
+            "entitlements",
+            "entitlement_processed_charge_ids",
+            "entitlement_json_import_runs",
+        }
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                      AND table_name = ANY(%s)
+                    """,
+                    (sorted(expected_tables),),
+                )
+                found_tables = {str(row["table_name"]) for row in cur.fetchall()}
+
+        missing_tables = sorted(expected_tables - found_tables)
+        if missing_tables:
+            raise EntitlementStorageError(
+                "Postgres entitlement schema is missing tables: "
+                f"{', '.join(missing_tables)}. Run entitlement migrations before startup.",
+            )
+
     def load_all(self) -> dict[int, Entitlement]:
         with self._connect() as conn:
             with conn.cursor() as cur:

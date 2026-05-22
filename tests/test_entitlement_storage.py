@@ -1,9 +1,12 @@
 import json
+import builtins
+import sys
 from pathlib import Path
 
 import pytest
 
 import diet_bot.entitlement_storage as entitlement_storage
+from diet_bot.runtime_config import load_runtime_config
 from diet_bot.entitlement_storage import (
     EntitlementStateCorrupt,
     EntitlementStorageError,
@@ -121,6 +124,91 @@ def test_recover_from_backup_requires_valid_backup_and_restores(tmp_path: Path) 
     store.recover_from_backup()
 
     assert store.load_all()[456].extra_weekly_pdf_remaining == 2
+
+
+def test_create_entitlement_store_defaults_to_json_without_postgres_import(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sys.modules.pop("diet_bot.postgres_entitlement_store", None)
+    sys.modules.pop("psycopg", None)
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.startswith(("diet_bot.postgres_entitlement_store", "psycopg")):
+            raise AssertionError(f"JSON runtime imported postgres dependency {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    from diet_bot.entitlement_runtime import create_entitlement_store
+
+    path = tmp_path / "subscriptions.json"
+    config = load_runtime_config({"DIET_BOT_SUBSCRIPTIONS_STATE_FILE": str(path)})
+
+    store = create_entitlement_store(config)
+
+    assert isinstance(store, JsonEntitlementStore)
+    assert store.path == path
+
+
+def test_create_entitlement_store_uses_postgres_when_requested() -> None:
+    from diet_bot.entitlement_runtime import create_entitlement_store
+    from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
+
+    database_url = "postgresql://user:secret@example/db"
+    config = load_runtime_config(
+        {
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": database_url,
+        },
+    )
+
+    store = create_entitlement_store(config)
+
+    assert isinstance(store, PostgresEntitlementStore)
+    assert store.dsn == database_url
+
+
+def test_json_startup_validation_uses_existing_fail_closed_parser(tmp_path: Path) -> None:
+    from diet_bot.entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
+
+    path = tmp_path / "subscriptions.json"
+    path.write_text("{not-json", encoding="utf-8")
+    config = load_runtime_config({"DIET_BOT_SUBSCRIPTIONS_STATE_FILE": str(path)})
+    store = create_entitlement_store(config)
+
+    with pytest.raises(RuntimeError, match="Entitlement state is invalid"):
+        validate_entitlement_store_for_startup(config, store)
+
+
+def test_postgres_startup_validation_does_not_auto_migrate() -> None:
+    from diet_bot.entitlement_runtime import validate_entitlement_store_for_startup
+
+    class FakePostgresStore:
+        def __init__(self) -> None:
+            self.validated = False
+            self.initialize_called = False
+
+        def validate_schema(self) -> None:
+            self.validated = True
+
+        def initialize(self) -> None:
+            self.initialize_called = True
+            raise AssertionError("startup validation must not auto-migrate")
+
+    store = FakePostgresStore()
+    config = load_runtime_config(
+        {
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    validate_entitlement_store_for_startup(config, store)
+
+    assert store.validated is True
+    assert store.initialize_called is False
 
 
 def _write_state(path: Path, entitlements: dict[int, Entitlement]) -> None:

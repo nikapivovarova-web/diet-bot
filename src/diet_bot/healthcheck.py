@@ -16,6 +16,7 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     parser = argparse.ArgumentParser(description="Check diet bot runtime configuration.")
     parser.add_argument(
         "--strict-production",
+        "--strict",
         action="store_true",
         help="include opt-in production readiness checks",
     )

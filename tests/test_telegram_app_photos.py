@@ -168,6 +168,90 @@ def test_start_keyboard_has_welcome_buttons() -> None:
 
 
 @pytest.mark.anyio
+async def test_run_bot_startup_rejects_production_json_before_bot(monkeypatch) -> None:
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("DIET_BOT_ENV", "production")
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "json")
+    monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://user:secret@example/db")
+
+    def fail_bot(_token):
+        raise AssertionError("Bot must not be constructed for invalid runtime config")
+
+    monkeypatch.setattr(telegram_app, "Bot", fail_bot)
+
+    with pytest.raises(RuntimeError, match="JSON storage is not allowed in production"):
+        await telegram_app.run_bot()
+
+
+@pytest.mark.anyio
+async def test_run_bot_startup_json_default_validates_json_storage(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "subscriptions.json"
+    path.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("DIET_BOT_ENV", "development")
+    monkeypatch.delenv("DIET_BOT_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("DIET_BOT_DATABASE_URL", raising=False)
+    monkeypatch.setenv("DIET_BOT_SUBSCRIPTIONS_STATE_FILE", str(path))
+
+    def fail_bot(_token):
+        raise AssertionError("Bot must not be constructed before storage validation")
+
+    monkeypatch.setattr(telegram_app, "Bot", fail_bot)
+
+    with pytest.raises(RuntimeError, match="Entitlement state is invalid"):
+        await telegram_app.run_bot()
+
+
+@pytest.mark.anyio
+async def test_run_bot_startup_postgres_mode_skips_json_validation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "subscriptions.json"
+    path.write_text("{not-json", encoding="utf-8")
+    fake_bot = object()
+    validated: list[tuple[str, object]] = []
+    polled: list[object] = []
+
+    class FakeDispatcher:
+        async def start_polling(self, bot) -> None:
+            polled.append(bot)
+
+    async def fake_set_commands(_bot) -> None:
+        return None
+
+    def fake_create_store(config):
+        return object()
+
+    def fake_validate_store(config, store) -> None:
+        validated.append((config.storage_backend, store))
+
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("DIET_BOT_ENV", "development")
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "postgres")
+    monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://user:secret@example/db")
+    monkeypatch.setenv("DIET_BOT_SUBSCRIPTIONS_STATE_FILE", str(path))
+    monkeypatch.setattr(telegram_app, "create_entitlement_store", fake_create_store, raising=False)
+    monkeypatch.setattr(
+        telegram_app,
+        "validate_entitlement_store_for_startup",
+        fake_validate_store,
+        raising=False,
+    )
+    monkeypatch.setattr(telegram_app, "Bot", lambda _token: fake_bot)
+    monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_commands)
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+
+    await telegram_app.run_bot()
+
+    assert validated and validated[0][0] == "postgres"
+    assert polled == [fake_bot]
+
+
+@pytest.mark.anyio
 async def test_promo_code_button_asks_for_code(monkeypatch, tmp_path) -> None:
     chat_id = 80_201
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")

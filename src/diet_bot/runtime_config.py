@@ -15,12 +15,15 @@ DEFAULT_PROMO_CODES_STATE_FILE = DEFAULT_STATE_FILE.with_name("promo_codes.json"
 MISSING_BOT_TOKEN_ERROR = "Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN."
 
 _TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_VALID_STORAGE_BACKENDS = {"json", "postgres"}
+_PRODUCTION_ENVIRONMENTS = {"production", "prod"}
 
 
 @dataclass(frozen=True)
 class RuntimeConfig:
     bot_token: str | None
     bot_token_source: str | None
+    environment: str
     payments_enabled: bool
     telegram_provider_token: str
     database_url: str | None
@@ -33,14 +36,17 @@ class RuntimeConfig:
     weekly_selection_diagnostics_enabled: bool
     privacy_policy_url: str | None
     storage_backend: str = "json"
+    config_errors: tuple[str, ...] = ()
 
     def safe_summary(self) -> dict[str, object]:
         return {
+            "environment": self.environment,
             "bot_token": "set" if self.bot_token else "missing",
             "bot_token_source": self.bot_token_source if self.bot_token else None,
             "payments_enabled": self.payments_enabled,
             "telegram_provider_token": "set" if self.telegram_provider_token else "missing",
             "database_url": "set" if self.database_url else "missing",
+            "database_url_present": bool(self.database_url),
             "state_file": str(self.state_file),
             "subscriptions_state_file": str(self.subscriptions_state_file),
             "promo_codes_state_file": str(self.promo_codes_state_file),
@@ -53,9 +59,17 @@ class RuntimeConfig:
         }
 
     def validate_startup(self) -> tuple[str, ...]:
-        if self.bot_token:
-            return ()
-        return (MISSING_BOT_TOKEN_ERROR,)
+        issues = list(self.config_errors)
+        if self.storage_backend == "postgres" and not self.database_url:
+            issues.append("DIET_BOT_DATABASE_URL is required for postgres storage.")
+        if is_production_environment(self.environment):
+            if not self.database_url:
+                issues.append("DIET_BOT_DATABASE_URL is required in production.")
+            if self.storage_backend == "json":
+                issues.append("JSON storage is not allowed in production.")
+        if not self.bot_token:
+            issues.append(MISSING_BOT_TOKEN_ERROR)
+        return tuple(issues)
 
     def validate_strict_production(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -67,7 +81,7 @@ class RuntimeConfig:
             issues.append("DIET_BOT_PRIVACY_POLICY_URL is required for strict production.")
         if self.storage_backend == "json":
             issues.append(
-                "Strict production requires non-JSON storage; current runtime uses JSON state files.",
+                "Strict production requires non-JSON storage; JSON storage is not allowed in production.",
             )
         return tuple(issues)
 
@@ -75,11 +89,14 @@ class RuntimeConfig:
 def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
     source = os.environ if env is None else env
     bot_token, bot_token_source = _bot_token_from_env(source)
+    environment = _environment_from_env(source)
+    storage_backend, config_errors = _storage_backend_from_env(source, environment)
     state_file = _path_from_env(source, "DIET_BOT_STATE_FILE", DEFAULT_STATE_FILE)
 
     return RuntimeConfig(
         bot_token=bot_token,
         bot_token_source=bot_token_source,
+        environment=environment,
         payments_enabled=_text_from_env(source, "DIET_BOT_PAYMENTS_ENABLED") == "1",
         telegram_provider_token=_text_from_env(source, "TELEGRAM_PROVIDER_TOKEN") or "",
         database_url=_text_from_env(source, "DIET_BOT_DATABASE_URL"),
@@ -99,6 +116,8 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         tester_chat_ids=frozenset(_parse_id_set(source.get("DIET_BOT_TESTER_CHAT_IDS"))),
         weekly_selection_diagnostics_enabled=weekly_selection_diagnostics_enabled(source),
         privacy_policy_url=_text_from_env(source, "DIET_BOT_PRIVACY_POLICY_URL"),
+        storage_backend=storage_backend,
+        config_errors=config_errors,
     )
 
 
@@ -128,6 +147,10 @@ def parse_optional_int(raw: str | None) -> int | None:
     return _parse_optional_int(raw)
 
 
+def is_production_environment(environment: str | None) -> bool:
+    return (environment or "").strip().lower() in _PRODUCTION_ENVIRONMENTS
+
+
 def _bot_token_from_env(env: Mapping[str, str]) -> tuple[str | None, str | None]:
     diet_bot_token = _text_from_env(env, "DIET_BOT_TOKEN")
     if diet_bot_token:
@@ -138,6 +161,21 @@ def _bot_token_from_env(env: Mapping[str, str]) -> tuple[str | None, str | None]
         return telegram_bot_token, "TELEGRAM_BOT_TOKEN"
 
     return None, None
+
+
+def _environment_from_env(env: Mapping[str, str]) -> str:
+    return (_text_from_env(env, "DIET_BOT_ENV") or "development").lower()
+
+
+def _storage_backend_from_env(env: Mapping[str, str], environment: str) -> tuple[str, tuple[str, ...]]:
+    raw = _text_from_env(env, "DIET_BOT_STORAGE_BACKEND")
+    if raw is None:
+        return ("postgres" if is_production_environment(environment) else "json"), ()
+
+    backend = raw.lower()
+    if backend in _VALID_STORAGE_BACKENDS:
+        return backend, ()
+    return backend, ("DIET_BOT_STORAGE_BACKEND must be 'json' or 'postgres'.",)
 
 
 def _text_from_env(env: Mapping[str, str], key: str) -> str | None:

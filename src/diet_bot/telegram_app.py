@@ -90,8 +90,9 @@ from .runtime_config import (
     weekly_selection_diagnostics_enabled,
 )
 from .safety import evaluate_safety
+from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
 from .entitlement_service import EntitlementService
-from .entitlement_storage import EntitlementStorageError, JsonEntitlementStore
+from .entitlement_storage import EntitlementStorageError
 from .subscriptions import (
     MONTHLY_ONE_DAY_LIMIT,
     MONTHLY_WEEKLY_PDF_LIMIT,
@@ -134,16 +135,13 @@ ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить дос�
 
 
 def _entitlement_service() -> EntitlementService:
-    return EntitlementService(JsonEntitlementStore(SUBSCRIPTIONS_STATE_FILE))
+    config = replace(load_runtime_config(), subscriptions_state_file=SUBSCRIPTIONS_STATE_FILE)
+    return EntitlementService(create_entitlement_store(config))
 
 
-def _validate_entitlement_storage() -> None:
-    try:
-        JsonEntitlementStore(SUBSCRIPTIONS_STATE_FILE).load_all()
-    except EntitlementStorageError as exc:
-        raise RuntimeError(
-            f"Entitlement state is invalid at {SUBSCRIPTIONS_STATE_FILE}: {exc}",
-        ) from exc
+def _validate_entitlement_storage(config) -> None:
+    store = create_entitlement_store(config)
+    validate_entitlement_store_for_startup(config, store)
 
 
 async def _send_entitlement_storage_error(message: Message) -> None:
@@ -1267,7 +1265,7 @@ async def run_bot() -> None:
     if startup_issues:
         raise RuntimeError("; ".join(startup_issues))
     assert config.bot_token is not None
-    _validate_entitlement_storage()
+    _validate_entitlement_storage(config)
     bot = Bot(config.bot_token)
     await _set_bot_commands(bot)
     dispatcher = create_dispatcher()
