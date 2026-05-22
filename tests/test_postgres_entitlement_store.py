@@ -93,7 +93,7 @@ def store() -> PostgresEntitlementStore:
     try:
         _create_test_schema(psycopg, sql, admin_dsn, schema_name)
     except Exception as exc:
-        pytest.skip(f"Postgres test database is unavailable: {exc}")
+        pytest.fail(f"Postgres test database schema setup failed: {exc}")
 
     scoped_dsn = make_conninfo(
         TEST_DATABASE_URL,
@@ -105,7 +105,7 @@ def store() -> PostgresEntitlementStore:
         candidate.initialize()
     except Exception as exc:
         _drop_test_schema(psycopg, sql, admin_dsn, schema_name)
-        pytest.skip(f"Postgres test database is unavailable: {exc}")
+        pytest.fail(f"Postgres test database initialization failed: {exc}")
     try:
         yield candidate
     finally:
