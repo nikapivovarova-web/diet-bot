@@ -97,7 +97,7 @@ def test_week_pdf_contains_fixed_soup_recipe_to_the_end(tmp_path: Path, sample_w
     text = _pdf_text(pdf_path)
 
     assert "овощной бульон и кокосовое молоко" in text
-    assert "подавайте с кинзой и кокосовыми сливками" in text
+    assert "посыпьте кинзой и добавьте по ложке кокосовых сливок" in text
 
 
 def test_week_pdf_uses_batch_adjusted_cracker_recipe(tmp_path: Path, sample_week_dates) -> None:
@@ -111,7 +111,8 @@ def test_week_pdf_uses_batch_adjusted_cracker_recipe(tmp_path: Path, sample_week
     assert "Приготовьте 6 крекеров на 3 перекуса" in text
     assert "ржаная мука" in text
     assert "пшеничная мука" in text
-    assert "выпекайте 60-90 минут" in text
+    assert "Выпекайте 45 минут" in text
+    assert "пеките еще 45 минут" in text
 
 
 def _plan_for_recipe(recipe) -> MealPlan:
