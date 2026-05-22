@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import math
-import os
 import random
 import re
 import time
@@ -80,6 +79,16 @@ from .recipe_catalog import RecipeTemplate, built_in_recipes
 from .recipe_traits import RecipeTraits, infer_recipe_traits
 from .promo_codes import PromoCodeActivation, activate_promo_code
 from .questionnaire import QuestionnaireSession, start_session
+from .runtime_config import (
+    DEFAULT_PROMO_CODES_STATE_FILE,
+    DEFAULT_STATE_FILE,
+    DEFAULT_SUBSCRIPTIONS_STATE_FILE,
+    load_runtime_config,
+    parse_id_set as _parse_runtime_id_set,
+    parse_optional_int as _parse_runtime_optional_int,
+    validate_startup,
+    weekly_selection_diagnostics_enabled,
+)
 from .safety import evaluate_safety
 from .entitlement_service import EntitlementService
 from .entitlement_storage import EntitlementStorageError, JsonEntitlementStore
@@ -295,12 +304,7 @@ def _weekly_selection_phase_timeout(phase: str) -> float:
 
 
 def _weekly_selection_diag_enabled() -> bool:
-    return os.getenv("DIET_BOT_WEEKLY_SELECTION_DIAG", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return weekly_selection_diagnostics_enabled()
 
 
 def _weekly_selection_phase_label(phase: str) -> str:
@@ -565,32 +569,19 @@ class RecipeHistoryItem:
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
-    ids: set[int] = set()
-    for item in re.split(r"[\s,;]+", raw or ""):
-        if not item:
-            continue
-        try:
-            ids.add(int(item))
-        except ValueError:
-            continue
-    return ids
+    return _parse_runtime_id_set(raw)
 
 
 def _parse_optional_int(raw: str | None) -> int | None:
-    if raw is None:
-        return None
-    try:
-        return int(raw.strip())
-    except ValueError:
-        return None
+    return _parse_runtime_optional_int(raw)
 
 
 def _payments_enabled_from_env() -> bool:
-    return os.getenv("DIET_BOT_PAYMENTS_ENABLED", "").strip() == "1"
+    return load_runtime_config().payments_enabled
 
 
 def _support_chat_id_from_env() -> int | None:
-    return _parse_optional_int(os.getenv("DIET_BOT_SUPPORT_CHAT_ID"))
+    return load_runtime_config().support_chat_id
 
 
 def _payments_enabled() -> bool:
@@ -724,17 +715,15 @@ BATCH_CONTAINER_RE = re.compile(r"(?:форма|форму|ячейк|капсу
 RECENT_RECIPE_LIMIT = 160
 DATA_DIR = Path(__file__).with_name("data")
 WELCOME_PHOTO_PATH = DATA_DIR / "welcome_foodbalance.png"
-DEFAULT_STATE_FILE = Path(__file__).resolve().parents[2] / ".diet_bot_state" / "history.json"
-STATE_FILE = Path(os.getenv("DIET_BOT_STATE_FILE", str(DEFAULT_STATE_FILE)))
-DEFAULT_SUBSCRIPTIONS_STATE_FILE = DEFAULT_STATE_FILE.with_name("subscriptions.json")
-SUBSCRIPTIONS_STATE_FILE = Path(os.getenv("DIET_BOT_SUBSCRIPTIONS_STATE_FILE", str(DEFAULT_SUBSCRIPTIONS_STATE_FILE)))
-DEFAULT_PROMO_CODES_STATE_FILE = DEFAULT_STATE_FILE.with_name("promo_codes.json")
-PROMO_CODES_STATE_FILE = Path(os.getenv("DIET_BOT_PROMO_CODES_STATE_FILE", str(DEFAULT_PROMO_CODES_STATE_FILE)))
-ADMIN_USER_IDS = _parse_id_set(os.getenv("DIET_BOT_ADMIN_USER_IDS"))
-TESTER_CHAT_IDS = _parse_id_set(os.getenv("DIET_BOT_TESTER_CHAT_IDS"))
-TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "").strip()
-PAYMENTS_ENABLED = _payments_enabled_from_env()
-SUPPORT_CHAT_ID = _support_chat_id_from_env()
+_RUNTIME_CONFIG = load_runtime_config()
+STATE_FILE = _RUNTIME_CONFIG.state_file
+SUBSCRIPTIONS_STATE_FILE = _RUNTIME_CONFIG.subscriptions_state_file
+PROMO_CODES_STATE_FILE = _RUNTIME_CONFIG.promo_codes_state_file
+ADMIN_USER_IDS = set(_RUNTIME_CONFIG.admin_user_ids)
+TESTER_CHAT_IDS = set(_RUNTIME_CONFIG.tester_chat_ids)
+TELEGRAM_PROVIDER_TOKEN = _RUNTIME_CONFIG.telegram_provider_token
+PAYMENTS_ENABLED = _RUNTIME_CONFIG.payments_enabled
+SUPPORT_CHAT_ID = _RUNTIME_CONFIG.support_chat_id
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
 CALLBACK_NEW = "diet:new"
@@ -1273,11 +1262,13 @@ def create_dispatcher() -> Dispatcher:
 
 
 async def run_bot() -> None:
-    token = os.getenv("DIET_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.")
+    config = load_runtime_config()
+    startup_issues = validate_startup(config)
+    if startup_issues:
+        raise RuntimeError("; ".join(startup_issues))
+    assert config.bot_token is not None
     _validate_entitlement_storage()
-    bot = Bot(token)
+    bot = Bot(config.bot_token)
     await _set_bot_commands(bot)
     dispatcher = create_dispatcher()
     await dispatcher.start_polling(bot)
