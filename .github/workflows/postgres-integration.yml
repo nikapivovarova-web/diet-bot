@@ -42,8 +42,8 @@ jobs:
           python-version: "3.11"
       - name: Install package and test dependencies
         run: python -m pip install -e ".[dev]"
-      - name: Run PostgreSQL entitlement integration tests
-        run: python -m pytest -q -p no:cacheprovider -m postgres_integration tests/test_postgres_entitlement_store.py
+      - name: Run PostgreSQL integration tests
+        run: python -m pytest -q -p no:cacheprovider -m postgres_integration tests/test_postgres_entitlement_store.py tests/test_postgres_payment_store.py
       - name: Run entitlement JSON migration tests
         run: python -m pytest -q -p no:cacheprovider tests/test_entitlement_json_migration.py
       - name: Run storage runtime safety tests
