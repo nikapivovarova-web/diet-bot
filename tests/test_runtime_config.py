@@ -52,6 +52,93 @@ def test_provider_token_alone_does_not_enable_payments() -> None:
     assert config.payments_enabled is False
 
 
+def test_storage_backend_defaults_to_json_outside_production() -> None:
+    assert load_runtime_config({}).storage_backend == "json"
+    assert load_runtime_config({"DIET_BOT_ENV": "local"}).storage_backend == "json"
+    assert load_runtime_config({"DIET_BOT_ENV": "development"}).storage_backend == "json"
+
+
+def test_storage_backend_accepts_explicit_json_and_postgres() -> None:
+    json_config = load_runtime_config({"DIET_BOT_STORAGE_BACKEND": "json"})
+    postgres_config = load_runtime_config(
+        {
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    assert json_config.storage_backend == "json"
+    assert postgres_config.storage_backend == "postgres"
+    assert validate_startup(postgres_config) == ("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.",)
+
+
+def test_invalid_storage_backend_is_startup_config_error() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_STORAGE_BACKEND": "sqlite",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_STORAGE_BACKEND" in issue for issue in issues)
+    assert any("json" in issue and "postgres" in issue for issue in issues)
+
+
+def test_production_defaults_to_postgres_backend_when_unset() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    assert config.environment == "production"
+    assert config.storage_backend == "postgres"
+    assert validate_startup(config) == ()
+
+
+def test_production_explicit_json_backend_is_rejected() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_STORAGE_BACKEND": "json",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert config.storage_backend == "json"
+    assert any("JSON storage is not allowed in production" in issue for issue in issues)
+
+
+def test_postgres_backend_requires_database_url() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+        },
+    )
+
+    assert any("DIET_BOT_DATABASE_URL is required for postgres storage" in issue for issue in validate_startup(config))
+
+
+def test_production_requires_database_url() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ENV": "production",
+        },
+    )
+
+    assert config.storage_backend == "postgres"
+    assert any("DIET_BOT_DATABASE_URL is required in production" in issue for issue in validate_startup(config))
+
+
 def test_support_admin_and_tester_ids_are_parsed() -> None:
     config = load_runtime_config(
         {
@@ -104,6 +191,9 @@ def test_safe_summary_redacts_secrets() -> None:
     assert summary["bot_token"] == "set"
     assert summary["telegram_provider_token"] == "set"
     assert summary["database_url"] == "set"
+    assert summary["database_url_present"] is True
+    assert summary["environment"] == "development"
+    assert summary["storage_backend"] == "json"
     assert summary["admin_user_ids_count"] == 2
     assert summary["tester_chat_ids_count"] == 1
     assert "bot-super-secret" not in encoded
