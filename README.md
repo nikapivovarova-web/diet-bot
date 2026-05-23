@@ -19,10 +19,16 @@ Create a bot in BotFather and set the token:
 
 ```powershell
 $env:DIET_BOT_TOKEN = "123456:telegram-token"
-$env:TELEGRAM_PROVIDER_TOKEN = "123456:TEST:telegram-provider-token" # YooKassa payments via Telegram
 $env:PYTHONPATH = "src"
 .\.venv\Scripts\python.exe -m diet_bot.telegram_app
 ```
+
+Payments are disabled by default. Do not set `DIET_BOT_PAYMENTS_ENABLED` or
+`TELEGRAM_PROVIDER_TOKEN` for normal local runs; payment QA and live payment
+enablement require an explicit enablement decision.
+
+Production operators should follow
+[`docs/production-runbook.md`](docs/production-runbook.md) before any cutover.
 
 MVP commands:
 
