@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import uuid
+from inspect import signature
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -41,6 +42,15 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     assert "WHERE status IN ('queued', 'running')" in statements
     assert "idx_weekly_pdf_jobs_idempotency_key_unique" in statements
     assert "idx_weekly_pdf_jobs_stale" in statements
+
+
+def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
+    start_signature = signature(PostgresWeeklyPdfJobStore.start_job_and_consume)
+    cleanup_signature = signature(PostgresWeeklyPdfJobStore.cleanup_stale)
+
+    assert "test_access" in start_signature.parameters
+    assert "chat_id" in cleanup_signature.parameters
+    assert hasattr(PostgresWeeklyPdfJobStore, "cancel_queued")
 
 
 @pytest.fixture
@@ -266,8 +276,8 @@ def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore
     ).job
     started = store.start_job_and_consume(job.job_id, now=now, stale_after=now - timedelta(seconds=1)).job
 
-    cleaned = store.cleanup_stale(now=now)
-    cleaned_again = store.cleanup_stale(now=now + timedelta(minutes=1))
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now)
+    cleaned_again = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(minutes=1))
 
     assert [job.job_id for job in cleaned.jobs] == [started.job_id]
     assert cleaned.job_results[0].status == FinishJobResultStatus.FAILED
@@ -287,7 +297,7 @@ def test_cleanup_stale_queued_job_cancels_without_refund(store: PostgresWeeklyPd
         stale_after=now - timedelta(seconds=1),
     ).job
 
-    cleaned = store.cleanup_stale(now=now)
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now)
 
     assert [cleaned_job.job_id for cleaned_job in cleaned.jobs] == [job.job_id]
     assert cleaned.job_results[0].status == FinishJobResultStatus.CANCELLED
@@ -320,6 +330,27 @@ def test_test_access_job_does_not_mutate_quota_or_refund(store: PostgresWeeklyPd
     assert failed.refund_status == REFUND_STATUS_NOT_REQUIRED
     assert saved.monthly_weekly_pdf_remaining == 0
     assert saved.is_test_access_active(now)
+
+
+def test_test_access_flag_job_does_not_create_or_refund_entitlement(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 110
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="test-access-flag-job",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+
+    started = store.start_job_and_consume(job.job_id, now=now, test_access=True).job
+    failed = store.finish_failure_and_refund_once(started.job_id, reason="send_failed", now=now).job
+    saved = PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).load_all()
+
+    assert started.status == JOB_STATUS_RUNNING
+    assert started.consumption_source == "test_access"
+    assert started.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert failed.status == JOB_STATUS_FAILED
+    assert failed.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert chat_id not in saved
 
 
 def test_finish_success_rejects_queued_job_without_status_change(store: PostgresWeeklyPdfJobStore) -> None:
