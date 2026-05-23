@@ -227,6 +227,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     path.write_text("{not-json", encoding="utf-8")
     fake_bot = object()
     validated: list[tuple[str, object]] = []
+    weekly_pdf_validated: list[str] = []
     polled: list[object] = []
 
     class FakeDispatcher:
@@ -242,6 +243,9 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     def fake_validate_store(config, store) -> None:
         validated.append((config.storage_backend, store))
 
+    def fake_validate_weekly_pdf_jobs(config) -> None:
+        weekly_pdf_validated.append(config.storage_backend)
+
     monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
     monkeypatch.setenv("DIET_BOT_ENV", "development")
     monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "postgres")
@@ -254,6 +258,11 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
         fake_validate_store,
         raising=False,
     )
+    monkeypatch.setattr(
+        telegram_app,
+        "validate_weekly_pdf_job_runtime_for_startup",
+        fake_validate_weekly_pdf_jobs,
+    )
     monkeypatch.setattr(telegram_app, "Bot", lambda _token: fake_bot)
     monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_commands)
     monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
@@ -261,6 +270,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     await telegram_app.run_bot()
 
     assert validated and validated[0][0] == "postgres"
+    assert weekly_pdf_validated == ["postgres"]
     assert polled == [fake_bot]
 
 
