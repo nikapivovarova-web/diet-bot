@@ -128,6 +128,7 @@ class PostgresWeeklyPdfJobStore:
         *,
         now: datetime | None = None,
         stale_after: datetime | None = None,
+        test_access: bool = False,
     ) -> StartJobResult:
         current_time = _normalize_datetime(now)
         with self._connect() as conn:
@@ -143,21 +144,25 @@ class PostgresWeeklyPdfJobStore:
                     if job.status != JOB_STATUS_QUEUED:
                         return StartJobResult(StartJobResultStatus.TERMINAL, job)
 
-                    _lock_entitlement_map_cur(cur)
-                    entitlement = _load_entitlement_cur(cur, job.chat_id)
-                    consumption = consume_weekly_pdf_attempt(entitlement, current_time)
-                    _upsert_entitlement_cur(cur, job.chat_id, entitlement)
+                    if test_access:
+                        consumption_source = "test_access"
+                    else:
+                        _lock_entitlement_map_cur(cur)
+                        entitlement = _load_entitlement_cur(cur, job.chat_id)
+                        consumption = consume_weekly_pdf_attempt(entitlement, current_time)
+                        _upsert_entitlement_cur(cur, job.chat_id, entitlement)
 
-                    if not consumption.allowed:
-                        denied_job = self._mark_job_failed_without_refund_cur(
-                            cur,
-                            job,
-                            reason="weekly_pdf_entitlement_unavailable",
-                            now=current_time,
-                        )
-                        return StartJobResult(StartJobResultStatus.DENIED, denied_job)
+                        if not consumption.allowed:
+                            denied_job = self._mark_job_failed_without_refund_cur(
+                                cur,
+                                job,
+                                reason="weekly_pdf_entitlement_unavailable",
+                                now=current_time,
+                            )
+                            return StartJobResult(StartJobResultStatus.DENIED, denied_job)
+                        consumption_source = consumption.source
 
-                    refund_status = refund_status_for_consumption_source(consumption.source)
+                    refund_status = refund_status_for_consumption_source(consumption_source)
                     cur.execute(
                         """
                         UPDATE weekly_pdf_jobs
@@ -172,7 +177,7 @@ class PostgresWeeklyPdfJobStore:
                         RETURNING *
                         """,
                         (
-                            consumption.source,
+                            consumption_source,
                             refund_status,
                             _normalize_datetime(stale_after) if stale_after is not None else job.stale_after,
                             current_time,
@@ -262,13 +267,38 @@ class PostgresWeeklyPdfJobStore:
                         now=current_time,
                     )
 
+    def cancel_queued(
+        self,
+        job_id: UUID | str,
+        *,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> FinishJobResult:
+        current_time = _normalize_datetime(now)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return FinishJobResult(FinishJobResultStatus.NOT_FOUND, None)
+                    if job.status in TERMINAL_JOB_STATUSES:
+                        return FinishJobResult(FinishJobResultStatus.ALREADY_TERMINAL, job)
+                    if job.status != JOB_STATUS_QUEUED:
+                        return FinishJobResult(FinishJobResultStatus.INVALID_STATE, job)
+                    return FinishJobResult(
+                        FinishJobResultStatus.CANCELLED,
+                        self._cancel_queued_job_cur(cur, job, reason=reason, now=current_time),
+                    )
+
     def cleanup_stale(
         self,
         *,
+        chat_id: int,
         now: datetime | None = None,
-        limit: int = 100,
+        limit: int = 10,
     ) -> CleanupStaleResult:
         current_time = _normalize_datetime(now)
+        bounded_limit = min(25, max(1, int(limit)))
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
@@ -276,13 +306,14 @@ class PostgresWeeklyPdfJobStore:
                         """
                         SELECT *
                         FROM weekly_pdf_jobs
-                        WHERE status IN ('queued', 'running')
+                        WHERE chat_id = %s
+                          AND status IN ('queued', 'running')
                           AND stale_after <= %s
                         ORDER BY stale_after, created_at, job_id
                         LIMIT %s
                         FOR UPDATE SKIP LOCKED
                         """,
-                        (current_time, max(1, int(limit))),
+                        (int(chat_id), current_time, bounded_limit),
                     )
                     stale_jobs = [_job_from_row(row) for row in cur.fetchall()]
                     job_results: list[FinishJobResult] = []
@@ -291,7 +322,7 @@ class PostgresWeeklyPdfJobStore:
                             job_results.append(
                                 FinishJobResult(
                                     FinishJobResultStatus.CANCELLED,
-                                    self._cancel_queued_job_cur(cur, job, now=current_time),
+                                    self._cancel_queued_job_cur(cur, job, reason="weekly_pdf_job_stale", now=current_time),
                                 )
                             )
                         elif job.status == JOB_STATUS_RUNNING:
@@ -348,18 +379,26 @@ class PostgresWeeklyPdfJobStore:
         row = cur.fetchone()
         return _job_from_row(row) if row is not None else None
 
-    def _cancel_queued_job_cur(self, cur: Any, job: WeeklyPdfJob, *, now: datetime) -> WeeklyPdfJob:
+    def _cancel_queued_job_cur(
+        self,
+        cur: Any,
+        job: WeeklyPdfJob,
+        *,
+        reason: str | None = None,
+        now: datetime,
+    ) -> WeeklyPdfJob:
         cur.execute(
             """
             UPDATE weekly_pdf_jobs
             SET status = 'cancelled',
                 refund_status = 'not_required',
+                failure_reason = COALESCE(%s, failure_reason),
                 finished_at = COALESCE(finished_at, %s),
                 updated_at = %s
             WHERE job_id = %s
             RETURNING *
             """,
-            (now, now, job.job_id),
+            (_optional_text(reason), now, now, job.job_id),
         )
         return _job_from_row(cur.fetchone())
 

@@ -125,6 +125,8 @@ from .subscriptions import (
     set_test_access_enabled,
 )
 from .validation import validate_plan
+from .weekly_pdf_job_runtime import WeeklyPdfJobRuntime
+from .weekly_pdf_jobs import AdmitJobResultStatus, StartJobResultStatus, WeeklyPdfJob
 
 
 SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
@@ -152,6 +154,19 @@ def _entitlement_service() -> EntitlementService:
 
 def _payment_service():
     return create_payment_service(load_runtime_config())
+
+
+_WEEKLY_PDF_JOB_RUNTIME_NOT_LOADED = object()
+_WEEKLY_PDF_JOB_RUNTIME: WeeklyPdfJobRuntime | None | object = _WEEKLY_PDF_JOB_RUNTIME_NOT_LOADED
+
+
+def _weekly_pdf_job_runtime() -> WeeklyPdfJobRuntime | None:
+    global _WEEKLY_PDF_JOB_RUNTIME
+    if _WEEKLY_PDF_JOB_RUNTIME is _WEEKLY_PDF_JOB_RUNTIME_NOT_LOADED:
+        _WEEKLY_PDF_JOB_RUNTIME = WeeklyPdfJobRuntime.from_config(load_runtime_config())
+    if _WEEKLY_PDF_JOB_RUNTIME is None:
+        return None
+    return _WEEKLY_PDF_JOB_RUNTIME  # type: ignore[return-value]
 
 
 def _validate_entitlement_storage(config) -> None:
@@ -1095,7 +1110,11 @@ async def handle_callback(callback: CallbackQuery) -> None:
         if profile is None:
             await _start_questionnaire(message)
             return
-        await _send_week_plan_with_access(message, profile)
+        await _send_week_plan_with_access(
+            message,
+            profile,
+            idempotency_key=_weekly_pdf_callback_idempotency_key(callback),
+        )
         return
 
     if data.startswith(CALLBACK_ANSWER_PREFIX):
@@ -1569,8 +1588,38 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
     return sent
 
 
-async def _send_week_plan_with_access(message: Message, profile: UserProfile) -> bool:
+def _weekly_pdf_callback_idempotency_key(callback: CallbackQuery) -> str | None:
+    callback_id = getattr(callback, "id", None)
+    if not callback_id:
+        return None
+    return f"telegram_callback:{callback_id}"
+
+
+def _weekly_pdf_request_idempotency_key(message: Message, idempotency_key: str | None) -> str:
+    if idempotency_key:
+        return idempotency_key
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        return f"telegram_message:{message.chat.id}:{message_id}"
+    return f"telegram_request:{message.chat.id}:{time.time_ns()}"
+
+
+async def _send_week_plan_with_access(
+    message: Message,
+    profile: UserProfile,
+    *,
+    idempotency_key: str | None = None,
+) -> bool:
     chat_id = message.chat.id
+    weekly_pdf_job_runtime = _weekly_pdf_job_runtime()
+    if weekly_pdf_job_runtime is not None:
+        return await _send_week_plan_with_postgres_jobs(
+            message,
+            profile,
+            runtime=weekly_pdf_job_runtime,
+            idempotency_key=_weekly_pdf_request_idempotency_key(message, idempotency_key),
+        )
+
     if WEEK_PDF_QUEUE_MANAGER.has_chat(chat_id):
         _weekly_pdf_diag("queue_duplicate_precheck", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
         await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
@@ -1626,6 +1675,223 @@ async def _send_week_plan_with_access(message: Message, profile: UserProfile) ->
         _weekly_pdf_diag("queue_wait_cancelled", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
         WEEK_PDF_QUEUE_MANAGER.cancel(admission.future)
         raise
+
+
+async def _send_week_plan_with_postgres_jobs(
+    message: Message,
+    profile: UserProfile,
+    *,
+    runtime: WeeklyPdfJobRuntime,
+    idempotency_key: str,
+) -> bool:
+    chat_id = message.chat.id
+    try:
+        runtime.cleanup_stale(chat_id=chat_id)
+    except Exception:
+        logger.exception("Failed to cleanup stale weekly PDF jobs")
+        _weekly_pdf_diag("postgres_cleanup_stale_failed", chat_id=chat_id)
+
+    try:
+        job_admission = runtime.admit(
+            chat_id=chat_id,
+            idempotency_key=idempotency_key,
+            metadata={"source": "telegram_weekly_pdf"},
+        )
+    except Exception:
+        logger.exception("Failed to admit weekly PDF Postgres job")
+        _weekly_pdf_diag("postgres_admit_failed", chat_id=chat_id)
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if job_admission.status in {
+        AdmitJobResultStatus.ACTIVE_DUPLICATE,
+        AdmitJobResultStatus.EXISTING_IDEMPOTENCY,
+    }:
+        _weekly_pdf_diag("postgres_admit_duplicate", chat_id=chat_id, status=job_admission.status.value)
+        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
+        return False
+
+    queued_status_message: Message | None = None
+    postgres_start_attempted = False
+
+    async def run_weekly_pdf_job() -> bool:
+        nonlocal postgres_start_attempted
+        postgres_start_attempted = True
+        return await _send_week_plan_after_postgres_admission(
+            message,
+            profile,
+            runtime=runtime,
+            job=job_admission.job,
+            initial_status_message=queued_status_message,
+        )
+
+    try:
+        local_admission = WEEK_PDF_QUEUE_MANAGER.submit(chat_id, run_weekly_pdf_job)
+    except Exception:
+        _cancel_postgres_admitted_job(
+            runtime,
+            job_admission.job,
+            chat_id=chat_id,
+            reason="local_queue_submit_failed",
+        )
+        logger.exception("Failed to submit weekly PDF job to local queue")
+        await message.answer(WEEK_PDF_FAILURE_TEXT)
+        return False
+
+    if local_admission.duplicate:
+        _cancel_postgres_admitted_job(
+            runtime,
+            job_admission.job,
+            chat_id=chat_id,
+            reason="local_queue_duplicate_after_admit",
+        )
+        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
+        return False
+
+    if local_admission.future is None:
+        _cancel_postgres_admitted_job(
+            runtime,
+            job_admission.job,
+            chat_id=chat_id,
+            reason="local_queue_submit_failed",
+        )
+        await message.answer(WEEK_PDF_FAILURE_TEXT)
+        return False
+
+    if not local_admission.starts_immediately:
+        try:
+            queued_status_message = await message.answer(
+                _week_pdf_queue_status_text(local_admission.ahead_count),
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except asyncio.CancelledError:
+            WEEK_PDF_QUEUE_MANAGER.cancel(local_admission.future)
+            _cancel_postgres_admitted_job(
+                runtime,
+                job_admission.job,
+                chat_id=chat_id,
+                reason="local_queue_wait_cancelled",
+            )
+            raise
+        except Exception:
+            WEEK_PDF_QUEUE_MANAGER.cancel(local_admission.future)
+            _cancel_postgres_admitted_job(
+                runtime,
+                job_admission.job,
+                chat_id=chat_id,
+                reason="local_queue_status_failed",
+            )
+            raise
+        WEEK_PDF_QUEUE_MANAGER.mark_ready(local_admission.future)
+
+    try:
+        return await local_admission.future
+    except asyncio.CancelledError:
+        _weekly_pdf_diag("queue_wait_cancelled", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
+        WEEK_PDF_QUEUE_MANAGER.cancel(local_admission.future)
+        if not postgres_start_attempted:
+            _cancel_postgres_admitted_job(
+                runtime,
+                job_admission.job,
+                chat_id=chat_id,
+                reason="local_queue_wait_cancelled",
+            )
+        raise
+
+
+def _cancel_postgres_admitted_job(
+    runtime: WeeklyPdfJobRuntime,
+    job: WeeklyPdfJob,
+    *,
+    chat_id: int,
+    reason: str,
+) -> None:
+    try:
+        runtime.cancel_admitted_job(job.job_id, reason=reason)
+    except Exception:
+        logger.exception("Failed to cancel admitted weekly PDF Postgres job")
+        _weekly_pdf_diag("postgres_cancel_admitted_failed", chat_id=chat_id, reason=reason)
+
+
+async def _send_week_plan_after_postgres_admission(
+    message: Message,
+    profile: UserProfile,
+    *,
+    runtime: WeeklyPdfJobRuntime,
+    job: WeeklyPdfJob,
+    initial_status_message: Message | None = None,
+) -> bool:
+    chat_id = message.chat.id
+    try:
+        start_result = runtime.start_job_and_consume(
+            job.job_id,
+            test_access=chat_id in TESTER_CHAT_IDS,
+        )
+    except Exception:
+        logger.exception("Failed to start weekly PDF Postgres job")
+        _weekly_pdf_diag("postgres_start_failed", chat_id=chat_id)
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if start_result.status == StartJobResultStatus.DENIED:
+        await _send_limit_paywall(message, "weekly_pdf")
+        return False
+
+    if start_result.status != StartJobResultStatus.STARTED or start_result.job is None:
+        _weekly_pdf_diag("postgres_start_not_started", chat_id=chat_id, status=start_result.status.value)
+        await message.answer(
+            WEEK_PDF_ALREADY_RUNNING_TEXT
+            if start_result.status == StartJobResultStatus.ALREADY_RUNNING
+            else WEEK_PDF_FAILURE_TEXT
+        )
+        return False
+
+    consumption = AttemptConsumption(True, "weekly_pdf", start_result.job.consumption_source)
+    recipe_history_entries: list[RecipeHistoryItem] = []
+    try:
+        sent = await _send_week_plan(
+            message,
+            profile,
+            status_text=_format_entitlement_status(chat_id),
+            recipe_history_entries=recipe_history_entries,
+            pdf_slot_acquired=True,
+            initial_status_message=initial_status_message,
+        )
+    except Exception:
+        _finish_postgres_job_failure(
+            runtime,
+            job,
+            chat_id=chat_id,
+            reason="weekly_pdf_exception",
+        )
+        raise
+
+    if not sent:
+        _finish_postgres_job_failure(
+            runtime,
+            job,
+            chat_id=chat_id,
+            reason="weekly_pdf_not_sent",
+        )
+        return False
+
+    runtime.finish_success(job.job_id)
+    _record_successful_generation_history(chat_id, consumption, recipe_history_entries)
+    return True
+
+
+def _finish_postgres_job_failure(
+    runtime: WeeklyPdfJobRuntime,
+    job: WeeklyPdfJob,
+    *,
+    chat_id: int,
+    reason: str,
+) -> None:
+    try:
+        runtime.finish_failure_and_refund_once(job.job_id, reason=reason)
+    except Exception:
+        logger.exception("Failed to finalize failed weekly PDF Postgres job")
+        _weekly_pdf_diag("postgres_finish_failure_failed", chat_id=chat_id, reason=reason)
 
 
 async def _send_week_plan_after_queue_admission(
