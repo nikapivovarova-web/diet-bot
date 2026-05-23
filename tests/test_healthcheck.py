@@ -38,6 +38,27 @@ def test_healthcheck_default_fails_without_token(capsys) -> None:
     assert "Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN." in output
 
 
+def test_healthcheck_production_startup_requires_support_and_privacy(capsys) -> None:
+    from diet_bot.healthcheck import main
+
+    exit_code = main(
+        [],
+        env={
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ENV": "production",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "mode=startup" in output
+    assert "DIET_BOT_SUPPORT_CHAT_ID" in output
+    assert "DIET_BOT_PRIVACY_POLICY_URL" in output
+    assert "secret" not in output
+
+
 def test_healthcheck_strict_mode_reports_production_issues(capsys) -> None:
     from diet_bot.healthcheck import main
 

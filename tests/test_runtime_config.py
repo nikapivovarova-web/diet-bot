@@ -13,6 +13,17 @@ from diet_bot.runtime_config import (
 )
 
 
+def _production_env() -> dict[str, str]:
+    return {
+        "DIET_BOT_TOKEN": "fake-token",
+        "DIET_BOT_ENV": "production",
+        "DIET_BOT_STORAGE_BACKEND": "postgres",
+        "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
+        "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
+    }
+
+
 def test_bot_token_prefers_diet_bot_token() -> None:
     config = load_runtime_config(
         {
@@ -92,12 +103,66 @@ def test_production_defaults_to_postgres_backend_when_unset() -> None:
             "DIET_BOT_TOKEN": "fake-token",
             "DIET_BOT_ENV": "production",
             "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
+            "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
         },
     )
 
     assert config.environment == "production"
     assert config.storage_backend == "postgres"
     assert validate_startup(config) == ()
+
+
+def test_production_startup_accepts_required_postgres_support_and_privacy() -> None:
+    config = load_runtime_config(_production_env())
+
+    assert validate_startup(config) == ()
+
+
+def test_production_requires_support_chat_id() -> None:
+    env = _production_env()
+    env.pop("DIET_BOT_SUPPORT_CHAT_ID")
+    config = load_runtime_config(env)
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_SUPPORT_CHAT_ID" in issue for issue in issues)
+
+
+def test_production_rejects_invalid_support_chat_id() -> None:
+    config = load_runtime_config(
+        {
+            **_production_env(),
+            "DIET_BOT_SUPPORT_CHAT_ID": "not-a-chat-id",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_SUPPORT_CHAT_ID" in issue for issue in issues)
+
+
+def test_production_requires_privacy_policy_url() -> None:
+    env = _production_env()
+    env.pop("DIET_BOT_PRIVACY_POLICY_URL")
+    config = load_runtime_config(env)
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_PRIVACY_POLICY_URL" in issue for issue in issues)
+
+
+def test_production_rejects_invalid_privacy_policy_url() -> None:
+    config = load_runtime_config(
+        {
+            **_production_env(),
+            "DIET_BOT_PRIVACY_POLICY_URL": "foodbalance.example/privacy",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_PRIVACY_POLICY_URL" in issue for issue in issues)
 
 
 def test_production_explicit_json_backend_is_rejected() -> None:
@@ -107,6 +172,8 @@ def test_production_explicit_json_backend_is_rejected() -> None:
             "DIET_BOT_ENV": "production",
             "DIET_BOT_STORAGE_BACKEND": "json",
             "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
+            "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
         },
     )
 
