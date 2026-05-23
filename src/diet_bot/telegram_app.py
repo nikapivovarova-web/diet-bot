@@ -125,7 +125,10 @@ from .subscriptions import (
     set_test_access_enabled,
 )
 from .validation import validate_plan
-from .weekly_pdf_job_runtime import WeeklyPdfJobRuntime
+from .weekly_pdf_job_runtime import (
+    WeeklyPdfJobRuntime,
+    validate_weekly_pdf_job_runtime_for_startup,
+)
 from .weekly_pdf_jobs import AdmitJobResultStatus, StartJobResultStatus, WeeklyPdfJob
 
 
@@ -1333,6 +1336,7 @@ async def run_bot() -> None:
         raise RuntimeError("; ".join(startup_issues))
     assert config.bot_token is not None
     _validate_entitlement_storage(config)
+    validate_weekly_pdf_job_runtime_for_startup(config)
     bot = Bot(config.bot_token)
     await _set_bot_commands(bot)
     dispatcher = create_dispatcher()
