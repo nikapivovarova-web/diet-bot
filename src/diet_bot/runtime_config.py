@@ -5,6 +5,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -72,6 +73,10 @@ class RuntimeConfig:
                 issues.append("DIET_BOT_DATABASE_URL is required in production.")
             if self.storage_backend == "json":
                 issues.append("JSON storage is not allowed in production.")
+            if self.support_chat_id is None:
+                issues.append("DIET_BOT_SUPPORT_CHAT_ID is required and must be a valid integer in production.")
+            if not _is_valid_http_url(self.privacy_policy_url):
+                issues.append("DIET_BOT_PRIVACY_POLICY_URL is required and must be a valid HTTP(S) URL in production.")
         if not self.bot_token:
             issues.append(MISSING_BOT_TOKEN_ERROR)
         return tuple(issues)
@@ -210,6 +215,13 @@ def _parse_optional_int(raw: str | None) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def _is_valid_http_url(raw: str | None) -> bool:
+    if raw is None:
+        return False
+    parsed = urlparse(raw)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def _parse_id_set(raw: str | None) -> set[int]:
