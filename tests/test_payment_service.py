@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -48,6 +49,64 @@ def test_create_and_validate_order() -> None:
     assert order.currency == "XTR"
     assert validation.valid
     assert validation.order == order
+
+
+def test_pre_checkout_validation_does_not_require_chat_id() -> None:
+    repo = FakePaymentRepository()
+    service = PaymentService(
+        repo,
+        order_id_factory=lambda: "order_1234567890",
+        nonce_factory=lambda: "nonce_abcdef123456",
+    )
+    order = service.create_order(
+        user_id=101,
+        chat_id=202,
+        product=PRODUCT_SUBSCRIPTION_MONTH,
+        provider=PROVIDER_TELEGRAM_STARS,
+    )
+
+    validation = service.validate_order_payment(
+        encode_payment_order_payload(order.order_id, order.nonce),
+        user_id=101,
+        chat_id=None,
+        provider=PROVIDER_TELEGRAM_STARS,
+        amount=400,
+        currency="XTR",
+    )
+
+    assert validation.valid
+    assert validation.order == order
+
+
+def test_pre_checkout_validation_rejects_expired_pending_order() -> None:
+    now = datetime(2026, 5, 22, 12, tzinfo=UTC)
+    repo = FakePaymentRepository()
+    service = PaymentService(
+        repo,
+        order_id_factory=lambda: "order_1234567890",
+        nonce_factory=lambda: "nonce_abcdef123456",
+        now_factory=lambda: now,
+    )
+    order = service.create_order(
+        user_id=101,
+        chat_id=202,
+        product=PRODUCT_SUBSCRIPTION_MONTH,
+        provider=PROVIDER_TELEGRAM_STARS,
+    )
+    repo.orders[order.order_id] = replace(order, created_at=now - timedelta(minutes=31))
+
+    validation = service.validate_order_payment(
+        encode_payment_order_payload(order.order_id, order.nonce),
+        user_id=101,
+        chat_id=None,
+        provider=PROVIDER_TELEGRAM_STARS,
+        amount=400,
+        currency="XTR",
+    )
+
+    assert not validation.valid
+    assert validation.reason == "order_expired"
+    assert repo.orders[order.order_id].status == ORDER_STATUS_FAILED
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile, FSInputFile
 
 import diet_bot.telegram_app as telegram_app
@@ -23,6 +24,18 @@ from diet_bot.domain import (
 )
 from diet_bot.presentation import format_meal_card, format_week_shopping_list
 from diet_bot.promo_codes import PromoCodeRecord, load_promo_codes, save_promo_codes
+from diet_bot.payments import (
+    PRODUCT_EXTRA_ONE_DAY,
+    PRODUCT_EXTRA_WEEKLY_PDF,
+    PRODUCT_SUBSCRIPTION_MONTH,
+    PROVIDER_TELEGRAM_STARS,
+    PROVIDER_YOOKASSA,
+    PaymentHandlingResult,
+    PaymentOrder,
+    PaymentValidationResult,
+    decode_payment_order_payload,
+    encode_payment_order_payload,
+)
 from diet_bot.telegram_app import (
     BOT_COMMANDS,
     BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
@@ -678,7 +691,7 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     ]
 
 
-def test_pre_checkout_validates_payload_currency_and_amount(monkeypatch) -> None:
+def test_pre_checkout_rejects_static_payloads(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
     valid_query = SimpleNamespace(
         invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
@@ -711,16 +724,52 @@ def test_pre_checkout_validates_payload_currency_and_amount(monkeypatch) -> None
         total_amount=0,
     )
 
-    assert _is_valid_pre_checkout(valid_query)
+    assert not _is_valid_pre_checkout(valid_query)
     assert not _is_valid_pre_checkout(wrong_amount_query)
     assert not _is_valid_pre_checkout(wrong_currency_query)
-    assert _is_valid_pre_checkout(valid_rub_query)
+    assert not _is_valid_pre_checkout(valid_rub_query)
     assert not _is_valid_pre_checkout(wrong_rub_amount_query)
     assert not _is_valid_pre_checkout(unknown_payload_query)
 
 
+def test_pre_checkout_accepts_valid_order_payload_without_chat_validation(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    order = service.create_order(
+        user_id=101,
+        chat_id=202,
+        product=PRODUCT_SUBSCRIPTION_MONTH,
+        provider=PROVIDER_TELEGRAM_STARS,
+    )
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    query = SimpleNamespace(
+        invoice_payload=encode_payment_order_payload(order.order_id, order.nonce),
+        currency="XTR",
+        total_amount=400,
+        from_user=SimpleNamespace(id=101),
+    )
+
+    assert _is_valid_pre_checkout(query)
+    assert service.validations[-1]["chat_id"] is None
+
+
+def test_pre_checkout_rejects_static_legacy_payload(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    query = SimpleNamespace(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        currency="XTR",
+        total_amount=PAYMENT_PAYLOAD_AMOUNTS[PAYLOAD_SUBSCRIPTION_MONTH],
+        from_user=SimpleNamespace(id=101),
+    )
+
+    assert not _is_valid_pre_checkout(query)
+    assert service.validations == []
+
+
 @pytest.mark.anyio
-async def test_send_subscription_invoice_link_creates_recurring_stars_invoice() -> None:
+async def test_send_subscription_invoice_link_creates_recurring_stars_invoice(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
     message = FakeMessage()
 
     await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
@@ -728,21 +777,129 @@ async def test_send_subscription_invoice_link_creates_recurring_stars_invoice() 
     invoice = message.bot.invoice_links[0]
     assert invoice["currency"] == "XTR"
     assert invoice["provider_token"] == ""
-    assert invoice["payload"] == PAYLOAD_SUBSCRIPTION_MONTH
+    assert invoice["payload"].startswith("diet:order:v1:")
     assert invoice["prices"][0].amount == SUBSCRIPTION_STARS_AMOUNT
     assert invoice["subscription_period"] == 2_592_000
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
 
 @pytest.mark.anyio
-async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice() -> None:
+async def test_stars_invoice_creates_ledger_order_and_uses_order_payload(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    message = FakeMessage(chat_id=202, user_id=101)
+
+    await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+
+    invoice = message.bot.invoice_links[0]
+    decoded = decode_payment_order_payload(invoice["payload"])
+    assert decoded is not None
+    assert decoded.order_id == "order_00000001"
+    assert decoded.nonce == "nonce_00000001"
+    assert invoice["payload"] != PAYLOAD_SUBSCRIPTION_MONTH
+    assert service.created_orders == [
+        {
+            "user_id": 101,
+            "chat_id": 202,
+            "product": PRODUCT_SUBSCRIPTION_MONTH,
+            "provider": PROVIDER_TELEGRAM_STARS,
+        },
+    ]
+
+
+@pytest.mark.anyio
+async def test_payment_callback_uses_callback_user_as_buyer_and_message_chat_for_delivery(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id=202, user_id=777_000)
+    callback = FakeCallback(CALLBACK_PAY_TELEGRAM_STARS, message, user_id=101)
+
+    await telegram_app.handle_callback(callback)
+
+    invoice = message.bot.invoice_links[0]
+    decoded = decode_payment_order_payload(invoice["payload"])
+    assert decoded is not None
+    assert service.created_orders == [
+        {
+            "user_id": 101,
+            "chat_id": 202,
+            "product": PRODUCT_SUBSCRIPTION_MONTH,
+            "provider": PROVIDER_TELEGRAM_STARS,
+        },
+    ]
+
+    accepted_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=400,
+        from_user=SimpleNamespace(id=101),
+    )
+    wrong_user_query = SimpleNamespace(
+        invoice_payload=invoice["payload"],
+        currency="XTR",
+        total_amount=400,
+        from_user=SimpleNamespace(id=999),
+    )
+
+    assert _is_valid_pre_checkout(accepted_query)
+    assert not _is_valid_pre_checkout(wrong_user_query)
+
+
+@pytest.mark.anyio
+async def test_rub_invoice_creates_ledger_order_and_uses_order_payload(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    message = FakeMessage(chat_id=202, user_id=101)
+
+    await telegram_app._send_yookassa_invoice_link(message, telegram_app.PAYLOAD_RU_EXTRA_ONE_DAY)
+
+    invoice = message.bot.invoice_links[0]
+    decoded = decode_payment_order_payload(invoice["payload"])
+    assert decoded is not None
+    assert decoded.order_id == "order_00000001"
+    assert invoice["payload"] != telegram_app.PAYLOAD_RU_EXTRA_ONE_DAY
+    assert invoice["currency"] == "RUB"
+    assert service.created_orders == [
+        {
+            "user_id": 101,
+            "chat_id": 202,
+            "product": PRODUCT_EXTRA_ONE_DAY,
+            "provider": PROVIDER_YOOKASSA,
+        },
+    ]
+
+
+@pytest.mark.anyio
+async def test_invoice_creation_failure_marks_ledger_order_failed(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    message = FakeMessage(chat_id=202, user_id=101)
+    message.bot = FailingInvoiceBot()
+
+    await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+
+    assert message.bot.invoice_links == []
+    assert service.failed_orders == [("order_00000001", "invoice_creation_failed")]
+    assert message.texts
+
+
+@pytest.mark.anyio
+async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
     message = FakeMessage()
 
     await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
 
     invoice = message.bot.invoice_links[0]
     assert invoice["currency"] == "XTR"
-    assert invoice["payload"] == PAYLOAD_EXTRA_ONE_DAY
+    assert invoice["payload"].startswith("diet:order:v1:")
     assert invoice["prices"][0].amount == 35
     assert invoice["subscription_period"] is None
 
@@ -820,7 +977,23 @@ async def test_enabled_payments_without_provider_blocks_rub_provider_invoice(mon
 
 
 @pytest.mark.anyio
+async def test_enabled_payments_with_json_runtime_fails_closed_before_invoice(monkeypatch) -> None:
+    monkeypatch.setenv("DIET_BOT_PAYMENTS_ENABLED", "1")
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "json")
+    monkeypatch.delenv("DIET_BOT_DATABASE_URL", raising=False)
+    _set_payments_enabled_from_env(monkeypatch)
+    message = FakeMessage(chat_id=202, user_id=101)
+
+    await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+
+    assert message.bot.invoice_links == []
+    assert message.texts
+
+
+@pytest.mark.anyio
 async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
     monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     message = FakeMessage()
@@ -835,7 +1008,7 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert callback.answers == [None]
     assert invoice["currency"] == "RUB"
     assert invoice["provider_token"] == "provider-token"
-    assert invoice["payload"] == telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH
+    assert invoice["payload"].startswith("diet:order:v1:")
     assert invoice["prices"][0].amount == 59_900
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
@@ -888,6 +1061,53 @@ async def test_ru_invoice_without_provider_token_shows_unavailable_message(monke
     assert "Стоимость: 50 ₽." in sent_text
     assert "ЮKassa сейчас недоступна" in sent_text
     assert markup is None
+
+
+def test_successful_payment_order_payload_grants_once_and_validates_chat(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    order = service.create_order(
+        user_id=101,
+        chat_id=202,
+        product=PRODUCT_SUBSCRIPTION_MONTH,
+        provider=PROVIDER_TELEGRAM_STARS,
+    )
+    payment = SimpleNamespace(
+        invoice_payload=encode_payment_order_payload(order.order_id, order.nonce),
+        currency="XTR",
+        total_amount=400,
+        telegram_payment_charge_id="tg-charge-1",
+        provider_payment_charge_id=None,
+    )
+
+    first = telegram_app._apply_successful_payment(202, payment, user_id=101)
+    duplicate = telegram_app._apply_successful_payment(202, payment, user_id=101)
+
+    assert first.processed
+    assert first.grant == "subscription"
+    assert duplicate.duplicate
+    assert not duplicate.processed
+    assert [request["chat_id"] for request in service.successful_requests] == [202, 202]
+    assert service.grants == [PRODUCT_SUBSCRIPTION_MONTH]
+
+
+def test_static_legacy_successful_payment_records_unknown_without_grant(monkeypatch, tmp_path) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    payment = SimpleNamespace(
+        invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
+        currency="XTR",
+        total_amount=400,
+        telegram_payment_charge_id="tg-charge-static",
+        provider_payment_charge_id=None,
+    )
+
+    result = telegram_app._apply_successful_payment(202, payment)
+
+    assert not result.processed
+    assert service.unknown_payloads == [PAYLOAD_SUBSCRIPTION_MONTH]
+    assert telegram_app.load_entitlements(tmp_path / "subscriptions.json") == {}
 
 
 def test_trial_subscription_keyboard_has_cta_button() -> None:
@@ -1082,9 +1302,10 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self, data: str, message: FakeMessage) -> None:
+    def __init__(self, data: str, message: FakeMessage, *, user_id: int | None = None) -> None:
         self.data = data
         self.message = message
+        self.from_user = SimpleNamespace(id=message.chat.id if user_id is None else user_id)
         self.answers = []
 
     async def answer(self, text=None) -> None:
@@ -1122,6 +1343,141 @@ class FakeInvoiceBot:
 
     async def send_message(self, **kwargs) -> None:
         self.sent_messages.append(kwargs)
+
+
+class FailingInvoiceBot(FakeInvoiceBot):
+    async def create_invoice_link(self, **kwargs) -> str:
+        raise TelegramAPIError(SimpleNamespace(), "invoice failed")
+
+
+class FakeTelegramPaymentService:
+    def __init__(self) -> None:
+        self.orders: dict[str, PaymentOrder] = {}
+        self.created_orders: list[dict[str, object]] = []
+        self.failed_orders: list[tuple[str, str | None]] = []
+        self.validations: list[dict[str, object]] = []
+        self.successful_requests: list[dict[str, object]] = []
+        self.grants: list[str] = []
+        self.unknown_payloads: list[str] = []
+        self._counter = 0
+        self._processed_charges: set[str] = set()
+
+    def create_order(self, *, user_id: int, chat_id: int, product: str, provider: str) -> PaymentOrder:
+        self._counter += 1
+        order = PaymentOrder(
+            order_id=f"order_{self._counter:08d}",
+            user_id=user_id,
+            chat_id=chat_id,
+            product=product,
+            provider=provider,
+            amount=_fake_amount(provider, product),
+            currency="XTR" if provider == PROVIDER_TELEGRAM_STARS else "RUB",
+            nonce=f"nonce_{self._counter:08d}",
+        )
+        self.orders[order.order_id] = order
+        self.created_orders.append(
+            {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "product": product,
+                "provider": provider,
+            },
+        )
+        return order
+
+    def validate_order_payment(
+        self,
+        payload: str,
+        *,
+        user_id: int,
+        chat_id: int | None,
+        provider: str,
+        amount: int,
+        currency: str,
+        require_pending: bool = True,
+    ) -> PaymentValidationResult:
+        self.validations.append(
+            {
+                "payload": payload,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "provider": provider,
+                "amount": amount,
+                "currency": currency,
+                "require_pending": require_pending,
+            },
+        )
+        decoded = decode_payment_order_payload(payload)
+        if decoded is None:
+            return PaymentValidationResult(False, reason="non_order_payload")
+        order = self.orders.get(decoded.order_id)
+        if order is None:
+            return PaymentValidationResult(False, reason="order_not_found")
+        if int(order.user_id) != int(user_id):
+            return PaymentValidationResult(False, order, "user_mismatch")
+        if chat_id is not None and int(order.chat_id) != int(chat_id):
+            return PaymentValidationResult(False, order, "chat_mismatch")
+        if order.provider != provider:
+            return PaymentValidationResult(False, order, "provider_mismatch")
+        if int(order.amount) != int(amount):
+            return PaymentValidationResult(False, order, "amount_mismatch")
+        if order.currency != currency:
+            return PaymentValidationResult(False, order, "currency_mismatch")
+        return PaymentValidationResult(True, order)
+
+    def handle_successful_payment(self, **kwargs) -> PaymentHandlingResult:
+        self.successful_requests.append(dict(kwargs))
+        validation = self.validate_order_payment(
+            kwargs["payload"],
+            user_id=kwargs["user_id"],
+            chat_id=kwargs["chat_id"],
+            provider=kwargs["provider"],
+            amount=kwargs["amount"],
+            currency=kwargs["currency"],
+            require_pending=False,
+        )
+        if not validation.valid:
+            self.unknown_payloads.append(kwargs["payload"])
+            return PaymentHandlingResult(False, reason=validation.reason)
+        charge_id = kwargs["telegram_payment_charge_id"] or kwargs.get("provider_payment_charge_id")
+        assert validation.order is not None
+        if charge_id in self._processed_charges:
+            return PaymentHandlingResult(False, validation.order.product, duplicate=True, reason="duplicate_charge")
+        self._processed_charges.add(charge_id)
+        self.grants.append(validation.order.product)
+        return PaymentHandlingResult(True, validation.order.product)
+
+    def mark_order_failed(self, order_id: str, reason: str | None = None) -> PaymentOrder:
+        self.failed_orders.append((order_id, reason))
+        order = self.orders[order_id]
+        failed = PaymentOrder(
+            order_id=order.order_id,
+            user_id=order.user_id,
+            chat_id=order.chat_id,
+            product=order.product,
+            provider=order.provider,
+            amount=order.amount,
+            currency=order.currency,
+            nonce=order.nonce,
+            status="failed",
+            failure_reason=reason,
+        )
+        self.orders[order_id] = failed
+        return failed
+
+
+def _fake_amount(provider: str, product: str) -> int:
+    if provider == PROVIDER_TELEGRAM_STARS:
+        return {
+            PRODUCT_SUBSCRIPTION_MONTH: 400,
+            PRODUCT_EXTRA_ONE_DAY: 35,
+            PRODUCT_EXTRA_WEEKLY_PDF: 170,
+        }[product]
+    return {
+        PRODUCT_SUBSCRIPTION_MONTH: 59_900,
+        PRODUCT_EXTRA_ONE_DAY: 5_000,
+        PRODUCT_EXTRA_WEEKLY_PDF: 25_000,
+    }[product]
 
 
 def profile_with(**kwargs) -> UserProfile:

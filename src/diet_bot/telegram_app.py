@@ -93,6 +93,17 @@ from .safety import evaluate_safety
 from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
 from .entitlement_service import EntitlementService
 from .entitlement_storage import EntitlementStorageError
+from .payment_runtime import PaymentLedgerUnavailable, create_payment_service
+from .payments import (
+    PRODUCT_EXTRA_ONE_DAY,
+    PRODUCT_EXTRA_WEEKLY_PDF,
+    PRODUCT_SUBSCRIPTION_MONTH,
+    PROVIDER_TELEGRAM_STARS,
+    PROVIDER_YOOKASSA,
+    PaymentHandlingResult,
+    PaymentOrder,
+    encode_payment_order_payload,
+)
 from .subscriptions import (
     MONTHLY_ONE_DAY_LIMIT,
     MONTHLY_WEEKLY_PDF_LIMIT,
@@ -137,6 +148,10 @@ ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить дос�
 def _entitlement_service() -> EntitlementService:
     config = replace(load_runtime_config(), subscriptions_state_file=SUBSCRIPTIONS_STATE_FILE)
     return EntitlementService(create_entitlement_store(config))
+
+
+def _payment_service():
+    return create_payment_service(load_runtime_config())
 
 
 def _validate_entitlement_storage(config) -> None:
@@ -752,6 +767,14 @@ PAYLOAD_EXTRA_WEEKLY_PDF = "diet:stars:extra_weekly_pdf"
 PAYLOAD_RU_SUBSCRIPTION_MONTH = "diet:rub:subscription_month"
 PAYLOAD_RU_EXTRA_ONE_DAY = "diet:rub:extra_one_day"
 PAYLOAD_RU_EXTRA_WEEKLY_PDF = "diet:rub:extra_weekly_pdf"
+PAYMENT_LEDGER_UNAVAILABLE_TEXT = (
+    "\u041e\u043f\u043b\u0430\u0442\u0430 \u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e "
+    "\u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430. "
+    "\u0421\u0447\u0435\u0442 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d. "
+    "\u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435 "
+    "\u0438\u043b\u0438 \u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 "
+    "\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0443."
+)
 PAYMENT_PAYLOAD_AMOUNTS = {
     PAYLOAD_SUBSCRIPTION_MONTH: SUBSCRIPTION_STARS_AMOUNT,
     PAYLOAD_EXTRA_ONE_DAY: EXTRA_ONE_DAY_STARS_AMOUNT,
@@ -781,6 +804,23 @@ RUB_PAYMENT_PAYLOAD_DESCRIPTIONS = {
     PAYLOAD_RU_SUBSCRIPTION_MONTH: "30 дней доступа: 4 недельных PDF и 5 дневных рационов.",
     PAYLOAD_RU_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
+}
+PAYMENT_PAYLOAD_PRODUCTS = {
+    PAYLOAD_SUBSCRIPTION_MONTH: (PROVIDER_TELEGRAM_STARS, PRODUCT_SUBSCRIPTION_MONTH),
+    PAYLOAD_EXTRA_ONE_DAY: (PROVIDER_TELEGRAM_STARS, PRODUCT_EXTRA_ONE_DAY),
+    PAYLOAD_EXTRA_WEEKLY_PDF: (PROVIDER_TELEGRAM_STARS, PRODUCT_EXTRA_WEEKLY_PDF),
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: (PROVIDER_YOOKASSA, PRODUCT_SUBSCRIPTION_MONTH),
+    PAYLOAD_RU_EXTRA_ONE_DAY: (PROVIDER_YOOKASSA, PRODUCT_EXTRA_ONE_DAY),
+    PAYLOAD_RU_EXTRA_WEEKLY_PDF: (PROVIDER_YOOKASSA, PRODUCT_EXTRA_WEEKLY_PDF),
+}
+PAYMENT_PRODUCT_PAYLOADS = {value: key for key, value in PAYMENT_PAYLOAD_PRODUCTS.items()}
+PAYMENT_CALLBACK_PRODUCTS = {
+    CALLBACK_PAY_TELEGRAM_STARS: (PROVIDER_TELEGRAM_STARS, PRODUCT_SUBSCRIPTION_MONTH),
+    CALLBACK_PAY_RU_CARD: (PROVIDER_YOOKASSA, PRODUCT_SUBSCRIPTION_MONTH),
+    CALLBACK_PAY_RU_EXTRA_ONE_DAY: (PROVIDER_YOOKASSA, PRODUCT_EXTRA_ONE_DAY),
+    CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF: (PROVIDER_YOOKASSA, PRODUCT_EXTRA_WEEKLY_PDF),
+    CALLBACK_BUY_EXTRA_ONE_DAY: (PROVIDER_TELEGRAM_STARS, PRODUCT_EXTRA_ONE_DAY),
+    CALLBACK_BUY_EXTRA_WEEKLY_PDF: (PROVIDER_TELEGRAM_STARS, PRODUCT_EXTRA_WEEKLY_PDF),
 }
 WELCOME_TEXT = (
     "Привет! Я FoodBalance — ваш персональный помощник по сбалансированному питанию 🥗\n\n"
@@ -987,42 +1027,42 @@ async def handle_callback(callback: CallbackQuery) -> None:
         await callback.answer()
         if await _send_active_subscription_notice_if_needed(message):
             return
-        await _send_stars_invoice_link(message, PAYLOAD_SUBSCRIPTION_MONTH)
+        await _send_payment_invoice_link(message, *PAYMENT_CALLBACK_PRODUCTS[data], payer_user_id=_callback_user_id(callback))
         return
 
     if data == CALLBACK_PAY_RU_CARD:
         await callback.answer()
         if await _send_active_subscription_notice_if_needed(message):
             return
-        await _send_yookassa_invoice_link(message, PAYLOAD_RU_SUBSCRIPTION_MONTH)
+        await _send_payment_invoice_link(message, *PAYMENT_CALLBACK_PRODUCTS[data], payer_user_id=_callback_user_id(callback))
         return
 
     if data == CALLBACK_PAY_RU_EXTRA_ONE_DAY:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_yookassa_invoice_link(message, PAYLOAD_RU_EXTRA_ONE_DAY)
+        await _send_payment_invoice_link(message, *PAYMENT_CALLBACK_PRODUCTS[data], payer_user_id=_callback_user_id(callback))
         return
 
     if data == CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_yookassa_invoice_link(message, PAYLOAD_RU_EXTRA_WEEKLY_PDF)
+        await _send_payment_invoice_link(message, *PAYMENT_CALLBACK_PRODUCTS[data], payer_user_id=_callback_user_id(callback))
         return
 
     if data == CALLBACK_BUY_EXTRA_ONE_DAY:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_stars_invoice_link(message, PAYLOAD_EXTRA_ONE_DAY)
+        await _send_payment_invoice_link(message, *PAYMENT_CALLBACK_PRODUCTS[data], payer_user_id=_callback_user_id(callback))
         return
 
     if data == CALLBACK_BUY_EXTRA_WEEKLY_PDF:
         await callback.answer()
         if await _send_extra_purchase_subscription_notice_if_needed(message):
             return
-        await _send_stars_invoice_link(message, PAYLOAD_EXTRA_WEEKLY_PDF)
+        await _send_payment_invoice_link(message, *PAYMENT_CALLBACK_PRODUCTS[data], payer_user_id=_callback_user_id(callback))
         return
 
     if data == CALLBACK_FEATURES:
@@ -1101,7 +1141,15 @@ async def handle_successful_payment(message: Message) -> None:
         return
 
     try:
-        result = _apply_successful_payment(message.chat.id, payment)
+        result = _apply_successful_payment(
+            message.chat.id,
+            payment,
+            user_id=_message_user_id(message),
+        )
+    except PaymentLedgerUnavailable as exc:
+        logger.warning("Failed to apply payment because payment ledger is unavailable: %s", exc.reason)
+        await _send_payment_ledger_unavailable_notice(message)
+        return
     except EntitlementStorageError:
         logger.exception("Failed to apply payment due to entitlement storage error")
         await _send_entitlement_storage_error(message)
@@ -3264,6 +3312,10 @@ async def _send_payments_disabled_notice(message: Message) -> None:
     await message.answer(PAYMENTS_DISABLED_TEXT, reply_markup=_payments_disabled_keyboard())
 
 
+async def _send_payment_ledger_unavailable_notice(message: Message) -> None:
+    await message.answer(PAYMENT_LEDGER_UNAVAILABLE_TEXT, reply_markup=_payments_disabled_keyboard())
+
+
 async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
     try:
         entitlement = _entitlement_for_chat(message.chat.id)
@@ -3316,24 +3368,62 @@ def _ru_card_payment_unavailable_text(payload: str) -> str:
     )
 
 
-async def _send_stars_invoice_link(message: Message, payload: str) -> None:
+async def _send_payment_invoice_link(
+    message: Message,
+    provider: str,
+    product: str,
+    *,
+    payer_user_id: int | None = None,
+) -> None:
+    payload = PAYMENT_PRODUCT_PAYLOADS[(provider, product)]
+    if provider == PROVIDER_TELEGRAM_STARS:
+        await _send_stars_invoice_link(message, payload, payer_user_id=payer_user_id)
+        return
+    await _send_yookassa_invoice_link(message, payload, payer_user_id=payer_user_id)
+
+
+async def _send_stars_invoice_link(message: Message, payload: str, *, payer_user_id: int | None = None) -> None:
     if not _payments_enabled():
         await _send_payments_disabled_notice(message)
         return
 
+    provider, product = _payment_product_for_legacy_payload(payload)
+    if provider != PROVIDER_TELEGRAM_STARS:
+        raise ValueError(f"Unsupported Stars payment payload: {payload!r}")
     amount = PAYMENT_PAYLOAD_AMOUNTS[payload]
     title = PAYMENT_PAYLOAD_TITLES[payload]
     description = PAYMENT_PAYLOAD_DESCRIPTIONS[payload]
     subscription_period = SUBSCRIPTION_PERIOD_SECONDS if payload == PAYLOAD_SUBSCRIPTION_MONTH else None
-    invoice_link = await message.bot.create_invoice_link(
-        title=title,
-        description=description,
-        payload=payload,
-        currency="XTR",
-        prices=[LabeledPrice(label=title, amount=amount)],
-        provider_token="",
-        subscription_period=subscription_period,
-    )
+    try:
+        service, order, invoice_payload = _create_payment_order_payload(
+            message,
+            provider,
+            product,
+            payer_user_id=payer_user_id,
+        )
+    except PaymentLedgerUnavailable as exc:
+        logger.warning("Payment ledger is unavailable for Stars invoice: %s", exc.reason)
+        await _send_payment_ledger_unavailable_notice(message)
+        return
+    except Exception:
+        logger.exception("Failed to create payment ledger order for Stars invoice")
+        await _send_payment_ledger_unavailable_notice(message)
+        return
+
+    try:
+        invoice_link = await message.bot.create_invoice_link(
+            title=title,
+            description=description,
+            payload=invoice_payload,
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=amount)],
+            provider_token="",
+            subscription_period=subscription_period,
+        )
+    except TelegramAPIError:
+        _mark_payment_order_failed(service, order.order_id, "invoice_creation_failed")
+        await message.answer("Не удалось создать счет для оплаты. Попробуйте позже.")
+        return
     await message.answer(
         f"{title}\n\nСтоимость: {amount} Stars.",
         reply_markup=InlineKeyboardMarkup(
@@ -3344,11 +3434,14 @@ async def _send_stars_invoice_link(message: Message, payload: str) -> None:
     )
 
 
-async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
+async def _send_yookassa_invoice_link(message: Message, payload: str, *, payer_user_id: int | None = None) -> None:
     if not _payments_enabled():
         await _send_payments_disabled_notice(message)
         return
 
+    provider, product = _payment_product_for_legacy_payload(payload)
+    if provider != PROVIDER_YOOKASSA:
+        raise ValueError(f"Unsupported YooKassa payment payload: {payload!r}")
     provider_token = TELEGRAM_PROVIDER_TOKEN.strip()
     if not provider_token:
         await message.answer(_ru_card_payment_unavailable_text(payload))
@@ -3358,10 +3451,26 @@ async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
     title = RUB_PAYMENT_PAYLOAD_TITLES[payload]
     description = RUB_PAYMENT_PAYLOAD_DESCRIPTIONS[payload]
     try:
+        service, order, invoice_payload = _create_payment_order_payload(
+            message,
+            provider,
+            product,
+            payer_user_id=payer_user_id,
+        )
+    except PaymentLedgerUnavailable as exc:
+        logger.warning("Payment ledger is unavailable for YooKassa invoice: %s", exc.reason)
+        await _send_payment_ledger_unavailable_notice(message)
+        return
+    except Exception:
+        logger.exception("Failed to create payment ledger order for YooKassa invoice")
+        await _send_payment_ledger_unavailable_notice(message)
+        return
+
+    try:
         invoice_link = await message.bot.create_invoice_link(
             title=title,
             description=description,
-            payload=payload,
+            payload=invoice_payload,
             currency="RUB",
             prices=[LabeledPrice(label=title, amount=amount)],
             provider_token=provider_token,
@@ -3370,6 +3479,7 @@ async def _send_yookassa_invoice_link(message: Message, payload: str) -> None:
             provider_data=json.dumps(_yookassa_provider_data(payload), ensure_ascii=False),
         )
     except TelegramAPIError:
+        _mark_payment_order_failed(service, order.order_id, "invoice_creation_failed")
         await message.answer("Не удалось создать счет для оплаты. Попробуйте позже.")
         return
 
@@ -3416,39 +3526,156 @@ def _format_kopecks_for_display(amount: int) -> str:
     return f"{rubles}.{kopecks:02d}"
 
 
+def _payment_product_for_legacy_payload(payload: str) -> tuple[str, str]:
+    try:
+        return PAYMENT_PAYLOAD_PRODUCTS[payload]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported payment payload: {payload!r}") from exc
+
+
+def _create_payment_order_payload(
+    message: Message,
+    provider: str,
+    product: str,
+    *,
+    payer_user_id: int | None = None,
+) -> tuple[object, PaymentOrder, str]:
+    service = _payment_service()
+    order = service.create_order(
+        user_id=_message_user_id(message) if payer_user_id is None else int(payer_user_id),
+        chat_id=message.chat.id,
+        product=product,
+        provider=provider,
+    )
+    return service, order, encode_payment_order_payload(order.order_id, order.nonce)
+
+
+def _mark_payment_order_failed(service: object, order_id: str, reason: str) -> None:
+    mark_order_failed = getattr(service, "mark_order_failed", None)
+    if callable(mark_order_failed):
+        mark_order_failed(order_id, reason)
+
+
+def _message_user_id(message: Message) -> int:
+    from_user = getattr(message, "from_user", None)
+    user_id = getattr(from_user, "id", None)
+    return int(message.chat.id if user_id is None else user_id)
+
+
+def _callback_user_id(callback: CallbackQuery) -> int:
+    from_user = getattr(callback, "from_user", None)
+    user_id = getattr(from_user, "id", None)
+    if user_id is None:
+        raise ValueError("CallbackQuery.from_user.id is required for payment invoice creation.")
+    return int(user_id)
+
+
+def _pre_checkout_user_id(pre_checkout_query: PreCheckoutQuery) -> int | None:
+    from_user = getattr(pre_checkout_query, "from_user", None)
+    user_id = getattr(from_user, "id", None)
+    return int(user_id) if user_id is not None else None
+
+
+def _payment_provider_for_currency(currency: str) -> str | None:
+    if currency == "XTR":
+        return PROVIDER_TELEGRAM_STARS
+    if currency == "RUB":
+        return PROVIDER_YOOKASSA
+    return None
+
+
+def _payment_provider_for_payment(payment: SuccessfulPayment) -> str | None:
+    provider = _payment_provider_for_currency(payment.currency)
+    if provider is not None:
+        return provider
+    legacy_mapping = PAYMENT_PAYLOAD_PRODUCTS.get(payment.invoice_payload)
+    return legacy_mapping[0] if legacy_mapping else None
+
+
+def _payment_raw_payload(payment: SuccessfulPayment) -> dict[str, object]:
+    raw = {
+        "invoice_payload": payment.invoice_payload,
+        "currency": payment.currency,
+        "total_amount": payment.total_amount,
+        "telegram_payment_charge_id": getattr(payment, "telegram_payment_charge_id", None),
+        "provider_payment_charge_id": getattr(payment, "provider_payment_charge_id", None),
+    }
+    subscription_expiration = getattr(payment, "subscription_expiration_date", None)
+    if subscription_expiration is not None:
+        raw["subscription_expiration_date"] = subscription_expiration
+    return raw
+
+
+def _payment_application_from_handling_result(result: PaymentHandlingResult) -> PaymentApplication:
+    grants = {
+        PRODUCT_SUBSCRIPTION_MONTH: "subscription",
+        PRODUCT_EXTRA_ONE_DAY: "extra_one_day",
+        PRODUCT_EXTRA_WEEKLY_PDF: "extra_weekly_pdf",
+    }
+    return PaymentApplication(result.processed, grants.get(result.grant), result.duplicate)
+
+
 def _is_valid_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> bool:
     if not _payments_enabled():
         return False
 
-    expected_amount = PAYMENT_PAYLOAD_AMOUNTS.get(pre_checkout_query.invoice_payload)
-    if expected_amount is not None:
-        return pre_checkout_query.currency == "XTR" and pre_checkout_query.total_amount == expected_amount
+    payload = str(pre_checkout_query.invoice_payload or "")
+    if not payload.startswith("diet:order:"):
+        return False
 
-    expected_rub_amount = RUB_PAYMENT_PAYLOAD_AMOUNTS.get(pre_checkout_query.invoice_payload)
-    return (
-        expected_rub_amount is not None
-        and bool(TELEGRAM_PROVIDER_TOKEN.strip())
-        and pre_checkout_query.currency == "RUB"
-        and pre_checkout_query.total_amount == expected_rub_amount
-    )
+    provider = _payment_provider_for_currency(pre_checkout_query.currency)
+    if provider is None:
+        return False
+    if provider == PROVIDER_YOOKASSA and not TELEGRAM_PROVIDER_TOKEN.strip():
+        return False
+    user_id = _pre_checkout_user_id(pre_checkout_query)
+    if user_id is None:
+        return False
 
-
-def _apply_successful_payment(chat_id: int, payment: SuccessfulPayment) -> PaymentApplication:
-    service = _entitlement_service()
-    charge_id = payment.telegram_payment_charge_id
-    payload = payment.invoice_payload
-
-    if payload in {PAYLOAD_SUBSCRIPTION_MONTH, PAYLOAD_RU_SUBSCRIPTION_MONTH}:
-        return service.apply_subscription_payment(
-            chat_id,
-            charge_id,
-            subscription_expiration_timestamp=getattr(payment, "subscription_expiration_date", None),
+    try:
+        validation = _payment_service().validate_order_payment(
+            payload,
+            user_id=user_id,
+            chat_id=None,
+            provider=provider,
+            amount=pre_checkout_query.total_amount,
+            currency=pre_checkout_query.currency,
         )
-    if payload in {PAYLOAD_EXTRA_ONE_DAY, PAYLOAD_RU_EXTRA_ONE_DAY}:
-        return service.apply_extra_one_day_payment(chat_id, charge_id)
-    if payload in {PAYLOAD_EXTRA_WEEKLY_PDF, PAYLOAD_RU_EXTRA_WEEKLY_PDF}:
-        return service.apply_extra_weekly_pdf_payment(chat_id, charge_id)
-    return PaymentApplication(False)
+    except PaymentLedgerUnavailable as exc:
+        logger.warning("Payment ledger is unavailable during pre_checkout: %s", exc.reason)
+        return False
+    except Exception:
+        logger.exception("Failed to validate pre_checkout against payment ledger")
+        return False
+    return validation.valid
+
+
+def _apply_successful_payment(
+    chat_id: int,
+    payment: SuccessfulPayment,
+    *,
+    user_id: int | None = None,
+) -> PaymentApplication:
+    provider = _payment_provider_for_payment(payment)
+    if provider is None:
+        return PaymentApplication(False)
+    try:
+        result = _payment_service().handle_successful_payment(
+            payload=payment.invoice_payload,
+            user_id=chat_id if user_id is None else user_id,
+            chat_id=chat_id,
+            provider=provider,
+            amount=payment.total_amount,
+            currency=payment.currency,
+            telegram_payment_charge_id=getattr(payment, "telegram_payment_charge_id", None),
+            provider_payment_charge_id=getattr(payment, "provider_payment_charge_id", None),
+            raw_payload=_payment_raw_payload(payment),
+        )
+    except PaymentLedgerUnavailable:
+        raise
+    except Exception as exc:
+        raise PaymentLedgerUnavailable("payment_ledger_unavailable", "Payment ledger is unavailable.") from exc
+    return _payment_application_from_handling_result(result)
 
 
 def _payment_success_text(result: PaymentApplication) -> str:
