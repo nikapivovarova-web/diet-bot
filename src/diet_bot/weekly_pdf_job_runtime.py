@@ -75,15 +75,7 @@ class WeeklyPdfJobRuntime:
     def from_config(cls, config: object) -> "WeeklyPdfJobRuntime | None":
         if getattr(config, "storage_backend", "json") != "postgres":
             return None
-        database_url = getattr(config, "database_url", None)
-        if not database_url:
-            raise RuntimeError("DIET_BOT_DATABASE_URL is required for weekly PDF Postgres jobs.")
-
-        from .postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore
-
-        store = PostgresWeeklyPdfJobStore(str(database_url))
-        store.initialize()
-        return cls(store)
+        return cls(_create_postgres_weekly_pdf_job_store(config))
 
     def admit(
         self,
@@ -146,3 +138,27 @@ def _normalize_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def validate_weekly_pdf_job_runtime_for_startup(config: object) -> None:
+    if getattr(config, "storage_backend", "json") != "postgres":
+        return
+
+    store = _create_postgres_weekly_pdf_job_store(config)
+    try:
+        store.validate_schema()
+    except Exception as exc:
+        raise RuntimeError(
+            "Postgres weekly PDF job storage is not ready; "
+            "run weekly PDF job migrations before startup.",
+        ) from exc
+
+
+def _create_postgres_weekly_pdf_job_store(config: object):
+    database_url = getattr(config, "database_url", None)
+    if not database_url:
+        raise RuntimeError("DIET_BOT_DATABASE_URL is required for weekly PDF Postgres jobs.")
+
+    from .postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore
+
+    return PostgresWeeklyPdfJobStore(str(database_url))

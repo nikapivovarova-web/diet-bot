@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import sys
+import types
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
+
+import pytest
 
 from diet_bot.weekly_pdf_job_runtime import WeeklyPdfJobRuntime
 from diet_bot.weekly_pdf_jobs import (
@@ -21,12 +25,16 @@ from diet_bot.weekly_pdf_jobs import (
 )
 
 
-def test_json_runtime_factory_does_not_import_postgres_store(monkeypatch) -> None:
+def test_json_runtime_factory_and_startup_validation_do_not_import_postgres_store(monkeypatch) -> None:
+    from diet_bot.weekly_pdf_job_runtime import validate_weekly_pdf_job_runtime_for_startup
+
+    monkeypatch.delitem(sys.modules, "diet_bot.postgres_weekly_pdf_job_store", raising=False)
+    monkeypatch.delitem(sys.modules, "psycopg", raising=False)
     imported: list[str] = []
 
     def fail_import(name, *_args, **_kwargs):
         imported.append(name)
-        if name == "diet_bot.postgres_weekly_pdf_job_store":
+        if name.startswith(("diet_bot.postgres_weekly_pdf_job_store", "psycopg")):
             raise AssertionError("JSON backend must not import Postgres weekly PDF store")
         return original_import(name, *_args, **_kwargs)
 
@@ -39,6 +47,112 @@ def test_json_runtime_factory_does_not_import_postgres_store(monkeypatch) -> Non
 
     assert runtime is None
     assert "diet_bot.postgres_weekly_pdf_job_store" not in imported
+    validate_weekly_pdf_job_runtime_for_startup(
+        type("Config", (), {"storage_backend": "json", "database_url": None})(),
+    )
+    assert "diet_bot.postgres_weekly_pdf_job_store" not in sys.modules
+    assert "psycopg" not in sys.modules
+
+
+def test_postgres_runtime_factory_constructs_store_without_initializing(monkeypatch) -> None:
+    calls: list[tuple[str, str | None]] = []
+    fake_module = types.ModuleType("diet_bot.postgres_weekly_pdf_job_store")
+
+    class FakePostgresWeeklyPdfJobStore:
+        def __init__(self, dsn: str) -> None:
+            calls.append(("construct", dsn))
+
+        def initialize(self) -> None:
+            calls.append(("initialize", None))
+            raise AssertionError("runtime factory must not auto-migrate")
+
+        def validate_schema(self) -> None:
+            calls.append(("validate_schema", None))
+
+    fake_module.PostgresWeeklyPdfJobStore = FakePostgresWeeklyPdfJobStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_weekly_pdf_job_store", fake_module)
+
+    runtime = WeeklyPdfJobRuntime.from_config(
+        type(
+            "Config",
+            (),
+            {
+                "storage_backend": "postgres",
+                "database_url": "postgresql://user:secret@example/db",
+            },
+        )(),
+    )
+
+    assert runtime is not None
+    assert calls == [("construct", "postgresql://user:secret@example/db")]
+
+
+def test_postgres_startup_validation_validates_schema_without_initializing(monkeypatch) -> None:
+    from diet_bot.weekly_pdf_job_runtime import validate_weekly_pdf_job_runtime_for_startup
+
+    calls: list[tuple[str, str | None]] = []
+    fake_module = types.ModuleType("diet_bot.postgres_weekly_pdf_job_store")
+
+    class FakePostgresWeeklyPdfJobStore:
+        def __init__(self, dsn: str) -> None:
+            calls.append(("construct", dsn))
+
+        def initialize(self) -> None:
+            calls.append(("initialize", None))
+            raise AssertionError("startup validation must not auto-migrate")
+
+        def validate_schema(self) -> None:
+            calls.append(("validate_schema", None))
+
+    fake_module.PostgresWeeklyPdfJobStore = FakePostgresWeeklyPdfJobStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_weekly_pdf_job_store", fake_module)
+
+    validate_weekly_pdf_job_runtime_for_startup(
+        type(
+            "Config",
+            (),
+            {
+                "storage_backend": "postgres",
+                "database_url": "postgresql://user:secret@example/db",
+            },
+        )(),
+    )
+
+    assert calls == [
+        ("construct", "postgresql://user:secret@example/db"),
+        ("validate_schema", None),
+    ]
+
+
+def test_postgres_startup_validation_wraps_schema_failure(monkeypatch) -> None:
+    from diet_bot.weekly_pdf_job_runtime import validate_weekly_pdf_job_runtime_for_startup
+
+    fake_module = types.ModuleType("diet_bot.postgres_weekly_pdf_job_store")
+
+    class FakePostgresWeeklyPdfJobStore:
+        def __init__(self, _dsn: str) -> None:
+            pass
+
+        def initialize(self) -> None:
+            raise AssertionError("startup validation must not auto-migrate")
+
+        def validate_schema(self) -> None:
+            raise RuntimeError("missing weekly_pdf_jobs")
+
+    fake_module.PostgresWeeklyPdfJobStore = FakePostgresWeeklyPdfJobStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_weekly_pdf_job_store", fake_module)
+
+    with pytest.raises(RuntimeError, match="run weekly PDF job migrations before startup"):
+        validate_weekly_pdf_job_runtime_for_startup(
+            type(
+                "Config",
+                (),
+                {
+                    "storage_backend": "postgres",
+                    "database_url": "postgresql://user:secret@example/db",
+                },
+            )(),
+        )
 
 
 def test_runtime_admit_duplicate_does_not_start_or_consume() -> None:
