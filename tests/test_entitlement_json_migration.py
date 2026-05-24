@@ -119,6 +119,104 @@ def test_apply_requires_database_url_after_source_is_valid(tmp_path: Path) -> No
         migration.main(["--source", str(source), "--migration-id", "apply-without-dsn", "--apply"], env={})
 
 
+def test_expected_source_fingerprint_mismatch_fails_before_postgres_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "subscriptions.json"
+    _write_source(source, {404: Entitlement(monthly_one_day_remaining=1)})
+
+    def fail_if_connected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("expected source fingerprint guard must fail before Postgres is touched")
+
+    monkeypatch.setattr(migration, "PostgresEntitlementStore", fail_if_connected)
+
+    with pytest.raises(SystemExit, match="source fingerprint"):
+        migration.main(
+            [
+                "--source",
+                str(source),
+                "--migration-id",
+                "fingerprint-mismatch",
+                "--expected-source-fingerprint",
+                "not-the-current-fingerprint",
+                "--apply",
+                "--database-url",
+                "postgresql://example.invalid/db",
+            ],
+            env={},
+        )
+
+
+def test_expected_entitlement_count_mismatch_fails_before_postgres_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "subscriptions.json"
+    _write_source(
+        source,
+        {
+            505: Entitlement(monthly_one_day_remaining=1, processed_payment_charge_ids=["charge-1"]),
+            606: Entitlement(monthly_weekly_pdf_remaining=1),
+        },
+    )
+
+    def fail_if_connected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("expected count guard must fail before Postgres is touched")
+
+    monkeypatch.setattr(migration, "PostgresEntitlementStore", fail_if_connected)
+
+    with pytest.raises(SystemExit, match="entitlement count"):
+        migration.main(
+            [
+                "--source",
+                str(source),
+                "--migration-id",
+                "entitlement-count-mismatch",
+                "--expected-entitlement-count",
+                "1",
+                "--apply",
+                "--database-url",
+                "postgresql://example.invalid/db",
+            ],
+            env={},
+        )
+
+
+def test_expected_processed_charge_count_mismatch_fails_before_postgres_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "subscriptions.json"
+    _write_source(
+        source,
+        {
+            707: Entitlement(processed_payment_charge_ids=["charge-1", "charge-2"]),
+        },
+    )
+
+    def fail_if_connected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("expected processed charge count guard must fail before Postgres is touched")
+
+    monkeypatch.setattr(migration, "PostgresEntitlementStore", fail_if_connected)
+
+    with pytest.raises(SystemExit, match="processed charge count"):
+        migration.main(
+            [
+                "--source",
+                str(source),
+                "--migration-id",
+                "processed-charge-count-mismatch",
+                "--expected-processed-charge-count",
+                "1",
+                "--apply",
+                "--database-url",
+                "postgresql://example.invalid/db",
+            ],
+            env={},
+        )
+
+
 def _write_source(path: Path, entitlements: dict[int, Entitlement]) -> None:
     path.write_text(
         json.dumps(
