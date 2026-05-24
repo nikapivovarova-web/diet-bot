@@ -1,4 +1,5 @@
 import json
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,6 +229,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     fake_bot = object()
     validated: list[tuple[str, object]] = []
     weekly_pdf_validated: list[str] = []
+    guard_events: list[str] = []
     polled: list[object] = []
 
     class FakeDispatcher:
@@ -246,11 +248,28 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     def fake_validate_weekly_pdf_jobs(config) -> None:
         weekly_pdf_validated.append(config.storage_backend)
 
+    class FakeGuard:
+        def __init__(self, database_url: str) -> None:
+            assert database_url == "postgresql://user:secret@example/db"
+            guard_events.append("guard_init")
+
+        def acquire(self):
+            guard_events.append("guard_acquire")
+            return self
+
+        def close(self) -> None:
+            guard_events.append("guard_close")
+
     monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
     monkeypatch.setenv("DIET_BOT_ENV", "development")
     monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "postgres")
     monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://user:secret@example/db")
     monkeypatch.setenv("DIET_BOT_SUBSCRIPTIONS_STATE_FILE", str(path))
+    monkeypatch.setitem(
+        sys.modules,
+        "diet_bot.postgres_single_poller_guard",
+        SimpleNamespace(PostgresSinglePollerGuard=FakeGuard),
+    )
     monkeypatch.setattr(telegram_app, "create_entitlement_store", fake_create_store, raising=False)
     monkeypatch.setattr(
         telegram_app,
@@ -271,6 +290,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
 
     assert validated and validated[0][0] == "postgres"
     assert weekly_pdf_validated == ["postgres"]
+    assert guard_events == ["guard_init", "guard_acquire", "guard_close"]
     assert polled == [fake_bot]
 
 

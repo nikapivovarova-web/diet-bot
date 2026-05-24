@@ -54,12 +54,12 @@ assert "psycopg" not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_run_bot_startup_invokes_weekly_pdf_schema_validation_for_postgres(monkeypatch) -> None:
+def test_run_bot_postgres_startup_acquires_guard_even_outside_production(monkeypatch) -> None:
     import diet_bot.telegram_app as telegram_app
     from diet_bot.runtime_config import load_runtime_config
 
     fake_bot = object()
-    calls: list[tuple[str, str]] = []
+    events: list[str] = []
     polled: list[object] = []
     config = load_runtime_config(
         {
@@ -76,19 +76,34 @@ def test_run_bot_startup_invokes_weekly_pdf_schema_validation_for_postgres(monke
     async def fake_set_commands(_bot) -> None:
         return None
 
-    original_import = __import__
+    class FakeGuard:
+        def __init__(self, database_url: str) -> None:
+            assert database_url == "postgresql://user:secret@example/db"
+            events.append("guard_init")
 
-    def guarded_import(name, *args, **kwargs):
-        if name.startswith(("diet_bot.postgres_single_poller_guard", "psycopg")):
-            raise AssertionError(f"non-production startup touched single-poller guard {name}")
-        return original_import(name, *args, **kwargs)
+        def acquire(self) -> FakeGuard:
+            events.append("guard_acquire")
+            return self
+
+        def close(self) -> None:
+            events.append("guard_close")
 
     def fake_validate_entitlement_storage(startup_config) -> None:
-        calls.append(("entitlement", startup_config.storage_backend))
+        assert startup_config is config
+        events.append("validate_entitlement")
 
     def fake_validate_weekly_pdf_jobs(startup_config) -> None:
-        calls.append(("weekly_pdf", startup_config.storage_backend))
+        assert startup_config is config
+        events.append("validate_weekly_pdf")
 
+    def fake_bot_factory(_token: str):
+        events.append("bot")
+        return fake_bot
+
+    fake_guard_module = types.ModuleType("diet_bot.postgres_single_poller_guard")
+    fake_guard_module.PostgresSinglePollerGuard = FakeGuard
+
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", fake_validate_entitlement_storage)
     monkeypatch.setattr(
@@ -96,15 +111,21 @@ def test_run_bot_startup_invokes_weekly_pdf_schema_validation_for_postgres(monke
         "validate_weekly_pdf_job_runtime_for_startup",
         fake_validate_weekly_pdf_jobs,
     )
-    monkeypatch.setattr(telegram_app, "Bot", lambda _token: fake_bot)
+    monkeypatch.setattr(telegram_app, "Bot", fake_bot_factory)
     monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_commands)
     monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
-    monkeypatch.setattr("builtins.__import__", guarded_import)
 
     asyncio.run(telegram_app.run_bot())
 
-    assert calls == [("entitlement", "postgres"), ("weekly_pdf", "postgres")]
     assert polled == [fake_bot]
+    assert events == [
+        "validate_entitlement",
+        "validate_weekly_pdf",
+        "guard_init",
+        "guard_acquire",
+        "bot",
+        "guard_close",
+    ]
 
 
 def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch) -> None:
@@ -146,6 +167,22 @@ def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch
         assert startup_config is config
         events.append("validate_payment")
 
+    class FakeGuard:
+        def __init__(self, database_url: str) -> None:
+            assert database_url == "postgresql://user:secret@example/db"
+            events.append("guard_init")
+
+        def acquire(self) -> FakeGuard:
+            events.append("guard_acquire")
+            return self
+
+        def close(self) -> None:
+            events.append("guard_close")
+
+    fake_guard_module = types.ModuleType("diet_bot.postgres_single_poller_guard")
+    fake_guard_module.PostgresSinglePollerGuard = FakeGuard
+
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", fake_validate_entitlement_storage)
     monkeypatch.setattr(
@@ -164,9 +201,12 @@ def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch
         "validate_entitlement",
         "validate_weekly_pdf",
         "validate_payment",
+        "guard_init",
+        "guard_acquire",
         "bot",
         "set_commands",
         "start_polling",
+        "guard_close",
     ]
 
 
@@ -350,6 +390,47 @@ def test_run_bot_guard_failure_exits_before_bot_or_telegram_path(monkeypatch) ->
     monkeypatch.setattr(telegram_app, "Bot", fail_bot)
 
     with pytest.raises(RuntimeError, match="another production poller is already active"):
+        asyncio.run(telegram_app.run_bot())
+
+    assert events == ["guard_init", "guard_acquire"]
+
+
+def test_run_bot_unknown_env_postgres_guard_failure_exits_before_bot(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+    from diet_bot.runtime_config import load_runtime_config
+
+    events: list[str] = []
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "123456:test-token",
+            "DIET_BOT_ENV": "staging",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    class FailingGuard:
+        def __init__(self, _database_url: str) -> None:
+            events.append("guard_init")
+
+        def acquire(self) -> FailingGuard:
+            events.append("guard_acquire")
+            raise RuntimeError("single-poller guard unavailable")
+
+    def fail_bot(_token: str):
+        raise AssertionError("Bot must not be constructed when Postgres guard fails")
+
+    fake_guard_module = types.ModuleType("diet_bot.postgres_single_poller_guard")
+    fake_guard_module.PostgresSinglePollerGuard = FailingGuard
+
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
+    monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_weekly_pdf_job_runtime_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_payment_runtime_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "Bot", fail_bot)
+
+    with pytest.raises(RuntimeError, match="single-poller guard unavailable"):
         asyncio.run(telegram_app.run_bot())
 
     assert events == ["guard_init", "guard_acquire"]

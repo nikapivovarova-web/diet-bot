@@ -83,7 +83,6 @@ from .runtime_config import (
     DEFAULT_PROMO_CODES_STATE_FILE,
     DEFAULT_STATE_FILE,
     DEFAULT_SUBSCRIPTIONS_STATE_FILE,
-    is_production_environment,
     load_runtime_config,
     parse_id_set as _parse_runtime_id_set,
     parse_optional_int as _parse_runtime_optional_int,
@@ -1355,7 +1354,7 @@ async def run_bot() -> None:
 
 
 def _acquire_postgres_single_poller_guard(config):
-    if not (is_production_environment(config.environment) and config.storage_backend == "postgres"):
+    if config.storage_backend != "postgres":
         return None
     assert config.database_url is not None
     from .postgres_single_poller_guard import PostgresSinglePollerGuard
