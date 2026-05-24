@@ -25,6 +25,7 @@ def guarded_import(name, *args, **kwargs):
         "diet_bot.postgres_single_poller_guard",
         "diet_bot.postgres_entitlement_store",
         "diet_bot.postgres_weekly_pdf_job_store",
+        "diet_bot.postgres_payment_store",
         "psycopg",
     )):
         raise AssertionError(f"telegram_app import touched postgres dependency {name}")
@@ -35,6 +36,7 @@ import diet_bot.telegram_app
 assert "diet_bot.postgres_single_poller_guard" not in sys.modules
 assert "diet_bot.postgres_entitlement_store" not in sys.modules
 assert "diet_bot.postgres_weekly_pdf_job_store" not in sys.modules
+assert "diet_bot.postgres_payment_store" not in sys.modules
 assert "psycopg" not in sys.modules
 """
     env = os.environ.copy()
@@ -105,6 +107,69 @@ def test_run_bot_startup_invokes_weekly_pdf_schema_validation_for_postgres(monke
     assert polled == [fake_bot]
 
 
+def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+    from diet_bot.runtime_config import load_runtime_config
+
+    events: list[str] = []
+    fake_bot = object()
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "123456:test-token",
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    class FakeDispatcher:
+        async def start_polling(self, bot) -> None:
+            assert bot is fake_bot
+            events.append("start_polling")
+
+    async def fake_set_commands(_bot) -> None:
+        events.append("set_commands")
+
+    def fake_bot_factory(_token: str):
+        events.append("bot")
+        return fake_bot
+
+    def fake_validate_entitlement_storage(startup_config) -> None:
+        assert startup_config is config
+        events.append("validate_entitlement")
+
+    def fake_validate_weekly_pdf_jobs(startup_config) -> None:
+        assert startup_config is config
+        events.append("validate_weekly_pdf")
+
+    def fake_validate_payment(startup_config) -> None:
+        assert startup_config is config
+        events.append("validate_payment")
+
+    monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", fake_validate_entitlement_storage)
+    monkeypatch.setattr(
+        telegram_app,
+        "validate_weekly_pdf_job_runtime_for_startup",
+        fake_validate_weekly_pdf_jobs,
+    )
+    monkeypatch.setattr(telegram_app, "validate_payment_runtime_for_startup", fake_validate_payment)
+    monkeypatch.setattr(telegram_app, "Bot", fake_bot_factory)
+    monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_commands)
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+
+    asyncio.run(telegram_app.run_bot())
+
+    assert events == [
+        "validate_entitlement",
+        "validate_weekly_pdf",
+        "validate_payment",
+        "bot",
+        "set_commands",
+        "start_polling",
+    ]
+
+
 def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, tmp_path) -> None:
     import diet_bot.telegram_app as telegram_app
     from diet_bot.runtime_config import load_runtime_config
@@ -136,6 +201,7 @@ def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, t
             "diet_bot.postgres_single_poller_guard",
             "diet_bot.postgres_entitlement_store",
             "diet_bot.postgres_weekly_pdf_job_store",
+            "diet_bot.postgres_payment_store",
             "psycopg",
         )):
             raise AssertionError(f"JSON startup touched postgres dependency {name}")
@@ -144,6 +210,7 @@ def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, t
     monkeypatch.delitem(sys.modules, "diet_bot.postgres_single_poller_guard", raising=False)
     monkeypatch.delitem(sys.modules, "diet_bot.postgres_entitlement_store", raising=False)
     monkeypatch.delitem(sys.modules, "diet_bot.postgres_weekly_pdf_job_store", raising=False)
+    monkeypatch.delitem(sys.modules, "diet_bot.postgres_payment_store", raising=False)
     monkeypatch.delitem(sys.modules, "psycopg", raising=False)
     monkeypatch.setattr("builtins.__import__", guarded_import)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
@@ -157,9 +224,11 @@ def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, t
     assert "diet_bot.postgres_single_poller_guard" not in imported
     assert "diet_bot.postgres_entitlement_store" not in imported
     assert "diet_bot.postgres_weekly_pdf_job_store" not in imported
+    assert "diet_bot.postgres_payment_store" not in imported
     assert "diet_bot.postgres_single_poller_guard" not in sys.modules
     assert "diet_bot.postgres_entitlement_store" not in sys.modules
     assert "diet_bot.postgres_weekly_pdf_job_store" not in sys.modules
+    assert "diet_bot.postgres_payment_store" not in sys.modules
     assert "psycopg" not in sys.modules
 
 

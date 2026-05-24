@@ -64,3 +64,84 @@ def test_enabled_postgres_payment_runtime_is_lazy(monkeypatch: pytest.MonkeyPatc
 
     assert service is not None
     assert created == [("postgresql://user:secret@example/test", 5, 3)]
+
+
+def test_disabled_payment_startup_validation_does_not_import_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from diet_bot.payment_runtime import validate_payment_runtime_for_startup
+
+    sys.modules.pop("diet_bot.postgres_payment_store", None)
+    sys.modules.pop("psycopg", None)
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.startswith(("diet_bot.postgres_payment_store", "psycopg")):
+            raise AssertionError(f"disabled payment startup validation imported {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    validate_payment_runtime_for_startup(load_runtime_config({}))
+
+
+def test_enabled_payment_startup_validation_checks_postgres_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from diet_bot.payment_runtime import validate_payment_runtime_for_startup
+
+    calls: list[tuple[str, str]] = []
+
+    class FakePostgresPaymentStore:
+        def __init__(self, dsn: str) -> None:
+            calls.append(("init", dsn))
+
+        def validate_schema(self) -> None:
+            calls.append(("validate_schema", "called"))
+
+    module = types.ModuleType("diet_bot.postgres_payment_store")
+    module.PostgresPaymentStore = FakePostgresPaymentStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_payment_store", module)
+    config = load_runtime_config(
+        {
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/test",
+        },
+    )
+
+    validate_payment_runtime_for_startup(config)
+
+    assert calls == [
+        ("init", "postgresql://user:secret@example/test"),
+        ("validate_schema", "called"),
+    ]
+
+
+def test_enabled_payment_startup_validation_wraps_schema_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from diet_bot.payment_runtime import PaymentLedgerUnavailable, validate_payment_runtime_for_startup
+
+    class FakePostgresPaymentStore:
+        def __init__(self, _dsn: str) -> None:
+            pass
+
+        def validate_schema(self) -> None:
+            raise RuntimeError("missing payment_orders")
+
+    module = types.ModuleType("diet_bot.postgres_payment_store")
+    module.PostgresPaymentStore = FakePostgresPaymentStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_payment_store", module)
+    config = load_runtime_config(
+        {
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/test",
+        },
+    )
+
+    with pytest.raises(PaymentLedgerUnavailable, match="Payment ledger schema is not ready") as exc_info:
+        validate_payment_runtime_for_startup(config)
+
+    assert exc_info.value.reason == "payment_ledger_schema_invalid"

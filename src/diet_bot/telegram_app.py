@@ -94,7 +94,11 @@ from .safety import evaluate_safety
 from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
 from .entitlement_service import EntitlementService
 from .entitlement_storage import EntitlementStorageError
-from .payment_runtime import PaymentLedgerUnavailable, create_payment_service
+from .payment_runtime import (
+    PaymentLedgerUnavailable,
+    create_payment_service,
+    validate_payment_runtime_for_startup,
+)
 from .payments import (
     PRODUCT_EXTRA_ONE_DAY,
     PRODUCT_EXTRA_WEEKLY_PDF,
@@ -1338,6 +1342,7 @@ async def run_bot() -> None:
     assert config.bot_token is not None
     _validate_entitlement_storage(config)
     validate_weekly_pdf_job_runtime_for_startup(config)
+    validate_payment_runtime_for_startup(config)
     single_poller_guard = _acquire_postgres_single_poller_guard(config)
     try:
         bot = Bot(config.bot_token)
