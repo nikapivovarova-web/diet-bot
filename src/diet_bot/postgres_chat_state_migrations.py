@@ -61,6 +61,26 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605250002",
+        description="Create chat state JSON import audit table",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS chat_state_json_import_runs (
+                migration_id TEXT PRIMARY KEY,
+                source_fingerprint TEXT NOT NULL,
+                source_metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                status TEXT NOT NULL DEFAULT 'started',
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                finished_at TIMESTAMPTZ,
+                CONSTRAINT chk_chat_state_json_import_runs_status CHECK (
+                    status IN ('started', 'applied', 'failed')
+                )
+            )
+            """,
+        ),
+    ),
 )
 
 
