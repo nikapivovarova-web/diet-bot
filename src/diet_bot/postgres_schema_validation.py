@@ -15,6 +15,7 @@ class PostgresSchemaExpectation:
     table_columns: Mapping[str, tuple[str, ...]]
     indexes: tuple[str, ...]
     remediation: str
+    constraints: tuple[str, ...] = ()
 
 
 def validate_postgres_schema(
@@ -59,6 +60,17 @@ def validate_postgres_schema(
             _fail(
                 expectation,
                 f"missing indexes: {', '.join(missing_indexes)}",
+                error_cls=error_cls,
+            )
+
+    expected_constraints = set(expectation.constraints)
+    if expected_constraints:
+        found_constraints = _fetch_constraints(cur, expected_constraints)
+        missing_constraints = sorted(expected_constraints - found_constraints)
+        if missing_constraints:
+            _fail(
+                expectation,
+                f"missing constraints: {', '.join(missing_constraints)}",
                 error_cls=error_cls,
             )
 
@@ -115,6 +127,19 @@ def _fetch_indexes(cur: Any, expected_indexes: set[str]) -> set[str]:
         (sorted(expected_indexes),),
     )
     return {str(row["indexname"]) for row in cur.fetchall()}
+
+
+def _fetch_constraints(cur: Any, expected_constraints: set[str]) -> set[str]:
+    cur.execute(
+        """
+        SELECT conname
+        FROM pg_constraint
+        WHERE connamespace = current_schema()::regnamespace
+          AND conname = ANY(%s)
+        """,
+        (sorted(expected_constraints),),
+    )
+    return {str(row["conname"]) for row in cur.fetchall()}
 
 
 def _missing_columns(

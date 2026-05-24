@@ -16,6 +16,7 @@ def test_validate_postgres_schema_accepts_complete_schema() -> None:
             "orders": {"order_id", "amount"},
         },
         indexes={"idx_orders_amount"},
+        constraints={"chk_orders_amount_positive"},
         migrations={"202605240001"},
     )
 
@@ -30,6 +31,7 @@ def test_validate_postgres_schema_rejects_missing_migration_version() -> None:
             "orders": {"order_id", "amount"},
         },
         indexes={"idx_orders_amount"},
+        constraints={"chk_orders_amount_positive"},
         migrations=set(),
     )
 
@@ -45,6 +47,7 @@ def test_validate_postgres_schema_rejects_missing_column() -> None:
             "orders": {"order_id"},
         },
         indexes={"idx_orders_amount"},
+        constraints={"chk_orders_amount_positive"},
         migrations={"202605240001"},
     )
 
@@ -60,10 +63,27 @@ def test_validate_postgres_schema_rejects_missing_index() -> None:
             "orders": {"order_id", "amount"},
         },
         indexes=set(),
+        constraints={"chk_orders_amount_positive"},
         migrations={"202605240001"},
     )
 
     with pytest.raises(RuntimeError, match="missing indexes.*idx_orders_amount"):
+        validate_postgres_schema(cursor, _expectation())
+
+
+def test_validate_postgres_schema_rejects_missing_constraint() -> None:
+    cursor = SchemaCursor(
+        tables={"schema_migrations", "orders"},
+        columns={
+            "schema_migrations": {"version", "description", "applied_at"},
+            "orders": {"order_id", "amount"},
+        },
+        indexes={"idx_orders_amount"},
+        constraints=set(),
+        migrations={"202605240001"},
+    )
+
+    with pytest.raises(RuntimeError, match="missing constraints.*chk_orders_amount_positive"):
         validate_postgres_schema(cursor, _expectation())
 
 
@@ -77,6 +97,7 @@ def _expectation() -> PostgresSchemaExpectation:
         },
         indexes=("idx_orders_amount",),
         remediation="run test migrations",
+        constraints=("chk_orders_amount_positive",),
     )
 
 
@@ -87,11 +108,13 @@ class SchemaCursor:
         tables: set[str],
         columns: dict[str, set[str]],
         indexes: set[str],
+        constraints: set[str],
         migrations: set[str],
     ) -> None:
         self.tables = tables
         self.columns = columns
         self.indexes = indexes
+        self.constraints = constraints
         self.migrations = migrations
         self._rows: list[dict[str, str]] = []
 
@@ -115,6 +138,9 @@ class SchemaCursor:
             return
         if "FROM pg_indexes" in normalized:
             self._rows = [{"indexname": index} for index in sorted(self.indexes & values)]
+            return
+        if "FROM pg_constraint" in normalized:
+            self._rows = [{"conname": constraint} for constraint in sorted(self.constraints & values)]
             return
         raise AssertionError(f"unexpected query: {query}")
 
