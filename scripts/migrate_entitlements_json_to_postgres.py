@@ -26,6 +26,14 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--migration-id", required=True)
     parser.add_argument("--database-url")
+    parser.add_argument(
+        "--allow-non-empty-target",
+        action="store_true",
+        help="allow overwriting an entitlement target that already contains rows",
+    )
+    parser.add_argument("--expected-source-fingerprint")
+    parser.add_argument("--expected-entitlement-count", type=_non_negative_int)
+    parser.add_argument("--expected-processed-charge-count", type=_non_negative_int)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="write the import into PostgreSQL")
     mode.add_argument("--dry-run", action="store_true", help="preview the import without a DB connection")
@@ -38,6 +46,13 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     source_fingerprint = _source_fingerprint(source)
     entitlements = JsonEntitlementStore(source).load_all()
     report = _report(entitlements)
+    _validate_expected_source(
+        source_fingerprint=source_fingerprint,
+        report=report,
+        expected_source_fingerprint=args.expected_source_fingerprint,
+        expected_entitlement_count=args.expected_entitlement_count,
+        expected_processed_charge_count=args.expected_processed_charge_count,
+    )
     mode_name = "apply" if args.apply else "dry_run"
     payload = _payload(
         mode=mode_name,
@@ -64,6 +79,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             source_metadata=source_metadata,
             entitlements=entitlements,
             result_payload=payload,
+            allow_non_empty_target=args.allow_non_empty_target,
         )
     except Exception as exc:
         if isinstance(exc, MigrationError):
@@ -81,6 +97,39 @@ def _report(entitlements: dict[int, Entitlement]) -> dict[str, int]:
             for entitlement in entitlements.values()
         ),
     }
+
+
+def _validate_expected_source(
+    *,
+    source_fingerprint: str,
+    report: dict[str, int],
+    expected_source_fingerprint: str | None,
+    expected_entitlement_count: int | None,
+    expected_processed_charge_count: int | None,
+) -> None:
+    if expected_source_fingerprint is not None:
+        expected = expected_source_fingerprint.strip().lower()
+        if expected != source_fingerprint:
+            raise SystemExit(
+                "source fingerprint mismatch: "
+                f"expected {expected_source_fingerprint}, got {source_fingerprint}",
+            )
+    if (
+        expected_entitlement_count is not None
+        and report["entitlements"] != expected_entitlement_count
+    ):
+        raise SystemExit(
+            "entitlement count mismatch: "
+            f"expected {expected_entitlement_count}, got {report['entitlements']}",
+        )
+    if (
+        expected_processed_charge_count is not None
+        and report["processed_charge_ids"] != expected_processed_charge_count
+    ):
+        raise SystemExit(
+            "processed charge count mismatch: "
+            f"expected {expected_processed_charge_count}, got {report['processed_charge_ids']}",
+        )
 
 
 def _payload(
@@ -132,6 +181,16 @@ def _source_fingerprint(path: Path) -> str:
     else:
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return parsed
 
 
 if __name__ == "__main__":

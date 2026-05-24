@@ -93,6 +93,7 @@ class PostgresEntitlementStore:
         source_metadata: Mapping[str, Any],
         entitlements: Mapping[int, Entitlement],
         result_payload: Mapping[str, Any],
+        allow_non_empty_target: bool = False,
     ) -> dict[str, Any]:
         normalized = _normalize_entitlements(entitlements)
         with self._connect() as conn:
@@ -120,6 +121,8 @@ class PostgresEntitlementStore:
                                 f"{existing['status']!r}.",
                             )
                         return dict(existing["result_json"])
+                    if not allow_non_empty_target:
+                        self._require_empty_json_import_target_cur(cur)
 
                     cur.execute(
                         """
@@ -275,6 +278,28 @@ class PostgresEntitlementStore:
 
     def _lock_import_cur(self, cur: Any) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_IMPORT_LOCK_ID,))
+
+    def _require_empty_json_import_target_cur(self, cur: Any) -> None:
+        counts = self._json_import_target_counts_cur(cur)
+        if not any(counts.values()):
+            return
+        formatted_counts = ", ".join(f"{name}={count}" for name, count in counts.items())
+        raise EntitlementStorageError(
+            "Refusing JSON entitlement import into non-empty Postgres target "
+            f"({formatted_counts}). Pass --allow-non-empty-target only after verifying "
+            "the overwrite is intentional.",
+        )
+
+    def _json_import_target_counts_cur(self, cur: Any) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for table_name in (
+            "entitlements",
+            "entitlement_processed_charge_ids",
+            "entitlement_json_import_runs",
+        ):
+            cur.execute(f"SELECT count(*) AS count FROM {table_name}")
+            counts[table_name] = int(cur.fetchone()["count"])
+        return counts
 
     def _connect(self):
         try:

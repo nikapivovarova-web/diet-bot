@@ -255,6 +255,65 @@ def test_json_migration_apply_validates_parity_and_rerun_is_idempotent(
     assert store.load_all() == JsonEntitlementStore(source).load_all()
 
 
+def test_json_migration_refuses_non_empty_target_by_default(
+    tmp_path: Path,
+    store: PostgresEntitlementStore,
+) -> None:
+    existing_chat_id = _chat_id()
+    existing_entitlement = Entitlement(monthly_one_day_remaining=1)
+    store.save_all({existing_chat_id: existing_entitlement})
+
+    source = tmp_path / "subscriptions.json"
+    _write_source(source, {_chat_id(): Entitlement(monthly_one_day_remaining=5)})
+
+    with pytest.raises(migration.MigrationError, match="non-empty"):
+        migration.main(
+            [
+                "--source",
+                str(source),
+                "--migration-id",
+                f"migration-{uuid.uuid4().hex}",
+                "--apply",
+                "--database-url",
+                store.dsn,
+            ],
+            env={},
+        )
+
+    assert store.load_all() == {existing_chat_id: existing_entitlement}
+
+
+def test_json_migration_allows_non_empty_target_with_explicit_override(
+    tmp_path: Path,
+    store: PostgresEntitlementStore,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store.save_all({_chat_id(): Entitlement(monthly_one_day_remaining=1)})
+
+    source = tmp_path / "subscriptions.json"
+    entitlements = {
+        _chat_id(): Entitlement(monthly_one_day_remaining=5, processed_payment_charge_ids=["charge-1"]),
+    }
+    _write_source(source, entitlements)
+
+    assert migration.main(
+        [
+            "--source",
+            str(source),
+            "--migration-id",
+            f"migration-{uuid.uuid4().hex}",
+            "--apply",
+            "--allow-non-empty-target",
+            "--database-url",
+            store.dsn,
+        ],
+        env={},
+    ) == 0
+    capsys.readouterr()
+
+    assert store.load_all() == JsonEntitlementStore(source).load_all()
+
+
 def test_json_migration_same_migration_id_with_different_fingerprint_fails(
     tmp_path: Path,
     store: PostgresEntitlementStore,
