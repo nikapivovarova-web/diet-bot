@@ -14,6 +14,29 @@ def create_payment_service(config: RuntimeConfig | None = None) -> PaymentServic
     return PaymentService(create_payment_store(config))
 
 
+def validate_payment_runtime_for_startup(config: RuntimeConfig | None = None) -> None:
+    runtime_config = load_runtime_config() if config is None else config
+    if not runtime_config.payments_enabled:
+        return
+
+    store = create_payment_store(runtime_config)
+    validate_schema = getattr(store, "validate_schema", None)
+    if not callable(validate_schema):
+        raise PaymentLedgerUnavailable(
+            "payment_ledger_schema_invalid",
+            "Payment ledger schema is not ready; run payment migrations before startup.",
+        )
+    try:
+        validate_schema()
+    except PaymentLedgerUnavailable:
+        raise
+    except Exception as exc:
+        raise PaymentLedgerUnavailable(
+            "payment_ledger_schema_invalid",
+            "Payment ledger schema is not ready; run payment migrations before startup.",
+        ) from exc
+
+
 def create_payment_store(config: RuntimeConfig | None = None):
     runtime_config = load_runtime_config() if config is None else config
     if not runtime_config.payments_enabled:
