@@ -49,6 +49,7 @@ from .builder import (
 )
 from .catalog import built_in_foods
 from .calculator import calculate_targets
+from .chat_state_storage import JsonChatStateStore
 from .domain import (
     ActivityLevel,
     BatchPrep,
@@ -754,6 +755,8 @@ _RUNTIME_CONFIG = load_runtime_config()
 STATE_FILE = _RUNTIME_CONFIG.state_file
 SUBSCRIPTIONS_STATE_FILE = _RUNTIME_CONFIG.subscriptions_state_file
 PROMO_CODES_STATE_FILE = _RUNTIME_CONFIG.promo_codes_state_file
+_CHAT_STATE_STORE: JsonChatStateStore | None = None
+_CHAT_STATE_STORE_PATH: Path | None = None
 ADMIN_USER_IDS = set(_RUNTIME_CONFIG.admin_user_ids)
 TESTER_CHAT_IDS = set(_RUNTIME_CONFIG.tester_chat_ids)
 TELEGRAM_PROVIDER_TOKEN = _RUNTIME_CONFIG.telegram_provider_token
@@ -783,6 +786,18 @@ PAYMENT_CALLBACKS = {
     CALLBACK_BUY_EXTRA_ONE_DAY,
     CALLBACK_BUY_EXTRA_WEEKLY_PDF,
 }
+
+
+def _chat_state_store() -> JsonChatStateStore:
+    global _CHAT_STATE_STORE, _CHAT_STATE_STORE_PATH
+
+    path = Path(STATE_FILE)
+    if _CHAT_STATE_STORE is None or _CHAT_STATE_STORE_PATH != path:
+        _CHAT_STATE_STORE = JsonChatStateStore(path)
+        _CHAT_STATE_STORE_PATH = path
+    return _CHAT_STATE_STORE
+
+
 PAYLOAD_SUBSCRIPTION_MONTH = "diet:stars:subscription_month"
 PAYLOAD_EXTRA_ONE_DAY = "diet:stars:extra_one_day"
 PAYLOAD_EXTRA_WEEKLY_PDF = "diet:stars:extra_weekly_pdf"
@@ -3364,12 +3379,13 @@ def _load_chat_history(chat_id: int) -> None:
 
 
 def _save_chat_history(chat_id: int) -> None:
-    state = _load_state()
-    chat_state = dict(state.get(str(chat_id), {}))
-    chat_state["recipe_ids"] = RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:]
-    chat_state["recipe_keys"] = RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:]
-    state[str(chat_id)] = chat_state
-    _save_state(state)
+    _chat_state_store().save_chat_state(
+        chat_id,
+        {
+            "recipe_ids": RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:],
+            "recipe_keys": RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:],
+        },
+    )
 
 
 def _profile_for_chat(chat_id: int) -> UserProfile | None:
@@ -3390,37 +3406,15 @@ def _profile_for_chat(chat_id: int) -> UserProfile | None:
 
 
 def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
-    state = _load_state()
-    chat_state = dict(state.get(str(chat_id), {}))
-    chat_state["profile"] = _profile_to_dict(profile)
-    state[str(chat_id)] = chat_state
-    _save_state(state)
+    _chat_state_store().save_chat_state(chat_id, {"profile": _profile_to_dict(profile)})
 
 
 def _load_state() -> dict[str, dict[str, object]]:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(loaded, dict):
-        return {}
-    state: dict[str, dict[str, object]] = {}
-    for chat_id, value in loaded.items():
-        chat_state: dict[str, object] = {
-            "recipe_ids": list(value.get("recipe_ids", [])) if isinstance(value, dict) else [],
-            "recipe_keys": list(value.get("recipe_keys", [])) if isinstance(value, dict) else [],
-        }
-        if isinstance(value, dict) and isinstance(value.get("profile"), dict):
-            chat_state["profile"] = value["profile"]
-        state[str(chat_id)] = chat_state
-    return state
+    return _chat_state_store().load_all()
 
 
 def _save_state(state: dict[str, dict[str, object]]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _chat_state_store().save_all(state)
 
 
 def _profile_to_dict(profile: UserProfile) -> dict[str, object]:
