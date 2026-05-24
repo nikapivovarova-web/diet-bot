@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pytest
 
 from diet_bot.entitlement_service import EntitlementService
-from diet_bot.entitlement_storage import JsonEntitlementStore
+from diet_bot.entitlement_storage import EntitlementStorageError, JsonEntitlementStore
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.subscriptions import Entitlement
 from scripts import migrate_entitlements_json_to_postgres as migration
@@ -115,6 +115,7 @@ def store() -> PostgresEntitlementStore:
 def test_schema_init_is_idempotent(store: PostgresEntitlementStore) -> None:
     store.initialize()
     store.initialize()
+    store.validate_schema()
 
     with store._connect() as conn:
         with conn.cursor() as cur:
@@ -157,6 +158,15 @@ def test_schema_init_is_idempotent(store: PostgresEntitlementStore) -> None:
         "entitlement_processed_charge_ids_pkey",
     }
     assert migration_count >= 2
+
+
+def test_validate_schema_rejects_missing_required_migration_version(store: PostgresEntitlementStore) -> None:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM schema_migrations WHERE version = %s", ("202605220002",))
+
+    with pytest.raises(EntitlementStorageError, match="missing migration versions.*202605220002"):
+        store.validate_schema()
 
 
 def test_entitlement_roundtrip(store: PostgresEntitlementStore) -> None:

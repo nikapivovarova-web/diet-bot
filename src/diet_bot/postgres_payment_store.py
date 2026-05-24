@@ -20,7 +20,12 @@ from .payments import (
     PaymentOrder,
     RecordedPaymentCharge,
 )
-from .postgres_payment_migrations import run_payment_schema_migrations
+from .postgres_payment_migrations import MIGRATIONS, run_payment_schema_migrations
+from .postgres_schema_validation import (
+    SCHEMA_MIGRATIONS_COLUMNS,
+    PostgresSchemaExpectation,
+    validate_postgres_schema,
+)
 from .subscriptions import (
     Entitlement,
     apply_extra_one_day_payment,
@@ -30,6 +35,62 @@ from .subscriptions import (
 
 
 GrantEntitlementInTransaction = Callable[[Any, PaymentOrder, PaymentCharge], None]
+
+PAYMENT_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
+    component="payment",
+    migration_versions=tuple(migration.version for migration in MIGRATIONS),
+    table_columns={
+        "schema_migrations": SCHEMA_MIGRATIONS_COLUMNS,
+        "payment_orders": (
+            "order_id",
+            "user_id",
+            "chat_id",
+            "product",
+            "provider",
+            "amount",
+            "currency",
+            "nonce",
+            "status",
+            "failure_reason",
+            "created_at",
+            "updated_at",
+            "paid_at",
+            "granted_at",
+            "failed_at",
+        ),
+        "payment_charges": (
+            "charge_id",
+            "order_id",
+            "provider",
+            "telegram_payment_charge_id",
+            "provider_payment_charge_id",
+            "amount",
+            "currency",
+            "status",
+            "raw_payload_json",
+            "created_at",
+        ),
+        "payment_events": (
+            "event_id",
+            "order_id",
+            "event_type",
+            "provider",
+            "event_key",
+            "telegram_payment_charge_id",
+            "provider_payment_charge_id",
+            "payload_json",
+            "created_at",
+        ),
+    },
+    indexes=(
+        "idx_payment_charges_telegram_charge_id_unique",
+        "idx_payment_charges_provider_charge_id_unique",
+        "idx_payment_events_event_key_unique",
+        "idx_payment_orders_user_chat_created",
+        "idx_payment_events_order_created",
+    ),
+    remediation="Run payment migrations before use.",
+)
 
 
 class PostgresPaymentStore:
@@ -55,25 +116,9 @@ class PostgresPaymentStore:
                     run_payment_schema_migrations(cur)
 
     def validate_schema(self) -> None:
-        expected_tables = {"schema_migrations", "payment_orders", "payment_charges", "payment_events"}
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = current_schema()
-                      AND table_name = ANY(%s)
-                    """,
-                    (sorted(expected_tables),),
-                )
-                found_tables = {str(row["table_name"]) for row in cur.fetchall()}
-        missing_tables = sorted(expected_tables - found_tables)
-        if missing_tables:
-            raise RuntimeError(
-                "Postgres payment schema is missing tables: "
-                f"{', '.join(missing_tables)}. Run payment migrations before use.",
-            )
+                validate_postgres_schema(cur, PAYMENT_SCHEMA_EXPECTATION)
 
     def create_order(self, order: PaymentOrder) -> PaymentOrder:
         with self._connect() as conn:

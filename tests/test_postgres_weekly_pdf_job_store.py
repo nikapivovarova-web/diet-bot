@@ -95,6 +95,7 @@ def store() -> PostgresWeeklyPdfJobStore:
 def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
     store.initialize()
     store.initialize()
+    store.validate_schema()
 
     with store._connect() as conn:
         with conn.cursor() as cur:
@@ -127,6 +128,15 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "idx_weekly_pdf_jobs_idempotency_key_unique",
         "idx_weekly_pdf_jobs_stale",
     }
+
+
+def test_validate_schema_rejects_missing_critical_column(store: PostgresWeeklyPdfJobStore) -> None:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE weekly_pdf_jobs DROP COLUMN failure_reason")
+
+    with pytest.raises(RuntimeError, match=r"missing columns.*weekly_pdf_jobs\.failure_reason"):
+        store.validate_schema()
 
 
 def test_two_store_instances_admit_same_chat_to_one_active_job_only(

@@ -6,12 +6,57 @@ from contextlib import contextmanager
 from typing import Any
 
 from .entitlement_storage import EntitlementStorageError
-from .postgres_entitlement_migrations import run_entitlement_schema_migrations
+from .postgres_entitlement_migrations import MIGRATIONS, run_entitlement_schema_migrations
+from .postgres_schema_validation import (
+    SCHEMA_MIGRATIONS_COLUMNS,
+    PostgresSchemaExpectation,
+    validate_postgres_schema,
+)
 from .subscriptions import Entitlement
 
 
 ENTITLEMENT_MAP_LOCK_ID = 4_382_026_052_200_001
 ENTITLEMENT_IMPORT_LOCK_ID = 4_382_026_052_200_002
+
+ENTITLEMENT_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
+    component="entitlement",
+    migration_versions=tuple(migration.version for migration in MIGRATIONS),
+    table_columns={
+        "schema_migrations": SCHEMA_MIGRATIONS_COLUMNS,
+        "entitlements": (
+            "chat_id",
+            "free_trial_used",
+            "subscription_period_start",
+            "subscription_period_end",
+            "test_access_until",
+            "test_access_enabled",
+            "monthly_one_day_remaining",
+            "monthly_weekly_pdf_remaining",
+            "extra_one_day_remaining",
+            "extra_weekly_pdf_remaining",
+            "created_at",
+            "updated_at",
+            "version",
+        ),
+        "entitlement_processed_charge_ids": (
+            "chat_id",
+            "charge_id",
+            "position",
+            "recorded_at",
+        ),
+        "entitlement_json_import_runs": (
+            "migration_id",
+            "source_fingerprint",
+            "source_metadata_json",
+            "result_json",
+            "status",
+            "started_at",
+            "finished_at",
+        ),
+    },
+    indexes=("idx_entitlement_processed_charge_ids_chat_position",),
+    remediation="Run entitlement migrations before startup.",
+)
 
 
 class PostgresEntitlementStore:
@@ -37,31 +82,13 @@ class PostgresEntitlementStore:
                     run_entitlement_schema_migrations(cur)
 
     def validate_schema(self) -> None:
-        expected_tables = {
-            "schema_migrations",
-            "entitlements",
-            "entitlement_processed_charge_ids",
-            "entitlement_json_import_runs",
-        }
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = current_schema()
-                      AND table_name = ANY(%s)
-                    """,
-                    (sorted(expected_tables),),
+                validate_postgres_schema(
+                    cur,
+                    ENTITLEMENT_SCHEMA_EXPECTATION,
+                    error_cls=EntitlementStorageError,
                 )
-                found_tables = {str(row["table_name"]) for row in cur.fetchall()}
-
-        missing_tables = sorted(expected_tables - found_tables)
-        if missing_tables:
-            raise EntitlementStorageError(
-                "Postgres entitlement schema is missing tables: "
-                f"{', '.join(missing_tables)}. Run entitlement migrations before startup.",
-            )
 
     def load_all(self) -> dict[int, Entitlement]:
         with self._connect() as conn:

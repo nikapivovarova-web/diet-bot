@@ -7,7 +7,12 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
-from .postgres_weekly_pdf_job_migrations import run_weekly_pdf_job_schema_migrations
+from .postgres_schema_validation import (
+    SCHEMA_MIGRATIONS_COLUMNS,
+    PostgresSchemaExpectation,
+    validate_postgres_schema,
+)
+from .postgres_weekly_pdf_job_migrations import MIGRATIONS, run_weekly_pdf_job_schema_migrations
 from .subscriptions import AttemptConsumption, Entitlement, consume_weekly_pdf_attempt, refund_attempt
 from .weekly_pdf_jobs import (
     AdmitJobResult,
@@ -25,6 +30,37 @@ from .weekly_pdf_jobs import (
     TERMINAL_JOB_STATUSES,
     WeeklyPdfJob,
     refund_status_for_consumption_source,
+)
+
+
+WEEKLY_PDF_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
+    component="weekly PDF job",
+    migration_versions=tuple(migration.version for migration in MIGRATIONS),
+    table_columns={
+        "schema_migrations": SCHEMA_MIGRATIONS_COLUMNS,
+        "weekly_pdf_jobs": (
+            "job_id",
+            "chat_id",
+            "idempotency_key",
+            "status",
+            "refund_status",
+            "consumption_source",
+            "stale_after",
+            "metadata_json",
+            "failure_reason",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "heartbeat_at",
+            "finished_at",
+        ),
+    },
+    indexes=(
+        "idx_weekly_pdf_jobs_active_chat_unique",
+        "idx_weekly_pdf_jobs_idempotency_key_unique",
+        "idx_weekly_pdf_jobs_stale",
+    ),
+    remediation="Run weekly PDF job migrations before use.",
 )
 
 
@@ -51,25 +87,9 @@ class PostgresWeeklyPdfJobStore:
                     run_weekly_pdf_job_schema_migrations(cur)
 
     def validate_schema(self) -> None:
-        expected_tables = {"schema_migrations", "weekly_pdf_jobs"}
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = current_schema()
-                      AND table_name = ANY(%s)
-                    """,
-                    (sorted(expected_tables),),
-                )
-                found_tables = {str(row["table_name"]) for row in cur.fetchall()}
-        missing_tables = sorted(expected_tables - found_tables)
-        if missing_tables:
-            raise RuntimeError(
-                "Postgres weekly PDF job schema is missing tables: "
-                f"{', '.join(missing_tables)}. Run weekly PDF job migrations before use.",
-            )
+                validate_postgres_schema(cur, WEEKLY_PDF_JOB_SCHEMA_EXPECTATION)
 
     def admit_job(
         self,
