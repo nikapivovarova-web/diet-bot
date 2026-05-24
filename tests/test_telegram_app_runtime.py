@@ -26,6 +26,8 @@ def guarded_import(name, *args, **kwargs):
         "diet_bot.postgres_entitlement_store",
         "diet_bot.postgres_weekly_pdf_job_store",
         "diet_bot.postgres_payment_store",
+        "diet_bot.postgres_chat_state_store",
+        "diet_bot.postgres_chat_state_migrations",
         "psycopg",
     )):
         raise AssertionError(f"telegram_app import touched postgres dependency {name}")
@@ -37,6 +39,8 @@ assert "diet_bot.postgres_single_poller_guard" not in sys.modules
 assert "diet_bot.postgres_entitlement_store" not in sys.modules
 assert "diet_bot.postgres_weekly_pdf_job_store" not in sys.modules
 assert "diet_bot.postgres_payment_store" not in sys.modules
+assert "diet_bot.postgres_chat_state_store" not in sys.modules
+assert "diet_bot.postgres_chat_state_migrations" not in sys.modules
 assert "psycopg" not in sys.modules
 """
     env = os.environ.copy()
@@ -52,6 +56,121 @@ assert "psycopg" not in sys.modules
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_chat_state_runtime_json_path_does_not_import_postgres_or_psycopg(tmp_path) -> None:
+    code = f"""
+import builtins
+import sys
+from pathlib import Path
+
+from diet_bot.runtime_config import load_runtime_config
+from diet_bot.chat_state_runtime import create_chat_state_store, validate_chat_state_store_for_startup
+
+state_path = Path({str(tmp_path / "history.json")!r})
+state_path.write_text("{{}}", encoding="utf-8")
+config = load_runtime_config({{
+    "DIET_BOT_STORAGE_BACKEND": "json",
+    "DIET_BOT_STATE_FILE": str(state_path),
+}})
+
+real_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name.startswith((
+        "diet_bot.postgres_chat_state_store",
+        "diet_bot.postgres_chat_state_migrations",
+        "psycopg",
+    )):
+        raise AssertionError(f"JSON chat state runtime imported postgres dependency {{name}}")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+store = create_chat_state_store(config)
+validate_chat_state_store_for_startup(config, store)
+assert store.load_all() == {{}}
+assert "diet_bot.postgres_chat_state_store" not in sys.modules
+assert "diet_bot.postgres_chat_state_migrations" not in sys.modules
+assert "psycopg" not in sys.modules
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(["src", env.get("PYTHONPATH", "")])
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.getcwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_chat_state_runtime_postgres_validates_schema_without_initializing(monkeypatch) -> None:
+    from diet_bot.chat_state_runtime import validate_chat_state_store_for_startup
+    from diet_bot.runtime_config import load_runtime_config
+
+    calls: list[tuple[str, str]] = []
+    config = load_runtime_config(
+        {
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    class FakePostgresChatStateStore:
+        def __init__(self, database_url: str) -> None:
+            calls.append(("init", database_url))
+
+        def initialize(self) -> None:
+            calls.append(("initialize", "called"))
+
+        def validate_schema(self) -> None:
+            calls.append(("validate_schema", "called"))
+
+    fake_module = types.ModuleType("diet_bot.postgres_chat_state_store")
+    fake_module.PostgresChatStateStore = FakePostgresChatStateStore
+
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_chat_state_store", fake_module)
+
+    validate_chat_state_store_for_startup(config)
+
+    assert calls == [
+        ("init", "postgresql://user:secret@example/db"),
+        ("validate_schema", "called"),
+    ]
+
+
+def test_telegram_app_uses_postgres_chat_state_store_when_backend_is_postgres(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+    from diet_bot.runtime_config import load_runtime_config
+
+    calls: list[tuple[str, str]] = []
+    config = load_runtime_config(
+        {
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    class FakePostgresChatStateStore:
+        def __init__(self, database_url: str) -> None:
+            calls.append(("init", database_url))
+
+    fake_module = types.ModuleType("diet_bot.postgres_chat_state_store")
+    fake_module.PostgresChatStateStore = FakePostgresChatStateStore
+
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_chat_state_store", fake_module)
+    monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "_CHAT_STATE_STORE", None)
+    monkeypatch.setattr(telegram_app, "_CHAT_STATE_STORE_KEY", None, raising=False)
+
+    store = telegram_app._chat_state_store()
+
+    assert isinstance(store, FakePostgresChatStateStore)
+    assert calls == [("init", "postgresql://user:secret@example/db")]
 
 
 def test_run_bot_postgres_startup_acquires_guard_even_outside_production(monkeypatch) -> None:
@@ -96,6 +215,10 @@ def test_run_bot_postgres_startup_acquires_guard_even_outside_production(monkeyp
         assert startup_config is config
         events.append("validate_weekly_pdf")
 
+    def fake_validate_chat_state(startup_config) -> None:
+        assert startup_config is config
+        events.append("validate_chat_state")
+
     def fake_bot_factory(_token: str):
         events.append("bot")
         return fake_bot
@@ -105,6 +228,7 @@ def test_run_bot_postgres_startup_acquires_guard_even_outside_production(monkeyp
 
     monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", fake_validate_chat_state)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", fake_validate_entitlement_storage)
     monkeypatch.setattr(
         telegram_app,
@@ -119,6 +243,7 @@ def test_run_bot_postgres_startup_acquires_guard_even_outside_production(monkeyp
 
     assert polled == [fake_bot]
     assert events == [
+        "validate_chat_state",
         "validate_entitlement",
         "validate_weekly_pdf",
         "guard_init",
@@ -163,6 +288,10 @@ def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch
         assert startup_config is config
         events.append("validate_weekly_pdf")
 
+    def fake_validate_chat_state(startup_config) -> None:
+        assert startup_config is config
+        events.append("validate_chat_state")
+
     def fake_validate_payment(startup_config) -> None:
         assert startup_config is config
         events.append("validate_payment")
@@ -184,6 +313,7 @@ def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch
 
     monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", fake_validate_chat_state)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", fake_validate_entitlement_storage)
     monkeypatch.setattr(
         telegram_app,
@@ -198,6 +328,7 @@ def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch
     asyncio.run(telegram_app.run_bot())
 
     assert events == [
+        "validate_chat_state",
         "validate_entitlement",
         "validate_weekly_pdf",
         "validate_payment",
@@ -242,6 +373,8 @@ def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, t
             "diet_bot.postgres_entitlement_store",
             "diet_bot.postgres_weekly_pdf_job_store",
             "diet_bot.postgres_payment_store",
+            "diet_bot.postgres_chat_state_store",
+            "diet_bot.postgres_chat_state_migrations",
             "psycopg",
         )):
             raise AssertionError(f"JSON startup touched postgres dependency {name}")
@@ -251,6 +384,8 @@ def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, t
     monkeypatch.delitem(sys.modules, "diet_bot.postgres_entitlement_store", raising=False)
     monkeypatch.delitem(sys.modules, "diet_bot.postgres_weekly_pdf_job_store", raising=False)
     monkeypatch.delitem(sys.modules, "diet_bot.postgres_payment_store", raising=False)
+    monkeypatch.delitem(sys.modules, "diet_bot.postgres_chat_state_store", raising=False)
+    monkeypatch.delitem(sys.modules, "diet_bot.postgres_chat_state_migrations", raising=False)
     monkeypatch.delitem(sys.modules, "psycopg", raising=False)
     monkeypatch.setattr("builtins.__import__", guarded_import)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
@@ -265,10 +400,14 @@ def test_run_bot_json_startup_does_not_import_postgres_or_psycopg(monkeypatch, t
     assert "diet_bot.postgres_entitlement_store" not in imported
     assert "diet_bot.postgres_weekly_pdf_job_store" not in imported
     assert "diet_bot.postgres_payment_store" not in imported
+    assert "diet_bot.postgres_chat_state_store" not in imported
+    assert "diet_bot.postgres_chat_state_migrations" not in imported
     assert "diet_bot.postgres_single_poller_guard" not in sys.modules
     assert "diet_bot.postgres_entitlement_store" not in sys.modules
     assert "diet_bot.postgres_weekly_pdf_job_store" not in sys.modules
     assert "diet_bot.postgres_payment_store" not in sys.modules
+    assert "diet_bot.postgres_chat_state_store" not in sys.modules
+    assert "diet_bot.postgres_chat_state_migrations" not in sys.modules
     assert "psycopg" not in sys.modules
 
 
@@ -324,11 +463,16 @@ def test_run_bot_production_postgres_acquires_guard_before_bot_and_releases(
         assert startup_config is config
         events.append("validate_weekly_pdf")
 
+    def fake_validate_chat_state(startup_config) -> None:
+        assert startup_config is config
+        events.append("validate_chat_state")
+
     fake_guard_module = types.ModuleType("diet_bot.postgres_single_poller_guard")
     fake_guard_module.PostgresSinglePollerGuard = FakeGuard
 
     monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", fake_validate_chat_state)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", fake_validate_entitlement_storage)
     monkeypatch.setattr(
         telegram_app,
@@ -342,6 +486,7 @@ def test_run_bot_production_postgres_acquires_guard_before_bot_and_releases(
     asyncio.run(telegram_app.run_bot())
 
     assert events == [
+        "validate_chat_state",
         "validate_entitlement",
         "validate_weekly_pdf",
         "guard_init",
@@ -385,6 +530,7 @@ def test_run_bot_guard_failure_exits_before_bot_or_telegram_path(monkeypatch) ->
 
     monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", lambda _config: None)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", lambda _config: None)
     monkeypatch.setattr(telegram_app, "validate_weekly_pdf_job_runtime_for_startup", lambda _config: None)
     monkeypatch.setattr(telegram_app, "Bot", fail_bot)
@@ -425,6 +571,7 @@ def test_run_bot_unknown_env_postgres_guard_failure_exits_before_bot(monkeypatch
 
     monkeypatch.setitem(sys.modules, "diet_bot.postgres_single_poller_guard", fake_guard_module)
     monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", lambda _config: None)
     monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", lambda _config: None)
     monkeypatch.setattr(telegram_app, "validate_weekly_pdf_job_runtime_for_startup", lambda _config: None)
     monkeypatch.setattr(telegram_app, "validate_payment_runtime_for_startup", lambda _config: None)

@@ -49,7 +49,11 @@ from .builder import (
 )
 from .catalog import built_in_foods
 from .calculator import calculate_targets
-from .chat_state_storage import JsonChatStateStore
+from .chat_state_runtime import (
+    ChatStateStore,
+    create_chat_state_store,
+    validate_chat_state_store_for_startup,
+)
 from .domain import (
     ActivityLevel,
     BatchPrep,
@@ -755,8 +759,8 @@ _RUNTIME_CONFIG = load_runtime_config()
 STATE_FILE = _RUNTIME_CONFIG.state_file
 SUBSCRIPTIONS_STATE_FILE = _RUNTIME_CONFIG.subscriptions_state_file
 PROMO_CODES_STATE_FILE = _RUNTIME_CONFIG.promo_codes_state_file
-_CHAT_STATE_STORE: JsonChatStateStore | None = None
-_CHAT_STATE_STORE_PATH: Path | None = None
+_CHAT_STATE_STORE: ChatStateStore | None = None
+_CHAT_STATE_STORE_KEY: tuple[str, str] | None = None
 ADMIN_USER_IDS = set(_RUNTIME_CONFIG.admin_user_ids)
 TESTER_CHAT_IDS = set(_RUNTIME_CONFIG.tester_chat_ids)
 TELEGRAM_PROVIDER_TOKEN = _RUNTIME_CONFIG.telegram_provider_token
@@ -788,14 +792,23 @@ PAYMENT_CALLBACKS = {
 }
 
 
-def _chat_state_store() -> JsonChatStateStore:
-    global _CHAT_STATE_STORE, _CHAT_STATE_STORE_PATH
+def _chat_state_store() -> ChatStateStore:
+    global _CHAT_STATE_STORE, _CHAT_STATE_STORE_KEY
 
-    path = Path(STATE_FILE)
-    if _CHAT_STATE_STORE is None or _CHAT_STATE_STORE_PATH != path:
-        _CHAT_STATE_STORE = JsonChatStateStore(path)
-        _CHAT_STATE_STORE_PATH = path
+    config = load_runtime_config()
+    if config.storage_backend == "json":
+        config = replace(config, state_file=Path(STATE_FILE))
+    key = _chat_state_store_key(config)
+    if _CHAT_STATE_STORE is None or _CHAT_STATE_STORE_KEY != key:
+        _CHAT_STATE_STORE = create_chat_state_store(config)
+        _CHAT_STATE_STORE_KEY = key
     return _CHAT_STATE_STORE
+
+
+def _chat_state_store_key(config) -> tuple[str, str]:
+    if config.storage_backend == "postgres":
+        return (config.storage_backend, str(config.database_url or ""))
+    return (config.storage_backend, str(config.state_file))
 
 
 PAYLOAD_SUBSCRIPTION_MONTH = "diet:stars:subscription_month"
@@ -1354,6 +1367,7 @@ async def run_bot() -> None:
     if startup_issues:
         raise RuntimeError("; ".join(startup_issues))
     assert config.bot_token is not None
+    validate_chat_state_store_for_startup(config)
     _validate_entitlement_storage(config)
     validate_weekly_pdf_job_runtime_for_startup(config)
     validate_payment_runtime_for_startup(config)

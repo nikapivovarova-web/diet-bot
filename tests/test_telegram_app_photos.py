@@ -227,6 +227,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     path = tmp_path / "subscriptions.json"
     path.write_text("{not-json", encoding="utf-8")
     fake_bot = object()
+    chat_state_validated: list[str] = []
     validated: list[tuple[str, object]] = []
     weekly_pdf_validated: list[str] = []
     guard_events: list[str] = []
@@ -247,6 +248,9 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
 
     def fake_validate_weekly_pdf_jobs(config) -> None:
         weekly_pdf_validated.append(config.storage_backend)
+
+    def fake_validate_chat_state(config) -> None:
+        chat_state_validated.append(config.storage_backend)
 
     class FakeGuard:
         def __init__(self, database_url: str) -> None:
@@ -282,12 +286,18 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
         "validate_weekly_pdf_job_runtime_for_startup",
         fake_validate_weekly_pdf_jobs,
     )
+    monkeypatch.setattr(
+        telegram_app,
+        "validate_chat_state_store_for_startup",
+        fake_validate_chat_state,
+    )
     monkeypatch.setattr(telegram_app, "Bot", lambda _token: fake_bot)
     monkeypatch.setattr(telegram_app, "_set_bot_commands", fake_set_commands)
     monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
 
     await telegram_app.run_bot()
 
+    assert chat_state_validated == ["postgres"]
     assert validated and validated[0][0] == "postgres"
     assert weekly_pdf_validated == ["postgres"]
     assert guard_events == ["guard_init", "guard_acquire", "guard_close"]
