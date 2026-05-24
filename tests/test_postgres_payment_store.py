@@ -167,6 +167,7 @@ def store() -> PostgresPaymentStore:
 def test_schema_init_is_idempotent(store: PostgresPaymentStore) -> None:
     store.initialize()
     store.initialize()
+    store.validate_schema()
 
     with store._connect() as conn:
         with conn.cursor() as cur:
@@ -227,6 +228,15 @@ def test_schema_init_is_idempotent(store: PostgresPaymentStore) -> None:
         "idx_payment_charges_provider_charge_id_unique",
         "idx_payment_events_event_key_unique",
     }
+
+
+def test_validate_schema_rejects_missing_critical_index(store: PostgresPaymentStore) -> None:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP INDEX idx_payment_events_order_created")
+
+    with pytest.raises(RuntimeError, match="missing indexes.*idx_payment_events_order_created"):
+        store.validate_schema()
 
 
 def test_order_lifecycle(store: PostgresPaymentStore) -> None:
