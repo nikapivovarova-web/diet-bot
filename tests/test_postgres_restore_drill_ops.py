@@ -65,6 +65,18 @@ def test_restore_cleanup_runs_dropdb_by_default(
     assert "diet_bot_restore_drill_unit_001" in calls[-1]["cmd"]
     assert ADMIN_DSN not in _joined_commands(calls)
     assert "fake-admin-password" not in _joined_commands(calls)
+    createdb_env = calls[0]["env"]
+    pg_restore_env = calls[1]["env"]
+    assert isinstance(createdb_env, dict)
+    assert isinstance(pg_restore_env, dict)
+    assert createdb_env["PGHOST"] == "db.example.invalid"
+    assert createdb_env["PGUSER"] == "restore_admin"
+    assert createdb_env["PGDATABASE"] == "postgres"
+    assert createdb_env["PGPASSWORD"] == "fake-admin-password"
+    assert pg_restore_env["PGHOST"] == "db.example.invalid"
+    assert pg_restore_env["PGUSER"] == "restore_admin"
+    assert pg_restore_env["PGDATABASE"] == "diet_bot_restore_drill_unit_001"
+    assert pg_restore_env["PGPASSWORD"] == "fake-admin-password"
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["cleanup"] == {"dropdb": "ran", "kept_restore_db": False}
