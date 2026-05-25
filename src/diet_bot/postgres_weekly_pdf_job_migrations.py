@@ -36,6 +36,8 @@ MIGRATIONS = (
                 stale_after TIMESTAMPTZ NOT NULL,
                 metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 failure_reason TEXT,
+                delivered_at TIMESTAMPTZ,
+                finalization_error TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 started_at TIMESTAMPTZ,
@@ -67,6 +69,20 @@ MIGRATIONS = (
             CREATE INDEX IF NOT EXISTS idx_weekly_pdf_jobs_stale
                 ON weekly_pdf_jobs(stale_after)
                 WHERE status IN ('queued', 'running')
+            """,
+        ),
+    ),
+    PostgresMigration(
+        version="202605250001",
+        description="Track delivered weekly PDF jobs",
+        statements=(
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS finalization_error TEXT
             """,
         ),
     ),

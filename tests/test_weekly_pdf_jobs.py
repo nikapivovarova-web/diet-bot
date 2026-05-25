@@ -14,6 +14,8 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    MarkDeliveredResult,
+    MarkDeliveredResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     StartJobResult,
@@ -59,6 +61,26 @@ def test_job_metadata_is_copied_on_creation() -> None:
     assert job.metadata == {"request_id": "weekly-1"}
 
 
+def test_job_tracks_delivery_and_finalization_fields() -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    delivered_at = now + timedelta(seconds=10)
+
+    job = WeeklyPdfJob(
+        job_id=uuid4(),
+        chat_id=123,
+        idempotency_key="idem-123",
+        status=JOB_STATUS_SUCCEEDED,
+        refund_status=REFUND_STATUS_NOT_REQUIRED,
+        consumption_source="monthly",
+        stale_after=now + timedelta(minutes=15),
+        delivered_at=delivered_at,
+        finalization_error="stale_after_delivery",
+    )
+
+    assert job.delivered_at == delivered_at
+    assert job.finalization_error == "stale_after_delivery"
+
+
 def test_result_wrappers_expose_explicit_statuses() -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     job = _job(status=JOB_STATUS_QUEUED, now=now)
@@ -66,11 +88,13 @@ def test_result_wrappers_expose_explicit_statuses() -> None:
     admit = AdmitJobResult(AdmitJobResultStatus.ADMITTED, job)
     start = StartJobResult(StartJobResultStatus.ALREADY_RUNNING, job)
     finish = FinishJobResult(FinishJobResultStatus.INVALID_STATE, job)
+    delivered = MarkDeliveredResult(MarkDeliveredResultStatus.DELIVERED, job)
     cleanup = CleanupStaleResult([finish])
 
     assert admit.status.value == "admitted"
     assert start.status.value == "already_running"
     assert finish.status.value == "invalid_state"
+    assert delivered.status.value == "delivered"
     assert cleanup.jobs == [job]
 
 

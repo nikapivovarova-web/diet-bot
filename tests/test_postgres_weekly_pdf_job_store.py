@@ -12,7 +12,7 @@ import pytest
 
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_weekly_pdf_job_migrations import MIGRATIONS
-from diet_bot.postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore
+from diet_bot.postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore, WEEKLY_PDF_JOB_SCHEMA_EXPECTATION
 from diet_bot.subscriptions import Entitlement, apply_subscription_payment, grant_test_access
 from diet_bot.weekly_pdf_jobs import (
     AdmitJobResultStatus,
@@ -22,6 +22,7 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    MarkDeliveredResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -38,6 +39,8 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     statements = "\n".join(statement for migration in MIGRATIONS for statement in migration.statements)
 
     assert "CREATE TABLE IF NOT EXISTS weekly_pdf_jobs" in statements
+    assert "delivered_at TIMESTAMPTZ" in statements
+    assert "finalization_error TEXT" in statements
     assert "idx_weekly_pdf_jobs_active_chat_unique" in statements
     assert "WHERE status IN ('queued', 'running')" in statements
     assert "idx_weekly_pdf_jobs_idempotency_key_unique" in statements
@@ -51,6 +54,9 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert "test_access" in start_signature.parameters
     assert "chat_id" in cleanup_signature.parameters
     assert hasattr(PostgresWeeklyPdfJobStore, "cancel_queued")
+    assert hasattr(PostgresWeeklyPdfJobStore, "mark_delivered")
+    assert "delivered_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "finalization_error" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
 
 
 @pytest.fixture
@@ -121,6 +127,16 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
                 """
             )
             indexes = {row["indexname"] for row in cur.fetchall()}
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'weekly_pdf_jobs'
+                  AND column_name IN ('delivered_at', 'finalization_error')
+                """
+            )
+            new_columns = {row["column_name"] for row in cur.fetchall()}
 
     assert tables == {"schema_migrations", "weekly_pdf_jobs"}
     assert indexes == {
@@ -128,14 +144,15 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "idx_weekly_pdf_jobs_idempotency_key_unique",
         "idx_weekly_pdf_jobs_stale",
     }
+    assert new_columns == {"delivered_at", "finalization_error"}
 
 
 def test_validate_schema_rejects_missing_critical_column(store: PostgresWeeklyPdfJobStore) -> None:
     with store._connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("ALTER TABLE weekly_pdf_jobs DROP COLUMN failure_reason")
+            cur.execute("ALTER TABLE weekly_pdf_jobs DROP COLUMN delivered_at")
 
-    with pytest.raises(RuntimeError, match=r"missing columns.*weekly_pdf_jobs\.failure_reason"):
+    with pytest.raises(RuntimeError, match=r"missing columns.*weekly_pdf_jobs\.delivered_at"):
         store.validate_schema()
 
 
@@ -271,8 +288,38 @@ def test_finish_failure_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
     assert failed_again_result.status == FinishJobResultStatus.ALREADY_TERMINAL
     assert failed.status == JOB_STATUS_FAILED
     assert failed.refund_status == REFUND_STATUS_REFUNDED
+    assert failed.delivered_at is None
     assert failed_again.refund_status == REFUND_STATUS_REFUNDED
     assert _weekly_remaining(store, chat_id) == 1
+
+
+def test_delivered_failure_closes_successfully_without_refund(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 112
+    delivered_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="delivered-failure-no-refund",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+
+    delivered = store.mark_delivered(started.job_id, now=delivered_at)
+    failed_result = store.finish_failure_and_refund_once(
+        started.job_id,
+        reason="status_done_failed",
+        now=now + timedelta(seconds=6),
+    )
+
+    assert delivered.status == MarkDeliveredResultStatus.DELIVERED
+    assert delivered.job.delivered_at == delivered_at
+    assert failed_result.status == FinishJobResultStatus.SUCCEEDED
+    assert failed_result.job.status == JOB_STATUS_SUCCEEDED
+    assert failed_result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert failed_result.job.delivered_at == delivered_at
+    assert failed_result.job.finalization_error == "status_done_failed"
+    assert _weekly_remaining(store, chat_id) == 0
 
 
 def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
@@ -295,6 +342,32 @@ def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore
     assert cleaned.jobs[0].refund_status == REFUND_STATUS_REFUNDED
     assert cleaned_again.jobs == []
     assert _weekly_remaining(store, chat_id) == 1
+
+
+def test_cleanup_stale_delivered_running_job_succeeds_without_refund(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 113
+    delivered_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="stale-delivered-running-no-refund",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now, stale_after=now - timedelta(seconds=1)).job
+    store.mark_delivered(started.job_id, now=delivered_at)
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(seconds=10))
+    cleaned_again = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(minutes=1))
+
+    assert [job.job_id for job in cleaned.jobs] == [started.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.SUCCEEDED
+    assert cleaned.jobs[0].status == JOB_STATUS_SUCCEEDED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert cleaned.jobs[0].delivered_at == delivered_at
+    assert cleaned.jobs[0].finalization_error == "stale_after_delivery"
+    assert cleaned_again.jobs == []
+    assert _weekly_remaining(store, chat_id) == 0
 
 
 def test_cleanup_stale_queued_job_cancels_without_refund(store: PostgresWeeklyPdfJobStore) -> None:
@@ -400,6 +473,30 @@ def test_finish_success_allows_running_job(store: PostgresWeeklyPdfJobStore) -> 
     assert result.status == FinishJobResultStatus.SUCCEEDED
     assert result.job.status == JOB_STATUS_SUCCEEDED
     assert result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+
+
+def test_finish_success_preserves_delivered_marker(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 114
+    delivered_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="success-preserves-delivered",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+    delivered = store.mark_delivered(started.job_id, now=delivered_at)
+
+    result = store.finish_success(started.job_id, now=now + timedelta(seconds=6))
+
+    assert delivered.status == MarkDeliveredResultStatus.DELIVERED
+    assert result.status == FinishJobResultStatus.SUCCEEDED
+    assert result.job.status == JOB_STATUS_SUCCEEDED
+    assert result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert result.job.delivered_at == delivered_at
+    assert result.job.finalization_error is None
+    assert _weekly_remaining(store, chat_id) == 0
 
 
 def _save_subscription(

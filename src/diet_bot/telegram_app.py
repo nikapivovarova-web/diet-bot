@@ -1929,6 +1929,10 @@ async def _send_week_plan_after_postgres_admission(
 
     consumption = AttemptConsumption(True, "weekly_pdf", start_result.job.consumption_source)
     recipe_history_entries: list[RecipeHistoryItem] = []
+
+    def mark_document_delivered() -> None:
+        runtime.mark_delivered(job.job_id)
+
     try:
         sent = await _send_week_plan(
             message,
@@ -1937,6 +1941,7 @@ async def _send_week_plan_after_postgres_admission(
             recipe_history_entries=recipe_history_entries,
             pdf_slot_acquired=True,
             initial_status_message=initial_status_message,
+            on_document_delivered=mark_document_delivered,
         )
     except Exception:
         _finish_postgres_job_failure(
@@ -2120,6 +2125,7 @@ async def _send_week_plan(
     recipe_history_entries: list[RecipeHistoryItem] | None = None,
     pdf_slot_acquired: bool = False,
     initial_status_message: Message | None = None,
+    on_document_delivered: Callable[[], None] | None = None,
 ) -> bool:
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
@@ -2204,6 +2210,7 @@ async def _send_week_plan(
                 pdf_data,
                 pdf_filename,
                 status_text=status_text,
+                on_document_delivered=on_document_delivered,
             )
         except Exception:
             await _stop_week_pdf_status(status_task)
@@ -2232,6 +2239,7 @@ async def _send_week_pdf_document(
     pdf_filename: str,
     *,
     status_text: str | None = None,
+    on_document_delivered: Callable[[], None] | None = None,
 ) -> None:
     caption = "Готово - ваш рацион на неделю в PDF."
     if status_text:
@@ -2257,6 +2265,8 @@ async def _send_week_pdf_document(
             error=type(exc).__name__,
         )
         raise
+    if on_document_delivered is not None:
+        on_document_delivered()
     _weekly_pdf_diag(
         "telegram_upload_end",
         chat_id=message.chat.id,
