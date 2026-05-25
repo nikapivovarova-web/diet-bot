@@ -36,6 +36,7 @@ MIGRATIONS = (
                 stale_after TIMESTAMPTZ NOT NULL,
                 metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 failure_reason TEXT,
+                send_started_at TIMESTAMPTZ,
                 delivered_at TIMESTAMPTZ,
                 finalization_error TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -83,6 +84,16 @@ MIGRATIONS = (
             """
             ALTER TABLE weekly_pdf_jobs
             ADD COLUMN IF NOT EXISTS finalization_error TEXT
+            """,
+        ),
+    ),
+    PostgresMigration(
+        version="202605250002",
+        description="Track weekly PDF send starts",
+        statements=(
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS send_started_at TIMESTAMPTZ
             """,
         ),
     ),

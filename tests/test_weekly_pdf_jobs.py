@@ -16,6 +16,8 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_SUCCEEDED,
     MarkDeliveredResult,
     MarkDeliveredResultStatus,
+    MarkSendStartedResult,
+    MarkSendStartedResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     StartJobResult,
@@ -64,6 +66,7 @@ def test_job_metadata_is_copied_on_creation() -> None:
 def test_job_tracks_delivery_and_finalization_fields() -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     delivered_at = now + timedelta(seconds=10)
+    send_started_at = now + timedelta(seconds=3)
 
     job = WeeklyPdfJob(
         job_id=uuid4(),
@@ -73,10 +76,12 @@ def test_job_tracks_delivery_and_finalization_fields() -> None:
         refund_status=REFUND_STATUS_NOT_REQUIRED,
         consumption_source="monthly",
         stale_after=now + timedelta(minutes=15),
+        send_started_at=send_started_at,
         delivered_at=delivered_at,
         finalization_error="stale_after_delivery",
     )
 
+    assert job.send_started_at == send_started_at
     assert job.delivered_at == delivered_at
     assert job.finalization_error == "stale_after_delivery"
 
@@ -89,12 +94,14 @@ def test_result_wrappers_expose_explicit_statuses() -> None:
     start = StartJobResult(StartJobResultStatus.ALREADY_RUNNING, job)
     finish = FinishJobResult(FinishJobResultStatus.INVALID_STATE, job)
     delivered = MarkDeliveredResult(MarkDeliveredResultStatus.DELIVERED, job)
+    send_started = MarkSendStartedResult(MarkSendStartedResultStatus.SEND_STARTED, job)
     cleanup = CleanupStaleResult([finish])
 
     assert admit.status.value == "admitted"
     assert start.status.value == "already_running"
     assert finish.status.value == "invalid_state"
     assert delivered.status.value == "delivered"
+    assert send_started.status.value == "send_started"
     assert cleanup.jobs == [job]
 
 

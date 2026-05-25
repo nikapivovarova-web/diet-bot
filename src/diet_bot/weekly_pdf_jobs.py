@@ -44,6 +44,7 @@ class WeeklyPdfJob:
     heartbeat_at: datetime | None = None
     finished_at: datetime | None = None
     failure_reason: str | None = None
+    send_started_at: datetime | None = None
     delivered_at: datetime | None = None
     finalization_error: str | None = None
 
@@ -106,6 +107,19 @@ class MarkDeliveredResultStatus(str, Enum):
 @dataclass(frozen=True)
 class MarkDeliveredResult:
     status: MarkDeliveredResultStatus
+    job: WeeklyPdfJob | None
+
+
+class MarkSendStartedResultStatus(str, Enum):
+    SEND_STARTED = "send_started"
+    ALREADY_SEND_STARTED = "already_send_started"
+    INVALID_STATE = "invalid_state"
+    NOT_FOUND = "not_found"
+
+
+@dataclass(frozen=True)
+class MarkSendStartedResult:
+    status: MarkSendStartedResultStatus
     job: WeeklyPdfJob | None
 
 
