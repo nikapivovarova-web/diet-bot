@@ -55,6 +55,53 @@ Keep the backup read-only. Use the backed-up `subscriptions.json` as the source
 for entitlement import and the backed-up `history.json` as the source for chat
 state import so both migrations are reproducible.
 
+## Postgres Backup And Restore Drill
+
+Use this drill to prove a Postgres custom-format backup can be restored into a
+generated disposable database. The drill prints sanitized JSON only: it reports
+env var names, generated database names, backup file metadata, and table counts,
+never raw DSNs, passwords, Telegram tokens, profile JSON, or payment payloads.
+
+Create the backup with a dedicated backup URL env var. Do not use
+`DIET_BOT_DATABASE_URL`; the script intentionally does not fall back to the
+runtime database URL.
+
+```powershell
+$env:DIET_BOT_BACKUP_DATABASE_URL = "<postgres-backup-dsn>"
+.\.venv\Scripts\python.exe .\scripts\ops\postgres_backup.py `
+  --source-url-env DIET_BOT_BACKUP_DATABASE_URL `
+  --output-dir ".\ops-backups"
+```
+
+Run the restore drill with an admin URL that is allowed to create and drop only
+the generated drill database. The restore target name is generated with a
+`diet_bot_restore_drill_` marker and is dropped by default.
+
+```powershell
+$env:DIET_BOT_RESTORE_ADMIN_DATABASE_URL = "<postgres-admin-dsn>"
+.\.venv\Scripts\python.exe .\scripts\ops\postgres_restore_drill.py `
+  --backup-file ".\ops-backups\diet-bot-postgres-backup-YYYYMMDDTHHMMSSZ.dump" `
+  --admin-url-env DIET_BOT_RESTORE_ADMIN_DATABASE_URL
+```
+
+For a source-to-restore row-count comparison, freeze writes first and keep them
+frozen until the backup and comparison finish. Without frozen writes, row-count
+differences can reflect normal traffic rather than restore failure.
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\ops\postgres_restore_drill.py `
+  --backup-file ".\ops-backups\diet-bot-postgres-backup-YYYYMMDDTHHMMSSZ.dump" `
+  --admin-url-env DIET_BOT_RESTORE_ADMIN_DATABASE_URL `
+  --compare-source-url-env DIET_BOT_BACKUP_DATABASE_URL
+```
+
+Safety rules:
+
+- Do not restore into any existing, production, or manually named database.
+- Use `--keep-restore-db` only for supervised inspection, then drop the generated drill database manually.
+- Do not run migrations, deploys, restarts, bot startup, Telegram API calls, or payment actions as part of this drill.
+- Keep the sanitized JSON summaries with the backup artifact for audit.
+
 ## Migration Order
 
 Run migrations explicitly, in this order, before starting the production bot.
