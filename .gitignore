@@ -24,3 +24,4 @@ htmlcov/
 *.log
 *.tmp
 *.bak
+*.dump
