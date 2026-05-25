@@ -489,6 +489,14 @@ def _payment_context_mismatch_reason(
 def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:
     cur.execute(
         """
+        INSERT INTO entitlements (chat_id)
+        VALUES (%s)
+        ON CONFLICT (chat_id) DO NOTHING
+        """,
+        (chat_id,),
+    )
+    cur.execute(
+        """
         SELECT
             chat_id,
             free_trial_used,
