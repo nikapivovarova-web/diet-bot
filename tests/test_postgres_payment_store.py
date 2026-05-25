@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
+import diet_bot.postgres_payment_store as postgres_payment_store
 from diet_bot.payments import (
     ORDER_STATUS_FAILED,
     ORDER_STATUS_GRANTED,
@@ -125,6 +128,20 @@ def test_record_event_returns_existing_row_after_event_key_insert_conflict() -> 
 
     assert event.event_id == "event_existing"
     assert any("INSERT INTO payment_events" in query and "ON CONFLICT DO NOTHING" in query for query in cur.queries)
+
+
+def test_load_entitlement_creates_missing_row_before_locking() -> None:
+    cur = MissingEntitlementCursor()
+
+    entitlement = postgres_payment_store._load_entitlement_cur(cur, 202)
+
+    normalized_queries = [" ".join(query.split()) for query in cur.queries]
+    assert normalized_queries[0].startswith("INSERT INTO entitlements")
+    assert "ON CONFLICT (chat_id) DO NOTHING" in normalized_queries[0]
+    assert normalized_queries[1].startswith("SELECT")
+    assert "FROM entitlements" in normalized_queries[1]
+    assert "FOR UPDATE" in normalized_queries[1]
+    assert entitlement.processed_payment_charge_ids == []
 
 
 @pytest.fixture
@@ -407,6 +424,136 @@ def test_successful_payment_transaction_grants_entitlement_tables(
     assert charge_ids == {"telegram_stars:tg-charge-grant"}
 
 
+def test_concurrent_successful_payments_for_same_new_chat_preserve_both_grants(
+    store: PostgresPaymentStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    now = datetime(2026, 5, 22, tzinfo=UTC)
+    subscription_order = store.create_order(_order("order_concur_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    extra_order = store.create_order(_order("order_concur_pdf", PRODUCT_EXTRA_WEEKLY_PDF))
+    charge_ids = {
+        subscription_order.order_id: "tg-charge-concur-sub",
+        extra_order.order_id: "tg-charge-concur-pdf",
+    }
+    load_barrier = threading.Barrier(2)
+    original_load_entitlement = postgres_payment_store._load_entitlement_cur
+
+    def wait_after_empty_entitlement_load(cur: object, chat_id: int):
+        entitlement = original_load_entitlement(cur, chat_id)
+        if int(chat_id) == subscription_order.chat_id and not entitlement.processed_payment_charge_ids:
+            try:
+                load_barrier.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+        return entitlement
+
+    monkeypatch.setattr(postgres_payment_store, "_load_entitlement_cur", wait_after_empty_entitlement_load)
+
+    def record(order: PaymentOrder):
+        return store.record_successful_payment_and_grant_entitlement(
+            order_id=order.order_id,
+            provider=PROVIDER_TELEGRAM_STARS,
+            telegram_payment_charge_id=charge_ids[order.order_id],
+            provider_payment_charge_id=None,
+            amount=order.amount,
+            currency=order.currency,
+            product=order.product,
+            now=now,
+            subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(record, subscription_order),
+            executor.submit(record, extra_order),
+        ]
+        results = [future.result(timeout=10) for future in futures]
+
+    assert [result.inserted for result in results] == [True, True]
+    assert store.get_order(subscription_order.order_id).status == ORDER_STATUS_GRANTED
+    assert store.get_order(extra_order.order_id).status == ORDER_STATUS_GRANTED
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT monthly_one_day_remaining, monthly_weekly_pdf_remaining, extra_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (subscription_order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute(
+                """
+                SELECT charge_id
+                FROM entitlement_processed_charge_ids
+                WHERE chat_id = %s
+                ORDER BY position
+                """,
+                (subscription_order.chat_id,),
+            )
+            processed_charge_ids = [row["charge_id"] for row in cur.fetchall()]
+
+    assert int(entitlement["monthly_one_day_remaining"]) == MONTHLY_ONE_DAY_LIMIT
+    assert int(entitlement["monthly_weekly_pdf_remaining"]) == MONTHLY_WEEKLY_PDF_LIMIT
+    assert int(entitlement["extra_weekly_pdf_remaining"]) == 1
+    assert set(processed_charge_ids) == {
+        "telegram_stars:tg-charge-concur-sub",
+        "telegram_stars:tg-charge-concur-pdf",
+    }
+
+
+def test_successful_payment_transaction_duplicate_same_charge_is_idempotent(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    order = store.create_order(_order("order_same_charge", PRODUCT_EXTRA_WEEKLY_PDF))
+    request = {
+        "order_id": order.order_id,
+        "provider": PROVIDER_TELEGRAM_STARS,
+        "telegram_payment_charge_id": "tg-charge-same",
+        "provider_payment_charge_id": None,
+        "amount": order.amount,
+        "currency": order.currency,
+        "product": order.product,
+    }
+
+    first = store.record_successful_payment_and_grant_entitlement(**request)
+    second = store.record_successful_payment_and_grant_entitlement(**request)
+
+    assert first.inserted
+    assert not second.inserted
+    assert second.reason == "duplicate_charge"
+    assert store.get_order(order.order_id).status == ORDER_STATUS_GRANTED
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT extra_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute(
+                """
+                SELECT charge_id
+                FROM entitlement_processed_charge_ids
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            processed_charge_ids = [row["charge_id"] for row in cur.fetchall()]
+            cur.execute("SELECT count(*) AS count FROM payment_charges")
+            charge_count = int(cur.fetchone()["count"])
+
+    assert int(entitlement["extra_weekly_pdf_remaining"]) == 1
+    assert processed_charge_ids == ["telegram_stars:tg-charge-same"]
+    assert charge_count == 1
+
+
 def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
     store: PostgresPaymentStore,
 ) -> None:
@@ -631,6 +778,47 @@ class RaceConflictCursor:
         row = self._next_row
         self._next_row = None
         return row
+
+
+class MissingEntitlementCursor:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+        self._next_row: dict[str, object] | None = None
+        self._next_rows: list[dict[str, object]] = []
+
+    def execute(self, query: object, params: object | None = None) -> None:
+        text = str(query)
+        self.queries.append(text)
+        normalized = " ".join(text.split())
+        if normalized.startswith("SELECT") and "FROM entitlements" in normalized:
+            self._next_row = {
+                "chat_id": 202,
+                "free_trial_used": False,
+                "subscription_period_start": None,
+                "subscription_period_end": None,
+                "test_access_until": None,
+                "test_access_enabled": False,
+                "monthly_one_day_remaining": 0,
+                "monthly_weekly_pdf_remaining": 0,
+                "extra_one_day_remaining": 0,
+                "extra_weekly_pdf_remaining": 0,
+            }
+            return
+        if normalized.startswith("SELECT") and "FROM entitlement_processed_charge_ids" in normalized:
+            self._next_rows = []
+            return
+        self._next_row = None
+        self._next_rows = []
+
+    def fetchone(self) -> dict[str, object] | None:
+        row = self._next_row
+        self._next_row = None
+        return row
+
+    def fetchall(self) -> list[dict[str, object]]:
+        rows = self._next_rows
+        self._next_rows = []
+        return rows
 
 
 def _charge_row(
