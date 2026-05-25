@@ -22,6 +22,8 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_SUCCEEDED,
     MarkDeliveredResult,
     MarkDeliveredResultStatus,
+    MarkSendStartedResult,
+    MarkSendStartedResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -300,6 +302,7 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
 
     async def fake_send_week_plan(*_args, **kwargs) -> bool:
         events.append(("send",))
+        kwargs["on_document_send_started"]()
         kwargs["on_document_delivered"]()
         return True
 
@@ -318,6 +321,7 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
         ("preflight", chat_id),
         ("start", runtime.job.job_id, False),
         ("send",),
+        ("send_started", runtime.job.job_id),
         ("delivered", runtime.job.job_id),
         ("success", runtime.job.job_id),
     ]
@@ -346,6 +350,7 @@ async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refun
 
     async def fake_send_week_plan(*_args, **kwargs) -> bool:
         events.append(("send",))
+        kwargs["on_document_send_started"]()
         kwargs["on_document_delivered"]()
         events.append(("send_return",))
         return True
@@ -364,6 +369,7 @@ async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refun
         ("admit", chat_id, "idem-marker-failure"),
         ("start", runtime.job.job_id, False),
         ("send",),
+        ("send_started", runtime.job.job_id),
         ("delivered", runtime.job.job_id),
         ("success", runtime.job.job_id),
         ("send_return",),
@@ -380,6 +386,97 @@ async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refun
         )
         in diag_events
     )
+
+
+@pytest.mark.anyio
+async def test_postgres_send_start_marker_failure_preserves_pre_upload_refund(monkeypatch) -> None:
+    chat_id = 201_017
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
+
+    def fail_mark_send_started(job_id):
+        events.append(("send_started", job_id))
+        raise RuntimeError("send-start marker failed")
+
+    runtime.mark_send_started = fail_mark_send_started
+
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
+        events.append(("send",))
+        try:
+            kwargs["on_document_send_started"]()
+        except RuntimeError:
+            events.append(("upload_blocked",))
+            return False
+        events.append(("answer_document",))
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(
+        FakeMessage(chat_id),
+        profile_with(),
+        idempotency_key="idem-send-start-failure",
+    )
+
+    assert sent is False
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-send-start-failure"),
+        ("start", runtime.job.job_id, False),
+        ("send",),
+        ("send_started", runtime.job.job_id),
+        ("upload_blocked",),
+        ("failure", runtime.job.job_id, "weekly_pdf_not_sent"),
+    ]
+    assert ("answer_document",) not in events
+    assert runtime.job.status == JOB_STATUS_FAILED
+    assert runtime.job.refund_status == REFUND_STATUS_REFUNDED
+    assert runtime.job.send_started_at is None
+    assert runtime.job.delivered_at is None
+
+
+@pytest.mark.anyio
+async def test_postgres_upload_failure_after_send_start_is_non_refundable(monkeypatch) -> None:
+    chat_id = 201_018
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
+
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
+        events.append(("send",))
+        kwargs["on_document_send_started"]()
+        events.append(("answer_document",))
+        return False
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(
+        FakeMessage(chat_id),
+        profile_with(),
+        idempotency_key="idem-upload-failure-after-send-start",
+    )
+
+    assert sent is False
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-upload-failure-after-send-start"),
+        ("start", runtime.job.job_id, False),
+        ("send",),
+        ("send_started", runtime.job.job_id),
+        ("answer_document",),
+        ("failure", runtime.job.job_id, "weekly_pdf_not_sent"),
+    ]
+    assert ("delivered", runtime.job.job_id) not in events
+    assert runtime.job.status == JOB_STATUS_SUCCEEDED
+    assert runtime.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert runtime.job.send_started_at is not None
+    assert runtime.job.delivered_at is None
+    assert runtime.job.finalization_error == "weekly_pdf_not_sent"
 
 
 @pytest.mark.anyio
@@ -596,10 +693,35 @@ async def test_send_week_pdf_document_marks_delivery_after_answer_document_succe
         DocumentMessage(201_012),
         b"%PDF-1.4\n%test",
         "week.pdf",
+        on_document_send_started=lambda: events.append("send_started"),
         on_document_delivered=lambda: events.append("delivered"),
     )
 
-    assert events == ["answer_document", "delivered"]
+    assert events == ["send_started", "answer_document", "delivered"]
+
+
+@pytest.mark.anyio
+async def test_send_week_pdf_document_blocks_upload_when_send_start_marker_fails() -> None:
+    events: list[str] = []
+
+    class DocumentMessage(FakeMessage):
+        async def answer_document(self, **_kwargs) -> None:
+            events.append("answer_document")
+
+    def fail_send_started() -> None:
+        events.append("send_started")
+        raise RuntimeError("marker write failed")
+
+    with pytest.raises(RuntimeError, match="marker write failed"):
+        await telegram_app._send_week_pdf_document(
+            DocumentMessage(201_019),
+            b"%PDF-1.4\n%test",
+            "week.pdf",
+            on_document_send_started=fail_send_started,
+            on_document_delivered=lambda: events.append("delivered"),
+        )
+
+    assert events == ["send_started"]
 
 
 @pytest.mark.anyio
@@ -616,10 +738,11 @@ async def test_send_week_pdf_document_does_not_mark_delivery_before_upload_succe
             FailingDocumentMessage(201_013),
             b"%PDF-1.4\n%test",
             "week.pdf",
+            on_document_send_started=lambda: events.append("send_started"),
             on_document_delivered=lambda: events.append("delivered"),
         )
 
-    assert events == ["answer_document"]
+    assert events == ["send_started", "answer_document"]
 
 
 class FakeWeeklyPdfRuntime:
@@ -656,9 +779,21 @@ class FakeWeeklyPdfRuntime:
                 chat_id=self.job.chat_id,
                 job_id=self.job.job_id,
                 source=self.job.consumption_source,
+                send_started_at=self.job.send_started_at,
                 delivered_at=self.job.delivered_at,
                 refund_status=REFUND_STATUS_NOT_REQUIRED,
                 finalization_error="stale_after_delivery",
+            )
+            return
+        if self.job.send_started_at is not None:
+            self.job = _job(
+                status=JOB_STATUS_SUCCEEDED,
+                chat_id=self.job.chat_id,
+                job_id=self.job.job_id,
+                source=self.job.consumption_source,
+                send_started_at=self.job.send_started_at,
+                refund_status=REFUND_STATUS_NOT_REQUIRED,
+                finalization_error="stale_after_send_attempt_unconfirmed",
             )
             return
         refund_status = self.job.refund_status
@@ -705,6 +840,7 @@ class FakeWeeklyPdfRuntime:
             chat_id=self.job.chat_id,
             job_id=job_id,
             source=self.start_source,
+            send_started_at=self.job.send_started_at,
             delivered_at=self.job.delivered_at,
             refund_status=REFUND_STATUS_NOT_REQUIRED,
         )
@@ -713,6 +849,19 @@ class FakeWeeklyPdfRuntime:
             self.job,
         )
 
+    def mark_send_started(self, job_id):
+        self.events.append(("send_started", job_id))
+        self.job = _job(
+            status=JOB_STATUS_RUNNING,
+            chat_id=self.job.chat_id,
+            job_id=job_id,
+            source=self.start_source,
+            send_started_at=datetime(2026, 5, 23, 0, 0, 4, tzinfo=UTC),
+            delivered_at=self.job.delivered_at,
+            refund_status=self.job.refund_status,
+        )
+        return MarkSendStartedResult(MarkSendStartedResultStatus.SEND_STARTED, self.job)
+
     def mark_delivered(self, job_id):
         self.events.append(("delivered", job_id))
         self.job = _job(
@@ -720,6 +869,7 @@ class FakeWeeklyPdfRuntime:
             chat_id=self.job.chat_id,
             job_id=job_id,
             source=self.start_source,
+            send_started_at=self.job.send_started_at,
             delivered_at=datetime(2026, 5, 23, 0, 0, 5, tzinfo=UTC),
             refund_status=self.job.refund_status,
         )
@@ -733,7 +883,19 @@ class FakeWeeklyPdfRuntime:
                 chat_id=self.job.chat_id,
                 job_id=job_id,
                 source=self.start_source,
+                send_started_at=self.job.send_started_at,
                 delivered_at=self.job.delivered_at,
+                refund_status=REFUND_STATUS_NOT_REQUIRED,
+                finalization_error=reason,
+            )
+            return FinishJobResult(FinishJobResultStatus.SUCCEEDED, self.job)
+        if self.job.send_started_at is not None:
+            self.job = _job(
+                status=JOB_STATUS_SUCCEEDED,
+                chat_id=self.job.chat_id,
+                job_id=job_id,
+                source=self.start_source,
+                send_started_at=self.job.send_started_at,
                 refund_status=REFUND_STATUS_NOT_REQUIRED,
                 finalization_error=reason,
             )
@@ -803,6 +965,7 @@ def _job(
     chat_id: int,
     job_id=None,
     source: str | None = None,
+    send_started_at: datetime | None = None,
     delivered_at: datetime | None = None,
     finalization_error: str | None = None,
     refund_status: str = REFUND_STATUS_NOT_REQUIRED,
@@ -815,6 +978,7 @@ def _job(
         refund_status=refund_status,
         consumption_source=source,
         stale_after=datetime(2026, 5, 23, tzinfo=UTC) + timedelta(minutes=30),
+        send_started_at=send_started_at,
         delivered_at=delivered_at,
         finalization_error=finalization_error,
     )

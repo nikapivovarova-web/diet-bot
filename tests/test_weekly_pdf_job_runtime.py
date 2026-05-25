@@ -20,6 +20,8 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_SUCCEEDED,
     MarkDeliveredResult,
     MarkDeliveredResultStatus,
+    MarkSendStartedResult,
+    MarkSendStartedResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     StartJobResult,
     StartJobResultStatus,
@@ -260,6 +262,18 @@ def test_runtime_mark_delivered_delegates_to_store_once() -> None:
     assert store.calls == [("delivered", running.job_id)]
 
 
+def test_runtime_mark_send_started_delegates_to_store_once() -> None:
+    store = FakeWeeklyPdfStore()
+    running = _job(status=JOB_STATUS_RUNNING, chat_id=104)
+    store.next_send_started = MarkSendStartedResult(MarkSendStartedResultStatus.SEND_STARTED, running)
+    runtime = WeeklyPdfJobRuntime(store, now=lambda: NOW)
+
+    result = runtime.mark_send_started(running.job_id)
+
+    assert result.status == MarkSendStartedResultStatus.SEND_STARTED
+    assert store.calls == [("send_started", running.job_id)]
+
+
 def test_runtime_scoped_cleanup_uses_chat_id_and_small_limit() -> None:
     store = FakeWeeklyPdfStore()
     runtime = WeeklyPdfJobRuntime(store, now=lambda: NOW)
@@ -294,6 +308,7 @@ class FakeWeeklyPdfStore:
         self.next_success: FinishJobResult | None = None
         self.next_failure: FinishJobResult | None = None
         self.next_delivered: MarkDeliveredResult | None = None
+        self.next_send_started: MarkSendStartedResult | None = None
         self.next_cancel: FinishJobResult | None = None
 
     def admit_job(self, *, chat_id, idempotency_key, stale_after, metadata=None):
@@ -328,6 +343,13 @@ class FakeWeeklyPdfStore:
         self.calls.append(("delivered", job_id))
         return self.next_delivered or MarkDeliveredResult(
             MarkDeliveredResultStatus.DELIVERED,
+            _job(status=JOB_STATUS_RUNNING, chat_id=1),
+        )
+
+    def mark_send_started(self, job_id, *, now=None):
+        self.calls.append(("send_started", job_id))
+        return self.next_send_started or MarkSendStartedResult(
+            MarkSendStartedResultStatus.SEND_STARTED,
             _job(status=JOB_STATUS_RUNNING, chat_id=1),
         )
 
