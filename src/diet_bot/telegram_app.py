@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import random
 import re
 import secrets
@@ -108,6 +109,7 @@ from .payment_runtime import (
     create_payment_service,
     validate_payment_runtime_for_startup,
 )
+from .payment_recovery_spool import PaymentRecoveryRecord, append_payment_recovery_record
 from .payments import (
     PRODUCT_EXTRA_ONE_DAY,
     PRODUCT_EXTRA_WEEKLY_PDF,
@@ -116,6 +118,7 @@ from .payments import (
     PROVIDER_YOOKASSA,
     PaymentHandlingResult,
     PaymentOrder,
+    decode_payment_order_payload,
     encode_payment_order_payload,
 )
 from .subscriptions import (
@@ -848,6 +851,19 @@ PAYMENT_LEDGER_UNAVAILABLE_TEXT = (
     "\u0438\u043b\u0438 \u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 "
     "\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0443."
 )
+PAYMENT_ACTIVATION_DELAYED_TEXT = (
+    "\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430, "
+    "\u043d\u043e \u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f "
+    "\u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u0437\u0430\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f. "
+    "\u041d\u0435 \u043e\u043f\u043b\u0430\u0447\u0438\u0432\u0430\u0439\u0442\u0435 "
+    "\u043f\u043e\u0432\u0442\u043e\u0440\u043d\u043e. "
+    "\u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430 "
+    "\u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442 \u043f\u043b\u0430\u0442\u0435\u0436; "
+    "\u043f\u043e\u0432\u0442\u043e\u0440\u043d\u0430\u044f "
+    "\u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 "
+    "\u0432\u043a\u043b\u044e\u0447\u0438\u0442 \u0434\u043e\u0441\u0442\u0443\u043f."
+)
+PAYMENT_RECOVERY_SPOOL_ENV = "DIET_BOT_PAYMENT_RECOVERY_SPOOL"
 PAYMENT_PAYLOAD_AMOUNTS = {
     PAYLOAD_SUBSCRIPTION_MONTH: SUBSCRIPTION_STARS_AMOUNT,
     PAYLOAD_EXTRA_ONE_DAY: EXTRA_ONE_DAY_STARS_AMOUNT,
@@ -1249,8 +1265,8 @@ async def handle_successful_payment(message: Message) -> None:
             user_id=_message_user_id(message),
         )
     except PaymentLedgerUnavailable as exc:
-        logger.warning("Failed to apply payment because payment ledger is unavailable: %s", exc.reason)
-        await _send_payment_ledger_unavailable_notice(message)
+        _spool_failed_successful_payment(message, payment, exc)
+        await _send_payment_activation_delayed_notice(message)
         return
     except EntitlementStorageError:
         logger.exception("Failed to apply payment due to entitlement storage error")
@@ -3896,6 +3912,10 @@ async def _send_payment_ledger_unavailable_notice(message: Message) -> None:
     await message.answer(PAYMENT_LEDGER_UNAVAILABLE_TEXT, reply_markup=_payments_disabled_keyboard())
 
 
+async def _send_payment_activation_delayed_notice(message: Message) -> None:
+    await message.answer(PAYMENT_ACTIVATION_DELAYED_TEXT, reply_markup=_payments_disabled_keyboard())
+
+
 async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
     try:
         entitlement = _entitlement_for_chat(message.chat.id)
@@ -4184,6 +4204,85 @@ def _payment_raw_payload(payment: SuccessfulPayment) -> dict[str, object]:
     if subscription_expiration is not None:
         raw["subscription_expiration_date"] = subscription_expiration
     return raw
+
+
+def _spool_failed_successful_payment(
+    message: Message,
+    payment: SuccessfulPayment,
+    exc: PaymentLedgerUnavailable,
+) -> None:
+    record: PaymentRecoveryRecord | None = None
+    try:
+        record = _payment_recovery_record_from_message(message, payment)
+        append_payment_recovery_record(_payment_recovery_spool_path(), record)
+    except Exception:
+        logger.critical(
+            "Failed to spool payment recovery record after successful_payment grant failure",
+            exc_info=True,
+            extra=_payment_recovery_log_extra(message, payment, exc, record),
+        )
+        return
+
+    logger.critical(
+        "Spooled payment recovery record after successful_payment grant failure",
+        extra=_payment_recovery_log_extra(message, payment, exc, record),
+    )
+
+
+def _payment_recovery_record_from_message(
+    message: Message,
+    payment: SuccessfulPayment,
+) -> PaymentRecoveryRecord:
+    provider = _payment_provider_for_payment(payment)
+    if provider is None:
+        raise ValueError("Cannot determine payment provider for successful_payment recovery record.")
+    return PaymentRecoveryRecord(
+        provider=provider,
+        chat_id=int(message.chat.id),
+        user_id=_message_user_id(message),
+        invoice_payload=str(payment.invoice_payload),
+        telegram_payment_charge_id=getattr(payment, "telegram_payment_charge_id", None),
+        provider_payment_charge_id=getattr(payment, "provider_payment_charge_id", None),
+        currency=str(payment.currency),
+        total_amount=int(payment.total_amount),
+        subscription_expiration_date=getattr(payment, "subscription_expiration_date", None),
+        created_at=datetime.now(UTC),
+    )
+
+
+def _payment_recovery_spool_path() -> Path:
+    configured_path = os.environ.get(PAYMENT_RECOVERY_SPOOL_ENV, "").strip()
+    if configured_path:
+        return Path(configured_path)
+    return Path(SUBSCRIPTIONS_STATE_FILE).with_name("payment_recovery.jsonl")
+
+
+def _payment_recovery_log_extra(
+    message: Message,
+    payment: SuccessfulPayment,
+    exc: PaymentLedgerUnavailable,
+    record: PaymentRecoveryRecord | None,
+) -> dict[str, object]:
+    return {
+        "record_id": record.record_id if record is not None else None,
+        "payment_provider": record.provider if record is not None else _payment_provider_for_payment(payment),
+        "chat_id": int(message.chat.id),
+        "user_id": _message_user_id(message),
+        "order_id": _payment_order_id_for_log(getattr(payment, "invoice_payload", None)),
+        "telegram_payment_charge_id": getattr(payment, "telegram_payment_charge_id", None),
+        "provider_payment_charge_id": getattr(payment, "provider_payment_charge_id", None),
+        "ledger_failure_reason": exc.reason,
+    }
+
+
+def _payment_order_id_for_log(invoice_payload: object) -> str | None:
+    if not isinstance(invoice_payload, str):
+        return None
+    try:
+        decoded = decode_payment_order_payload(invoice_payload)
+    except Exception:
+        return None
+    return decoded.order_id if decoded is not None else None
 
 
 def _payment_application_from_handling_result(result: PaymentHandlingResult) -> PaymentApplication:
