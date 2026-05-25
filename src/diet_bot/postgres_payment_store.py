@@ -20,6 +20,7 @@ from .payments import (
     PaymentOrder,
     RecordedPaymentCharge,
 )
+from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
 from .postgres_payment_migrations import MIGRATIONS, run_payment_schema_migrations
 from .postgres_schema_validation import (
     SCHEMA_MIGRATIONS_COLUMNS,
@@ -449,6 +450,7 @@ def _grant_entitlement_cur(
     now: datetime | None,
     subscription_expiration_timestamp: int | None,
 ) -> None:
+    _lock_entitlement_map_cur(cur)
     entitlement = _load_entitlement_cur(cur, order.chat_id)
     charge_key = _entitlement_charge_key(order, charge)
     if order.product == PRODUCT_SUBSCRIPTION_MONTH:
@@ -465,6 +467,10 @@ def _grant_entitlement_cur(
     else:
         raise RuntimeError(f"Unsupported payment product for entitlement grant: {order.product!r}")
     _upsert_entitlement_cur(cur, order.chat_id, entitlement)
+
+
+def _lock_entitlement_map_cur(cur: Any) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
 
 
 def _payment_context_mismatch_reason(
