@@ -161,6 +161,23 @@ class PostgresPaymentStore:
                 row = cur.fetchone()
         return _order_from_row(row) if row is not None else None
 
+    def find_charge_by_external_id(
+        self,
+        *,
+        provider: str,
+        telegram_payment_charge_id: str | None,
+        provider_payment_charge_id: str | None,
+    ) -> PaymentCharge | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._find_charge_by_external_id_cur(
+                    cur,
+                    provider=provider,
+                    telegram_payment_charge_id=telegram_payment_charge_id,
+                    provider_payment_charge_id=provider_payment_charge_id,
+                    for_update=False,
+                )
+
     def record_event(self, event: PaymentEvent) -> PaymentEvent:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -353,16 +370,34 @@ class PostgresPaymentStore:
         return _event_from_row(row) if row is not None else None
 
     def _find_existing_charge_cur(self, cur: Any, charge: PaymentCharge) -> PaymentCharge | None:
+        return self._find_charge_by_external_id_cur(
+            cur,
+            provider=charge.provider,
+            telegram_payment_charge_id=charge.telegram_payment_charge_id,
+            provider_payment_charge_id=charge.provider_payment_charge_id,
+            for_update=True,
+        )
+
+    def _find_charge_by_external_id_cur(
+        self,
+        cur: Any,
+        *,
+        provider: str,
+        telegram_payment_charge_id: str | None,
+        provider_payment_charge_id: str | None,
+        for_update: bool,
+    ) -> PaymentCharge | None:
         clauses: list[str] = []
-        params: list[Any] = [charge.provider]
-        if _optional_text(charge.telegram_payment_charge_id):
+        params: list[Any] = [provider]
+        if _optional_text(telegram_payment_charge_id):
             clauses.append("telegram_payment_charge_id = %s")
-            params.append(_optional_text(charge.telegram_payment_charge_id))
-        if _optional_text(charge.provider_payment_charge_id):
+            params.append(_optional_text(telegram_payment_charge_id))
+        if _optional_text(provider_payment_charge_id):
             clauses.append("provider_payment_charge_id = %s")
-            params.append(_optional_text(charge.provider_payment_charge_id))
+            params.append(_optional_text(provider_payment_charge_id))
         if not clauses:
             return None
+        lock_suffix = " FOR UPDATE" if for_update else ""
         cur.execute(
             f"""
             SELECT *
@@ -371,7 +406,7 @@ class PostgresPaymentStore:
               AND ({" OR ".join(clauses)})
             ORDER BY charge_id
             LIMIT 1
-            FOR UPDATE
+            {lock_suffix}
             """,
             tuple(params),
         )

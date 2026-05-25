@@ -138,6 +138,35 @@ def test_record_event_returns_existing_row_after_event_key_insert_conflict() -> 
     assert any("INSERT INTO payment_events" in query and "ON CONFLICT DO NOTHING" in query for query in cur.queries)
 
 
+def test_find_charge_by_external_id_is_read_only_and_returns_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing_row = _charge_row(
+        charge_id=42,
+        order_id="order_charge_lookup",
+        provider=PROVIDER_YOOKASSA,
+        telegram_payment_charge_id="tg-charge-lookup",
+        provider_payment_charge_id="provider-charge-lookup",
+        amount=59_900,
+        currency="RUB",
+    )
+    cur = StaticSelectCursor(existing_row)
+    store = PostgresPaymentStore("postgresql://example/test")
+    monkeypatch.setattr(store, "_connect", lambda: StaticConnection(cur))
+
+    charge = store.find_charge_by_external_id(
+        provider=PROVIDER_YOOKASSA,
+        telegram_payment_charge_id="tg-charge-lookup",
+        provider_payment_charge_id="provider-charge-lookup",
+    )
+
+    assert charge is not None
+    assert charge.order_id == "order_charge_lookup"
+    assert charge.amount == 59_900
+    normalized = [" ".join(query.split()).upper() for query in cur.queries]
+    assert all(query.startswith("SELECT") for query in normalized)
+    assert not any("FOR UPDATE" in query for query in normalized)
+    assert not any(query.startswith(("INSERT", "UPDATE", "DELETE")) for query in normalized)
+
+
 def test_load_entitlement_creates_missing_row_before_locking() -> None:
     cur = MissingEntitlementCursor()
 
@@ -886,6 +915,45 @@ class RaceConflictCursor:
         row = self._next_row
         self._next_row = None
         return row
+
+
+class StaticConnection:
+    def __init__(self, cursor: object) -> None:
+        self._cursor = cursor
+
+    def __enter__(self) -> StaticConnection:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def cursor(self) -> StaticCursorContext:
+        return StaticCursorContext(self._cursor)
+
+
+class StaticCursorContext:
+    def __init__(self, cursor: object) -> None:
+        self._cursor = cursor
+
+    def __enter__(self) -> object:
+        return self._cursor
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class StaticSelectCursor:
+    def __init__(self, row: dict[str, object] | None) -> None:
+        self.row = row
+        self.queries: list[str] = []
+        self.params: list[object | None] = []
+
+    def execute(self, query: object, params: object | None = None) -> None:
+        self.queries.append(str(query))
+        self.params.append(params)
+
+    def fetchone(self) -> dict[str, object] | None:
+        return self.row
 
 
 class MissingEntitlementCursor:
