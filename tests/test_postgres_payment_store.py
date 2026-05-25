@@ -27,7 +27,15 @@ from diet_bot.payments import (
 )
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_payment_store import PostgresPaymentStore
-from diet_bot.subscriptions import MONTHLY_ONE_DAY_LIMIT, MONTHLY_WEEKLY_PDF_LIMIT
+from diet_bot.subscriptions import (
+    MONTHLY_ONE_DAY_LIMIT,
+    MONTHLY_WEEKLY_PDF_LIMIT,
+    AttemptConsumption,
+    Entitlement,
+    apply_subscription_payment,
+    consume_weekly_pdf_attempt,
+    refund_attempt,
+)
 
 
 TEST_DATABASE_URL = os.getenv("DIET_BOT_TEST_DATABASE_URL")
@@ -142,6 +150,32 @@ def test_load_entitlement_creates_missing_row_before_locking() -> None:
     assert "FROM entitlements" in normalized_queries[1]
     assert "FOR UPDATE" in normalized_queries[1]
     assert entitlement.processed_payment_charge_ids == []
+
+
+def test_grant_entitlement_takes_entitlement_map_lock_before_loading() -> None:
+    cur = MissingEntitlementCursor()
+    order = _order("order_lock_before_load", PRODUCT_EXTRA_WEEKLY_PDF)
+    charge = PaymentCharge(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-lock-before-load",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+    )
+
+    postgres_payment_store._grant_entitlement_cur(
+        cur,
+        order,
+        charge,
+        now=None,
+        subscription_expiration_timestamp=None,
+    )
+
+    normalized_queries = [" ".join(query.split()) for query in cur.queries]
+    assert normalized_queries[0].startswith("SELECT pg_advisory_xact_lock")
+    assert cur.params[0] == (postgres_payment_store.ENTITLEMENT_MAP_LOCK_ID,)
+    assert normalized_queries[1].startswith("INSERT INTO entitlements")
 
 
 @pytest.fixture
@@ -504,6 +538,80 @@ def test_concurrent_successful_payments_for_same_new_chat_preserve_both_grants(
     }
 
 
+@pytest.mark.parametrize("entitlement_action", ["consume", "refund"])
+def test_payment_grant_serializes_with_entitlement_map_transaction(
+    store: PostgresPaymentStore,
+    monkeypatch: pytest.MonkeyPatch,
+    entitlement_action: str,
+) -> None:
+    entitlement_store = PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1)
+    entitlement_store.initialize()
+    now = datetime(2026, 5, 22, tzinfo=UTC)
+    chat_id = 202
+    entitlement = Entitlement()
+    apply_subscription_payment(
+        entitlement,
+        "seed-subscription-charge",
+        now=now,
+        subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
+    )
+    entitlement.monthly_weekly_pdf_remaining = 1 if entitlement_action == "consume" else 0
+    entitlement_store.save_all({chat_id: entitlement})
+    order = store.create_order(_order(f"order_lock_{entitlement_action}", PRODUCT_EXTRA_WEEKLY_PDF))
+    loaded_stale_map = threading.Event()
+    payment_started = threading.Event()
+    payment_upserted = threading.Event()
+    original_upsert = postgres_payment_store._upsert_entitlement_cur
+
+    def observe_payment_upsert(cur: object, upsert_chat_id: int, upsert_entitlement: Entitlement) -> None:
+        original_upsert(cur, upsert_chat_id, upsert_entitlement)
+        if upsert_chat_id == chat_id and "telegram_stars:tg-charge-lock-extra" in upsert_entitlement.processed_payment_charge_ids:
+            payment_upserted.set()
+
+    monkeypatch.setattr(postgres_payment_store, "_upsert_entitlement_cur", observe_payment_upsert)
+
+    def run_stale_entitlement_transaction() -> None:
+        with entitlement_store.transact() as entitlements:
+            loaded_stale_map.set()
+            assert payment_started.wait(timeout=5)
+            payment_upserted.wait(timeout=1)
+            current = entitlements[chat_id]
+            if entitlement_action == "consume":
+                consumption = consume_weekly_pdf_attempt(current, now)
+                assert consumption.allowed
+                assert consumption.source == "monthly"
+            else:
+                refund_attempt(current, AttemptConsumption(True, "weekly_pdf", "monthly"))
+            entitlements[chat_id] = current
+
+    def record_paid_extra_grant():
+        payment_started.set()
+        return store.record_successful_payment_and_grant_entitlement(
+            order_id=order.order_id,
+            provider=PROVIDER_TELEGRAM_STARS,
+            telegram_payment_charge_id="tg-charge-lock-extra",
+            provider_payment_charge_id=None,
+            amount=order.amount,
+            currency=order.currency,
+            product=order.product,
+            now=now,
+            subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        entitlement_future = executor.submit(run_stale_entitlement_transaction)
+        assert loaded_stale_map.wait(timeout=5)
+        payment_future = executor.submit(record_paid_extra_grant)
+        entitlement_future.result(timeout=10)
+        result = payment_future.result(timeout=10)
+
+    saved = entitlement_store.load_all()[chat_id]
+    assert result.inserted
+    assert store.get_order(order.order_id).status == ORDER_STATUS_GRANTED
+    assert saved.extra_weekly_pdf_remaining == 1
+    assert "telegram_stars:tg-charge-lock-extra" in saved.processed_payment_charge_ids
+
+
 def test_successful_payment_transaction_duplicate_same_charge_is_idempotent(
     store: PostgresPaymentStore,
 ) -> None:
@@ -783,12 +891,14 @@ class RaceConflictCursor:
 class MissingEntitlementCursor:
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.params: list[object | None] = []
         self._next_row: dict[str, object] | None = None
         self._next_rows: list[dict[str, object]] = []
 
     def execute(self, query: object, params: object | None = None) -> None:
         text = str(query)
         self.queries.append(text)
+        self.params.append(params)
         normalized = " ".join(text.split())
         if normalized.startswith("SELECT") and "FROM entitlements" in normalized:
             self._next_row = {
