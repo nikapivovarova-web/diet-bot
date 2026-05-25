@@ -6,6 +6,7 @@ import logging
 import math
 import random
 import re
+import secrets
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -146,6 +147,8 @@ from .weekly_pdf_jobs import AdmitJobResultStatus, StartJobResultStatus, WeeklyP
 
 
 SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
+QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID: dict[int, str] = {}
+_QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID: dict[int, asyncio.Lock] = {}
 TRIAL_CHAT_IDS: set[int] = set()
 PROFILE_BY_CHAT_ID: dict[int, UserProfile] = {}
 PLAN_COUNT_BY_CHAT_ID: dict[int, int] = {}
@@ -795,6 +798,7 @@ CALLBACK_SUPPORT = "diet:support"
 CALLBACK_ONE_DAY_PLAN = "diet:one_day"
 CALLBACK_WEEK_PLAN_PDF = "diet:week_pdf"
 CALLBACK_ANSWER_PREFIX = "diet:answer:"
+STALE_QUESTIONNAIRE_CALLBACK_TEXT = "Этот вопрос уже не активен. Продолжайте с последнего вопроса."
 PAYMENT_CALLBACKS = {
     CALLBACK_PAY_TELEGRAM_STARS,
     CALLBACK_PAY_RU_CARD,
@@ -950,7 +954,7 @@ async def plan(message: Message) -> None:
 async def cancel(message: Message) -> None:
     if await _reject_non_private_message(message):
         return
-    SESSION_BY_CHAT_ID.pop(message.chat.id, None)
+    _clear_questionnaire_session(message.chat.id)
     TRIAL_CHAT_IDS.discard(message.chat.id)
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
@@ -1180,25 +1184,34 @@ async def handle_callback(callback: CallbackQuery) -> None:
         return
 
     if data.startswith(CALLBACK_ANSWER_PREFIX):
-        session = SESSION_BY_CHAT_ID.get(message.chat.id)
-        if session is None or session.current_question is None:
-            await callback.answer("Анкета уже не активна")
-            await message.answer(
-                "Нажмите кнопку, чтобы составить рацион 👇",
-                reply_markup=_main_menu_keyboard(message.chat.id),
-            )
-            return
+        async with _questionnaire_callback_lock(message.chat.id):
+            session = SESSION_BY_CHAT_ID.get(message.chat.id)
+            if session is None or session.current_question is None:
+                await callback.answer("Анкета уже не активна")
+                await message.answer(
+                    "Нажмите кнопку, чтобы составить рацион 👇",
+                    reply_markup=_main_menu_keyboard(message.chat.id),
+                )
+                return
 
-        try:
-            option_index = int(data.removeprefix(CALLBACK_ANSWER_PREFIX))
-            answer = session.current_question.options[option_index]
-        except (ValueError, IndexError):
-            await callback.answer("Кнопка устарела")
-            await message.answer(session.current_question.prompt, reply_markup=_question_keyboard(session.current_question))
-            return
+            payload = _parse_questionnaire_answer_callback(data)
+            if payload is None:
+                await _answer_stale_questionnaire_callback(callback, message, session)
+                return
+            callback_token, callback_step_index, option_index = payload
+            expected_token = QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id)
+            if expected_token is None or callback_token != expected_token or callback_step_index != session.step_index:
+                await _answer_stale_questionnaire_callback(callback, message, session)
+                return
 
-        await callback.answer(answer)
-        await _handle_questionnaire_answer(message, answer)
+            try:
+                answer = session.current_question.options[option_index]
+            except IndexError:
+                await _answer_stale_questionnaire_callback(callback, message, session)
+                return
+
+            await callback.answer(answer)
+            await _handle_questionnaire_answer(message, answer)
         return
 
     await callback.answer()
@@ -1352,13 +1365,13 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
         await message.answer(error)
         await message.answer(
             session.current_question.prompt,
-            reply_markup=_question_keyboard(session.current_question),
+            reply_markup=_question_keyboard_for_session(chat_id, session),
         )
         return
 
     early_stop = next_session.should_stop_after_answer()
     if early_stop:
-        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        _clear_questionnaire_session(chat_id)
         TRIAL_CHAT_IDS.discard(chat_id)
         await message.answer(early_stop, reply_markup=_main_menu_keyboard(chat_id))
         return
@@ -1367,7 +1380,7 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     if not next_session.is_complete:
         await message.answer(
             next_session.current_question.prompt,
-            reply_markup=_question_keyboard(next_session.current_question),
+            reply_markup=_question_keyboard_for_session(chat_id, next_session),
         )
         return
 
@@ -1377,7 +1390,7 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     PLAN_COUNT_BY_CHAT_ID[chat_id] = 0
     PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = random.SystemRandom().randrange(1, 1_000_000_000)
     _load_chat_history(chat_id)
-    SESSION_BY_CHAT_ID.pop(chat_id, None)
+    _clear_questionnaire_session(chat_id)
     is_trial = chat_id in TRIAL_CHAT_IDS
     TRIAL_CHAT_IDS.discard(chat_id)
     if is_trial:
@@ -1473,7 +1486,7 @@ async def _start_support_request(message: Message) -> None:
 
 async def _start_promo_code_request(message: Message) -> None:
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
-    SESSION_BY_CHAT_ID.pop(message.chat.id, None)
+    _clear_questionnaire_session(message.chat.id)
     TRIAL_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.add(message.chat.id)
     await message.answer(PROMO_CODE_PROMPT_TEXT)
@@ -1597,17 +1610,62 @@ def _truncate_support_text(text: str, limit: int = 2400) -> str:
     return text[: limit - 15].rstrip() + "\n...[сокращено]"
 
 
+def _clear_questionnaire_session(chat_id: int) -> None:
+    SESSION_BY_CHAT_ID.pop(chat_id, None)
+    QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.pop(chat_id, None)
+
+
+def _questionnaire_callback_lock(chat_id: int) -> asyncio.Lock:
+    lock = _QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID[chat_id] = lock
+    return lock
+
+
+def _parse_questionnaire_answer_callback(data: str) -> tuple[str, int, int] | None:
+    parts = data.removeprefix(CALLBACK_ANSWER_PREFIX).split(":")
+    if len(parts) != 3:
+        return None
+    token, step_index_text, option_index_text = parts
+    if not token:
+        return None
+    try:
+        return token, int(step_index_text), int(option_index_text)
+    except ValueError:
+        return None
+
+
+async def _answer_stale_questionnaire_callback(
+    callback: CallbackQuery,
+    message: Message,
+    session: QuestionnaireSession,
+) -> None:
+    await callback.answer(STALE_QUESTIONNAIRE_CALLBACK_TEXT)
+    if session.current_question is None:
+        await message.answer(
+            "Нажмите кнопку, чтобы составить рацион 👇",
+            reply_markup=_main_menu_keyboard(message.chat.id),
+        )
+        return
+    await message.answer(
+        session.current_question.prompt,
+        reply_markup=_question_keyboard_for_session(message.chat.id, session),
+    )
+
+
 async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> None:
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     session = start_session()
     SESSION_BY_CHAT_ID[message.chat.id] = session
+    QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[message.chat.id] = secrets.token_urlsafe(6)
     if is_trial:
         TRIAL_CHAT_IDS.add(message.chat.id)
     else:
         TRIAL_CHAT_IDS.discard(message.chat.id)
     await message.answer(
         session.current_question.prompt,
-        reply_markup=_question_keyboard(session.current_question),
+        reply_markup=_question_keyboard_for_session(message.chat.id, session),
     )
 
 
@@ -4499,12 +4557,38 @@ def _plan_choice_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _question_keyboard(question) -> InlineKeyboardMarkup | None:
+def _question_keyboard_for_session(chat_id: int, session: QuestionnaireSession) -> InlineKeyboardMarkup | None:
+    return _question_keyboard(session.current_question, chat_id=chat_id, step_index=session.step_index)
+
+
+def _question_answer_callback_data(
+    option_index: int,
+    *,
+    chat_id: int | None = None,
+    step_index: int | None = None,
+) -> str:
+    token = QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(chat_id) if chat_id is not None else None
+    if token is not None and step_index is not None:
+        return f"{CALLBACK_ANSWER_PREFIX}{token}:{step_index}:{option_index}"
+    return f"{CALLBACK_ANSWER_PREFIX}{option_index}"
+
+
+def _question_keyboard(
+    question,
+    *,
+    chat_id: int | None = None,
+    step_index: int | None = None,
+) -> InlineKeyboardMarkup | None:
     if not question:
         return None
     return _optional_keyboard_with_privacy_policy(
         [
-            [InlineKeyboardButton(text=option, callback_data=f"{CALLBACK_ANSWER_PREFIX}{index}")]
+            [
+                InlineKeyboardButton(
+                    text=option,
+                    callback_data=_question_answer_callback_data(index, chat_id=chat_id, step_index=step_index),
+                )
+            ]
             for index, option in enumerate(question.options)
         ],
     )

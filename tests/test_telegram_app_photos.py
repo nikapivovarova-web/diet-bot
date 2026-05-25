@@ -143,6 +143,33 @@ def _button_text_urls(markup) -> list[tuple[str, str | None]]:
     return [(button.text, button.url) for row in markup.inline_keyboard for button in row]
 
 
+def _first_callback_data_from_last_message(message) -> str:
+    _text, markup = message.texts[-1]
+    assert markup is not None
+    return markup.inline_keyboard[0][0].callback_data
+
+
+def _sample_questionnaire_answer(question) -> str:
+    if question.options:
+        return question.options[0]
+    return {
+        "age": "32",
+        "height_cm": "178",
+        "weight_kg": "86",
+    }[question.key]
+
+
+async def _advance_questionnaire_to(message, question_key: str) -> None:
+    while True:
+        session = SESSION_BY_CHAT_ID.get(message.chat.id)
+        assert session is not None
+        question = session.current_question
+        assert question is not None
+        if question.key == question_key:
+            return
+        await _handle_questionnaire_answer(message, _sample_questionnaire_answer(question))
+
+
 class FakePromoEntitlementService:
     def __init__(self, *, fail_grants: int = 0) -> None:
         self.fail_grants = fail_grants
@@ -2082,6 +2109,279 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_current_questionnaire_callback_advances_normally(monkeypatch, tmp_path) -> None:
+    chat_id = 91_031
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id)
+    try:
+        await telegram_app._start_questionnaire(message)
+        await _advance_questionnaire_to(message, "sex")
+        callback_data = _first_callback_data_from_last_message(message)
+        selected_answer = SESSION_BY_CHAT_ID[chat_id].current_question.options[0]
+
+        callback = FakeCallback(callback_data, message)
+        await telegram_app.handle_callback(callback)
+
+        session = SESSION_BY_CHAT_ID[chat_id]
+        assert callback.answers == [selected_answer]
+        assert session.current_question.key == "height_cm"
+        assert session.answers["sex"] == selected_answer
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_repeated_questionnaire_callback_delivery_does_not_advance_again(monkeypatch, tmp_path) -> None:
+    chat_id = 91_032
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id)
+    try:
+        await telegram_app._start_questionnaire(message)
+        await _advance_questionnaire_to(message, "goal")
+        callback_data = _first_callback_data_from_last_message(message)
+        selected_answer = SESSION_BY_CHAT_ID[chat_id].current_question.options[0]
+
+        await telegram_app.handle_callback(FakeCallback(callback_data, message))
+        repeated_callback = FakeCallback(callback_data, message)
+        await telegram_app.handle_callback(repeated_callback)
+
+        session = SESSION_BY_CHAT_ID[chat_id]
+        assert repeated_callback.answers[-1]
+        assert session.current_question.key == "activity"
+        assert session.answers["goal"] == selected_answer
+        assert "activity" not in session.answers
+        assert chat_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_stale_questionnaire_callback_from_previous_step_does_not_complete(monkeypatch, tmp_path) -> None:
+    chat_id = 91_033
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id)
+    try:
+        await telegram_app._start_questionnaire(message)
+        await _advance_questionnaire_to(message, "conditions")
+        stale_callback_data = _first_callback_data_from_last_message(message)
+        await _handle_questionnaire_answer(
+            message,
+            _sample_questionnaire_answer(SESSION_BY_CHAT_ID[chat_id].current_question),
+        )
+
+        stale_callback = FakeCallback(stale_callback_data, message)
+        await telegram_app.handle_callback(stale_callback)
+
+        session = SESSION_BY_CHAT_ID.get(chat_id)
+        assert stale_callback.answers[-1]
+        assert session is not None
+        assert session.current_question.key == "excluded_foods"
+        assert "excluded_foods" not in session.answers
+        assert chat_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_cancelled_questionnaire_callback_does_not_mutate_restarted_flow(monkeypatch, tmp_path) -> None:
+    chat_id = 91_034
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id)
+    try:
+        await telegram_app._start_questionnaire(message)
+        await _advance_questionnaire_to(message, "sex")
+        cancelled_callback_data = _first_callback_data_from_last_message(message)
+
+        await telegram_app.cancel(FakeMessage(chat_id))
+        await telegram_app._start_questionnaire(message)
+        await _advance_questionnaire_to(message, "sex")
+
+        stale_callback = FakeCallback(cancelled_callback_data, message)
+        await telegram_app.handle_callback(stale_callback)
+
+        session = SESSION_BY_CHAT_ID[chat_id]
+        assert stale_callback.answers[-1]
+        assert session.current_question.key == "sex"
+        assert "sex" not in session.answers
+        assert chat_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_concurrent_duplicate_questionnaire_callback_same_chat_stales_second(monkeypatch, tmp_path) -> None:
+    chat_id = 91_035
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    message = FakeMessage(chat_id)
+    first_answer_started = asyncio.Event()
+    release_first_answer = asyncio.Event()
+    second_answer_started = asyncio.Event()
+    release_second_answer = asyncio.Event()
+    plan_calls = 0
+
+    class BlockingFirstCallback(FakeCallback):
+        async def answer(self, text=None) -> None:
+            self.answers.append(text)
+            first_answer_started.set()
+            await release_first_answer.wait()
+
+    class PausingSecondCallback(FakeCallback):
+        async def answer(self, text=None) -> None:
+            self.answers.append(text)
+            second_answer_started.set()
+            await release_second_answer.wait()
+
+    async def fake_send_plan(*_args, **_kwargs) -> bool:
+        nonlocal plan_calls
+        plan_calls += 1
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+    first_task = None
+    second_task = None
+    try:
+        await telegram_app._start_questionnaire(message, is_trial=True)
+        await _advance_questionnaire_to(message, "conditions")
+        callback_data = _first_callback_data_from_last_message(message)
+        selected_answer = SESSION_BY_CHAT_ID[chat_id].current_question.options[0]
+
+        first_callback = BlockingFirstCallback(callback_data, message)
+        second_callback = PausingSecondCallback(callback_data, message)
+        first_task = asyncio.create_task(telegram_app.handle_callback(first_callback))
+        await asyncio.wait_for(first_answer_started.wait(), timeout=1)
+
+        second_task = asyncio.create_task(telegram_app.handle_callback(second_callback))
+        try:
+            await asyncio.wait_for(second_answer_started.wait(), timeout=0.1)
+        except TimeoutError:
+            pass
+        else:
+            release_second_answer.set()
+            await asyncio.sleep(0)
+
+        release_first_answer.set()
+        release_second_answer.set()
+        await asyncio.gather(first_task, second_task)
+
+        session = SESSION_BY_CHAT_ID.get(chat_id)
+        entitlement = telegram_app.load_entitlements(subscriptions_path).get(chat_id, telegram_app.Entitlement())
+        assert first_callback.answers == [selected_answer]
+        assert second_callback.answers[-1] == telegram_app.STALE_QUESTIONNAIRE_CALLBACK_TEXT
+        assert session is not None
+        assert session.current_question.key == "excluded_foods"
+        assert session.answers["conditions"] == selected_answer
+        assert "excluded_foods" not in session.answers
+        assert chat_id not in PROFILE_BY_CHAT_ID
+        assert plan_calls == 0
+        assert entitlement.free_trial_used is False
+    finally:
+        release_first_answer.set()
+        release_second_answer.set()
+        cleanup_tasks = [task for task in (first_task, second_task) if task is not None and not task.done()]
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+        getattr(telegram_app, "_QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_questionnaire_callback_different_chats_do_not_block_each_other(monkeypatch, tmp_path) -> None:
+    first_chat_id = 91_036
+    second_chat_id = 91_037
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    first_message = FakeMessage(first_chat_id)
+    second_message = FakeMessage(second_chat_id)
+    first_answer_started = asyncio.Event()
+    release_first_answer = asyncio.Event()
+    second_answer_started = asyncio.Event()
+
+    class BlockingFirstCallback(FakeCallback):
+        async def answer(self, text=None) -> None:
+            self.answers.append(text)
+            first_answer_started.set()
+            await release_first_answer.wait()
+
+    class TrackingSecondCallback(FakeCallback):
+        async def answer(self, text=None) -> None:
+            self.answers.append(text)
+            second_answer_started.set()
+
+    first_task = None
+    second_task = None
+    try:
+        await telegram_app._start_questionnaire(first_message)
+        await telegram_app._start_questionnaire(second_message)
+        await _advance_questionnaire_to(first_message, "sex")
+        await _advance_questionnaire_to(second_message, "sex")
+        first_callback_data = _first_callback_data_from_last_message(first_message)
+        second_callback_data = _first_callback_data_from_last_message(second_message)
+        first_answer = SESSION_BY_CHAT_ID[first_chat_id].current_question.options[0]
+        second_answer = SESSION_BY_CHAT_ID[second_chat_id].current_question.options[0]
+
+        first_callback = BlockingFirstCallback(first_callback_data, first_message)
+        second_callback = TrackingSecondCallback(second_callback_data, second_message)
+        first_task = asyncio.create_task(telegram_app.handle_callback(first_callback))
+        await asyncio.wait_for(first_answer_started.wait(), timeout=1)
+
+        second_task = asyncio.create_task(telegram_app.handle_callback(second_callback))
+        await asyncio.wait_for(second_answer_started.wait(), timeout=1)
+
+        second_session = SESSION_BY_CHAT_ID[second_chat_id]
+        assert second_callback.answers == [second_answer]
+        assert second_session.current_question.key == "height_cm"
+        assert second_session.answers["sex"] == second_answer
+
+        release_first_answer.set()
+        await first_task
+        first_session = SESSION_BY_CHAT_ID[first_chat_id]
+        assert first_callback.answers == [first_answer]
+        assert first_session.current_question.key == "height_cm"
+        assert first_session.answers["sex"] == first_answer
+    finally:
+        release_first_answer.set()
+        cleanup_tasks = [task for task in (first_task, second_task) if task is not None and not task.done()]
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        for chat_id in (first_chat_id, second_chat_id):
+            SESSION_BY_CHAT_ID.pop(chat_id, None)
+            PROFILE_BY_CHAT_ID.pop(chat_id, None)
+            getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+            getattr(telegram_app, "_QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID", {}).pop(chat_id, None)
 
 
 @pytest.mark.anyio
