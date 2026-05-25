@@ -143,7 +143,7 @@ from .weekly_pdf_job_runtime import (
     WeeklyPdfJobRuntime,
     validate_weekly_pdf_job_runtime_for_startup,
 )
-from .weekly_pdf_jobs import AdmitJobResultStatus, StartJobResultStatus, WeeklyPdfJob
+from .weekly_pdf_jobs import AdmitJobResultStatus, FinishJobResultStatus, StartJobResultStatus, WeeklyPdfJob
 
 
 SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
@@ -2056,9 +2056,53 @@ async def _send_week_plan_after_postgres_admission(
 
     consumption = AttemptConsumption(True, "weekly_pdf", start_result.job.consumption_source)
     recipe_history_entries: list[RecipeHistoryItem] = []
+    post_upload_finalized = False
 
     def mark_document_delivered() -> None:
-        runtime.mark_delivered(job.job_id)
+        nonlocal post_upload_finalized
+        try:
+            runtime.mark_delivered(job.job_id)
+        except Exception as exc:
+            marker_error = type(exc).__name__
+            logger.exception(
+                "Failed to mark weekly PDF job delivered after Telegram upload chat_id=%s job_id=%s",
+                chat_id,
+                job.job_id,
+            )
+            _weekly_pdf_diag(
+                "postgres_mark_delivered_failed_after_upload",
+                chat_id=chat_id,
+                job_id=str(job.job_id),
+                error=marker_error,
+            )
+            try:
+                finish_result = runtime.finish_success(job.job_id)
+            except Exception as finish_exc:
+                logger.exception(
+                    "Failed to finalize weekly PDF job as succeeded after delivered marker failure "
+                    "chat_id=%s job_id=%s",
+                    chat_id,
+                    job.job_id,
+                )
+                _weekly_pdf_diag(
+                    "postgres_finish_success_failed_after_mark_delivered_failed",
+                    chat_id=chat_id,
+                    job_id=str(job.job_id),
+                    marker_error=marker_error,
+                    error=type(finish_exc).__name__,
+                )
+                return
+            post_upload_finalized = finish_result.status in {
+                FinishJobResultStatus.SUCCEEDED,
+                FinishJobResultStatus.ALREADY_TERMINAL,
+            }
+            _weekly_pdf_diag(
+                "postgres_finish_success_after_mark_delivered_failed",
+                chat_id=chat_id,
+                job_id=str(job.job_id),
+                marker_error=marker_error,
+                status=finish_result.status.value,
+            )
 
     try:
         sent = await _send_week_plan(
@@ -2071,24 +2115,27 @@ async def _send_week_plan_after_postgres_admission(
             on_document_delivered=mark_document_delivered,
         )
     except Exception:
-        _finish_postgres_job_failure(
-            runtime,
-            job,
-            chat_id=chat_id,
-            reason="weekly_pdf_exception",
-        )
+        if not post_upload_finalized:
+            _finish_postgres_job_failure(
+                runtime,
+                job,
+                chat_id=chat_id,
+                reason="weekly_pdf_exception",
+            )
         raise
 
     if not sent:
-        _finish_postgres_job_failure(
-            runtime,
-            job,
-            chat_id=chat_id,
-            reason="weekly_pdf_not_sent",
-        )
+        if not post_upload_finalized:
+            _finish_postgres_job_failure(
+                runtime,
+                job,
+                chat_id=chat_id,
+                reason="weekly_pdf_not_sent",
+            )
         return False
 
-    runtime.finish_success(job.job_id)
+    if not post_upload_finalized:
+        runtime.finish_success(job.job_id)
     _record_successful_generation_history(chat_id, consumption, recipe_history_entries)
     return True
 
