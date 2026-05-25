@@ -20,6 +20,8 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    MarkDeliveredResult,
+    MarkDeliveredResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     StartJobResult,
     StartJobResultStatus,
@@ -294,8 +296,9 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
 
     monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", allow_weekly_pdf_preflight)
 
-    async def fake_send_week_plan(*_args, **_kwargs) -> bool:
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
         events.append(("send",))
+        kwargs["on_document_delivered"]()
         return True
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
@@ -313,6 +316,7 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
         ("preflight", chat_id),
         ("start", runtime.job.job_id, False),
         ("send",),
+        ("delivered", runtime.job.job_id),
         ("success", runtime.job.job_id),
     ]
 
@@ -354,6 +358,39 @@ async def test_postgres_generation_failure_uses_store_refund_path_not_json_refun
 
 
 @pytest.mark.anyio
+async def test_postgres_post_delivery_failure_marks_delivered_before_failure(monkeypatch) -> None:
+    chat_id = 201_011
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
+
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
+        events.append(("send",))
+        kwargs["on_document_delivered"]()
+        raise RuntimeError("status edit failed")
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    with pytest.raises(RuntimeError, match="status edit failed"):
+        await telegram_app._send_week_plan_with_access(
+            FakeMessage(chat_id),
+            profile_with(),
+            idempotency_key="idem-post-delivery-failure",
+        )
+
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-post-delivery-failure"),
+        ("start", runtime.job.job_id, False),
+        ("send",),
+        ("delivered", runtime.job.job_id),
+        ("failure", runtime.job.job_id, "weekly_pdf_exception"),
+    ]
+
+
+@pytest.mark.anyio
 async def test_postgres_tester_chat_id_starts_lifecycle_as_test_access_without_json_mutation(monkeypatch) -> None:
     chat_id = 201_006
     events: list[tuple] = []
@@ -369,8 +406,9 @@ async def test_postgres_tester_chat_id_starts_lifecycle_as_test_access_without_j
     monkeypatch.setattr(telegram_app, "_consume_generation_attempt", fail_json_consume_or_refund)
     monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_json_consume_or_refund)
 
-    async def fake_send_week_plan(*_args, **_kwargs) -> bool:
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
         events.append(("send",))
+        kwargs["on_document_delivered"]()
         return True
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
@@ -387,8 +425,47 @@ async def test_postgres_tester_chat_id_starts_lifecycle_as_test_access_without_j
         ("admit", chat_id, "idem-test-access"),
         ("start", runtime.job.job_id, True),
         ("send",),
+        ("delivered", runtime.job.job_id),
         ("success", runtime.job.job_id),
     ]
+
+
+@pytest.mark.anyio
+async def test_send_week_pdf_document_marks_delivery_after_answer_document_success() -> None:
+    events: list[str] = []
+
+    class DocumentMessage(FakeMessage):
+        async def answer_document(self, **_kwargs) -> None:
+            events.append("answer_document")
+
+    await telegram_app._send_week_pdf_document(
+        DocumentMessage(201_012),
+        b"%PDF-1.4\n%test",
+        "week.pdf",
+        on_document_delivered=lambda: events.append("delivered"),
+    )
+
+    assert events == ["answer_document", "delivered"]
+
+
+@pytest.mark.anyio
+async def test_send_week_pdf_document_does_not_mark_delivery_before_upload_success() -> None:
+    events: list[str] = []
+
+    class FailingDocumentMessage(FakeMessage):
+        async def answer_document(self, **_kwargs) -> None:
+            events.append("answer_document")
+            raise RuntimeError("upload failed")
+
+    with pytest.raises(RuntimeError, match="upload failed"):
+        await telegram_app._send_week_pdf_document(
+            FailingDocumentMessage(201_013),
+            b"%PDF-1.4\n%test",
+            "week.pdf",
+            on_document_delivered=lambda: events.append("delivered"),
+        )
+
+    assert events == ["answer_document"]
 
 
 class FakeWeeklyPdfRuntime:
@@ -429,6 +506,17 @@ class FakeWeeklyPdfRuntime:
             FinishJobResultStatus.SUCCEEDED,
             _job(status=JOB_STATUS_SUCCEEDED, chat_id=self.job.chat_id, job_id=job_id, source=self.start_source),
         )
+
+    def mark_delivered(self, job_id):
+        self.events.append(("delivered", job_id))
+        self.job = _job(
+            status=JOB_STATUS_RUNNING,
+            chat_id=self.job.chat_id,
+            job_id=job_id,
+            source=self.start_source,
+            delivered_at=datetime(2026, 5, 23, 0, 0, 5, tzinfo=UTC),
+        )
+        return MarkDeliveredResult(MarkDeliveredResultStatus.DELIVERED, self.job)
 
     def finish_failure_and_refund_once(self, job_id, *, reason: str | None = None):
         self.events.append(("failure", job_id, reason))
@@ -485,6 +573,8 @@ def _job(
     chat_id: int,
     job_id=None,
     source: str | None = None,
+    delivered_at: datetime | None = None,
+    finalization_error: str | None = None,
 ) -> WeeklyPdfJob:
     return WeeklyPdfJob(
         job_id=job_id or uuid4(),
@@ -494,4 +584,6 @@ def _job(
         refund_status=REFUND_STATUS_NOT_REQUIRED,
         consumption_source=source,
         stale_after=datetime(2026, 5, 23, tzinfo=UTC) + timedelta(minutes=30),
+        delivered_at=delivered_at,
+        finalization_error=finalization_error,
     )

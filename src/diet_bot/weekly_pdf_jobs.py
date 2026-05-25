@@ -44,6 +44,8 @@ class WeeklyPdfJob:
     heartbeat_at: datetime | None = None
     finished_at: datetime | None = None
     failure_reason: str | None = None
+    delivered_at: datetime | None = None
+    finalization_error: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata))
@@ -91,6 +93,19 @@ class FinishJobResultStatus(str, Enum):
 @dataclass(frozen=True)
 class FinishJobResult:
     status: FinishJobResultStatus
+    job: WeeklyPdfJob | None
+
+
+class MarkDeliveredResultStatus(str, Enum):
+    DELIVERED = "delivered"
+    ALREADY_DELIVERED = "already_delivered"
+    INVALID_STATE = "invalid_state"
+    NOT_FOUND = "not_found"
+
+
+@dataclass(frozen=True)
+class MarkDeliveredResult:
+    status: MarkDeliveredResultStatus
     job: WeeklyPdfJob | None
 
 

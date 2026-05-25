@@ -18,6 +18,8 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    MarkDeliveredResult,
+    MarkDeliveredResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     StartJobResult,
     StartJobResultStatus,
@@ -246,6 +248,18 @@ def test_runtime_success_and_failure_delegate_to_store_once() -> None:
     ]
 
 
+def test_runtime_mark_delivered_delegates_to_store_once() -> None:
+    store = FakeWeeklyPdfStore()
+    running = _job(status=JOB_STATUS_RUNNING, chat_id=104)
+    store.next_delivered = MarkDeliveredResult(MarkDeliveredResultStatus.DELIVERED, running)
+    runtime = WeeklyPdfJobRuntime(store, now=lambda: NOW)
+
+    result = runtime.mark_delivered(running.job_id)
+
+    assert result.status == MarkDeliveredResultStatus.DELIVERED
+    assert store.calls == [("delivered", running.job_id)]
+
+
 def test_runtime_scoped_cleanup_uses_chat_id_and_small_limit() -> None:
     store = FakeWeeklyPdfStore()
     runtime = WeeklyPdfJobRuntime(store, now=lambda: NOW)
@@ -279,6 +293,7 @@ class FakeWeeklyPdfStore:
         self.next_start: StartJobResult | None = None
         self.next_success: FinishJobResult | None = None
         self.next_failure: FinishJobResult | None = None
+        self.next_delivered: MarkDeliveredResult | None = None
         self.next_cancel: FinishJobResult | None = None
 
     def admit_job(self, *, chat_id, idempotency_key, stale_after, metadata=None):
@@ -307,6 +322,13 @@ class FakeWeeklyPdfStore:
         return self.next_failure or FinishJobResult(
             FinishJobResultStatus.FAILED,
             _job(status=JOB_STATUS_FAILED, chat_id=1),
+        )
+
+    def mark_delivered(self, job_id, *, now=None):
+        self.calls.append(("delivered", job_id))
+        return self.next_delivered or MarkDeliveredResult(
+            MarkDeliveredResultStatus.DELIVERED,
+            _job(status=JOB_STATUS_RUNNING, chat_id=1),
         )
 
     def cancel_queued(self, job_id, *, reason=None, now=None):
