@@ -135,6 +135,26 @@ def _button_callbacks(markup) -> list[str | None]:
     return [button.callback_data for row in markup.inline_keyboard for button in row]
 
 
+class FakePromoEntitlementService:
+    def __init__(self, *, fail_grants: int = 0) -> None:
+        self.fail_grants = fail_grants
+        self.grants: list[tuple[int, str]] = []
+        self.entitlements: dict[int, telegram_app.Entitlement] = {}
+
+    def apply_subscription_payment(self, chat_id: int, charge_id: str):
+        if self.fail_grants:
+            self.fail_grants -= 1
+            raise telegram_app.EntitlementStorageError("grant failed")
+        entitlement = self.entitlements.get(chat_id, telegram_app.Entitlement())
+        result = telegram_app.apply_subscription_payment(entitlement, charge_id)
+        self.entitlements[chat_id] = entitlement
+        self.grants.append((chat_id, charge_id))
+        return result
+
+    def get_entitlement(self, chat_id: int) -> telegram_app.Entitlement:
+        return self.entitlements.get(chat_id, telegram_app.Entitlement())
+
+
 @pytest.fixture(autouse=True)
 def _enable_payments_for_existing_payment_ui_tests(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", True, raising=False)
@@ -350,6 +370,81 @@ async def test_promo_code_activation_grants_monthly_subscription(monkeypatch, tm
         assert entitlement.monthly_weekly_pdf_remaining == 4
         assert promo_codes["FB-ABCD-EFGH-2345"].used_by_chat_id == chat_id
         assert markup.inline_keyboard[0][0].callback_data == CALLBACK_ONE_DAY_PLAN
+    finally:
+        PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+
+
+def test_promo_code_activation_rolls_back_claim_when_entitlement_grant_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 80_203
+    promo_path = tmp_path / "promo_codes.json"
+    save_promo_codes(promo_path, {"FB-ABCD-EFGH-2345": PromoCodeRecord()})
+    service = FakePromoEntitlementService(fail_grants=1)
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "_entitlement_service", lambda: service)
+
+    with pytest.raises(telegram_app.EntitlementStorageError, match="grant failed"):
+        telegram_app._activate_promo_code_for_chat(chat_id, "fb abcd efgh 2345")
+
+    promo_codes = load_promo_codes(promo_path)
+    assert promo_codes["FB-ABCD-EFGH-2345"].used_by_chat_id is None
+    assert promo_codes["FB-ABCD-EFGH-2345"].used_at is None
+
+    retry = telegram_app._activate_promo_code_for_chat(chat_id, "FB-ABCD-EFGH-2345")
+
+    assert retry.activated
+    assert service.grants == [(chat_id, "promo:FB-ABCD-EFGH-2345")]
+    assert load_promo_codes(promo_path)["FB-ABCD-EFGH-2345"].used_by_chat_id == chat_id
+
+
+def test_promo_code_duplicate_after_success_does_not_grant_again(monkeypatch, tmp_path) -> None:
+    promo_path = tmp_path / "promo_codes.json"
+    save_promo_codes(promo_path, {"FB-ABCD-EFGH-2345": PromoCodeRecord()})
+    service = FakePromoEntitlementService()
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "_entitlement_service", lambda: service)
+
+    first = telegram_app._activate_promo_code_for_chat(80_204, "FB-ABCD-EFGH-2345")
+    second = telegram_app._activate_promo_code_for_chat(80_205, "FB-ABCD-EFGH-2345")
+
+    assert first.activated
+    assert second.status == "already_used"
+    assert second.used_by_chat_id == 80_204
+    assert service.grants == [(80_204, "promo:FB-ABCD-EFGH-2345")]
+
+
+@pytest.mark.anyio
+async def test_promo_code_handler_returns_entitlement_error_and_allows_retry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 80_206
+    promo_path = tmp_path / "promo_codes.json"
+    save_promo_codes(promo_path, {"FB-ABCD-EFGH-2345": PromoCodeRecord()})
+    service = FakePromoEntitlementService(fail_grants=1)
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "_entitlement_service", lambda: service)
+    PROMO_CODE_REQUEST_CHAT_IDS.add(chat_id)
+    first_message = FakeMessage(chat_id, text="FB-ABCD-EFGH-2345")
+
+    try:
+        await handle_answer(first_message)
+
+        promo_codes = load_promo_codes(promo_path)
+        assert first_message.texts == [(telegram_app.ENTITLEMENT_STORAGE_ERROR_TEXT, None)]
+        assert chat_id in PROMO_CODE_REQUEST_CHAT_IDS
+        assert promo_codes["FB-ABCD-EFGH-2345"].used_by_chat_id is None
+        assert promo_codes["FB-ABCD-EFGH-2345"].used_at is None
+
+        retry_message = FakeMessage(chat_id, text="FB-ABCD-EFGH-2345")
+        await handle_answer(retry_message)
+
+        assert chat_id not in PROMO_CODE_REQUEST_CHAT_IDS
+        assert service.grants == [(chat_id, "promo:FB-ABCD-EFGH-2345")]
+        assert load_promo_codes(promo_path)["FB-ABCD-EFGH-2345"].used_by_chat_id == chat_id
+        assert retry_message.texts[-1][1] is not None
     finally:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
 

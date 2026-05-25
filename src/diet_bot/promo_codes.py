@@ -114,6 +114,23 @@ def activate_promo_code(
     return PromoCodeActivation("activated", code, chat_id)
 
 
+def release_promo_code_activation(path: Path, raw_code: str, chat_id: int) -> bool:
+    code = normalize_promo_code(raw_code)
+    if not code:
+        return False
+
+    promo_codes = load_promo_codes(path)
+    record = promo_codes.get(code)
+    if record is None or record.used_by_chat_id != chat_id:
+        return False
+
+    record.used_by_chat_id = None
+    record.used_at = None
+    promo_codes[code] = record
+    save_promo_codes(path, promo_codes)
+    return True
+
+
 def generate_promo_codes(count: int, *, existing_codes: set[str] | None = None) -> list[str]:
     existing = {normalize_promo_code(code) for code in existing_codes or set()}
     generated: set[str] = set()
