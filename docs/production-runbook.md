@@ -52,7 +52,8 @@ Back up at least:
 - `.diet_bot_state/promo_codes.json`
 
 Keep the backup read-only. Use the backed-up `subscriptions.json` as the source
-for entitlement import so the migration is reproducible.
+for entitlement import and the backed-up `history.json` as the source for chat
+state import so both migrations are reproducible.
 
 ## Migration Order
 
@@ -103,7 +104,38 @@ below use placeholders only.
    '@ | .\.venv\Scripts\python.exe -
    ```
 
-5. Keep payment ledger migrations dormant and optional while payments are off.
+5. Apply chat state schema migrations explicitly.
+
+   ```powershell
+   @'
+   from diet_bot.postgres_chat_state_store import PostgresChatStateStore
+
+   PostgresChatStateStore("<postgres-dsn>").initialize()
+   '@ | .\.venv\Scripts\python.exe -
+   ```
+
+6. Migrate JSON chat state history to Postgres.
+
+   Dry-run from the backup first:
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\scripts\migrate_history_json_to_postgres.py `
+     --source "<backup-dir>\history.json" `
+     --migration-id "prod-history-YYYYMMDD-HHMM" `
+     --dry-run
+   ```
+
+   Apply only after the dry-run report is reviewed:
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\scripts\migrate_history_json_to_postgres.py `
+     --source "<backup-dir>\history.json" `
+     --migration-id "prod-history-YYYYMMDD-HHMM" `
+     --database-url "<postgres-dsn>" `
+     --apply
+   ```
+
+7. Keep payment ledger migrations dormant and optional while payments are off.
 
    Payment ledger tables are not required for this cutover with payments
    disabled. Treat any payment ledger migration, provider-token setup, or live
@@ -146,12 +178,14 @@ Run exactly one long-polling bot process for a bot token.
 3. Apply entitlement migrations.
 4. Dry-run and then apply the JSON entitlement import.
 5. Apply weekly PDF job migrations.
-6. Leave payment ledger migrations dormant unless separately approved.
-7. Run strict production healthcheck.
-8. Confirm only one poller will run.
-9. Stop the old poller.
-10. Start the new poller once.
-11. Monitor process logs and health signals.
+6. Apply chat state schema migrations.
+7. Dry-run and then apply the JSON history/chat-state import.
+8. Leave payment ledger migrations dormant unless separately approved.
+9. Run strict production healthcheck.
+10. Confirm only one poller will run.
+11. Stop the old poller.
+12. Start the new poller once.
+13. Monitor process logs and health signals.
 
 Do not use Telegram API calls or manual Telegram QA as part of this sequence
 unless that QA is separately approved.
@@ -171,5 +205,6 @@ Rollback depends on whether the new poller has processed production traffic.
 - Never print bot tokens, provider tokens, or database DSNs in tickets, chat, logs, or pull requests.
 - Do not put production DSNs or provider tokens into README examples.
 - Use a unique entitlement `--migration-id` for each attempted import.
+- Use a unique history/chat-state `--migration-id` for each attempted import.
 - Keep the JSON backup and migration output together for audit.
 - Treat payment enablement as a separate runbook and approval path.
