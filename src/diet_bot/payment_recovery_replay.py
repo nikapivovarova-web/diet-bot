@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from .payments import (
     ORDER_STATUS_PENDING,
     PRODUCT_SUBSCRIPTION_MONTH,
     PaymentCharge,
+    PaymentHandlingResult,
     PaymentOrder,
     PaymentPayloadError,
     decode_payment_order_payload,
@@ -32,7 +34,13 @@ STATUS_ALREADY_RECOVERED = "already_recovered"
 STATUS_BLOCKED = "blocked"
 STATUS_DB_VALIDATION_UNAVAILABLE = "db_validation_unavailable"
 
+APPLY_STATUS_RECOVERED = "recovered"
+APPLY_STATUS_ALREADY_RECOVERED = "already_recovered"
+APPLY_STATUS_BLOCKED = "blocked"
+APPLY_STATUS_APPLY_FAILED = "apply_failed"
+
 DEFAULT_DATABASE_URL_ENV = "DIET_BOT_DATABASE_URL"
+_SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 
 
 class PaymentReplayUsageError(RuntimeError):
@@ -50,6 +58,23 @@ class PaymentReplayLookup(Protocol):
         telegram_payment_charge_id: str | None,
         provider_payment_charge_id: str | None,
     ) -> PaymentCharge | None:
+        ...
+
+
+class PaymentReplayPaymentService(Protocol):
+    def handle_successful_payment(
+        self,
+        *,
+        payload: str,
+        user_id: int,
+        chat_id: int,
+        provider: str,
+        amount: int,
+        currency: str,
+        telegram_payment_charge_id: str | None,
+        provider_payment_charge_id: str | None = None,
+        raw_payload: dict[str, object] | None = None,
+    ) -> PaymentHandlingResult:
         ...
 
 
@@ -179,6 +204,115 @@ class PaymentReplayReport:
 
 
 @dataclass(frozen=True)
+class PaymentReplayApplyRecordResult:
+    line_number: int | None
+    record_id: str | None
+    preflight_status: str
+    apply_status: str
+    reason: str | None
+    timestamp: str
+    provider: str | None = None
+    amount: int | None = None
+    currency: str | None = None
+    chat_id: str | None = None
+    user_id: str | None = None
+    telegram_payment_charge_id: str | None = None
+    provider_payment_charge_id: str | None = None
+
+    @classmethod
+    def from_preflight(
+        cls,
+        preflight: PaymentReplayRecordReport,
+        *,
+        apply_status: str,
+        reason: str | None,
+        timestamp: str,
+    ) -> PaymentReplayApplyRecordResult:
+        return cls(
+            line_number=preflight.line_number,
+            record_id=preflight.record_id,
+            preflight_status=preflight.status,
+            apply_status=apply_status,
+            reason=_safe_result_reason(reason),
+            timestamp=timestamp,
+            provider=preflight.provider,
+            amount=preflight.amount,
+            currency=preflight.currency,
+            chat_id=preflight.chat_id,
+            user_id=preflight.user_id,
+            telegram_payment_charge_id=preflight.telegram_payment_charge_id,
+            provider_payment_charge_id=preflight.provider_payment_charge_id,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "timestamp": self.timestamp,
+            "line_number": self.line_number,
+            "record_id": self.record_id,
+            "preflight_status": self.preflight_status,
+            "apply_status": self.apply_status,
+            "reason": self.reason,
+        }
+        optional_fields = {
+            "provider": self.provider,
+            "amount": self.amount,
+            "currency": self.currency,
+            "chat_id": self.chat_id,
+            "user_id": self.user_id,
+            "telegram_payment_charge_id": self.telegram_payment_charge_id,
+            "provider_payment_charge_id": self.provider_payment_charge_id,
+        }
+        for key, value in optional_fields.items():
+            if value is not None:
+                payload[key] = value
+        return payload
+
+
+@dataclass(frozen=True)
+class PaymentReplayApplyReport:
+    mode: str
+    spool_path: Path
+    spool_fingerprint: str
+    result_jsonl_path: Path
+    db_validation_available: bool
+    preflight: PaymentReplayReport
+    results: tuple[PaymentReplayApplyRecordResult, ...]
+    started_at: str
+    finished_at: str
+
+    @property
+    def counts(self) -> dict[str, int]:
+        counts = {
+            "total": len(self.results),
+            APPLY_STATUS_RECOVERED: 0,
+            APPLY_STATUS_ALREADY_RECOVERED: 0,
+            APPLY_STATUS_BLOCKED: 0,
+            APPLY_STATUS_APPLY_FAILED: 0,
+        }
+        for result in self.results:
+            if result.apply_status in counts:
+                counts[result.apply_status] += 1
+        return counts
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "spool": {
+                "path": str(self.spool_path),
+                "exists": self.spool_path.exists(),
+                "bytes": self.spool_path.stat().st_size if self.spool_path.exists() else 0,
+                "fingerprint": self.spool_fingerprint,
+            },
+            "result_jsonl": {"path": str(self.result_jsonl_path)},
+            "db_validation_available": self.db_validation_available,
+            "counts": self.counts,
+            "results": [result.to_dict() for result in self.results],
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+
+
+@dataclass(frozen=True)
 class _ParsedRecord:
     line_number: int
     record: PaymentRecoveryRecord
@@ -270,6 +404,67 @@ def dry_run_spool(path: str | Path, *, lookup: PaymentReplayLookup | None = None
     )
 
 
+def apply_spool(
+    path: str | Path,
+    *,
+    lookup: PaymentReplayLookup,
+    payment_service: PaymentReplayPaymentService,
+    expected_spool_fingerprint: str | None,
+    result_jsonl: str | Path,
+) -> PaymentReplayApplyReport:
+    started_at = _now_iso()
+    spool_path = _require_spool(path)
+    spool_fingerprint = _spool_fingerprint(spool_path)
+    _validate_expected_fingerprint_value(
+        spool_fingerprint,
+        expected_spool_fingerprint,
+        required=True,
+    )
+    result_path = Path(result_jsonl)
+    _validate_result_jsonl_path(spool_path, result_path)
+
+    preflight = dry_run_spool(spool_path, lookup=lookup)
+    parsed_by_record_id = _deduped_parsed_records_by_id(_parse_spool(spool_path))
+    seen_keys: set[str] = set()
+    results: list[PaymentReplayApplyRecordResult] = []
+    for preflight_record in preflight.records:
+        key = _preflight_result_key(preflight_record)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        timestamp = _now_iso()
+        parsed = parsed_by_record_id.get(preflight_record.record_id or "")
+        if preflight_record.status == STATUS_REPLAYABLE_CANDIDATE and parsed is not None:
+            apply_status, reason = _apply_replayable_record(parsed.record, lookup, payment_service)
+        elif preflight_record.status == STATUS_ALREADY_RECOVERED:
+            apply_status = APPLY_STATUS_ALREADY_RECOVERED
+            reason = preflight_record.reason
+        else:
+            apply_status = APPLY_STATUS_BLOCKED
+            reason = preflight_record.reason or preflight_record.status
+        results.append(
+            PaymentReplayApplyRecordResult.from_preflight(
+                preflight_record,
+                apply_status=apply_status,
+                reason=reason,
+                timestamp=timestamp,
+            )
+        )
+
+    _append_apply_results(result_path, results)
+    return PaymentReplayApplyReport(
+        mode="apply",
+        spool_path=spool_path,
+        spool_fingerprint=spool_fingerprint,
+        result_jsonl_path=result_path,
+        db_validation_available=True,
+        preflight=preflight,
+        results=tuple(results),
+        started_at=started_at,
+        finished_at=_now_iso(),
+    )
+
+
 def render_human(report: PaymentReplayReport) -> str:
     counts = report.counts
     lines = [
@@ -306,9 +501,48 @@ def render_human(report: PaymentReplayReport) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_apply_human(report: PaymentReplayApplyReport) -> str:
+    counts = report.counts
+    lines = [
+        (
+            f"mode={report.mode} records={counts['total']} "
+            f"recovered={counts[APPLY_STATUS_RECOVERED]} "
+            f"already_recovered={counts[APPLY_STATUS_ALREADY_RECOVERED]} "
+            f"blocked={counts[APPLY_STATUS_BLOCKED]} "
+            f"apply_failed={counts[APPLY_STATUS_APPLY_FAILED]} "
+            f"db_validation_available={str(report.db_validation_available).lower()}"
+        )
+    ]
+    for item in report.results:
+        fields = [
+            f"line={item.line_number}",
+            f"record_id={item.record_id or 'unavailable'}",
+            f"preflight_status={item.preflight_status}",
+            f"apply_status={item.apply_status}",
+        ]
+        if item.reason:
+            fields.append(f"reason={item.reason}")
+        if item.provider:
+            fields.append(f"provider={item.provider}")
+        if item.amount is not None:
+            fields.append(f"amount={item.amount}")
+        if item.currency:
+            fields.append(f"currency={item.currency}")
+        if item.chat_id:
+            fields.append(f"chat_id={item.chat_id}")
+        if item.user_id:
+            fields.append(f"user_id={item.user_id}")
+        if item.telegram_payment_charge_id:
+            fields.append(f"telegram_payment_charge_id={item.telegram_payment_charge_id}")
+        if item.provider_payment_charge_id:
+            fields.append(f"provider_payment_charge_id={item.provider_payment_charge_id}")
+        lines.append(" ".join(fields))
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Inspect payment recovery spool records without applying payments.",
+        description="Inspect or apply payment recovery spool records.",
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
     for mode in ("list", "dry-run"):
@@ -319,17 +553,58 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         if mode == "dry-run":
             subparser.add_argument("--database-url")
             subparser.add_argument("--database-url-env", default=DEFAULT_DATABASE_URL_ENV)
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("--spool", required=True, type=Path)
+    apply_parser.add_argument("--database-url")
+    apply_parser.add_argument("--database-url-env", default=DEFAULT_DATABASE_URL_ENV)
+    apply_parser.add_argument("--expected-spool-fingerprint")
+    apply_parser.add_argument("--result-jsonl", type=Path)
+    apply_parser.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
     source_env = dict(os.environ if env is None else env)
 
     try:
         if args.mode == "list":
             report = list_spool(args.spool)
-        else:
+            _validate_expected_fingerprint(report, args.expected_spool_fingerprint)
+            if args.json_output:
+                print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                print(render_human(report), end="")
+            return _exit_code(report)
+        if args.mode == "dry-run":
             database_url = args.database_url or source_env.get(args.database_url_env)
             lookup = _build_postgres_lookup(database_url) if database_url else None
             report = dry_run_spool(args.spool, lookup=lookup)
-        _validate_expected_fingerprint(report, args.expected_spool_fingerprint)
+            _validate_expected_fingerprint(report, args.expected_spool_fingerprint)
+            if args.json_output:
+                print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                print(render_human(report), end="")
+            return _exit_code(report)
+
+        result_path = _require_result_jsonl_arg(args.result_jsonl)
+        spool_path = _require_spool(args.spool)
+        spool_fingerprint = _spool_fingerprint(spool_path)
+        _validate_expected_fingerprint_value(
+            spool_fingerprint,
+            args.expected_spool_fingerprint,
+            required=True,
+        )
+        database_url = args.database_url or source_env.get(args.database_url_env)
+        if not database_url:
+            raise PaymentReplayUsageError(
+                f"database URL is required for apply; pass --database-url or set {args.database_url_env}",
+            )
+        lookup = _build_postgres_lookup(database_url)
+        payment_service = _build_payment_service(lookup)
+        apply_report = apply_spool(
+            spool_path,
+            lookup=lookup,
+            payment_service=payment_service,
+            expected_spool_fingerprint=spool_fingerprint,
+            result_jsonl=result_path,
+        )
     except PaymentReplayUsageError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -338,16 +613,22 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         return 3
 
     if args.json_output:
-        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(apply_report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        print(render_human(report), end="")
-    return _exit_code(report)
+        print(render_apply_human(apply_report), end="")
+    return _exit_code(apply_report)
 
 
 def _build_postgres_lookup(database_url: str) -> PaymentReplayLookup:
     from .postgres_payment_store import PostgresPaymentStore
 
     return PostgresPaymentStore(database_url)
+
+
+def _build_payment_service(repository: PaymentReplayLookup) -> PaymentReplayPaymentService:
+    from .payment_service import PaymentService
+
+    return PaymentService(repository)  # type: ignore[arg-type]
 
 
 def _validate_record_against_lookup(
@@ -387,6 +668,43 @@ def _validate_record_against_lookup(
     if order.status == ORDER_STATUS_GRANTED:
         return STATUS_BLOCKED, "order_already_granted_with_different_charge"
     return STATUS_BLOCKED, "order_not_pending"
+
+
+def _apply_replayable_record(
+    record: PaymentRecoveryRecord,
+    lookup: PaymentReplayLookup,
+    payment_service: PaymentReplayPaymentService,
+) -> tuple[str, str]:
+    result = payment_service.handle_successful_payment(
+        payload=record.invoice_payload,
+        user_id=record.user_id,
+        chat_id=record.chat_id,
+        provider=record.provider,
+        amount=record.total_amount,
+        currency=record.currency,
+        telegram_payment_charge_id=record.telegram_payment_charge_id,
+        provider_payment_charge_id=record.provider_payment_charge_id,
+        raw_payload=_apply_raw_payload(record),
+    )
+    if result.processed:
+        return APPLY_STATUS_RECOVERED, "processed_successfully"
+    if result.duplicate:
+        post_status, post_reason = _validate_record_against_lookup(record, lookup)
+        if post_status == STATUS_ALREADY_RECOVERED:
+            return APPLY_STATUS_RECOVERED, post_reason
+        return APPLY_STATUS_APPLY_FAILED, result.reason or post_reason or "duplicate_not_exactly_recovered"
+    return APPLY_STATUS_APPLY_FAILED, result.reason or "payment_service_rejected"
+
+
+def _apply_raw_payload(record: PaymentRecoveryRecord) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "payment_recovery_replay": True,
+        "payment_recovery_record_id": record.record_id or "",
+        "payment_recovery_record_created_at": record.created_at,
+    }
+    if record.subscription_expiration_date is not None:
+        payload["subscription_expiration_date"] = record.subscription_expiration_date
+    return payload
 
 
 def _record_order_mismatch(
@@ -435,6 +753,19 @@ def _conflicting_duplicate_record_ids(records: Any) -> set[str]:
             continue
         contexts_by_id.setdefault(record.record_id, set()).add(_record_context(record))
     return {record_id for record_id, contexts in contexts_by_id.items() if len(contexts) > 1}
+
+
+def _deduped_parsed_records_by_id(
+    parsed: tuple[_ParsedRecord | _MalformedRecord, ...],
+) -> dict[str, _ParsedRecord]:
+    records: dict[str, _ParsedRecord] = {}
+    for item in parsed:
+        if isinstance(item, _MalformedRecord):
+            continue
+        record_id = item.record.record_id or ""
+        if record_id and record_id not in records:
+            records[record_id] = item
+    return records
 
 
 def _record_context(record: PaymentRecoveryRecord) -> tuple[object, ...]:
@@ -492,18 +823,57 @@ def _require_spool(path: str | Path) -> Path:
     return spool_path
 
 
+def _require_result_jsonl_arg(path: Path | None) -> Path:
+    if path is None:
+        raise PaymentReplayUsageError("result JSONL path is required for apply")
+    return path
+
+
+def _validate_result_jsonl_path(spool_path: Path, result_path: Path) -> None:
+    try:
+        if spool_path.resolve() == result_path.resolve():
+            raise PaymentReplayUsageError("result JSONL path must be different from spool path")
+    except OSError as exc:
+        raise PaymentReplayUsageError("could not validate result JSONL path") from exc
+
+
+def _append_apply_results(
+    result_path: Path,
+    results: list[PaymentReplayApplyRecordResult],
+) -> None:
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    with result_path.open("a", encoding="utf-8", newline="\n") as output:
+        for result in results:
+            output.write(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def _spool_fingerprint(path: Path) -> str:
     digest = hashlib.sha256()
     digest.update(b"payment-recovery-spool-v1\0")
     digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _validate_expected_fingerprint(report: PaymentReplayReport, expected: str | None) -> None:
-    if expected is None:
+    _validate_expected_fingerprint_value(report.spool_fingerprint, expected, required=False)
+
+
+def _validate_expected_fingerprint_value(actual: str, expected: str | None, *, required: bool) -> None:
+    if expected is None or not expected.strip():
+        if required:
+            raise PaymentReplayUsageError("expected spool fingerprint is required for apply")
         return
-    if expected.strip().lower() != report.spool_fingerprint:
+    if _normalize_spool_fingerprint(expected) != actual.lower():
         raise PaymentReplayUsageError("spool fingerprint mismatch")
+
+
+def _normalize_spool_fingerprint(value: str) -> str:
+    text = value.strip().lower()
+    if text.startswith("sha256:"):
+        return text
+    if re.fullmatch(r"[a-f0-9]{64}", text):
+        return f"sha256:{text}"
+    return text
 
 
 def _redact_identifier(label: str, value: object | None) -> str | None:
@@ -516,7 +886,28 @@ def _redact_identifier(label: str, value: object | None) -> str | None:
     return f"redacted:{digest[:12]}"
 
 
-def _exit_code(report: PaymentReplayReport) -> int:
+def _safe_result_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    text = str(reason).strip()
+    if not text:
+        return None
+    if _SAFE_REASON_RE.fullmatch(text):
+        return text
+    return "redacted_error"
+
+
+def _preflight_result_key(record: PaymentReplayRecordReport) -> str:
+    if record.record_id:
+        return f"record:{record.record_id}"
+    return f"line:{record.line_number}"
+
+
+def _exit_code(report: PaymentReplayReport | PaymentReplayApplyReport) -> int:
+    if isinstance(report, PaymentReplayApplyReport):
+        if report.counts[APPLY_STATUS_BLOCKED] or report.counts[APPLY_STATUS_APPLY_FAILED]:
+            return 1
+        return 0
     if report.counts[STATUS_BLOCKED]:
         return 1
     return 0

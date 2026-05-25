@@ -102,6 +102,73 @@ Safety rules:
 - Do not run migrations, deploys, restarts, bot startup, Telegram API calls, or payment actions as part of this drill.
 - Keep the sanitized JSON summaries with the backup artifact for audit.
 
+## Payment Recovery Replay
+
+Use this only for a reviewed payment recovery spool. The replay tool never
+edits the spool; apply mode writes a separate redacted result JSONL file for
+audit. No Telegram API call is needed.
+
+Back up the production database first with the approved backup process. Keep
+the backup artifact, the immutable spool, the list/dry-run outputs, and the
+apply result JSONL together.
+
+1. Put the reviewed spool in a read-only operator location. Do not edit,
+   reformat, sort, or trim the spool after review starts.
+
+2. List the spool and capture its fingerprint.
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\scripts\ops\payment_recovery_replay.py list `
+     --spool ".\ops-input\payment-recovery-spool.jsonl" `
+     --json
+   ```
+
+   Copy the reported `spool.fingerprint` value. It is formatted as
+   `sha256:<digest>` and must be reused unchanged for dry-run and apply.
+
+3. Run the database-backed dry-run preflight with the expected fingerprint.
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\scripts\ops\payment_recovery_replay.py dry-run `
+     --spool ".\ops-input\payment-recovery-spool.jsonl" `
+     --database-url-env DIET_BOT_DATABASE_URL `
+     --expected-spool-fingerprint "sha256:<digest>" `
+     --json
+   ```
+
+4. Review every blocked record before applying. Apply mode only attempts
+   records whose preflight status is `replayable_candidate`. Records reported
+   as `already_recovered` are recorded as no-op success, and blocked records
+   are not applied.
+
+5. Apply with the same expected fingerprint and a new result JSONL path.
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\scripts\ops\payment_recovery_replay.py apply `
+     --spool ".\ops-input\payment-recovery-spool.jsonl" `
+     --database-url-env DIET_BOT_DATABASE_URL `
+     --expected-spool-fingerprint "sha256:<digest>" `
+     --result-jsonl ".\ops-audit\payment-recovery-apply-YYYYMMDDTHHMMSSZ.jsonl"
+   ```
+
+6. Verify recovered orders and grants directly in the payment ledger and
+   entitlement data using approved read-only database inspection. Do not use
+   Telegram `getUpdates`, manual Telegram QA, provider token changes, deploys,
+   restarts, or schema changes for this replay.
+
+Exit codes:
+
+- `0`: selected records were recovered, already recovered, or no-op skipped as already recovered.
+- `1`: validation or apply blockers remain; inspect the redacted result JSONL.
+- `2`: usage, config, or spool fingerprint mismatch; do not apply.
+- `3`: database or unexpected runtime failure; stop and preserve the audit files.
+
+Result JSONL rows contain only redacted audit fields: `timestamp`,
+`record_id`, `preflight_status`, `apply_status`, `reason`, amount/currency,
+provider, and redacted chat, user, and charge identifiers. They must not
+contain invoice payloads, full charge IDs, chat/user IDs, tokens, raw provider
+payloads, or database DSNs.
+
 ## Migration Order
 
 Run migrations explicitly, in this order, before starting the production bot.
