@@ -9,10 +9,15 @@ import pytest
 
 from diet_bot.payment_recovery_spool import PaymentRecoveryRecord
 from diet_bot.payment_recovery_replay import (
+    APPLY_STATUS_ALREADY_RECOVERED,
+    APPLY_STATUS_APPLY_FAILED,
+    APPLY_STATUS_BLOCKED,
+    APPLY_STATUS_RECOVERED,
     STATUS_ALREADY_RECOVERED,
     STATUS_BLOCKED,
     STATUS_DB_VALIDATION_UNAVAILABLE,
     STATUS_REPLAYABLE_CANDIDATE,
+    apply_spool,
     dry_run_spool,
     list_spool,
 )
@@ -24,6 +29,7 @@ from diet_bot.payments import (
     PROVIDER_TELEGRAM_STARS,
     PROVIDER_YOOKASSA,
     PaymentCharge,
+    PaymentHandlingResult,
     PaymentOrder,
     encode_payment_order_payload,
 )
@@ -300,6 +306,243 @@ def test_dry_run_does_not_call_apply_or_write_methods(tmp_path: Path) -> None:
     assert report.records[0].status == STATUS_REPLAYABLE_CANDIDATE
 
 
+def test_apply_requires_expected_fingerprint_before_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    spool = _write_spool(tmp_path, [_record()])
+    result_jsonl = tmp_path / "apply-results.jsonl"
+
+    def fail_if_store_is_built(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("apply fingerprint guard must run before Postgres is touched")
+
+    monkeypatch.setattr(payment_recovery_replay.impl, "_build_postgres_lookup", fail_if_store_is_built)
+
+    exit_code = payment_recovery_replay.main(
+        [
+            "apply",
+            "--spool",
+            str(spool),
+            "--database-url",
+            "postgresql://user:secret-token@example.test/diet_bot",
+            "--result-jsonl",
+            str(result_jsonl),
+        ],
+        env={},
+    )
+
+    assert exit_code == 2
+    assert "expected spool fingerprint is required" in capsys.readouterr().err
+    assert not result_jsonl.exists()
+
+
+def test_apply_fingerprint_mismatch_blocks_before_database_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = _write_spool(tmp_path, [_record()])
+    result_jsonl = tmp_path / "apply-results.jsonl"
+
+    def fail_if_store_is_built(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("fingerprint mismatch must fail before Postgres is touched")
+
+    monkeypatch.setattr(payment_recovery_replay.impl, "_build_postgres_lookup", fail_if_store_is_built)
+
+    exit_code = payment_recovery_replay.main(
+        [
+            "apply",
+            "--spool",
+            str(spool),
+            "--database-url",
+            "postgresql://user:secret-token@example.test/diet_bot",
+            "--expected-spool-fingerprint",
+            "sha256:not-the-current-fingerprint",
+            "--result-jsonl",
+            str(result_jsonl),
+        ],
+        env={},
+    )
+
+    assert exit_code == 2
+    assert not result_jsonl.exists()
+
+
+def test_apply_replayable_candidate_calls_payment_service_once_and_writes_redacted_result_jsonl(
+    tmp_path: Path,
+) -> None:
+    record = _record()
+    spool = _write_spool(tmp_path, [record])
+    original_spool = spool.read_text(encoding="utf-8")
+    result_jsonl = tmp_path / "apply-results.jsonl"
+    lookup = FakePaymentReplayLookup(orders=[_order()])
+    service = FakePaymentService(PaymentHandlingResult(True, PRODUCT_SUBSCRIPTION_MONTH))
+
+    report = apply_spool(
+        spool,
+        lookup=lookup,
+        payment_service=service,
+        expected_spool_fingerprint=list_spool(spool).spool_fingerprint,
+        result_jsonl=result_jsonl,
+    )
+
+    assert report.results[0].preflight_status == STATUS_REPLAYABLE_CANDIDATE
+    assert report.results[0].apply_status == APPLY_STATUS_RECOVERED
+    assert len(service.calls) == 1
+    assert service.calls[0]["payload"] == record.invoice_payload
+    assert service.calls[0]["user_id"] == record.user_id
+    assert service.calls[0]["chat_id"] == record.chat_id
+    assert service.calls[0]["provider"] == record.provider
+    assert service.calls[0]["amount"] == record.total_amount
+    assert service.calls[0]["currency"] == record.currency
+    assert service.calls[0]["telegram_payment_charge_id"] == record.telegram_payment_charge_id
+    assert service.calls[0]["provider_payment_charge_id"] == record.provider_payment_charge_id
+    assert spool.read_text(encoding="utf-8") == original_spool
+    lines = _read_jsonl(result_jsonl)
+    assert lines == [report.results[0].to_dict()]
+    rendered = result_jsonl.read_text(encoding="utf-8")
+    _assert_redacted(rendered)
+
+
+def test_apply_already_recovered_does_not_call_payment_service_and_writes_noop_success(
+    tmp_path: Path,
+) -> None:
+    record = _record()
+    order = _order(status=ORDER_STATUS_GRANTED)
+    charge = _charge(order_id=order.order_id, amount=order.amount, currency=order.currency)
+    spool = _write_spool(tmp_path, [record])
+    result_jsonl = tmp_path / "apply-results.jsonl"
+    service = ExplodingPaymentService()
+
+    report = apply_spool(
+        spool,
+        lookup=FakePaymentReplayLookup(orders=[order], charges=[charge]),
+        payment_service=service,
+        expected_spool_fingerprint=list_spool(spool).spool_fingerprint,
+        result_jsonl=result_jsonl,
+    )
+
+    assert report.results[0].preflight_status == STATUS_ALREADY_RECOVERED
+    assert report.results[0].apply_status == APPLY_STATUS_ALREADY_RECOVERED
+    assert _read_jsonl(result_jsonl)[0]["apply_status"] == APPLY_STATUS_ALREADY_RECOVERED
+
+
+def test_apply_blocked_record_does_not_call_payment_service(tmp_path: Path) -> None:
+    spool = _write_spool(tmp_path, [_record()])
+    result_jsonl = tmp_path / "apply-results.jsonl"
+
+    report = apply_spool(
+        spool,
+        lookup=FakePaymentReplayLookup(),
+        payment_service=ExplodingPaymentService(),
+        expected_spool_fingerprint=list_spool(spool).spool_fingerprint,
+        result_jsonl=result_jsonl,
+    )
+
+    assert report.results[0].preflight_status == STATUS_BLOCKED
+    assert report.results[0].apply_status == APPLY_STATUS_BLOCKED
+    assert report.results[0].reason == "order_not_found"
+
+
+def test_apply_duplicate_payment_service_result_is_recovered_only_after_exact_preflight(
+    tmp_path: Path,
+) -> None:
+    record = _record()
+    order = _order()
+    lookup = FakePaymentReplayLookup(orders=[order])
+    spool = _write_spool(tmp_path, [record])
+    result_jsonl = tmp_path / "apply-results.jsonl"
+
+    def record_exact_recovery(_kwargs: dict[str, object]) -> None:
+        lookup.orders[order.order_id] = replace(order, status=ORDER_STATUS_GRANTED)
+        lookup.charges.append(_charge(order_id=order.order_id, amount=order.amount, currency=order.currency))
+
+    service = FakePaymentService(
+        PaymentHandlingResult(False, PRODUCT_SUBSCRIPTION_MONTH, duplicate=True, reason="duplicate_charge"),
+        side_effect=record_exact_recovery,
+    )
+
+    report = apply_spool(
+        spool,
+        lookup=lookup,
+        payment_service=service,
+        expected_spool_fingerprint=list_spool(spool).spool_fingerprint,
+        result_jsonl=result_jsonl,
+    )
+
+    assert report.results[0].preflight_status == STATUS_REPLAYABLE_CANDIDATE
+    assert report.results[0].apply_status == APPLY_STATUS_RECOVERED
+    assert report.results[0].reason == "exact_charge_already_granted"
+
+
+def test_apply_payment_service_mismatch_result_becomes_apply_failed(tmp_path: Path) -> None:
+    spool = _write_spool(tmp_path, [_record()])
+    result_jsonl = tmp_path / "apply-results.jsonl"
+    service = FakePaymentService(PaymentHandlingResult(False, reason="amount_mismatch"))
+
+    report = apply_spool(
+        spool,
+        lookup=FakePaymentReplayLookup(orders=[_order()]),
+        payment_service=service,
+        expected_spool_fingerprint=list_spool(spool).spool_fingerprint,
+        result_jsonl=result_jsonl,
+    )
+
+    assert report.results[0].preflight_status == STATUS_REPLAYABLE_CANDIDATE
+    assert report.results[0].apply_status == APPLY_STATUS_APPLY_FAILED
+    assert report.results[0].reason == "amount_mismatch"
+
+
+def test_apply_cli_exit_codes_success_blocker_fingerprint_and_runtime_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = _write_spool(tmp_path, [_record()])
+    fingerprint = list_spool(spool).spool_fingerprint
+    result_jsonl = tmp_path / "apply-results.jsonl"
+
+    store = FakePaymentReplayLookup(orders=[_order()])
+    service = FakePaymentService(PaymentHandlingResult(True, PRODUCT_SUBSCRIPTION_MONTH))
+    _patch_apply_builders(monkeypatch, store, service)
+
+    assert _run_apply_cli(spool, result_jsonl, fingerprint) == 0
+
+    blocker_jsonl = tmp_path / "apply-blocked.jsonl"
+    _patch_apply_builders(monkeypatch, FakePaymentReplayLookup(), ExplodingPaymentService())
+    assert _run_apply_cli(spool, blocker_jsonl, fingerprint) == 1
+
+    mismatch_jsonl = tmp_path / "apply-mismatch.jsonl"
+    assert _run_apply_cli(spool, mismatch_jsonl, "sha256:not-current") == 2
+
+    runtime_jsonl = tmp_path / "apply-runtime.jsonl"
+
+    def fail_build(_database_url: str) -> object:
+        raise RuntimeError("database unavailable with secret-token")
+
+    monkeypatch.setattr(payment_recovery_replay.impl, "_build_postgres_lookup", fail_build)
+    assert _run_apply_cli(spool, runtime_jsonl, fingerprint) == 3
+
+
+def test_apply_dedupes_exact_duplicate_records_before_calling_payment_service(tmp_path: Path) -> None:
+    record = _record()
+    spool = tmp_path / "payments.jsonl"
+    spool.write_text(record.to_json_line() + record.to_json_line(), encoding="utf-8")
+    result_jsonl = tmp_path / "apply-results.jsonl"
+    service = FakePaymentService(PaymentHandlingResult(True, PRODUCT_SUBSCRIPTION_MONTH))
+
+    report = apply_spool(
+        spool,
+        lookup=FakePaymentReplayLookup(orders=[_order()]),
+        payment_service=service,
+        expected_spool_fingerprint=list_spool(spool).spool_fingerprint,
+        result_jsonl=result_jsonl,
+    )
+
+    assert len(service.calls) == 1
+    assert len(report.results) == 1
+    assert len(_read_jsonl(result_jsonl)) == 1
+
+
 def _record(**overrides: object) -> PaymentRecoveryRecord:
     product = str(overrides.pop("product", PRODUCT_SUBSCRIPTION_MONTH))
     provider = str(overrides.get("provider", PROVIDER_YOOKASSA))
@@ -372,6 +615,36 @@ def _write_spool(tmp_path: Path, records: list[PaymentRecoveryRecord]) -> Path:
     spool = tmp_path / "payments.jsonl"
     spool.write_text("".join(record.to_json_line() for record in records), encoding="utf-8")
     return spool
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _patch_apply_builders(
+    monkeypatch: pytest.MonkeyPatch,
+    store: FakePaymentReplayLookup,
+    service: object,
+) -> None:
+    monkeypatch.setattr(payment_recovery_replay.impl, "_build_postgres_lookup", lambda _database_url: store)
+    monkeypatch.setattr(payment_recovery_replay.impl, "_build_payment_service", lambda _repository: service)
+
+
+def _run_apply_cli(spool: Path, result_jsonl: Path, fingerprint: str) -> int:
+    return payment_recovery_replay.main(
+        [
+            "apply",
+            "--spool",
+            str(spool),
+            "--database-url",
+            "postgresql://user:secret-token@example.test/diet_bot",
+            "--expected-spool-fingerprint",
+            fingerprint,
+            "--result-jsonl",
+            str(result_jsonl),
+        ],
+        env={},
+    )
 
 
 def _assert_redacted(output: str) -> None:
@@ -455,3 +728,26 @@ class ExplodingWritesLookup(FakePaymentReplayLookup):
 
     def mark_order_failed(self, order_id: str, reason: str | None = None) -> PaymentOrder:
         raise AssertionError("dry-run must not mark orders failed")
+
+
+class FakePaymentService:
+    def __init__(
+        self,
+        result: PaymentHandlingResult,
+        *,
+        side_effect: object | None = None,
+    ) -> None:
+        self.result = result
+        self.side_effect = side_effect
+        self.calls: list[dict[str, object]] = []
+
+    def handle_successful_payment(self, **kwargs: object) -> PaymentHandlingResult:
+        self.calls.append(dict(kwargs))
+        if callable(self.side_effect):
+            self.side_effect(kwargs)
+        return self.result
+
+
+class ExplodingPaymentService:
+    def handle_successful_payment(self, **_kwargs: object) -> PaymentHandlingResult:
+        raise AssertionError("blocked or already recovered records must not be applied")
