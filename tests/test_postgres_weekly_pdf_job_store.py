@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
+from diet_bot.postgres_chat_state_store import PostgresChatStateStore
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_weekly_pdf_job_migrations import MIGRATIONS
 from diet_bot.postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore, WEEKLY_PDF_JOB_SCHEMA_EXPECTATION
@@ -145,6 +146,40 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "idx_weekly_pdf_jobs_stale",
     }
     assert new_columns == {"delivered_at", "finalization_error"}
+
+
+def test_weekly_then_chat_state_migrations_create_both_schemas(store: PostgresWeeklyPdfJobStore) -> None:
+    chat_state_store = PostgresChatStateStore(store.dsn, connect_timeout=1, connect_attempts=1)
+
+    chat_state_store.initialize()
+
+    store.validate_schema()
+    chat_state_store.validate_schema()
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name IN (
+                    'schema_migrations',
+                    'weekly_pdf_jobs',
+                    'chat_profiles',
+                    'chat_recipe_history',
+                    'chat_state_json_import_runs'
+                  )
+                """
+            )
+            tables = {row["table_name"] for row in cur.fetchall()}
+
+    assert tables == {
+        "schema_migrations",
+        "weekly_pdf_jobs",
+        "chat_profiles",
+        "chat_recipe_history",
+        "chat_state_json_import_runs",
+    }
 
 
 def test_validate_schema_rejects_missing_critical_column(store: PostgresWeeklyPdfJobStore) -> None:
