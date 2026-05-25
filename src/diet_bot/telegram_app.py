@@ -748,11 +748,14 @@ WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
 WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0444\u0430\u0439\u043b \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e PDF \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
 WEEKLY_PDF_MAX_CONCURRENCY = DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY
 WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
+_ONE_DAY_PLAN_IN_FLIGHT_CHAT_IDS: set[int] = set()
+_ONE_DAY_PLAN_IN_FLIGHT_LOCK = RLock()
 DEFAULT_BATCH_TOTAL_UNITS = 6
 DEFAULT_BATCH_SERVING_UNITS = 2
 DEFAULT_BATCH_SERVINGS = DEFAULT_BATCH_TOTAL_UNITS // DEFAULT_BATCH_SERVING_UNITS
@@ -1663,30 +1666,51 @@ async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
         )
 
 
+def _try_enter_one_day_plan_generation(chat_id: int) -> bool:
+    with _ONE_DAY_PLAN_IN_FLIGHT_LOCK:
+        if chat_id in _ONE_DAY_PLAN_IN_FLIGHT_CHAT_IDS:
+            return False
+        _ONE_DAY_PLAN_IN_FLIGHT_CHAT_IDS.add(chat_id)
+        return True
+
+
+def _release_one_day_plan_generation(chat_id: int) -> None:
+    with _ONE_DAY_PLAN_IN_FLIGHT_LOCK:
+        _ONE_DAY_PLAN_IN_FLIGHT_CHAT_IDS.discard(chat_id)
+
+
 async def _send_one_day_plan_with_access(message: Message, profile: UserProfile) -> bool:
-    try:
-        consumption = _consume_generation_attempt(message.chat.id, "one_day")
-    except EntitlementStorageError:
-        logger.exception("Failed to consume one-day entitlement due to entitlement storage error")
-        await _send_entitlement_storage_error(message)
-        return False
-    if not consumption.allowed:
-        await _send_limit_paywall(message, "one_day")
+    chat_id = message.chat.id
+    if not _try_enter_one_day_plan_generation(chat_id):
+        await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
     try:
-        sent = await _send_plan(
-            message,
-            profile,
-            status_text=_format_entitlement_status(message.chat.id),
-        )
-    except Exception:
-        _refund_generation_attempt(message.chat.id, consumption)
-        raise
+        try:
+            consumption = _consume_generation_attempt(chat_id, "one_day")
+        except EntitlementStorageError:
+            logger.exception("Failed to consume one-day entitlement due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return False
+        if not consumption.allowed:
+            await _send_limit_paywall(message, "one_day")
+            return False
 
-    if not sent:
-        _refund_generation_attempt(message.chat.id, consumption)
-    return sent
+        try:
+            sent = await _send_plan(
+                message,
+                profile,
+                status_text=_format_entitlement_status(chat_id),
+            )
+        except Exception:
+            _refund_generation_attempt(chat_id, consumption)
+            raise
+
+        if not sent:
+            _refund_generation_attempt(chat_id, consumption)
+        return sent
+    finally:
+        _release_one_day_plan_generation(chat_id)
 
 
 def _weekly_pdf_callback_idempotency_key(callback: CallbackQuery) -> str | None:
