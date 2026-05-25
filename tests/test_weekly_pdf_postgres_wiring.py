@@ -9,6 +9,7 @@ import pytest
 
 import diet_bot.telegram_app as telegram_app
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
+from diet_bot.entitlement_storage import EntitlementStorageError
 from diet_bot.weekly_pdf_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus,
@@ -123,6 +124,7 @@ async def test_postgres_local_queue_submit_failure_cancels_admitted_job_without_
     message = FakeMessage(chat_id)
     runtime = FakeWeeklyPdfRuntime()
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    _allow_weekly_pdf_preflight(monkeypatch)
 
     def fail_submit(*_args, **_kwargs):
         raise RuntimeError("queue submit failed")
@@ -141,6 +143,77 @@ async def test_postgres_local_queue_submit_failure_cancels_admitted_job_without_
         ("cleanup", chat_id),
         ("admit", chat_id, "idem-queue-failed"),
         ("cancel", runtime.job.job_id, "local_queue_submit_failed"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_postgres_no_quota_after_admit_cancels_job_without_local_queue_submit(monkeypatch) -> None:
+    chat_id = 201_009
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+
+    def deny_weekly_pdf_preflight(preflight_chat_id: int) -> bool:
+        events.append(("preflight", preflight_chat_id))
+        return False
+
+    async def send_paywall(message: FakeMessage, ration_kind: str) -> None:
+        events.append(("paywall", message.chat.id, ration_kind))
+
+    def fail_submit(*_args, **_kwargs):
+        raise AssertionError("No-quota Postgres admission must not enter the local queue")
+
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", deny_weekly_pdf_preflight)
+    monkeypatch.setattr(telegram_app, "_send_limit_paywall", send_paywall)
+    monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_submit)
+
+    sent = await telegram_app._send_week_plan_with_access(
+        FakeMessage(chat_id),
+        profile_with(),
+        idempotency_key="idem-no-quota",
+    )
+
+    assert sent is False
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-no-quota"),
+        ("preflight", chat_id),
+        ("cancel", runtime.job.job_id, "entitlement_preflight_denied"),
+        ("paywall", chat_id, "weekly_pdf"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_postgres_preflight_error_after_admit_cancels_job_without_local_queue_submit(monkeypatch) -> None:
+    chat_id = 201_010
+    message = FakeMessage(chat_id)
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+
+    def fail_weekly_pdf_preflight(preflight_chat_id: int) -> bool:
+        events.append(("preflight", preflight_chat_id))
+        raise EntitlementStorageError("preflight failed")
+
+    def fail_submit(*_args, **_kwargs):
+        raise AssertionError("Postgres admission with preflight error must not enter the local queue")
+
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", fail_weekly_pdf_preflight)
+    monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_submit)
+
+    sent = await telegram_app._send_week_plan_with_access(
+        message,
+        profile_with(),
+        idempotency_key="idem-preflight-error",
+    )
+
+    assert sent is False
+    assert message.texts == [(telegram_app.ENTITLEMENT_STORAGE_ERROR_TEXT, None)]
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-preflight-error"),
+        ("preflight", chat_id),
+        ("cancel", runtime.job.job_id, "entitlement_preflight_error"),
     ]
 
 
@@ -172,6 +245,7 @@ async def test_postgres_cancel_after_local_ready_cancels_admitted_job_without_st
 
     runtime = FakeWeeklyPdfRuntime()
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    _allow_weekly_pdf_preflight(monkeypatch)
 
     def fail_json_consume_or_refund(*_args, **_kwargs):
         raise AssertionError("Cancelled Postgres admission must not mutate JSON entitlements")
@@ -214,6 +288,12 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
     monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
 
+    def allow_weekly_pdf_preflight(preflight_chat_id: int) -> bool:
+        events.append(("preflight", preflight_chat_id))
+        return True
+
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", allow_weekly_pdf_preflight)
+
     async def fake_send_week_plan(*_args, **_kwargs) -> bool:
         events.append(("send",))
         return True
@@ -230,6 +310,7 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
     assert events == [
         ("cleanup", chat_id),
         ("admit", chat_id, "idem-success"),
+        ("preflight", chat_id),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("success", runtime.job.job_id),
@@ -243,6 +324,7 @@ async def test_postgres_generation_failure_uses_store_refund_path_not_json_refun
     runtime = FakeWeeklyPdfRuntime(events=events)
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
     monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
 
     def fail_json_refund(*_args, **_kwargs):
         raise AssertionError("Postgres path must not use JSON entitlement refund")
@@ -279,6 +361,7 @@ async def test_postgres_tester_chat_id_starts_lifecycle_as_test_access_without_j
     monkeypatch.setattr(telegram_app, "TESTER_CHAT_IDS", {chat_id})
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
     monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
 
     def fail_json_consume_or_refund(*_args, **_kwargs):
         raise AssertionError("TESTER_CHAT_IDS Postgres path must not mutate JSON entitlements")
@@ -390,6 +473,10 @@ def profile_with(**kwargs) -> UserProfile:
     }
     data.update(kwargs)
     return UserProfile(**data)
+
+
+def _allow_weekly_pdf_preflight(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", lambda _chat_id: True)
 
 
 def _job(
