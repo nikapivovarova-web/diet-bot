@@ -628,6 +628,10 @@ def _support_chat_id_from_env() -> int | None:
     return load_runtime_config().support_chat_id
 
 
+def _privacy_policy_url_from_env() -> str | None:
+    return load_runtime_config().privacy_policy_url
+
+
 def _payments_enabled() -> bool:
     return PAYMENTS_ENABLED
 
@@ -770,6 +774,8 @@ TESTER_CHAT_IDS = set(_RUNTIME_CONFIG.tester_chat_ids)
 TELEGRAM_PROVIDER_TOKEN = _RUNTIME_CONFIG.telegram_provider_token
 PAYMENTS_ENABLED = _RUNTIME_CONFIG.payments_enabled
 SUPPORT_CHAT_ID = _RUNTIME_CONFIG.support_chat_id
+PRIVACY_POLICY_URL = _RUNTIME_CONFIG.privacy_policy_url
+PRIVACY_POLICY_TEXT = "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438"
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
 CALLBACK_NEW = "diet:new"
@@ -3530,6 +3536,35 @@ def _profile_from_dict(raw: dict[str, object]) -> UserProfile | None:
         return None
 
 
+def _privacy_policy_button() -> InlineKeyboardButton | None:
+    if not PRIVACY_POLICY_URL:
+        return None
+    return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, url=PRIVACY_POLICY_URL)
+
+
+def _rows_with_privacy_policy(
+    rows: Sequence[Sequence[InlineKeyboardButton]],
+) -> list[list[InlineKeyboardButton]]:
+    keyboard_rows = [list(row) for row in rows]
+    privacy_button = _privacy_policy_button()
+    if privacy_button is not None:
+        keyboard_rows.append([privacy_button])
+    return keyboard_rows
+
+
+def _keyboard_with_privacy_policy(rows: Sequence[Sequence[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=_rows_with_privacy_policy(rows))
+
+
+def _optional_keyboard_with_privacy_policy(
+    rows: Sequence[Sequence[InlineKeyboardButton]],
+) -> InlineKeyboardMarkup | None:
+    keyboard_rows = _rows_with_privacy_policy(rows)
+    if not keyboard_rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
 def _start_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=TRY_FREE_TEXT, callback_data=CALLBACK_START)],
@@ -3543,9 +3578,7 @@ def _start_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows,
-    )
+    return _keyboard_with_privacy_policy(rows)
 
 
 def _main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -3762,8 +3795,8 @@ async def _send_stars_invoice_link(message: Message, payload: str, *, payer_user
         return
     await message.answer(
         f"{title}\n\nСтоимость: {amount} Stars.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
+        reply_markup=_keyboard_with_privacy_policy(
+            [
                 [InlineKeyboardButton(text="Оплатить в Telegram", url=invoice_link)],
             ],
         ),
@@ -3821,8 +3854,8 @@ async def _send_yookassa_invoice_link(message: Message, payload: str, *, payer_u
 
     await message.answer(
         f"{title}\n\nСтоимость: {_format_kopecks_for_display(amount)} ₽.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
+        reply_markup=_keyboard_with_privacy_policy(
+            [
                 [InlineKeyboardButton(text="Оплатить в Telegram", url=invoice_link)],
             ],
         ),
@@ -4307,8 +4340,8 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
 def _subscription_payment_keyboard() -> InlineKeyboardMarkup:
     if not _payments_enabled():
         return _payments_disabled_keyboard()
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [InlineKeyboardButton(text=PAY_WITH_RU_CARD_TEXT, callback_data=CALLBACK_PAY_RU_CARD)],
             [InlineKeyboardButton(text=PAY_WITH_TELEGRAM_STARS_TEXT, callback_data=CALLBACK_PAY_TELEGRAM_STARS)],
         ],
@@ -4350,8 +4383,8 @@ def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:
             extra_weekly_pdf_stars_button,
         ]
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [extra_buttons[0]],
             [extra_buttons[1]],
             [extra_buttons[2]],
@@ -4363,16 +4396,16 @@ def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:
 def _trial_subscription_keyboard() -> InlineKeyboardMarkup:
     if not _payments_enabled():
         return _payments_disabled_keyboard()
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [InlineKeyboardButton(text=SUBSCRIBE_CTA_TEXT, callback_data=CALLBACK_SUBSCRIBE)],
         ],
     )
 
 
 def _payments_disabled_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
@@ -4404,10 +4437,10 @@ def _plan_choice_keyboard() -> InlineKeyboardMarkup:
 
 
 def _question_keyboard(question) -> InlineKeyboardMarkup | None:
-    if not question or not question.options:
+    if not question:
         return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _optional_keyboard_with_privacy_policy(
+        [
             [InlineKeyboardButton(text=option, callback_data=f"{CALLBACK_ANSWER_PREFIX}{index}")]
             for index, option in enumerate(question.options)
         ],
