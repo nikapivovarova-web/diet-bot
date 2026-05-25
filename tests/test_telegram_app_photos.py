@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -37,6 +38,11 @@ from diet_bot.payments import (
     PaymentValidationResult,
     decode_payment_order_payload,
     encode_payment_order_payload,
+)
+from diet_bot.payment_recovery_spool import (
+    ALLOWED_SERIALIZED_FIELDS,
+    append_payment_recovery_record as write_payment_recovery_record,
+    read_payment_recovery_records,
 )
 from diet_bot.telegram_app import (
     BOT_COMMANDS,
@@ -1446,6 +1452,139 @@ def test_static_legacy_successful_payment_records_unknown_without_grant(monkeypa
     assert telegram_app.load_entitlements(tmp_path / "subscriptions.json") == {}
 
 
+@pytest.mark.anyio
+async def test_successful_payment_ledger_failure_spools_recovery_record_before_notice(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    service = FailingSuccessfulPaymentService(
+        telegram_app.PaymentLedgerUnavailable("payment_ledger_unavailable", "ledger down"),
+    )
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    spool_path = tmp_path / "payment-recovery" / "payments.jsonl"
+    monkeypatch.setenv("DIET_BOT_PAYMENT_RECOVERY_SPOOL", str(spool_path))
+    events: list[tuple[str, object]] = []
+
+    def tracking_append(path, record) -> None:
+        events.append(("append", record.record_id))
+        write_payment_recovery_record(path, record)
+
+    monkeypatch.setattr(telegram_app, "append_payment_recovery_record", tracking_append, raising=False)
+
+    class RecordingMessage(FakeMessage):
+        async def answer(self, text, reply_markup=None):
+            events.append(("answer", text))
+            return await super().answer(text, reply_markup)
+
+    invoice_payload = encode_payment_order_payload("order_12345678", "nonce_12345678")
+    payment = SimpleNamespace(
+        invoice_payload=invoice_payload,
+        currency="RUB",
+        total_amount=59_900,
+        telegram_payment_charge_id="tg-charge-1",
+        provider_payment_charge_id="provider-charge-1",
+        subscription_expiration_date=1_781_234_567,
+        order_info={"email": "private@example.test"},
+        provider_data={"token": "secret"},
+    )
+    message = RecordingMessage(202, user_id=101)
+    message.successful_payment = payment
+
+    await telegram_app.handle_successful_payment(message)
+
+    result = read_payment_recovery_records(spool_path)
+    assert len(result.records) == 1
+    record = result.records[0]
+    assert record.provider == PROVIDER_YOOKASSA
+    assert record.chat_id == 202
+    assert record.user_id == 101
+    assert record.invoice_payload == invoice_payload
+    assert record.telegram_payment_charge_id == "tg-charge-1"
+    assert record.provider_payment_charge_id == "provider-charge-1"
+    assert record.currency == "RUB"
+    assert record.total_amount == 59_900
+    assert record.subscription_expiration_date == 1_781_234_567
+    assert set(record.to_dict()).issubset(ALLOWED_SERIALIZED_FIELDS)
+    assert "private@example.test" not in json.dumps(record.to_dict(), sort_keys=True)
+    assert "secret" not in json.dumps(record.to_dict(), sort_keys=True)
+    assert [event[0] for event in events] == ["append", "answer"]
+
+    sent_text = message.texts[-1][0]
+    assert "\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430" in sent_text
+    assert "\u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438" in sent_text
+    assert "\u041d\u0435 \u043e\u043f\u043b\u0430\u0447\u0438\u0432\u0430\u0439\u0442\u0435 \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u043e" in sent_text
+    assert "\u043f\u043e\u0434\u0434\u0435\u0440\u0436" in sent_text.lower()
+    assert "\u0421\u0447\u0435\u0442 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d" not in sent_text
+    assert "\u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043e\u043f\u043b\u0430\u0442\u0438\u0442\u044c" not in sent_text.lower()
+
+
+@pytest.mark.anyio
+async def test_successful_payment_successful_grant_does_not_spool(monkeypatch) -> None:
+    def fail_append(path, record) -> None:
+        raise AssertionError("successful grants must not be spooled")
+
+    monkeypatch.setattr(telegram_app, "append_payment_recovery_record", fail_append, raising=False)
+    monkeypatch.setattr(
+        telegram_app,
+        "_apply_successful_payment",
+        lambda _chat_id, _payment, *, user_id=None: telegram_app.PaymentApplication(True, "extra_one_day"),
+        raising=False,
+    )
+    monkeypatch.setattr(telegram_app, "_has_active_paid_access", lambda _chat_id: False, raising=False)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status", raising=False)
+    payment = SimpleNamespace(
+        invoice_payload=encode_payment_order_payload("order_12345678", "nonce_12345678"),
+        currency="XTR",
+        total_amount=35,
+        telegram_payment_charge_id="tg-charge-ok",
+        provider_payment_charge_id=None,
+    )
+    message = FakeMessage(202, user_id=101)
+    message.successful_payment = payment
+
+    await telegram_app.handle_successful_payment(message)
+
+    assert message.texts
+    assert "\u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u0437\u0430\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f" not in message.texts[-1][0]
+
+
+@pytest.mark.anyio
+async def test_successful_payment_spool_append_failure_logs_critical_and_sends_support_message(
+    monkeypatch,
+    caplog,
+) -> None:
+    service = FailingSuccessfulPaymentService(
+        telegram_app.PaymentLedgerUnavailable("payment_ledger_unavailable", "ledger down"),
+    )
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+
+    def fail_append(path, record) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(telegram_app, "append_payment_recovery_record", fail_append, raising=False)
+    caplog.set_level(logging.CRITICAL, logger=telegram_app.logger.name)
+    payment = SimpleNamespace(
+        invoice_payload=encode_payment_order_payload("order_12345678", "nonce_12345678"),
+        currency="XTR",
+        total_amount=400,
+        telegram_payment_charge_id="tg-charge-critical",
+        provider_payment_charge_id=None,
+    )
+    message = FakeMessage(202, user_id=101)
+    message.successful_payment = payment
+
+    await telegram_app.handle_successful_payment(message)
+
+    critical_records = [record for record in caplog.records if record.levelno >= logging.CRITICAL]
+    assert critical_records
+    assert any(getattr(record, "telegram_payment_charge_id", None) == "tg-charge-critical" for record in critical_records)
+    assert not any("diet:order:v1" in record.getMessage() for record in critical_records)
+    sent_text = message.texts[-1][0]
+    assert "\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430" in sent_text
+    assert "\u043f\u043e\u0434\u0434\u0435\u0440\u0436" in sent_text.lower()
+    assert "\u0414\u043e\u0441\u0442\u0443\u043f \u0430\u043a\u0442\u0438\u0432\u0435\u043d" not in sent_text
+
+
 def test_trial_subscription_keyboard_has_cta_button() -> None:
     keyboard = _trial_subscription_keyboard()
     button = keyboard.inline_keyboard[0][0]
@@ -1801,6 +1940,16 @@ class FakeTelegramPaymentService:
         )
         self.orders[order_id] = failed
         return failed
+
+
+class FailingSuccessfulPaymentService:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.successful_requests: list[dict[str, object]] = []
+
+    def handle_successful_payment(self, **kwargs) -> PaymentHandlingResult:
+        self.successful_requests.append(dict(kwargs))
+        raise self.exc
 
 
 def _fake_amount(provider: str, product: str) -> int:
