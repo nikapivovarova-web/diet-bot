@@ -2058,7 +2058,16 @@ async def _send_week_plan_after_postgres_admission(
     recipe_history_entries: list[RecipeHistoryItem] = []
 
     def mark_document_delivered() -> None:
-        runtime.mark_delivered(job.job_id)
+        try:
+            runtime.mark_delivered(job.job_id)
+        except Exception as exc:
+            logger.exception("Failed to mark weekly PDF job delivered after Telegram upload")
+            _weekly_pdf_diag(
+                "postgres_mark_delivered_failed_after_upload",
+                chat_id=chat_id,
+                job_id=str(job.job_id),
+                error=type(exc).__name__,
+            )
 
     try:
         sent = await _send_week_plan(

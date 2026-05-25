@@ -322,6 +322,62 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
 
 
 @pytest.mark.anyio
+async def test_postgres_delivered_marker_failure_after_upload_does_not_refund(monkeypatch) -> None:
+    chat_id = 201_014
+    events: list[tuple] = []
+    diag_events: list[tuple[str, dict[str, object]]] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    monkeypatch.setattr(
+        telegram_app,
+        "_weekly_pdf_diag",
+        lambda event, **fields: diag_events.append((event, fields)),
+    )
+    _allow_weekly_pdf_preflight(monkeypatch)
+
+    def fail_mark_delivered(job_id):
+        events.append(("delivered", job_id))
+        raise RuntimeError("marker write failed")
+
+    runtime.mark_delivered = fail_mark_delivered
+
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
+        events.append(("send",))
+        kwargs["on_document_delivered"]()
+        events.append(("send_return",))
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(
+        FakeMessage(chat_id),
+        profile_with(),
+        idempotency_key="idem-marker-failure",
+    )
+
+    assert sent is True
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-marker-failure"),
+        ("start", runtime.job.job_id, False),
+        ("send",),
+        ("delivered", runtime.job.job_id),
+        ("send_return",),
+        ("success", runtime.job.job_id),
+    ]
+    assert ("failure", runtime.job.job_id, "weekly_pdf_not_sent") not in events
+    assert ("failure", runtime.job.job_id, "weekly_pdf_exception") not in events
+    assert (
+        (
+            "postgres_mark_delivered_failed_after_upload",
+            {"chat_id": chat_id, "job_id": str(runtime.job.job_id), "error": "RuntimeError"},
+        )
+        in diag_events
+    )
+
+
+@pytest.mark.anyio
 async def test_postgres_generation_failure_uses_store_refund_path_not_json_refund(monkeypatch) -> None:
     chat_id = 201_005
     events: list[tuple] = []
