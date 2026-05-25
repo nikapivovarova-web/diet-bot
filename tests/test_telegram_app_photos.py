@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from datetime import UTC, date, datetime
@@ -2183,6 +2184,183 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_one_day_plan_double_callback_same_chat_consumes_once(monkeypatch, tmp_path) -> None:
+    chat_id = 91_020
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=2, weekly_pdf_remaining=1)
+    PROFILE_BY_CHAT_ID[chat_id] = profile_with()
+    first_message = FakeMessage(chat_id)
+    second_message = FakeMessage(chat_id)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    send_calls = 0
+
+    async def controlled_send_plan(message, *_args, **_kwargs) -> bool:
+        nonlocal send_calls
+        send_calls += 1
+        if message.chat.id == chat_id and send_calls == 1:
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", controlled_send_plan)
+    first_task = None
+    try:
+        first_task = asyncio.create_task(telegram_app.handle_callback(FakeCallback(CALLBACK_ONE_DAY_PLAN, first_message)))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        await telegram_app.handle_callback(FakeCallback(CALLBACK_ONE_DAY_PLAN, second_message))
+        entitlement_after_duplicate = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+
+        assert send_calls == 1
+        assert entitlement_after_duplicate.monthly_one_day_remaining == 1
+        assert second_message.texts == [(telegram_app.ONE_DAY_PLAN_ALREADY_RUNNING_TEXT, None)]
+
+        release_first.set()
+        await first_task
+        final_entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert final_entitlement.monthly_one_day_remaining == 1
+    finally:
+        release_first.set()
+        if first_task is not None and not first_task.done():
+            await asyncio.gather(first_task, return_exceptions=True)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_concurrent_one_day_requests_same_chat_consume_once(monkeypatch, tmp_path) -> None:
+    chat_id = 91_021
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=2, weekly_pdf_remaining=1)
+    first_message = FakeMessage(chat_id)
+    second_message = FakeMessage(chat_id)
+    third_message = FakeMessage(chat_id)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    send_calls = 0
+
+    async def controlled_send_plan(message, *_args, **_kwargs) -> bool:
+        nonlocal send_calls
+        send_calls += 1
+        if message.chat.id == chat_id and send_calls == 1:
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", controlled_send_plan)
+    first_task = None
+    try:
+        first_task = asyncio.create_task(telegram_app._send_one_day_plan_with_access(first_message, profile_with()))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        duplicate_sent = await telegram_app._send_one_day_plan_with_access(second_message, profile_with())
+        entitlement_after_duplicate = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+
+        assert duplicate_sent is False
+        assert send_calls == 1
+        assert entitlement_after_duplicate.monthly_one_day_remaining == 1
+        assert second_message.texts == [(telegram_app.ONE_DAY_PLAN_ALREADY_RUNNING_TEXT, None)]
+
+        release_first.set()
+        assert await first_task is True
+
+        retry_sent = await telegram_app._send_one_day_plan_with_access(third_message, profile_with())
+        final_entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert retry_sent is True
+        assert send_calls == 2
+        assert final_entitlement.monthly_one_day_remaining == 0
+    finally:
+        release_first.set()
+        if first_task is not None and not first_task.done():
+            await asyncio.gather(first_task, return_exceptions=True)
+
+
+@pytest.mark.anyio
+async def test_one_day_failure_releases_guard_and_allows_retry(monkeypatch, tmp_path) -> None:
+    chat_id = 91_022
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    send_calls = 0
+
+    async def flaky_send_plan(*_args, **_kwargs) -> bool:
+        nonlocal send_calls
+        send_calls += 1
+        if send_calls == 1:
+            raise RuntimeError("one-day send failed")
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", flaky_send_plan)
+
+    with pytest.raises(RuntimeError, match="one-day send failed"):
+        await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id), profile_with())
+
+    after_failure = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert after_failure.monthly_one_day_remaining == 1
+
+    sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id), profile_with())
+
+    after_retry = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert sent is True
+    assert send_calls == 2
+    assert after_retry.monthly_one_day_remaining == 0
+
+
+@pytest.mark.anyio
+async def test_one_day_generation_different_chats_do_not_block_each_other(monkeypatch, tmp_path) -> None:
+    first_chat_id = 91_023
+    second_chat_id = 91_024
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _save_active_subscription(subscriptions_path, first_chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    _save_active_subscription(subscriptions_path, second_chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_requests = asyncio.Event()
+    started_chat_ids: list[int] = []
+
+    async def controlled_send_plan(message, *_args, **_kwargs) -> bool:
+        started_chat_ids.append(message.chat.id)
+        if message.chat.id == first_chat_id:
+            first_started.set()
+        if message.chat.id == second_chat_id:
+            second_started.set()
+        await release_requests.wait()
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", controlled_send_plan)
+    first_task = asyncio.create_task(
+        telegram_app._send_one_day_plan_with_access(FakeMessage(first_chat_id), profile_with())
+    )
+    second_task = None
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        second_task = asyncio.create_task(
+            telegram_app._send_one_day_plan_with_access(FakeMessage(second_chat_id), profile_with())
+        )
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+
+        release_requests.set()
+        assert await first_task is True
+        assert await second_task is True
+        assert started_chat_ids == [first_chat_id, second_chat_id]
+    finally:
+        release_requests.set()
+        cleanup_tasks = [first_task]
+        if second_task is not None:
+            cleanup_tasks.append(second_task)
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
 @pytest.mark.anyio
