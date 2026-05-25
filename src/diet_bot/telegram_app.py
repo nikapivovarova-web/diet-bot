@@ -1767,6 +1767,31 @@ async def _send_week_plan_with_postgres_jobs(
         await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
         return False
 
+    try:
+        weekly_pdf_available = _weekly_pdf_attempt_available(chat_id)
+    except Exception:
+        _cancel_postgres_admitted_job(
+            runtime,
+            job_admission.job,
+            chat_id=chat_id,
+            reason="entitlement_preflight_error",
+        )
+        logger.exception("Failed to preflight weekly PDF entitlement after Postgres admission")
+        _weekly_pdf_diag("postgres_entitlement_preflight_error", chat_id=chat_id)
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if not weekly_pdf_available:
+        _cancel_postgres_admitted_job(
+            runtime,
+            job_admission.job,
+            chat_id=chat_id,
+            reason="entitlement_preflight_denied",
+        )
+        _weekly_pdf_diag("postgres_access_denied_no_weekly_pdf_attempt", chat_id=chat_id)
+        await _send_limit_paywall(message, "weekly_pdf")
+        return False
+
     queued_status_message: Message | None = None
     postgres_start_attempted = False
 
