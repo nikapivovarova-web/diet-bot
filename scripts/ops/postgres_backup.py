@@ -3,13 +3,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 DEFAULT_SOURCE_URL_ENV = "DIET_BOT_BACKUP_DATABASE_URL"
+_QUERY_ENV_MAP = {
+    "application_name": "PGAPPNAME",
+    "connect_timeout": "PGCONNECT_TIMEOUT",
+    "sslmode": "PGSSLMODE",
+    "target_session_attrs": "PGTARGETSESSIONATTRS",
+}
+_KEYWORD_ENV_MAP = {
+    "host": "PGHOST",
+    "port": "PGPORT",
+    "user": "PGUSER",
+    "password": "PGPASSWORD",
+    "dbname": "PGDATABASE",
+    **_QUERY_ENV_MAP,
+}
 
 
 def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> int:
@@ -35,7 +51,8 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
         str(output_file),
     ]
     child_env = dict(os.environ)
-    child_env["PGDATABASE"] = source_url
+    child_env.pop(args.source_url_env, None)
+    child_env.update(_connection_env_from_dsn(source_url))
 
     _run_tool(command, env=child_env, tool_name="pg_dump")
     _require_backup_file(output_file)
@@ -77,6 +94,69 @@ def _run_tool(command: list[str], *, env: dict[str, str], tool_name: str) -> Non
     )
     if result.returncode != 0:
         raise SystemExit(f"{tool_name} failed with exit code {result.returncode}; stderr redacted.")
+
+
+def _connection_env_from_dsn(dsn: str) -> dict[str, str]:
+    parsed = urlsplit(dsn)
+    if parsed.scheme in {"postgres", "postgresql"}:
+        connection_env: dict[str, str] = {}
+        if parsed.hostname:
+            connection_env["PGHOST"] = unquote(parsed.hostname)
+        if parsed.port:
+            connection_env["PGPORT"] = str(parsed.port)
+        if parsed.username:
+            connection_env["PGUSER"] = unquote(parsed.username)
+        if parsed.password:
+            connection_env["PGPASSWORD"] = unquote(parsed.password)
+        dbname = _database_name_from_dsn(dsn)
+        if dbname:
+            connection_env["PGDATABASE"] = dbname
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        for query_key, env_key in _QUERY_ENV_MAP.items():
+            values = query.get(query_key)
+            if values:
+                connection_env[env_key] = values[-1]
+        return connection_env
+
+    keyword_params = _keyword_dsn_params(dsn)
+    if keyword_params:
+        return {
+            env_key: value
+            for key, value in keyword_params.items()
+            if (env_key := _KEYWORD_ENV_MAP.get(key)) and value
+        }
+
+    return {"PGDATABASE": dsn}
+
+
+def _database_name_from_dsn(dsn: str) -> str | None:
+    parsed = urlsplit(dsn)
+    if parsed.scheme in {"postgres", "postgresql"}:
+        path = parsed.path.lstrip("/")
+        if not path:
+            return None
+        return unquote(path.split("/", 1)[0])
+
+    keyword_params = _keyword_dsn_params(dsn)
+    if keyword_params:
+        return keyword_params.get("dbname")
+    return None
+
+
+def _keyword_dsn_params(dsn: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    try:
+        tokens = shlex.split(dsn)
+    except ValueError:
+        return {}
+    for token in tokens:
+        if "=" not in token:
+            return {}
+        key, value = token.split("=", 1)
+        if not key:
+            return {}
+        params[key] = value
+    return params
 
 
 def _require_backup_file(path: Path) -> None:

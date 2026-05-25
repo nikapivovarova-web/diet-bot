@@ -56,8 +56,12 @@ def test_backup_runs_pg_dump_without_secret_in_argv_or_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fake_dsn = "postgresql://backup_user:fake-password@db.example.invalid/diet_bot"
+    fake_dsn = (
+        "postgresql://backup_user:fake-password@db.example.invalid:5433/"
+        "diet_bot?sslmode=require&connect_timeout=10"
+    )
     calls: list[dict[str, object]] = []
+    monkeypatch.setenv("DIET_BOT_BACKUP_DATABASE_URL", fake_dsn)
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append({"cmd": list(cmd), "env": dict(kwargs["env"])})
@@ -75,7 +79,6 @@ def test_backup_runs_pg_dump_without_secret_in_argv_or_output(
                 "--output-dir",
                 str(tmp_path),
             ],
-            env={"DIET_BOT_BACKUP_DATABASE_URL": fake_dsn},
         )
         == 0
     )
@@ -94,7 +97,14 @@ def test_backup_runs_pg_dump_without_secret_in_argv_or_output(
 
     child_env = calls[0]["env"]
     assert isinstance(child_env, dict)
-    assert child_env["PGDATABASE"] == fake_dsn
+    assert child_env["PGHOST"] == "db.example.invalid"
+    assert child_env["PGPORT"] == "5433"
+    assert child_env["PGUSER"] == "backup_user"
+    assert child_env["PGDATABASE"] == "diet_bot"
+    assert child_env["PGPASSWORD"] == "fake-password"
+    assert child_env["PGSSLMODE"] == "require"
+    assert child_env["PGCONNECT_TIMEOUT"] == "10"
+    assert child_env.get("DIET_BOT_BACKUP_DATABASE_URL") != fake_dsn
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "backup"
