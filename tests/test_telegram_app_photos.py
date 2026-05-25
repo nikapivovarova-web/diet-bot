@@ -122,6 +122,9 @@ from diet_bot.telegram_app import (
 )
 from diet_bot.questionnaire import start_session
 
+PRIVACY_URL = "https://foodbalance.example/privacy"
+PRIVACY_POLICY_TEXT = "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438"
+
 
 def _set_payments_enabled_from_env(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", telegram_app._payments_enabled_from_env(), raising=False)
@@ -133,6 +136,10 @@ def _set_support_chat_id_from_env(monkeypatch) -> None:
 
 def _button_callbacks(markup) -> list[str | None]:
     return [button.callback_data for row in markup.inline_keyboard for button in row]
+
+
+def _button_text_urls(markup) -> list[tuple[str, str | None]]:
+    return [(button.text, button.url) for row in markup.inline_keyboard for button in row]
 
 
 class FakePromoEntitlementService:
@@ -199,6 +206,26 @@ def test_start_keyboard_has_welcome_buttons() -> None:
     ]
     assert "FoodBalance" in WELCOME_TEXT
     assert WELCOME_PHOTO_PATH.exists()
+
+
+def test_start_keyboard_includes_privacy_url_when_configured(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", PRIVACY_URL, raising=False)
+
+    keyboard = _start_keyboard()
+
+    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(keyboard)
+
+
+@pytest.mark.anyio
+async def test_questionnaire_start_exposes_privacy_before_sensitive_question(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", PRIVACY_URL, raising=False)
+    message = FakeMessage()
+
+    await telegram_app._start_questionnaire(message)
+
+    sent_text, markup = message.texts[-1]
+    assert sent_text == start_session().current_question.prompt
+    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(markup)
 
 
 @pytest.mark.anyio
@@ -720,6 +747,34 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     ]
 
 
+def test_subscribe_paywall_and_trial_markups_include_privacy_url_when_configured(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", PRIVACY_URL, raising=False)
+
+    markups = [
+        _subscription_payment_keyboard(),
+        _paywall_keyboard(preferred="one_day"),
+        _paywall_keyboard(preferred="weekly_pdf"),
+        _trial_subscription_keyboard(),
+    ]
+
+    for markup in markups:
+        assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(markup)
+
+
+def test_privacy_button_is_omitted_when_url_absent(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None, raising=False)
+
+    markups = [
+        _start_keyboard(),
+        _subscription_payment_keyboard(),
+        _paywall_keyboard(preferred="one_day"),
+        _trial_subscription_keyboard(),
+    ]
+
+    for markup in markups:
+        assert all(button.url != PRIVACY_URL for row in markup.inline_keyboard for button in row)
+
+
 def test_default_payments_disabled_hides_payment_buttons(monkeypatch) -> None:
     monkeypatch.delenv("DIET_BOT_PAYMENTS_ENABLED", raising=False)
     _set_payments_enabled_from_env(monkeypatch)
@@ -916,6 +971,22 @@ async def test_send_subscription_invoice_link_creates_recurring_stars_invoice(mo
     assert invoice["prices"][0].amount == SUBSCRIPTION_STARS_AMOUNT
     assert invoice["subscription_period"] == 2_592_000
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
+
+
+@pytest.mark.anyio
+async def test_invoice_link_markups_include_privacy_url_when_configured(monkeypatch) -> None:
+    service = FakeTelegramPaymentService()
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    monkeypatch.setattr(telegram_app, "TELEGRAM_PROVIDER_TOKEN", "provider-token")
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", PRIVACY_URL, raising=False)
+    stars_message = FakeMessage(chat_id=202, user_id=101)
+    rub_message = FakeMessage(chat_id=303, user_id=102)
+
+    await _send_stars_invoice_link(stars_message, PAYLOAD_SUBSCRIPTION_MONTH)
+    await telegram_app._send_yookassa_invoice_link(rub_message, telegram_app.PAYLOAD_RU_SUBSCRIPTION_MONTH)
+
+    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(stars_message.texts[-1][1])
+    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(rub_message.texts[-1][1])
 
 
 @pytest.mark.anyio
