@@ -628,20 +628,122 @@ async def test_support_chat_ignores_regular_messages(monkeypatch, tmp_path) -> N
 
 
 @pytest.mark.anyio
-async def test_support_chat_ignores_product_commands_but_keeps_myid(monkeypatch, tmp_path) -> None:
+async def test_support_chat_rejects_product_commands_and_myid(monkeypatch, tmp_path) -> None:
     support_chat_id = -5_271_779_108
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
-    start_message = FakeMessage(support_chat_id, text="/start")
-    myid_message = FakeMessage(support_chat_id, text="/myid", user_id=70_104)
+    start_message = FakeMessage(support_chat_id, text="/start", chat_type="supergroup")
+    myid_message = FakeMessage(support_chat_id, text="/myid", user_id=70_104, chat_type="supergroup")
 
     await telegram_app.start(start_message)
     await handle_answer(myid_message)
 
-    assert start_message.texts == []
+    assert "private chat" in start_message.texts[-1][0]
     assert start_message.photos == []
-    assert "chat_id: -5271779108" in myid_message.texts[-1][0]
-    assert "user_id: 70104" in myid_message.texts[-1][0]
+    assert "private chat" in myid_message.texts[-1][0]
+
+
+@pytest.mark.anyio
+async def test_group_start_rejects_before_profile_session_or_state_stores(monkeypatch, tmp_path) -> None:
+    class FailingStateStore:
+        def load_all(self):
+            raise AssertionError("chat state store should not be read for group /start")
+
+        def save_all(self, state):
+            raise AssertionError("chat state store should not be written for group /start")
+
+        def save_chat_state(self, chat_id, chat_state):
+            raise AssertionError("chat state store should not be written for group /start")
+
+    class FailingEntitlementService:
+        def get_entitlement(self, chat_id):
+            raise AssertionError("entitlement store should not be read for group /start")
+
+    chat_id = -100_101_202
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: FailingStateStore())
+    monkeypatch.setattr(telegram_app, "_entitlement_service", lambda: FailingEntitlementService())
+    message = FakeMessage(chat_id, text="/start", chat_type="group")
+
+    await telegram_app.start(message)
+
+    assert "private chat" in message.texts[-1][0]
+    assert message.photos == []
+    assert chat_id not in PROFILE_BY_CHAT_ID
+    assert chat_id not in SESSION_BY_CHAT_ID
+    assert not (tmp_path / "history.json").exists()
+    assert not (tmp_path / "subscriptions.json").exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chat_type", ["group", "supergroup", "channel"])
+async def test_non_private_callback_rejects_before_state_mutation(monkeypatch, chat_type) -> None:
+    chat_id = -100_303_404
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id, chat_type=chat_type)
+    callback = FakeCallback(CALLBACK_START, message)
+
+    await telegram_app.handle_callback(callback)
+
+    assert "private chat" in callback.answers[-1]
+    assert message.texts == []
+    assert chat_id not in SESSION_BY_CHAT_ID
+    assert chat_id not in TRIAL_CHAT_IDS
+
+
+@pytest.mark.anyio
+async def test_group_hidden_admin_command_denied_without_grant(monkeypatch, tmp_path) -> None:
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {700})
+    message = FakeMessage(
+        chat_id=-100_505_606,
+        text="/330366 91002",
+        user_id=700,
+        chat_type="supergroup",
+    )
+
+    await secret_access_command(message)
+
+    assert "private chat" in message.texts[-1][0]
+    assert not subscriptions_path.exists()
+
+
+@pytest.mark.anyio
+async def test_private_start_still_sends_welcome(monkeypatch, tmp_path) -> None:
+    chat_id = 80_301
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id, text="/start", chat_type="private")
+
+    await telegram_app.start(message)
+
+    sent_text, markup = message.texts[-1]
+    assert sent_text == WELCOME_TEXT
+    callbacks = _button_callbacks(markup)
+    assert callbacks[0] == CALLBACK_START
+    assert CALLBACK_FEATURES in callbacks
+    assert chat_id not in SESSION_BY_CHAT_ID
+
+
+@pytest.mark.anyio
+async def test_private_callback_start_flow_unchanged(monkeypatch) -> None:
+    chat_id = 80_302
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    message = FakeMessage(chat_id, chat_type="private")
+    callback = FakeCallback(CALLBACK_START, message)
+
+    try:
+        await telegram_app.handle_callback(callback)
+
+        assert callback.answers == [None]
+        assert chat_id in SESSION_BY_CHAT_ID
+        assert chat_id in TRIAL_CHAT_IDS
+        assert message.texts[-1][0] == start_session().current_question.prompt
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
 
 
 def test_subscriber_cabinet_keyboard_shows_limits_without_upsells(monkeypatch, tmp_path) -> None:
@@ -1480,8 +1582,9 @@ class FakeMessage:
         username=None,
         first_name=None,
         last_name=None,
+        chat_type="private",
     ) -> None:
-        self.chat = type("FakeChat", (), {"id": chat_id})()
+        self.chat = type("FakeChat", (), {"id": chat_id, "type": chat_type})()
         self.from_user = SimpleNamespace(
             id=chat_id if user_id is None else user_id,
             username=username,
