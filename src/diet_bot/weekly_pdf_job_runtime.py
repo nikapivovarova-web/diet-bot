@@ -11,6 +11,7 @@ from .weekly_pdf_jobs import (
     CleanupStaleResult,
     FinishJobResult,
     MarkDeliveredResult,
+    MarkSendStartedResult,
     StartJobResult,
 )
 
@@ -41,6 +42,8 @@ class WeeklyPdfJobStore(Protocol):
     def finish_success(self, job_id: UUID | str, *, now: datetime | None = None) -> FinishJobResult: ...
 
     def mark_delivered(self, job_id: UUID | str, *, now: datetime | None = None) -> MarkDeliveredResult: ...
+
+    def mark_send_started(self, job_id: UUID | str, *, now: datetime | None = None) -> MarkSendStartedResult: ...
 
     def finish_failure_and_refund_once(
         self,
@@ -114,6 +117,9 @@ class WeeklyPdfJobRuntime:
 
     def mark_delivered(self, job_id: UUID | str) -> MarkDeliveredResult:
         return self.store.mark_delivered(job_id, now=_normalize_datetime(self.now()))
+
+    def mark_send_started(self, job_id: UUID | str) -> MarkSendStartedResult:
+        return self.store.mark_send_started(job_id, now=_normalize_datetime(self.now()))
 
     def finish_failure_and_refund_once(self, job_id: UUID | str, *, reason: str | None = None) -> FinishJobResult:
         return self.store.finish_failure_and_refund_once(

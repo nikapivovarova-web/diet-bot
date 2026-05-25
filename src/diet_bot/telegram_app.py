@@ -143,7 +143,13 @@ from .weekly_pdf_job_runtime import (
     WeeklyPdfJobRuntime,
     validate_weekly_pdf_job_runtime_for_startup,
 )
-from .weekly_pdf_jobs import AdmitJobResultStatus, FinishJobResultStatus, StartJobResultStatus, WeeklyPdfJob
+from .weekly_pdf_jobs import (
+    AdmitJobResultStatus,
+    FinishJobResultStatus,
+    MarkSendStartedResultStatus,
+    StartJobResultStatus,
+    WeeklyPdfJob,
+)
 
 
 SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
@@ -2058,6 +2064,35 @@ async def _send_week_plan_after_postgres_admission(
     recipe_history_entries: list[RecipeHistoryItem] = []
     post_upload_finalized = False
 
+    def mark_document_send_started() -> None:
+        try:
+            result = runtime.mark_send_started(job.job_id)
+        except Exception as exc:
+            logger.exception(
+                "Failed to mark weekly PDF job send-start before Telegram upload chat_id=%s job_id=%s",
+                chat_id,
+                job.job_id,
+            )
+            _weekly_pdf_diag(
+                "postgres_mark_send_started_failed_before_upload",
+                chat_id=chat_id,
+                job_id=str(job.job_id),
+                error=type(exc).__name__,
+            )
+            raise
+
+        if result.status not in {
+            MarkSendStartedResultStatus.SEND_STARTED,
+            MarkSendStartedResultStatus.ALREADY_SEND_STARTED,
+        }:
+            _weekly_pdf_diag(
+                "postgres_mark_send_started_rejected_before_upload",
+                chat_id=chat_id,
+                job_id=str(job.job_id),
+                status=result.status.value,
+            )
+            raise RuntimeError(f"Weekly PDF send-start marker was not persisted: {result.status.value}")
+
     def mark_document_delivered() -> None:
         nonlocal post_upload_finalized
         try:
@@ -2112,6 +2147,7 @@ async def _send_week_plan_after_postgres_admission(
             recipe_history_entries=recipe_history_entries,
             pdf_slot_acquired=True,
             initial_status_message=initial_status_message,
+            on_document_send_started=mark_document_send_started,
             on_document_delivered=mark_document_delivered,
         )
     except Exception:
@@ -2299,6 +2335,7 @@ async def _send_week_plan(
     recipe_history_entries: list[RecipeHistoryItem] | None = None,
     pdf_slot_acquired: bool = False,
     initial_status_message: Message | None = None,
+    on_document_send_started: Callable[[], None] | None = None,
     on_document_delivered: Callable[[], None] | None = None,
 ) -> bool:
     chat_id = message.chat.id
@@ -2384,6 +2421,7 @@ async def _send_week_plan(
                 pdf_data,
                 pdf_filename,
                 status_text=status_text,
+                on_document_send_started=on_document_send_started,
                 on_document_delivered=on_document_delivered,
             )
         except Exception:
@@ -2413,11 +2451,14 @@ async def _send_week_pdf_document(
     pdf_filename: str,
     *,
     status_text: str | None = None,
+    on_document_send_started: Callable[[], None] | None = None,
     on_document_delivered: Callable[[], None] | None = None,
 ) -> None:
     caption = "Готово - ваш рацион на неделю в PDF."
     if status_text:
         caption = f"{caption}\n\n{status_text}"
+    document = BufferedInputFile(pdf_data, filename=pdf_filename)
+    reply_markup = _after_plan_keyboard(message.chat.id)
     upload_started_at = time.perf_counter()
     _weekly_pdf_diag(
         "telegram_upload_start",
@@ -2425,11 +2466,13 @@ async def _send_week_pdf_document(
         bytes=len(pdf_data),
         filename=pdf_filename,
     )
+    if on_document_send_started is not None:
+        on_document_send_started()
     try:
         await message.answer_document(
-            document=BufferedInputFile(pdf_data, filename=pdf_filename),
+            document=document,
             caption=caption,
-            reply_markup=_after_plan_keyboard(message.chat.id),
+            reply_markup=reply_markup,
         )
     except Exception as exc:
         _weekly_pdf_diag(
