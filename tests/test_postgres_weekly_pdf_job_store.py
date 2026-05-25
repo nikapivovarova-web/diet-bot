@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
+import diet_bot.postgres_weekly_pdf_job_store as weekly_pdf_job_store
 from diet_bot.postgres_chat_state_store import PostgresChatStateStore
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_weekly_pdf_job_migrations import MIGRATIONS
@@ -29,6 +30,7 @@ from diet_bot.weekly_pdf_jobs import (
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
     StartJobResultStatus,
+    WeeklyPdfJob,
 )
 
 
@@ -332,6 +334,88 @@ def test_finish_failure_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
     assert _weekly_remaining(store, chat_id) == 1
 
 
+def test_finish_failure_after_send_started_closes_without_refund(monkeypatch) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    send_started_at = now + timedelta(seconds=5)
+    job = WeeklyPdfJob(
+        job_id=uuid.uuid4(),
+        chat_id=118,
+        idempotency_key="failure-after-send-started-no-refund",
+        status=JOB_STATUS_RUNNING,
+        refund_status=REFUND_STATUS_PENDING,
+        consumption_source="monthly",
+        stale_after=now + timedelta(minutes=15),
+        started_at=now,
+        send_started_at=send_started_at,
+    )
+
+    def fail_refund_path(*_args, **_kwargs):
+        raise AssertionError("send-started failures must not enter entitlement refund handling")
+
+    monkeypatch.setattr(weekly_pdf_job_store, "_lock_entitlement_map_cur", fail_refund_path)
+    monkeypatch.setattr(weekly_pdf_job_store, "_load_entitlement_cur", fail_refund_path)
+    monkeypatch.setattr(weekly_pdf_job_store, "refund_attempt", fail_refund_path)
+    monkeypatch.setattr(weekly_pdf_job_store, "_upsert_entitlement_cur", fail_refund_path)
+
+    cursor = FakeJobCursor(job)
+    store = PostgresWeeklyPdfJobStore("postgresql://unit-test")
+
+    result = store._finish_failure_and_refund_once_cur(
+        cursor,
+        job,
+        reason="telegram_upload_failed",
+        now=now + timedelta(seconds=10),
+    )
+
+    assert result.status == FinishJobResultStatus.SUCCEEDED
+    assert result.job.status == JOB_STATUS_SUCCEEDED
+    assert result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert result.job.send_started_at == send_started_at
+    assert result.job.delivered_at is None
+    assert result.job.failure_reason is None
+    assert result.job.finalization_error == "telegram_upload_failed"
+
+
+def test_finish_failure_after_send_started_preserves_consumed_quota(
+    store: PostgresWeeklyPdfJobStore,
+) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 118
+    send_started_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="failure-after-send-started-preserves-quota",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+    send_started = store.mark_send_started(started.job_id, now=send_started_at).job
+
+    failed_result = store.finish_failure_and_refund_once(
+        started.job_id,
+        reason="telegram_upload_failed",
+        now=now + timedelta(seconds=10),
+    )
+    failed_again_result = store.finish_failure_and_refund_once(
+        started.job_id,
+        reason="telegram_upload_failed",
+        now=now + timedelta(seconds=20),
+    )
+
+    assert send_started.send_started_at == send_started_at
+    assert failed_result.status == FinishJobResultStatus.SUCCEEDED
+    assert failed_again_result.status == FinishJobResultStatus.ALREADY_TERMINAL
+    assert failed_result.job.status == JOB_STATUS_SUCCEEDED
+    assert failed_result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert failed_result.job.send_started_at == send_started_at
+    assert failed_result.job.delivered_at is None
+    assert failed_result.job.failure_reason is None
+    assert failed_result.job.finalization_error == "telegram_upload_failed"
+    assert failed_again_result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert store.get_active_job_for_chat(chat_id) is None
+    assert _weekly_remaining(store, chat_id) == 0
+
+
 def test_delivered_failure_closes_successfully_without_refund(store: PostgresWeeklyPdfJobStore) -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     chat_id = 112
@@ -630,6 +714,52 @@ def _save_subscription(
 def _weekly_remaining(store: PostgresWeeklyPdfJobStore, chat_id: int) -> int:
     entitlement = PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).load_all()[chat_id]
     return entitlement.monthly_weekly_pdf_remaining
+
+
+class FakeJobCursor:
+    def __init__(self, job: WeeklyPdfJob) -> None:
+        self.job = job
+        self.row = _job_row(job)
+
+    def execute(self, query: str, params: tuple) -> None:
+        assert "refund_status = 'not_required'" in query
+        status, finalization_error, finished_at, updated_at, job_id = params
+        assert job_id == self.job.job_id
+        self.row = _job_row(
+            self.job,
+            status=status,
+            refund_status=REFUND_STATUS_NOT_REQUIRED,
+            finalization_error=finalization_error,
+            finished_at=finished_at,
+            updated_at=updated_at,
+        )
+
+    def fetchone(self):
+        return self.row
+
+
+def _job_row(job: WeeklyPdfJob, **overrides):
+    row = {
+        "job_id": job.job_id,
+        "chat_id": job.chat_id,
+        "idempotency_key": job.idempotency_key,
+        "status": job.status,
+        "refund_status": job.refund_status,
+        "consumption_source": job.consumption_source,
+        "stale_after": job.stale_after,
+        "metadata_json": job.metadata,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "started_at": job.started_at,
+        "heartbeat_at": job.heartbeat_at,
+        "finished_at": job.finished_at,
+        "failure_reason": job.failure_reason,
+        "send_started_at": job.send_started_at,
+        "delivered_at": job.delivered_at,
+        "finalization_error": job.finalization_error,
+    }
+    row.update(overrides)
+    return row
 
 
 def _active_job_count(store: PostgresWeeklyPdfJobStore, chat_id: int) -> int:

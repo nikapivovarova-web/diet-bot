@@ -425,6 +425,7 @@ class PostgresWeeklyPdfJobStore:
                                             self._finish_send_started_unconfirmed_job_cur(
                                                 cur,
                                                 job,
+                                                finalization_error="stale_after_send_attempt_unconfirmed",
                                                 now=current_time,
                                             ),
                                         )
@@ -557,6 +558,7 @@ class PostgresWeeklyPdfJobStore:
         cur: Any,
         job: WeeklyPdfJob,
         *,
+        finalization_error: str | None,
         now: datetime,
     ) -> WeeklyPdfJob:
         cur.execute(
@@ -572,7 +574,7 @@ class PostgresWeeklyPdfJobStore:
             """,
             (
                 JOB_STATUS_SUCCEEDED,
-                "stale_after_send_attempt_unconfirmed",
+                _optional_text(finalization_error),
                 now,
                 now,
                 job.job_id,
@@ -594,6 +596,16 @@ class PostgresWeeklyPdfJobStore:
             return FinishJobResult(
                 FinishJobResultStatus.SUCCEEDED,
                 self._finish_delivered_job_cur(
+                    cur,
+                    job,
+                    finalization_error=reason,
+                    now=now,
+                ),
+            )
+        if job.send_started_at is not None:
+            return FinishJobResult(
+                FinishJobResultStatus.SUCCEEDED,
+                self._finish_send_started_unconfirmed_job_cur(
                     cur,
                     job,
                     finalization_error=reason,
