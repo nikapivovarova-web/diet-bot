@@ -82,7 +82,11 @@ from .pdf_renderer import build_week_plan_pdf
 from .curated_data import curated_recipes
 from .recipe_catalog import RecipeTemplate, built_in_recipes
 from .recipe_traits import RecipeTraits, infer_recipe_traits
-from .promo_codes import PromoCodeActivation, activate_promo_code
+from .promo_codes import (
+    PromoCodeActivation,
+    activate_promo_code,
+    release_promo_code_activation,
+)
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import (
     DEFAULT_PROMO_CODES_STATE_FILE,
@@ -3990,7 +3994,14 @@ def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeAct
     if not activation.activated:
         return activation
 
-    _entitlement_service().apply_subscription_payment(chat_id, f"promo:{activation.code}")
+    try:
+        _entitlement_service().apply_subscription_payment(chat_id, f"promo:{activation.code}")
+    except Exception:
+        try:
+            release_promo_code_activation(PROMO_CODES_STATE_FILE, activation.code, chat_id)
+        except Exception:
+            logger.exception("Failed to roll back promo activation after entitlement grant failure")
+        raise
     return activation
 
 
