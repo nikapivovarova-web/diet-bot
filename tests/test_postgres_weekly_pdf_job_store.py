@@ -24,6 +24,7 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
     MarkDeliveredResultStatus,
+    MarkSendStartedResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -40,6 +41,7 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     statements = "\n".join(statement for migration in MIGRATIONS for statement in migration.statements)
 
     assert "CREATE TABLE IF NOT EXISTS weekly_pdf_jobs" in statements
+    assert "send_started_at TIMESTAMPTZ" in statements
     assert "delivered_at TIMESTAMPTZ" in statements
     assert "finalization_error TEXT" in statements
     assert "idx_weekly_pdf_jobs_active_chat_unique" in statements
@@ -55,7 +57,9 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert "test_access" in start_signature.parameters
     assert "chat_id" in cleanup_signature.parameters
     assert hasattr(PostgresWeeklyPdfJobStore, "cancel_queued")
+    assert hasattr(PostgresWeeklyPdfJobStore, "mark_send_started")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_delivered")
+    assert "send_started_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "delivered_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "finalization_error" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
 
@@ -134,7 +138,7 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
                 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND table_name = 'weekly_pdf_jobs'
-                  AND column_name IN ('delivered_at', 'finalization_error')
+                  AND column_name IN ('send_started_at', 'delivered_at', 'finalization_error')
                 """
             )
             new_columns = {row["column_name"] for row in cur.fetchall()}
@@ -145,7 +149,7 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "idx_weekly_pdf_jobs_idempotency_key_unique",
         "idx_weekly_pdf_jobs_stale",
     }
-    assert new_columns == {"delivered_at", "finalization_error"}
+    assert new_columns == {"send_started_at", "delivered_at", "finalization_error"}
 
 
 def test_weekly_then_chat_state_migrations_create_both_schemas(store: PostgresWeeklyPdfJobStore) -> None:
@@ -357,6 +361,46 @@ def test_delivered_failure_closes_successfully_without_refund(store: PostgresWee
     assert _weekly_remaining(store, chat_id) == 0
 
 
+def test_mark_send_started_sets_timestamp(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 115
+    send_started_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="send-started-sets-timestamp",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+
+    result = store.mark_send_started(started.job_id, now=send_started_at)
+
+    assert result.status == MarkSendStartedResultStatus.SEND_STARTED
+    assert result.job.status == JOB_STATUS_RUNNING
+    assert result.job.send_started_at == send_started_at
+    assert result.job.delivered_at is None
+
+
+def test_mark_send_started_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 116
+    send_started_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="send-started-idempotent",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+
+    first = store.mark_send_started(started.job_id, now=send_started_at)
+    second = store.mark_send_started(started.job_id, now=send_started_at + timedelta(seconds=30))
+
+    assert first.status == MarkSendStartedResultStatus.SEND_STARTED
+    assert second.status == MarkSendStartedResultStatus.ALREADY_SEND_STARTED
+    assert second.job.send_started_at == send_started_at
+
+
 def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     chat_id = 107
@@ -375,8 +419,39 @@ def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore
     assert cleaned.job_results[0].status == FinishJobResultStatus.FAILED
     assert cleaned.jobs[0].status == JOB_STATUS_FAILED
     assert cleaned.jobs[0].refund_status == REFUND_STATUS_REFUNDED
+    assert cleaned.jobs[0].send_started_at is None
     assert cleaned_again.jobs == []
     assert _weekly_remaining(store, chat_id) == 1
+
+
+def test_cleanup_stale_send_started_running_job_succeeds_without_refund(
+    store: PostgresWeeklyPdfJobStore,
+) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 117
+    send_started_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="stale-send-started-running-no-refund",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now, stale_after=now - timedelta(seconds=1)).job
+    store.mark_send_started(started.job_id, now=send_started_at)
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(seconds=10))
+    cleaned_again = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(minutes=1))
+
+    assert [job.job_id for job in cleaned.jobs] == [started.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.SUCCEEDED
+    assert cleaned.jobs[0].status == JOB_STATUS_SUCCEEDED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert cleaned.jobs[0].send_started_at == send_started_at
+    assert cleaned.jobs[0].delivered_at is None
+    assert cleaned.jobs[0].finalization_error == "stale_after_send_attempt_unconfirmed"
+    assert cleaned_again.jobs == []
+    assert store.get_active_job_for_chat(chat_id) is None
+    assert _weekly_remaining(store, chat_id) == 0
 
 
 def test_cleanup_stale_delivered_running_job_succeeds_without_refund(store: PostgresWeeklyPdfJobStore) -> None:

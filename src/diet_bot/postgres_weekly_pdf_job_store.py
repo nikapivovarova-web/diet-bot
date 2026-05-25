@@ -25,6 +25,8 @@ from .weekly_pdf_jobs import (
     JOB_STATUS_SUCCEEDED,
     MarkDeliveredResult,
     MarkDeliveredResultStatus,
+    MarkSendStartedResult,
+    MarkSendStartedResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -51,6 +53,7 @@ WEEKLY_PDF_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "stale_after",
             "metadata_json",
             "failure_reason",
+            "send_started_at",
             "delivered_at",
             "finalization_error",
             "created_at",
@@ -269,6 +272,33 @@ class PostgresWeeklyPdfJobStore:
                     )
                     return MarkDeliveredResult(MarkDeliveredResultStatus.DELIVERED, _job_from_row(cur.fetchone()))
 
+    def mark_send_started(self, job_id: UUID | str, *, now: datetime | None = None) -> MarkSendStartedResult:
+        current_time = _normalize_datetime(now)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return MarkSendStartedResult(MarkSendStartedResultStatus.NOT_FOUND, None)
+                    if job.status != JOB_STATUS_RUNNING:
+                        return MarkSendStartedResult(MarkSendStartedResultStatus.INVALID_STATE, job)
+                    if job.send_started_at is not None:
+                        return MarkSendStartedResult(MarkSendStartedResultStatus.ALREADY_SEND_STARTED, job)
+                    cur.execute(
+                        """
+                        UPDATE weekly_pdf_jobs
+                        SET send_started_at = %s,
+                            updated_at = %s
+                        WHERE job_id = %s
+                        RETURNING *
+                        """,
+                        (current_time, current_time, job.job_id),
+                    )
+                    return MarkSendStartedResult(
+                        MarkSendStartedResultStatus.SEND_STARTED,
+                        _job_from_row(cur.fetchone()),
+                    )
+
     def finish_success(self, job_id: UUID | str, *, now: datetime | None = None) -> FinishJobResult:
         current_time = _normalize_datetime(now)
         with self._connect() as conn:
@@ -388,14 +418,26 @@ class PostgresWeeklyPdfJobStore:
                                     )
                                 )
                             else:
-                                job_results.append(
-                                    self._finish_failure_and_refund_once_cur(
-                                        cur,
-                                        job,
-                                        reason="weekly_pdf_job_stale",
-                                        now=current_time,
+                                if job.send_started_at is not None:
+                                    job_results.append(
+                                        FinishJobResult(
+                                            FinishJobResultStatus.SUCCEEDED,
+                                            self._finish_send_started_unconfirmed_job_cur(
+                                                cur,
+                                                job,
+                                                now=current_time,
+                                            ),
+                                        )
                                     )
-                                )
+                                else:
+                                    job_results.append(
+                                        self._finish_failure_and_refund_once_cur(
+                                            cur,
+                                            job,
+                                            reason="weekly_pdf_job_stale",
+                                            now=current_time,
+                                        )
+                                    )
                     return CleanupStaleResult(job_results)
 
     def get_active_job_for_chat(self, chat_id: int) -> WeeklyPdfJob | None:
@@ -507,6 +549,34 @@ class PostgresWeeklyPdfJobStore:
             RETURNING *
             """,
             (JOB_STATUS_SUCCEEDED, _optional_text(finalization_error), now, now, job.job_id),
+        )
+        return _job_from_row(cur.fetchone())
+
+    def _finish_send_started_unconfirmed_job_cur(
+        self,
+        cur: Any,
+        job: WeeklyPdfJob,
+        *,
+        now: datetime,
+    ) -> WeeklyPdfJob:
+        cur.execute(
+            """
+            UPDATE weekly_pdf_jobs
+            SET status = %s,
+                refund_status = 'not_required',
+                finalization_error = COALESCE(%s, finalization_error),
+                finished_at = COALESCE(finished_at, %s),
+                updated_at = %s
+            WHERE job_id = %s
+            RETURNING *
+            """,
+            (
+                JOB_STATUS_SUCCEEDED,
+                "stale_after_send_attempt_unconfirmed",
+                now,
+                now,
+                job.job_id,
+            ),
         )
         return _job_from_row(cur.fetchone())
 
@@ -708,6 +778,7 @@ def _job_from_row(row: Any) -> WeeklyPdfJob:
         heartbeat_at=_datetime_or_none(row["heartbeat_at"]),
         finished_at=_datetime_or_none(row["finished_at"]),
         failure_reason=_optional_text(row["failure_reason"]),
+        send_started_at=_datetime_or_none(row["send_started_at"]),
         delivered_at=_datetime_or_none(row["delivered_at"]),
         finalization_error=_optional_text(row["finalization_error"]),
     )
