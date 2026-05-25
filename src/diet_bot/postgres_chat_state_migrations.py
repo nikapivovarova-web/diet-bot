@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 MIGRATIONS = (
     PostgresMigration(
-        version="202605250001",
+        version="202605250003",
         description="Create chat state tables",
         statements=(
             """
@@ -62,7 +62,7 @@ MIGRATIONS = (
         ),
     ),
     PostgresMigration(
-        version="202605250002",
+        version="202605250004",
         description="Create chat state JSON import audit table",
         statements=(
             """
