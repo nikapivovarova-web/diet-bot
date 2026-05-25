@@ -890,6 +890,7 @@ WELCOME_TEXT = (
     "без хаоса, ручных подсчётов и скучных однотипных меню.\n\n"
     "Начнём с короткой анкеты, чтобы я лучше понял, что вам подходит 👇"
 )
+PRIVATE_CHAT_ONLY_TEXT = "Bot works only in private chat."
 TRIAL_SUBSCRIPTION_TEXT = (
     "Это пробный рацион на 1 день, чтобы вы могли увидеть, как работает FoodBalance.\n\n"
     "В месячную подписку входят 4 недельных рациона и 5 дополнительных дневных рационов. "
@@ -905,6 +906,8 @@ BOT_COMMANDS = (
 
 @router.message(Command("start"))
 async def start(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
@@ -927,6 +930,8 @@ async def start(message: Message) -> None:
 
 @router.message(Command("plan"))
 async def plan(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
@@ -940,6 +945,8 @@ async def plan(message: Message) -> None:
 
 @router.message(Command("cancel"))
 async def cancel(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
     SESSION_BY_CHAT_ID.pop(message.chat.id, None)
     TRIAL_CHAT_IDS.discard(message.chat.id)
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
@@ -951,6 +958,8 @@ async def cancel(message: Message) -> None:
 
 @router.message(Command("myid"))
 async def myid(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
     user_id = _message_user_id(message)
     lines = [
         "Ваши Telegram ID:",
@@ -969,6 +978,8 @@ async def myid(message: Message) -> None:
 
 @router.message(Command("330366"))
 async def secret_access_command(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
     action, target_chat_id = _parse_test_access_command(message.text or "")
     if target_chat_id is not None:
         if not _is_admin_message(message):
@@ -1047,6 +1058,9 @@ async def handle_callback(callback: CallbackQuery) -> None:
     message = callback.message
     if not isinstance(message, Message):
         await callback.answer()
+        return
+
+    if await _reject_non_private_callback(callback, message):
         return
 
     if _is_support_chat(message.chat.id):
@@ -1200,6 +1214,8 @@ async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
 
 @router.message(F.successful_payment)
 async def handle_successful_payment(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
     payment = message.successful_payment
     if payment is None:
         return
@@ -1257,6 +1273,8 @@ async def handle_successful_payment(message: Message) -> None:
 @router.message()
 async def handle_answer(message: Message) -> None:
     chat_id = message.chat.id
+    if await _reject_non_private_message(message):
+        return
     text = (message.text or "").strip()
     normalized_command = _normalize_command_text(text)
     if normalized_command == "myid":
@@ -1421,6 +1439,27 @@ def _telegram_chunks(text: str, limit: int = 3900) -> list[str]:
 
 async def _set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(BOT_COMMANDS)
+
+
+def _is_private_chat_message(message: Message) -> bool:
+    chat_type = getattr(getattr(message, "chat", None), "type", None)
+    if chat_type is None:
+        return True
+    return str(getattr(chat_type, "value", chat_type)).lower() == "private"
+
+
+async def _reject_non_private_message(message: Message) -> bool:
+    if _is_private_chat_message(message):
+        return False
+    await message.answer(PRIVATE_CHAT_ONLY_TEXT)
+    return True
+
+
+async def _reject_non_private_callback(callback: CallbackQuery, message: Message) -> bool:
+    if _is_private_chat_message(message):
+        return False
+    await callback.answer(PRIVATE_CHAT_ONLY_TEXT)
+    return True
 
 
 async def _start_support_request(message: Message) -> None:
