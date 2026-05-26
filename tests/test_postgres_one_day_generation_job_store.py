@@ -73,6 +73,7 @@ def test_store_contract_without_connecting_to_postgres() -> None:
     assert hasattr(PostgresOneDayGenerationJobStore, "mark_send_started")
     assert hasattr(PostgresOneDayGenerationJobStore, "set_expected_value_messages")
     assert hasattr(PostgresOneDayGenerationJobStore, "finish_failure_and_refund_once")
+    assert hasattr(PostgresOneDayGenerationJobStore, "get_unresolved_manual_review_jobs")
     assert "expected_value_messages" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns[
         "one_day_generation_jobs"
     ]
@@ -726,6 +727,69 @@ def test_list_stale_candidates_selects_active_stale_jobs_only(
     candidates = store.list_stale_candidates(now=now, limit=10)
 
     assert [candidate.job_id for candidate in candidates] == [queued.job_id, running.job_id]
+
+
+def test_unresolved_manual_review_query_returns_only_review_required_jobs(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    _save_subscription(store, 123, now=now, one_day_remaining=1)
+    unknown = _running_job_with_expected_count(
+        store,
+        123,
+        "one-day-review-query-unknown",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+    store.mark_send_started(unknown.job_id, now=now + timedelta(seconds=1))
+    store.cleanup_stale(chat_id=123, now=now + timedelta(seconds=2))
+
+    _save_subscription(store, 124, now=now, one_day_remaining=1)
+    partial = _running_job_with_expected_count(
+        store,
+        124,
+        "one-day-review-query-partial",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+    store.mark_value_message_delivered(
+        partial.job_id,
+        value_message_key="meal-breakfast",
+        now=now + timedelta(seconds=1),
+    )
+    store.cleanup_stale(chat_id=124, now=now + timedelta(seconds=2))
+
+    _save_subscription(store, 125, now=now, one_day_remaining=1)
+    delivered = _running_job_with_expected_count(
+        store,
+        125,
+        "one-day-review-query-delivered",
+        now,
+        expected=2,
+    )
+    store.mark_value_message_delivered(
+        delivered.job_id,
+        value_message_key="meal-breakfast",
+        now=now + timedelta(seconds=1),
+    )
+    store.mark_value_message_delivered(
+        delivered.job_id,
+        value_message_key="meal-lunch",
+        now=now + timedelta(seconds=2),
+    )
+    store.finish_success(delivered.job_id, now=now + timedelta(seconds=3))
+
+    reviews = store.get_unresolved_manual_review_jobs(limit=10)
+    limited = store.get_unresolved_manual_review_jobs(limit=1)
+
+    assert [job.job_id for job in reviews] == [unknown.job_id, partial.job_id]
+    assert [job.delivery_status for job in reviews] == ["unknown", "unknown"]
+    assert [job.delivered_value_messages for job in reviews] == [0, 1]
+    assert all(job.requires_manual_review for job in reviews)
+    assert delivered.job_id not in {job.job_id for job in reviews}
+    assert [job.job_id for job in limited] == [unknown.job_id]
 
 
 def _running_job_with_expected_count(

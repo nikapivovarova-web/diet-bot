@@ -531,6 +531,22 @@ class PostgresOneDayGenerationJobStore:
                 )
                 return [_job_from_row(row) for row in cur.fetchall()]
 
+    def get_unresolved_manual_review_jobs(self, *, limit: int = 100) -> list[OneDayGenerationJob]:
+        bounded_limit = min(500, max(1, int(limit)))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM one_day_generation_jobs
+                    WHERE requires_manual_review = true
+                    ORDER BY updated_at, created_at, job_id
+                    LIMIT %s
+                    """,
+                    (bounded_limit,),
+                )
+                return [_job_from_row(row) for row in cur.fetchall()]
+
     def cleanup_stale(
         self,
         *,
