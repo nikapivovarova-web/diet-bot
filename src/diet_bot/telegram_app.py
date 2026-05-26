@@ -3697,15 +3697,17 @@ def _remember_recipe_history_items(
 ) -> None:
     if not entries:
         return
-    id_history = RECENT_RECIPE_IDS_BY_CHAT_ID.setdefault(chat_id, [])
-    key_history = RECENT_RECIPE_KEYS_BY_CHAT_ID.setdefault(chat_id, [])
-    id_history.extend(entry.recipe_id for entry in entries if entry.recipe_id)
-    key_history.extend(entry.recipe_key for entry in entries if entry.recipe_key)
-    if len(id_history) > RECENT_RECIPE_LIMIT:
-        del id_history[:-RECENT_RECIPE_LIMIT]
-    if len(key_history) > RECENT_RECIPE_LIMIT:
-        del key_history[:-RECENT_RECIPE_LIMIT]
-    _save_chat_history(chat_id)
+    id_history = [
+        *RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []),
+        *(entry.recipe_id for entry in entries if entry.recipe_id),
+    ][-RECENT_RECIPE_LIMIT:]
+    key_history = [
+        *RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []),
+        *(entry.recipe_key for entry in entries if entry.recipe_key),
+    ][-RECENT_RECIPE_LIMIT:]
+    _save_chat_history(chat_id, recipe_ids=id_history, recipe_keys=key_history)
+    RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = id_history
+    RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = key_history
 
 def _history_generation_id(consumption: AttemptConsumption) -> int | None:
     del consumption
@@ -4113,12 +4115,27 @@ def _load_chat_history(chat_id: int) -> None:
     RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = list(chat_state.get("recipe_keys", []))[-RECENT_RECIPE_LIMIT:]
 
 
-def _save_chat_history(chat_id: int) -> None:
+def _save_chat_history(
+    chat_id: int,
+    *,
+    recipe_ids: Sequence[str] | None = None,
+    recipe_keys: Sequence[str] | None = None,
+) -> None:
+    stored_recipe_ids = (
+        RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, [])
+        if recipe_ids is None
+        else recipe_ids
+    )
+    stored_recipe_keys = (
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, [])
+        if recipe_keys is None
+        else recipe_keys
+    )
     _chat_state_store().save_chat_state(
         chat_id,
         {
-            "recipe_ids": RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:],
-            "recipe_keys": RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, [])[-RECENT_RECIPE_LIMIT:],
+            "recipe_ids": list(stored_recipe_ids)[-RECENT_RECIPE_LIMIT:],
+            "recipe_keys": list(stored_recipe_keys)[-RECENT_RECIPE_LIMIT:],
         },
     )
 
