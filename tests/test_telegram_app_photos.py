@@ -311,6 +311,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     chat_state_validated: list[str] = []
     validated: list[tuple[str, object]] = []
     weekly_pdf_validated: list[str] = []
+    one_day_validated: list[str] = []
     guard_events: list[str] = []
     polled: list[object] = []
 
@@ -329,6 +330,9 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
 
     def fake_validate_weekly_pdf_jobs(config) -> None:
         weekly_pdf_validated.append(config.storage_backend)
+
+    def fake_validate_one_day_jobs(config) -> None:
+        one_day_validated.append(config.storage_backend)
 
     def fake_validate_chat_state(config) -> None:
         chat_state_validated.append(config.storage_backend)
@@ -369,6 +373,11 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     )
     monkeypatch.setattr(
         telegram_app,
+        "validate_one_day_generation_job_store_for_startup",
+        fake_validate_one_day_jobs,
+    )
+    monkeypatch.setattr(
+        telegram_app,
         "validate_chat_state_store_for_startup",
         fake_validate_chat_state,
     )
@@ -381,6 +390,7 @@ async def test_run_bot_startup_postgres_mode_skips_json_validation(
     assert chat_state_validated == ["postgres"]
     assert validated and validated[0][0] == "postgres"
     assert weekly_pdf_validated == ["postgres"]
+    assert one_day_validated == ["postgres"]
     assert guard_events == ["guard_init", "guard_acquire", "guard_close"]
     assert polled == [fake_bot]
 

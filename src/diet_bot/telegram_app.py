@@ -110,6 +110,7 @@ from .payment_runtime import (
     validate_payment_runtime_for_startup,
 )
 from .payment_recovery_spool import PaymentRecoveryRecord, append_payment_recovery_record
+from .one_day_generation_job_runtime import validate_one_day_generation_job_store_for_startup
 from .payments import (
     PRODUCT_EXTRA_ONE_DAY,
     PRODUCT_EXTRA_WEEKLY_PDF,
@@ -1436,6 +1437,7 @@ async def run_bot() -> None:
     validate_chat_state_store_for_startup(config)
     _validate_entitlement_storage(config)
     validate_weekly_pdf_job_runtime_for_startup(config)
+    validate_one_day_generation_job_store_for_startup(config)
     validate_payment_runtime_for_startup(config)
     single_poller_guard = _acquire_postgres_single_poller_guard(config)
     try:
