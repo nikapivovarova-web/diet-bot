@@ -1451,11 +1451,13 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     PLAN_COUNT_BY_CHAT_ID[chat_id] = 0
     PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = random.SystemRandom().randrange(1, 1_000_000_000)
     _load_chat_history(chat_id)
-    _clear_questionnaire_session(chat_id)
     is_trial = chat_id in TRIAL_CHAT_IDS
+    trial_session_token = QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(chat_id) if is_trial else None
+    trial_idempotency_key = _trial_plan_idempotency_key(chat_id, trial_session_token, profile) if is_trial else None
+    _clear_questionnaire_session(chat_id)
     TRIAL_CHAT_IDS.discard(chat_id)
     if is_trial:
-        await _send_trial_plan(message, profile)
+        await _send_trial_plan(message, profile, idempotency_key=trial_idempotency_key)
         return
     await _send_calculation_options(message, profile)
 
@@ -1761,7 +1763,29 @@ async def _send_calculation_report(
     )
 
 
-async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
+async def _send_trial_plan(
+    message: Message,
+    profile: UserProfile,
+    *,
+    idempotency_key: str | None = None,
+) -> None:
+    runtime = _one_day_generation_job_runtime()
+    if runtime is not None:
+        sent = await _send_trial_plan_with_postgres_job(
+            message,
+            profile,
+            runtime=runtime,
+            idempotency_key=idempotency_key
+            or _trial_plan_idempotency_key(
+                message.chat.id,
+                QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
+                profile,
+            ),
+        )
+        if sent:
+            await _send_trial_subscription_cta(message)
+        return
+
     try:
         consumption = _consume_generation_attempt(message.chat.id, "one_day")
     except EntitlementStorageError:
@@ -1784,10 +1808,175 @@ async def _send_trial_plan(message: Message, profile: UserProfile) -> None:
         return
 
     if sent:
-        await message.answer(
-            TRIAL_SUBSCRIPTION_TEXT + "\n\n" + _format_entitlement_status(message.chat.id),
-            reply_markup=_trial_subscription_keyboard(),
+        await _send_trial_subscription_cta(message)
+
+
+def _trial_plan_idempotency_key(chat_id: int, session_token: str | None, profile: UserProfile) -> str:
+    if session_token:
+        return f"telegram_trial_session:{chat_id}:{session_token}:one_day"
+
+    profile_payload = {
+        "age": profile.age,
+        "sex": profile.sex.value,
+        "height_cm": profile.height_cm,
+        "weight_kg": profile.weight_kg,
+        "goal": profile.goal.value,
+        "activity": profile.activity.value,
+        "meal_count": profile.meal_count,
+        "cooking_time": profile.cooking_time.value,
+        "restrictions": [
+            {"type": restriction.type.value, "value": restriction.value, "severity": restriction.severity}
+            for restriction in profile.restrictions
+        ],
+        "conditions": [str(condition) for condition in profile.conditions],
+        "allow_lactose_free_dairy": profile.allow_lactose_free_dairy,
+        "allow_gluten_free_oats": profile.allow_gluten_free_oats,
+    }
+    digest = hashlib.sha256(
+        json.dumps(profile_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"telegram_trial_profile:{chat_id}:{digest}:one_day"
+
+
+async def _send_trial_subscription_cta(message: Message) -> None:
+    await message.answer(
+        TRIAL_SUBSCRIPTION_TEXT + "\n\n" + _format_entitlement_status(message.chat.id),
+        reply_markup=_trial_subscription_keyboard(),
+    )
+
+
+async def _send_trial_plan_with_postgres_job(
+    message: Message,
+    profile: UserProfile,
+    *,
+    runtime: OneDayGenerationJobRuntime,
+    idempotency_key: str,
+) -> bool:
+    chat_id = message.chat.id
+    try:
+        runtime.cleanup_stale(chat_id=chat_id)
+    except Exception:
+        logger.exception("Failed to cleanup stale trial one-day generation jobs")
+
+    try:
+        job_admission = runtime.admit(
+            chat_id=chat_id,
+            idempotency_key=idempotency_key,
+            metadata={"source": "telegram_trial"},
         )
+    except Exception:
+        logger.exception("Failed to admit trial one-day generation Postgres job")
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if job_admission.status in {
+        OneDayAdmitJobResultStatus.ACTIVE_DUPLICATE,
+        OneDayAdmitJobResultStatus.EXISTING_IDEMPOTENCY,
+    }:
+        await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
+        return False
+
+    try:
+        start_result = runtime.start_job_and_consume(job_admission.job.job_id, test_access=False)
+    except Exception:
+        logger.exception("Failed to start trial one-day generation Postgres job")
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="trial_one_day_start_exception",
+        )
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if start_result.status == OneDayStartJobResultStatus.DENIED:
+        await _send_limit_paywall(message, "one_day")
+        return False
+
+    if start_result.status != OneDayStartJobResultStatus.STARTED or start_result.job is None:
+        await message.answer(
+            ONE_DAY_PLAN_ALREADY_RUNNING_TEXT
+            if start_result.status == OneDayStartJobResultStatus.ALREADY_RUNNING
+            else ENTITLEMENT_STORAGE_ERROR_TEXT
+        )
+        return False
+
+    job_id = start_result.job.job_id
+    if start_result.job.consumption_source != "free_trial":
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="trial_one_day_non_free_trial_source",
+        )
+        await _send_limit_paywall(message, "one_day")
+        return False
+
+    def set_expected_value_messages(expected_count: int) -> None:
+        result = runtime.set_expected_value_messages(job_id, expected_count)
+        if result.status not in {
+            OneDaySetExpectedValueMessagesResultStatus.SET,
+            OneDaySetExpectedValueMessagesResultStatus.ALREADY_SET,
+        }:
+            raise RuntimeError(f"Trial one-day expected message count was not persisted: {result.status.value}")
+
+    def mark_send_started() -> None:
+        result = runtime.mark_send_started(job_id)
+        if result.status not in {
+            OneDayMarkSendStartedResultStatus.SEND_STARTED,
+            OneDayMarkSendStartedResultStatus.ALREADY_SEND_STARTED,
+        }:
+            raise RuntimeError(f"Trial one-day send-start marker was not persisted: {result.status.value}")
+
+    def mark_value_message_delivered(value_message_key: str) -> None:
+        result = runtime.mark_value_message_delivered(job_id, value_message_key=value_message_key)
+        if result.status not in {
+            OneDayMarkValueMessageDeliveredResultStatus.DELIVERED,
+            OneDayMarkValueMessageDeliveredResultStatus.ALREADY_DELIVERED,
+        }:
+            raise RuntimeError(f"Trial one-day value delivery marker was not persisted: {result.status.value}")
+
+    try:
+        await _send_calculation_report(message, profile)
+        sent = await _send_plan(
+            message,
+            profile,
+            include_default_after_plan_keyboard=False,
+            on_expected_value_messages=set_expected_value_messages,
+            on_value_send_start=mark_send_started,
+            on_value_message_delivered=mark_value_message_delivered,
+        )
+    except Exception:
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="trial_one_day_exception",
+        )
+        raise
+
+    if not sent:
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="trial_one_day_not_sent",
+        )
+        return False
+
+    finish_result = runtime.finish_success(job_id)
+    if finish_result.status not in {
+        OneDayFinishJobResultStatus.SUCCEEDED,
+        OneDayFinishJobResultStatus.ALREADY_TERMINAL,
+    }:
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="trial_one_day_finish_success_invalid",
+        )
+        return False
+    return True
 
 
 def _try_enter_one_day_plan_generation(chat_id: int) -> bool:
