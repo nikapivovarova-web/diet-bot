@@ -181,6 +181,15 @@ def test_validate_schema_rejects_missing_required_column(store: PostgresOneDayGe
         store.validate_schema()
 
 
+def test_validate_schema_rejects_missing_required_table(store: PostgresOneDayGenerationJobStore) -> None:
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE one_day_generation_job_value_messages")
+
+    with pytest.raises(RuntimeError, match=r"missing tables.*one_day_generation_job_value_messages"):
+        store.validate_schema()
+
+
 def test_admit_creates_queued_job_defaults(store: PostgresOneDayGenerationJobStore) -> None:
     now = datetime(2026, 5, 26, tzinfo=UTC)
 
