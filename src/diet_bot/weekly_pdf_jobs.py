@@ -20,8 +20,14 @@ REFUND_STATUS_NOT_REQUIRED = "not_required"
 REFUND_STATUS_PENDING = "pending"
 REFUND_STATUS_REFUNDED = "refunded"
 
+DELIVERY_STATUS_NOT_STARTED = "not_started"
+DELIVERY_STATUS_SEND_STARTED = "send_started"
+DELIVERY_STATUS_DELIVERED = "delivered"
+DELIVERY_STATUS_UNKNOWN = "unknown"
+
 JobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
 RefundStatus = Literal["not_required", "pending", "refunded"]
+DeliveryStatus = Literal["not_started", "send_started", "delivered", "unknown"]
 
 ACTIVE_JOB_STATUSES = frozenset({JOB_STATUS_QUEUED, JOB_STATUS_RUNNING})
 TERMINAL_JOB_STATUSES = frozenset({JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED})
@@ -47,6 +53,11 @@ class WeeklyPdfJob:
     send_started_at: datetime | None = None
     delivered_at: datetime | None = None
     finalization_error: str | None = None
+    delivery_status: DeliveryStatus = DELIVERY_STATUS_NOT_STARTED
+    requires_manual_review: bool = False
+    manual_review_reason: str | None = None
+    manual_reviewed_at: datetime | None = None
+    manual_review_resolution: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata))
