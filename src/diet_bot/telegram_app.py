@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -110,7 +111,18 @@ from .payment_runtime import (
     validate_payment_runtime_for_startup,
 )
 from .payment_recovery_spool import PaymentRecoveryRecord, append_payment_recovery_record
-from .one_day_generation_job_runtime import validate_one_day_generation_job_store_for_startup
+from .one_day_generation_job_runtime import (
+    OneDayGenerationJobRuntime,
+    validate_one_day_generation_job_store_for_startup,
+)
+from .one_day_generation_jobs import (
+    AdmitJobResultStatus as OneDayAdmitJobResultStatus,
+    FinishJobResultStatus as OneDayFinishJobResultStatus,
+    MarkSendStartedResultStatus as OneDayMarkSendStartedResultStatus,
+    MarkValueMessageDeliveredResultStatus as OneDayMarkValueMessageDeliveredResultStatus,
+    SetExpectedValueMessagesResultStatus as OneDaySetExpectedValueMessagesResultStatus,
+    StartJobResultStatus as OneDayStartJobResultStatus,
+)
 from .payments import (
     PRODUCT_EXTRA_ONE_DAY,
     PRODUCT_EXTRA_WEEKLY_PDF,
@@ -196,6 +208,21 @@ def _weekly_pdf_job_runtime() -> WeeklyPdfJobRuntime | None:
     if _WEEKLY_PDF_JOB_RUNTIME is None:
         return None
     return _WEEKLY_PDF_JOB_RUNTIME  # type: ignore[return-value]
+
+
+_ONE_DAY_GENERATION_JOB_RUNTIME_NOT_LOADED = object()
+_ONE_DAY_GENERATION_JOB_RUNTIME: OneDayGenerationJobRuntime | None | object = (
+    _ONE_DAY_GENERATION_JOB_RUNTIME_NOT_LOADED
+)
+
+
+def _one_day_generation_job_runtime() -> OneDayGenerationJobRuntime | None:
+    global _ONE_DAY_GENERATION_JOB_RUNTIME
+    if _ONE_DAY_GENERATION_JOB_RUNTIME is _ONE_DAY_GENERATION_JOB_RUNTIME_NOT_LOADED:
+        _ONE_DAY_GENERATION_JOB_RUNTIME = OneDayGenerationJobRuntime.from_config(load_runtime_config())
+    if _ONE_DAY_GENERATION_JOB_RUNTIME is None:
+        return None
+    return _ONE_DAY_GENERATION_JOB_RUNTIME  # type: ignore[return-value]
 
 
 def _validate_entitlement_storage(config) -> None:
@@ -1181,7 +1208,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
     if data == CALLBACK_REPEAT:
         await callback.answer()
-        await _repeat_plan(message)
+        await _repeat_plan(message, idempotency_key=_one_day_callback_idempotency_key(callback))
         return
 
     if data == CALLBACK_ONE_DAY_PLAN:
@@ -1190,7 +1217,11 @@ async def handle_callback(callback: CallbackQuery) -> None:
         if profile is None:
             await _start_questionnaire(message)
             return
-        await _send_one_day_plan_with_access(message, profile)
+        await _send_one_day_plan_with_access(
+            message,
+            profile,
+            idempotency_key=_one_day_callback_idempotency_key(callback),
+        )
         return
 
     if data == CALLBACK_WEEK_PLAN_PDF:
@@ -1351,14 +1382,21 @@ async def handle_answer(message: Message) -> None:
         await message.answer(FEATURES_MESSAGE, reply_markup=_main_menu_keyboard(chat_id))
         return
     if text == REPEAT_PLAN_TEXT:
-        await _repeat_plan(message)
+        await _repeat_plan(
+            message,
+            idempotency_key=_one_day_request_idempotency_key(message, None, event="repeat"),
+        )
         return
     if text == ONE_DAY_PLAN_TEXT or text.startswith(SUBSCRIBER_ONE_DAY_PLAN_TEXT):
         profile = _profile_for_chat(chat_id)
         if profile is None:
             await _start_questionnaire(message)
             return
-        await _send_one_day_plan_with_access(message, profile)
+        await _send_one_day_plan_with_access(
+            message,
+            profile,
+            idempotency_key=_one_day_request_idempotency_key(message, None, event="one_day"),
+        )
         return
     if text == WEEK_PLAN_PDF_TEXT or text.startswith(SUBSCRIBER_WEEK_PLAN_PDF_TEXT):
         profile = _profile_for_chat(chat_id)
@@ -1693,12 +1731,16 @@ async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> N
     )
 
 
-async def _repeat_plan(message: Message) -> None:
+async def _repeat_plan(message: Message, *, idempotency_key: str | None = None) -> None:
     profile = _profile_for_chat(message.chat.id)
     if profile is None:
         await _start_questionnaire(message)
         return
-    await _send_one_day_plan_with_access(message, profile)
+    await _send_one_day_plan_with_access(
+        message,
+        profile,
+        idempotency_key=idempotency_key or _one_day_request_idempotency_key(message, None, event="repeat"),
+    )
 
 
 async def _send_calculation_options(message: Message, profile: UserProfile) -> None:
@@ -1761,13 +1803,27 @@ def _release_one_day_plan_generation(chat_id: int) -> None:
         _ONE_DAY_PLAN_IN_FLIGHT_CHAT_IDS.discard(chat_id)
 
 
-async def _send_one_day_plan_with_access(message: Message, profile: UserProfile) -> bool:
+async def _send_one_day_plan_with_access(
+    message: Message,
+    profile: UserProfile,
+    *,
+    idempotency_key: str | None = None,
+) -> bool:
     chat_id = message.chat.id
     if not _try_enter_one_day_plan_generation(chat_id):
         await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
     try:
+        runtime = _one_day_generation_job_runtime()
+        if runtime is not None:
+            return await _send_one_day_plan_with_postgres_job(
+                message,
+                profile,
+                runtime=runtime,
+                idempotency_key=_one_day_request_idempotency_key(message, idempotency_key, event="one_day"),
+            )
+
         try:
             consumption = _consume_generation_attempt(chat_id, "one_day")
         except EntitlementStorageError:
@@ -1793,6 +1849,174 @@ async def _send_one_day_plan_with_access(message: Message, profile: UserProfile)
         return sent
     finally:
         _release_one_day_plan_generation(chat_id)
+
+
+async def _send_one_day_plan_with_postgres_job(
+    message: Message,
+    profile: UserProfile,
+    *,
+    runtime: OneDayGenerationJobRuntime,
+    idempotency_key: str,
+) -> bool:
+    chat_id = message.chat.id
+    try:
+        runtime.cleanup_stale(chat_id=chat_id)
+    except Exception:
+        logger.exception("Failed to cleanup stale one-day generation jobs")
+
+    try:
+        job_admission = runtime.admit(
+            chat_id=chat_id,
+            idempotency_key=idempotency_key,
+            metadata={"source": "telegram_one_day"},
+        )
+    except Exception:
+        logger.exception("Failed to admit one-day generation Postgres job")
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if job_admission.status in {
+        OneDayAdmitJobResultStatus.ACTIVE_DUPLICATE,
+        OneDayAdmitJobResultStatus.EXISTING_IDEMPOTENCY,
+    }:
+        await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
+        return False
+
+    try:
+        start_result = runtime.start_job_and_consume(
+            job_admission.job.job_id,
+            test_access=chat_id in TESTER_CHAT_IDS,
+        )
+    except Exception:
+        logger.exception("Failed to start one-day generation Postgres job")
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="one_day_start_exception",
+        )
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if start_result.status == OneDayStartJobResultStatus.DENIED:
+        await _send_limit_paywall(message, "one_day")
+        return False
+
+    if start_result.status != OneDayStartJobResultStatus.STARTED or start_result.job is None:
+        await message.answer(
+            ONE_DAY_PLAN_ALREADY_RUNNING_TEXT
+            if start_result.status == OneDayStartJobResultStatus.ALREADY_RUNNING
+            else ENTITLEMENT_STORAGE_ERROR_TEXT
+        )
+        return False
+
+    job_id = start_result.job.job_id
+
+    def set_expected_value_messages(expected_count: int) -> None:
+        result = runtime.set_expected_value_messages(job_id, expected_count)
+        if result.status not in {
+            OneDaySetExpectedValueMessagesResultStatus.SET,
+            OneDaySetExpectedValueMessagesResultStatus.ALREADY_SET,
+        }:
+            raise RuntimeError(f"One-day expected message count was not persisted: {result.status.value}")
+
+    def mark_send_started() -> None:
+        result = runtime.mark_send_started(job_id)
+        if result.status not in {
+            OneDayMarkSendStartedResultStatus.SEND_STARTED,
+            OneDayMarkSendStartedResultStatus.ALREADY_SEND_STARTED,
+        }:
+            raise RuntimeError(f"One-day send-start marker was not persisted: {result.status.value}")
+
+    def mark_value_message_delivered(value_message_key: str) -> None:
+        result = runtime.mark_value_message_delivered(job_id, value_message_key=value_message_key)
+        if result.status not in {
+            OneDayMarkValueMessageDeliveredResultStatus.DELIVERED,
+            OneDayMarkValueMessageDeliveredResultStatus.ALREADY_DELIVERED,
+        }:
+            raise RuntimeError(f"One-day value delivery marker was not persisted: {result.status.value}")
+
+    try:
+        sent = await _send_plan(
+            message,
+            profile,
+            status_text=_format_entitlement_status(chat_id),
+            on_expected_value_messages=set_expected_value_messages,
+            on_value_send_start=mark_send_started,
+            on_value_message_delivered=mark_value_message_delivered,
+        )
+    except Exception:
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="one_day_exception",
+        )
+        raise
+
+    if not sent:
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="one_day_not_sent",
+        )
+        return False
+
+    finish_result = runtime.finish_success(job_id)
+    if finish_result.status not in {
+        OneDayFinishJobResultStatus.SUCCEEDED,
+        OneDayFinishJobResultStatus.ALREADY_TERMINAL,
+    }:
+        _finish_one_day_postgres_job_failure(
+            runtime,
+            job_id,
+            chat_id=chat_id,
+            reason="one_day_finish_success_invalid",
+        )
+        return False
+    return True
+
+
+def _finish_one_day_postgres_job_failure(
+    runtime: OneDayGenerationJobRuntime,
+    job_id: object,
+    *,
+    chat_id: int,
+    reason: str,
+) -> None:
+    try:
+        runtime.finish_failure_and_refund_once(job_id, reason=reason)
+    except Exception:
+        logger.exception(
+            "Failed to finalize failed one-day generation Postgres job for chat_id=%s",
+            _mask_chat_id(chat_id),
+        )
+
+
+def _one_day_callback_idempotency_key(callback: CallbackQuery) -> str | None:
+    callback_id = getattr(callback, "id", None)
+    data = getattr(callback, "data", None)
+    if callback_id and data:
+        return f"telegram_callback:{callback_id}:{data}"
+    if callback_id:
+        return f"telegram_callback:{callback_id}"
+    message = getattr(callback, "message", None)
+    message_id = getattr(message, "message_id", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if data and chat_id is not None and message_id is not None:
+        return f"telegram_callback_data:{chat_id}:{message_id}:{data}"
+    return None
+
+
+def _one_day_request_idempotency_key(message: Message, idempotency_key: str | None, *, event: str) -> str:
+    if idempotency_key:
+        return idempotency_key
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        return f"telegram_message:{message.chat.id}:{message_id}:{event}"
+    return f"telegram_request:{message.chat.id}:{event}:{time.time_ns()}"
 
 
 def _weekly_pdf_callback_idempotency_key(callback: CallbackQuery) -> str | None:
@@ -2296,6 +2520,9 @@ async def _send_plan(
     final_reply_markup: InlineKeyboardMarkup | None = None,
     include_default_after_plan_keyboard: bool = True,
     status_text: str | None = None,
+    on_expected_value_messages: Callable[[int], None] | None = None,
+    on_value_send_start: Callable[[], None] | None = None,
+    on_value_message_delivered: Callable[[str], None] | None = None,
 ) -> bool:
     chat_id = message.chat.id
     count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
@@ -2333,16 +2560,34 @@ async def _send_plan(
     messages = list(format_plan_messages(plan_result, validation))
     if status_text and len(messages) > 2:
         messages[-1] = f"{messages[-1]}\n\n{status_text}"
-    for meal in plan_result.meals:
+    if on_expected_value_messages is not None:
+        on_expected_value_messages(len(plan_result.meals) + 2)
+    if on_value_send_start is not None:
+        on_value_send_start()
+    for meal_index, meal in enumerate(plan_result.meals):
         await _send_meal_card(message, meal)
+        if on_value_message_delivered is not None:
+            on_value_message_delivered(_one_day_meal_value_message_key(meal_index, meal))
     _remember_recipes(chat_id, plan_result)
     plan_reply_markup = final_reply_markup
     if plan_reply_markup is None and include_default_after_plan_keyboard:
         plan_reply_markup = _after_plan_keyboard(message.chat.id)
-    for index, response in enumerate(messages[2:]):
-        markup = plan_reply_markup if index == len(messages[2:]) - 1 else None
+    summary_keys = ("summary:daily_totals", "summary:shopping")
+    summary_messages = messages[2:]
+    for index, response in enumerate(summary_messages):
+        markup = plan_reply_markup if index == len(summary_messages) - 1 else None
         await _send_text_chunks(message, response, markup)
+        if on_value_message_delivered is not None and index < len(summary_keys):
+            on_value_message_delivered(summary_keys[index])
     return True
+
+
+def _one_day_meal_value_message_key(index: int, meal: Meal) -> str:
+    recipe_key = meal.recipe_id or meal.recipe_key
+    if not recipe_key:
+        name_hash = hashlib.sha256(meal.name.encode("utf-8")).hexdigest()[:16]
+        recipe_key = f"name_hash:{name_hash}"
+    return f"meal:{index:02d}:{recipe_key}"
 
 
 async def _send_week_plan(

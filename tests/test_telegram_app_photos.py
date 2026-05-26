@@ -5,6 +5,7 @@ import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from aiogram.exceptions import TelegramAPIError
@@ -44,6 +45,21 @@ from diet_bot.payment_recovery_spool import (
     append_payment_recovery_record as write_payment_recovery_record,
     read_payment_recovery_records,
 )
+from diet_bot.one_day_generation_jobs import (
+    AdmitJobResult,
+    AdmitJobResultStatus as OneDayAdmitJobResultStatus,
+    FinishJobResult,
+    FinishJobResultStatus as OneDayFinishJobResultStatus,
+    MarkSendStartedResult,
+    MarkSendStartedResultStatus as OneDayMarkSendStartedResultStatus,
+    MarkValueMessageDeliveredResult,
+    MarkValueMessageDeliveredResultStatus,
+    OneDayGenerationJob,
+    SetExpectedValueMessagesResult,
+    SetExpectedValueMessagesResultStatus,
+    StartJobResult,
+    StartJobResultStatus as OneDayStartJobResultStatus,
+)
 from diet_bot.telegram_app import (
     BOT_COMMANDS,
     BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
@@ -60,6 +76,7 @@ from diet_bot.telegram_app import (
     CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF,
     CALLBACK_PAY_TELEGRAM_STARS,
     CALLBACK_PROMO_CODE,
+    CALLBACK_REPEAT,
     CALLBACK_START,
     CALLBACK_SUBSCRIBE,
     CALLBACK_SUPPORT,
@@ -1760,6 +1777,7 @@ class FakeMessage:
         first_name=None,
         last_name=None,
         chat_type="private",
+        message_id=None,
     ) -> None:
         self.chat = type("FakeChat", (), {"id": chat_id, "type": chat_type})()
         self.from_user = SimpleNamespace(
@@ -1770,6 +1788,7 @@ class FakeMessage:
             full_name=" ".join(part for part in (first_name, last_name) if part),
         )
         self.text = text
+        self.message_id = chat_id if message_id is None else message_id
         self.bot = FakeInvoiceBot()
         self.photos = []
         self.texts = []
@@ -1788,7 +1807,15 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self, data: str, message: FakeMessage, *, user_id: int | None = None) -> None:
+    def __init__(
+        self,
+        data: str,
+        message: FakeMessage,
+        *,
+        user_id: int | None = None,
+        callback_id: str | None = None,
+    ) -> None:
+        self.id = callback_id or f"callback-{message.chat.id}-{data}"
         self.data = data
         self.message = message
         self.from_user = SimpleNamespace(id=message.chat.id if user_id is None else user_id)
@@ -2012,6 +2039,112 @@ def _save_active_subscription(
     entitlement.extra_weekly_pdf_remaining = extra_weekly_pdf_remaining
     telegram_app.save_entitlements(path, {chat_id: entitlement})
     return entitlement
+
+
+def _one_day_plan_targets() -> NutritionTargets:
+    return NutritionTargets(
+        bmi=22,
+        bmi_category="normal",
+        bmr_kcal=1500,
+        tdee_kcal=2000,
+        water_l=2.0,
+        targets=NutrientVector({"energy_kcal": 2000}),
+        calorie_bounds=(1800, 2200),
+        macro_bounds={},
+    )
+
+
+def _one_day_plan_for_runtime_tests(*, meals: tuple[Meal, ...] | None = None, can_generate: bool = True) -> MealPlan:
+    if meals is None:
+        meals = (
+            Meal("Breakfast", (), "Recipe 1", recipe_id="r1"),
+            Meal("Lunch", (), "Recipe 2", recipe_key="lunch:curated:r2"),
+        )
+    return MealPlan(
+        meals,
+        _one_day_plan_targets(),
+        SafetyResult(can_generate_plan=can_generate, red_flags=() if can_generate else ("unsafe",)),
+    )
+
+
+class FakeOneDayGenerationRuntime:
+    def __init__(
+        self,
+        *,
+        admit_status: OneDayAdmitJobResultStatus = OneDayAdmitJobResultStatus.ADMITTED,
+        start_status: OneDayStartJobResultStatus = OneDayStartJobResultStatus.STARTED,
+        fail_mark_send_started: bool = False,
+    ) -> None:
+        self.admit_status = admit_status
+        self.start_status = start_status
+        self.fail_mark_send_started = fail_mark_send_started
+        self.calls: list[tuple[str, object]] = []
+        self.events: list[str] = []
+        self.expected_counts: list[int] = []
+        self.delivered_keys: list[str] = []
+        self.job = self._job(chat_id=0, idempotency_key="initial")
+
+    def _job(self, *, chat_id: int, idempotency_key: str) -> OneDayGenerationJob:
+        return OneDayGenerationJob(
+            job_id=uuid4(),
+            chat_id=chat_id,
+            idempotency_key=idempotency_key,
+            status="queued",
+            consumption_source=None,
+            refund_status="not_required",
+            delivery_status="not_started",
+            expected_value_messages=0,
+            delivered_value_messages=0,
+            stale_after=datetime(2026, 5, 26, tzinfo=UTC),
+        )
+
+    def cleanup_stale(self, *, chat_id: int):
+        self.events.append("runtime:cleanup_stale")
+        self.calls.append(("cleanup_stale", chat_id))
+
+    def admit(self, *, chat_id: int, idempotency_key: str, metadata=None):
+        self.events.append("runtime:admit")
+        self.calls.append(("admit", {"chat_id": chat_id, "idempotency_key": idempotency_key, "metadata": metadata}))
+        self.job = self._job(chat_id=chat_id, idempotency_key=idempotency_key)
+        return AdmitJobResult(self.admit_status, self.job)
+
+    def start_job_and_consume(self, job_id, *, test_access: bool = False):
+        self.events.append("runtime:start_job_and_consume")
+        self.calls.append(("start_job_and_consume", {"job_id": job_id, "test_access": test_access}))
+        return StartJobResult(self.start_status, self.job)
+
+    def set_expected_value_messages(self, job_id, expected_count: int):
+        self.events.append(f"runtime:set_expected:{expected_count}")
+        self.calls.append(("set_expected_value_messages", {"job_id": job_id, "expected_count": expected_count}))
+        self.expected_counts.append(expected_count)
+        return SetExpectedValueMessagesResult(SetExpectedValueMessagesResultStatus.SET, self.job)
+
+    def mark_send_started(self, job_id):
+        self.events.append("runtime:mark_send_started")
+        self.calls.append(("mark_send_started", job_id))
+        if self.fail_mark_send_started:
+            raise RuntimeError("send-start marker failed")
+        return MarkSendStartedResult(OneDayMarkSendStartedResultStatus.SEND_STARTED, self.job)
+
+    def mark_value_message_delivered(self, job_id, *, value_message_key: str):
+        self.events.append(f"runtime:mark_delivered:{value_message_key}")
+        self.calls.append(("mark_value_message_delivered", {"job_id": job_id, "value_message_key": value_message_key}))
+        self.delivered_keys.append(value_message_key)
+        return MarkValueMessageDeliveredResult(MarkValueMessageDeliveredResultStatus.DELIVERED, self.job)
+
+    def finish_success(self, job_id):
+        self.events.append("runtime:finish_success")
+        self.calls.append(("finish_success", job_id))
+        return FinishJobResult(OneDayFinishJobResultStatus.SUCCEEDED, self.job)
+
+    def finish_failure_and_refund_once(self, job_id, *, reason: str | None = None):
+        self.events.append(f"runtime:finish_failure:{reason}")
+        self.calls.append(("finish_failure_and_refund_once", {"job_id": job_id, "reason": reason}))
+        return FinishJobResult(OneDayFinishJobResultStatus.FAILED, self.job)
+
+
+def _install_one_day_runtime(monkeypatch, runtime: FakeOneDayGenerationRuntime | None) -> None:
+    monkeypatch.setattr(telegram_app, "_ONE_DAY_GENERATION_JOB_RUNTIME", runtime, raising=False)
 
 
 @pytest.mark.anyio
@@ -2820,6 +2953,317 @@ async def test_one_day_generation_different_chats_do_not_block_each_other(monkey
         if second_task is not None:
             cleanup_tasks.append(second_task)
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+
+@pytest.mark.anyio
+async def test_one_day_json_backend_preserves_legacy_consume_refund_behavior(monkeypatch, tmp_path) -> None:
+    chat_id = 91_025
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    send_calls = 0
+
+    async def fake_send_plan(*_args, **_kwargs) -> bool:
+        nonlocal send_calls
+        send_calls += 1
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+
+    sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id), profile_with())
+
+    entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert sent is True
+    assert send_calls == 1
+    assert entitlement.monthly_one_day_remaining == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "admit_status",
+    [OneDayAdmitJobResultStatus.ACTIVE_DUPLICATE, OneDayAdmitJobResultStatus.EXISTING_IDEMPOTENCY],
+)
+async def test_postgres_one_day_duplicate_admission_does_not_consume_or_generate(
+    monkeypatch,
+    admit_status,
+) -> None:
+    chat_id = 91_026
+    runtime = FakeOneDayGenerationRuntime(admit_status=admit_status)
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    def fail_consume(*_args, **_kwargs):
+        raise AssertionError("Postgres duplicate admission must not use legacy consume path")
+
+    async def fail_send_plan(*_args, **_kwargs) -> bool:
+        raise AssertionError("Postgres duplicate admission must not generate a one-day plan")
+
+    monkeypatch.setattr(telegram_app, "_consume_generation_attempt", fail_consume)
+    monkeypatch.setattr(telegram_app, "_send_plan", fail_send_plan)
+
+    sent = await telegram_app._send_one_day_plan_with_access(
+        FakeMessage(chat_id, message_id=410),
+        profile_with(),
+        idempotency_key="telegram_callback:duplicate:diet:one_day",
+    )
+
+    assert sent is False
+    assert runtime.calls == [
+        ("cleanup_stale", chat_id),
+        (
+            "admit",
+            {
+                "chat_id": chat_id,
+                "idempotency_key": "telegram_callback:duplicate:diet:one_day",
+                "metadata": {"source": "telegram_one_day"},
+            },
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_denied_start_sends_paywall(monkeypatch) -> None:
+    chat_id = 91_027
+    runtime = FakeOneDayGenerationRuntime(start_status=OneDayStartJobResultStatus.DENIED)
+    paywalls: list[str] = []
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def fake_send_limit_paywall(message, ration_kind) -> None:
+        paywalls.append(ration_kind)
+        await message.answer(f"paywall:{ration_kind}")
+
+    async def fail_send_plan(*_args, **_kwargs) -> bool:
+        raise AssertionError("Denied Postgres start must not generate a one-day plan")
+
+    monkeypatch.setattr(telegram_app, "_send_limit_paywall", fake_send_limit_paywall)
+    monkeypatch.setattr(telegram_app, "_send_plan", fail_send_plan)
+
+    sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id, message_id=411), profile_with())
+
+    assert sent is False
+    assert paywalls == ["one_day"]
+    assert [name for name, _ in runtime.calls] == ["cleanup_stale", "admit", "start_job_and_consume"]
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_successful_callback_marks_value_delivery(monkeypatch) -> None:
+    chat_id = 91_028
+    runtime = FakeOneDayGenerationRuntime()
+    message = FakeMessage(chat_id, message_id=412)
+    _install_one_day_runtime(monkeypatch, runtime)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    PROFILE_BY_CHAT_ID[chat_id] = profile_with()
+    plan = _one_day_plan_for_runtime_tests()
+
+    async def fake_send_meal_card(_message, meal) -> None:
+        runtime.events.append(f"telegram:meal:{meal.recipe_id or meal.recipe_key}")
+
+    async def fake_send_text_chunks(_message, text, _reply_markup=None) -> None:
+        runtime.events.append(f"telegram:summary:{text.splitlines()[0]}")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fake_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_send_text_chunks", fake_send_text_chunks)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status-text")
+    try:
+        await telegram_app.handle_callback(
+            FakeCallback(CALLBACK_ONE_DAY_PLAN, message, callback_id="callback-success-1"),
+        )
+
+        admit_call = next(payload for name, payload in runtime.calls if name == "admit")
+        assert admit_call["idempotency_key"] == f"telegram_callback:callback-success-1:{CALLBACK_ONE_DAY_PLAN}"
+        assert runtime.expected_counts == [len(plan.meals) + 2]
+        assert runtime.events.index("runtime:mark_send_started") < runtime.events.index("telegram:meal:r1")
+        assert runtime.delivered_keys == [
+            "meal:00:r1",
+            "meal:01:lunch:curated:r2",
+            "summary:daily_totals",
+            "summary:shopping",
+        ]
+        assert runtime.events[-1] == "runtime:finish_success"
+    finally:
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_text_request_uses_message_id_idempotency(monkeypatch) -> None:
+    chat_id = 91_029
+    runtime = FakeOneDayGenerationRuntime()
+    _install_one_day_runtime(monkeypatch, runtime)
+    PROFILE_BY_CHAT_ID[chat_id] = profile_with()
+
+    async def fake_send_plan(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+    try:
+        await handle_answer(FakeMessage(chat_id, text=ONE_DAY_PLAN_TEXT, message_id=222))
+
+        admit_call = next(payload for name, payload in runtime.calls if name == "admit")
+        assert admit_call["idempotency_key"] == f"telegram_message:{chat_id}:222:one_day"
+    finally:
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_postgres_repeat_callback_and_text_requests_use_one_day_runtime(monkeypatch) -> None:
+    callback_chat_id = 91_030
+    text_chat_id = 91_031
+    callback_runtime = FakeOneDayGenerationRuntime()
+    text_runtime = FakeOneDayGenerationRuntime()
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    PROFILE_BY_CHAT_ID[callback_chat_id] = profile_with()
+    PROFILE_BY_CHAT_ID[text_chat_id] = profile_with()
+
+    async def fake_send_plan(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+    try:
+        _install_one_day_runtime(monkeypatch, callback_runtime)
+        await telegram_app.handle_callback(
+            FakeCallback(CALLBACK_REPEAT, FakeMessage(callback_chat_id, message_id=223), callback_id="repeat-cb-1"),
+        )
+        callback_admit = next(payload for name, payload in callback_runtime.calls if name == "admit")
+
+        _install_one_day_runtime(monkeypatch, text_runtime)
+        await handle_answer(FakeMessage(text_chat_id, text=telegram_app.REPEAT_PLAN_TEXT, message_id=224))
+        text_admit = next(payload for name, payload in text_runtime.calls if name == "admit")
+
+        assert callback_admit["idempotency_key"] == f"telegram_callback:repeat-cb-1:{CALLBACK_REPEAT}"
+        assert text_admit["idempotency_key"] == f"telegram_message:{text_chat_id}:224:repeat"
+    finally:
+        PROFILE_BY_CHAT_ID.pop(callback_chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(text_chat_id, None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "plan",
+    [
+        _one_day_plan_for_runtime_tests(meals=(), can_generate=True),
+        _one_day_plan_for_runtime_tests(meals=(), can_generate=False),
+    ],
+)
+async def test_postgres_one_day_generation_failure_before_send_start_refunds_with_runtime(
+    monkeypatch,
+    plan,
+) -> None:
+    chat_id = 91_032
+    runtime = FakeOneDayGenerationRuntime()
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    def fail_old_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres one-day failures must not use legacy JSON refund path")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_old_refund)
+
+    sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id, message_id=225), profile_with())
+
+    assert sent is False
+    assert "runtime:mark_send_started" not in runtime.events
+    assert runtime.events[-1] == "runtime:finish_failure:one_day_not_sent"
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_send_start_marker_failure_refunds_before_value_send(monkeypatch) -> None:
+    chat_id = 91_033
+    runtime = FakeOneDayGenerationRuntime(fail_mark_send_started=True)
+    _install_one_day_runtime(monkeypatch, runtime)
+    plan = _one_day_plan_for_runtime_tests(meals=(Meal("Breakfast", (), "Recipe 1", recipe_id="r1"),))
+
+    async def fail_send_meal_card(*_args, **_kwargs) -> None:
+        raise AssertionError("Value message must not send when send-start marker fails")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fail_send_meal_card)
+
+    with pytest.raises(RuntimeError, match="send-start marker failed"):
+        await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id, message_id=226), profile_with())
+
+    assert runtime.events[-1] == "runtime:finish_failure:one_day_exception"
+    assert runtime.delivered_keys == []
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_send_failure_after_send_start_uses_runtime_no_legacy_refund(monkeypatch) -> None:
+    chat_id = 91_034
+    runtime = FakeOneDayGenerationRuntime()
+    _install_one_day_runtime(monkeypatch, runtime)
+    plan = _one_day_plan_for_runtime_tests(meals=(Meal("Breakfast", (), "Recipe 1", recipe_id="r1"),))
+
+    async def fail_send_meal_card(*_args, **_kwargs) -> None:
+        raise RuntimeError("telegram send failed")
+
+    def fail_old_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres one-day failures must not use legacy JSON refund path")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fail_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_old_refund)
+
+    with pytest.raises(RuntimeError, match="telegram send failed"):
+        await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id, message_id=227), profile_with())
+
+    assert "runtime:mark_send_started" in runtime.events
+    assert runtime.delivered_keys == []
+    assert runtime.events[-1] == "runtime:finish_failure:one_day_exception"
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_partial_delivery_failure_uses_runtime_no_legacy_refund(monkeypatch) -> None:
+    chat_id = 91_035
+    runtime = FakeOneDayGenerationRuntime()
+    _install_one_day_runtime(monkeypatch, runtime)
+    plan = _one_day_plan_for_runtime_tests()
+    sent_meals = 0
+
+    async def flaky_send_meal_card(_message, _meal) -> None:
+        nonlocal sent_meals
+        sent_meals += 1
+        if sent_meals == 2:
+            raise RuntimeError("second value failed")
+
+    def fail_old_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres partial delivery must not use legacy JSON refund path")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", flaky_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_old_refund)
+
+    with pytest.raises(RuntimeError, match="second value failed"):
+        await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id, message_id=228), profile_with())
+
+    assert runtime.delivered_keys == ["meal:00:r1"]
+    assert runtime.events[-1] == "runtime:finish_failure:one_day_exception"
+
+
+@pytest.mark.anyio
+async def test_send_trial_plan_keeps_legacy_path_without_one_day_job_runtime(monkeypatch, tmp_path) -> None:
+    chat_id = 91_036
+    subscriptions_path = tmp_path / "subscriptions.json"
+    runtime = FakeOneDayGenerationRuntime()
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, runtime)
+    message = FakeMessage(chat_id, message_id=229)
+
+    async def fake_send_plan(*_args, **_kwargs) -> bool:
+        return True
+
+    async def fake_send_calculation_report(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(telegram_app, "_send_calculation_report", fake_send_calculation_report)
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+
+    await telegram_app._send_trial_plan(message, profile_with())
+
+    entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert entitlement.free_trial_used is True
+    assert runtime.calls == []
+    assert message.texts[-1][0].startswith(TRIAL_SUBSCRIPTION_TEXT)
 
 
 @pytest.mark.anyio
