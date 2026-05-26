@@ -12,8 +12,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_FILE = PROJECT_ROOT / ".diet_bot_state" / "history.json"
 DEFAULT_SUBSCRIPTIONS_STATE_FILE = DEFAULT_STATE_FILE.with_name("subscriptions.json")
 DEFAULT_PROMO_CODES_STATE_FILE = DEFAULT_STATE_FILE.with_name("promo_codes.json")
+DEFAULT_PAYMENT_RECOVERY_SPOOL = DEFAULT_SUBSCRIPTIONS_STATE_FILE.with_name("payment_recovery.jsonl")
 
 MISSING_BOT_TOKEN_ERROR = "Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN."
+PAYMENT_RECOVERY_SPOOL_ENV = "DIET_BOT_PAYMENT_RECOVERY_SPOOL"
 
 _TRUTHY_VALUES = {"1", "true", "yes", "on"}
 _VALID_STORAGE_BACKENDS = {"json", "postgres"}
@@ -31,6 +33,8 @@ class RuntimeConfig:
     state_file: Path
     subscriptions_state_file: Path
     promo_codes_state_file: Path
+    payment_recovery_spool: Path
+    payment_recovery_spool_configured: bool
     support_chat_id: int | None
     admin_user_ids: frozenset[int]
     tester_chat_ids: frozenset[int]
@@ -51,6 +55,8 @@ class RuntimeConfig:
             "state_file": str(self.state_file),
             "subscriptions_state_file": str(self.subscriptions_state_file),
             "promo_codes_state_file": str(self.promo_codes_state_file),
+            "payment_recovery_spool": str(self.payment_recovery_spool),
+            "payment_recovery_spool_configured": self.payment_recovery_spool_configured,
             "support_chat_id": "set" if self.support_chat_id is not None else "missing",
             "admin_user_ids_count": len(self.admin_user_ids),
             "tester_chat_ids_count": len(self.tester_chat_ids),
@@ -68,6 +74,10 @@ class RuntimeConfig:
                 issues.append("Payments require Postgres storage backend.")
             if not self.database_url:
                 issues.append("DIET_BOT_DATABASE_URL is required when payments are enabled.")
+            if not self.payment_recovery_spool_configured:
+                issues.append("DIET_BOT_PAYMENT_RECOVERY_SPOOL is required when payments are enabled.")
+            elif not self.payment_recovery_spool.is_absolute():
+                issues.append("DIET_BOT_PAYMENT_RECOVERY_SPOOL must be an absolute path when payments are enabled.")
         if is_production_environment(self.environment):
             if not self.database_url:
                 issues.append("DIET_BOT_DATABASE_URL is required in production.")
@@ -102,6 +112,21 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
     environment = _environment_from_env(source)
     storage_backend, config_errors = _storage_backend_from_env(source, environment)
     state_file = _path_from_env(source, "DIET_BOT_STATE_FILE", DEFAULT_STATE_FILE)
+    subscriptions_state_file = _path_from_env(
+        source,
+        "DIET_BOT_SUBSCRIPTIONS_STATE_FILE",
+        DEFAULT_SUBSCRIPTIONS_STATE_FILE,
+    )
+    promo_codes_state_file = _path_from_env(
+        source,
+        "DIET_BOT_PROMO_CODES_STATE_FILE",
+        DEFAULT_PROMO_CODES_STATE_FILE,
+    )
+    payment_recovery_spool, payment_recovery_spool_configured = _path_from_env_with_configured(
+        source,
+        PAYMENT_RECOVERY_SPOOL_ENV,
+        subscriptions_state_file.with_name("payment_recovery.jsonl"),
+    )
 
     return RuntimeConfig(
         bot_token=bot_token,
@@ -111,16 +136,10 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         telegram_provider_token=_text_from_env(source, "TELEGRAM_PROVIDER_TOKEN") or "",
         database_url=_text_from_env(source, "DIET_BOT_DATABASE_URL"),
         state_file=state_file,
-        subscriptions_state_file=_path_from_env(
-            source,
-            "DIET_BOT_SUBSCRIPTIONS_STATE_FILE",
-            DEFAULT_SUBSCRIPTIONS_STATE_FILE,
-        ),
-        promo_codes_state_file=_path_from_env(
-            source,
-            "DIET_BOT_PROMO_CODES_STATE_FILE",
-            DEFAULT_PROMO_CODES_STATE_FILE,
-        ),
+        subscriptions_state_file=subscriptions_state_file,
+        promo_codes_state_file=promo_codes_state_file,
+        payment_recovery_spool=payment_recovery_spool,
+        payment_recovery_spool_configured=payment_recovery_spool_configured,
         support_chat_id=_optional_int_from_env(source, "DIET_BOT_SUPPORT_CHAT_ID"),
         admin_user_ids=frozenset(_parse_id_set(source.get("DIET_BOT_ADMIN_USER_IDS"))),
         tester_chat_ids=frozenset(_parse_id_set(source.get("DIET_BOT_TESTER_CHAT_IDS"))),
@@ -199,6 +218,13 @@ def _text_from_env(env: Mapping[str, str], key: str) -> str | None:
 def _path_from_env(env: Mapping[str, str], key: str, default: Path) -> Path:
     value = _text_from_env(env, key)
     return Path(value) if value is not None else default
+
+
+def _path_from_env_with_configured(env: Mapping[str, str], key: str, default: Path) -> tuple[Path, bool]:
+    value = _text_from_env(env, key)
+    if value is None:
+        return default, False
+    return Path(value), True
 
 
 def _optional_int_from_env(env: Mapping[str, str], key: str) -> int | None:

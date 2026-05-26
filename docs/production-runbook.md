@@ -39,6 +39,28 @@ Payment configuration:
 - Leave `DIET_BOT_PAYMENTS_ENABLED` unset or set to `0`.
 - Leave `TELEGRAM_PROVIDER_TOKEN` unset unless payment QA or live payment enablement is explicitly approved.
 - Do not add any payment provider token to shell history, logs, docs, or pull request text.
+- When payments are enabled, set `DIET_BOT_PAYMENT_RECOVERY_SPOOL` to a
+  durable absolute path outside the repository, temp directories, and other
+  ephemeral filesystems.
+
+Payment recovery spool storage:
+
+- The spool is required only when `DIET_BOT_PAYMENTS_ENABLED=1`.
+- The operator must provision the parent directory before startup; bot startup
+  must not create the parent directory.
+- The path must be absolute, and the target path must be a file path, not a
+  directory.
+- Ownership and permissions must allow the bot process to create same-directory
+  probe files, append-open the existing spool if present, flush, fsync, and
+  unlink the startup probe.
+- Keep the spool on durable storage with the production data backup and restore
+  set. Include it in backup and restore drills alongside the Postgres backup
+  artifact.
+- Do not place the spool under the repository checkout, `.diet_bot_state` in a
+  deploy tree, OS temp directories, container scratch space, or other ephemeral
+  filesystems.
+- Recovery replay uses the PR45 payment recovery replay tooling documented
+  below. Review and fingerprint the immutable spool before dry-run or apply.
 
 ## Backup First
 

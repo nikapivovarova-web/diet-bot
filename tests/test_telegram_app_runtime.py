@@ -253,7 +253,7 @@ def test_run_bot_postgres_startup_acquires_guard_even_outside_production(monkeyp
     ]
 
 
-def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch) -> None:
+def test_run_bot_payment_enabled_validates_payment_runtime_before_bot(monkeypatch, tmp_path) -> None:
     import diet_bot.telegram_app as telegram_app
     from diet_bot.runtime_config import load_runtime_config
 
@@ -265,6 +265,7 @@ def test_run_bot_payment_enabled_validates_payment_schema_before_bot(monkeypatch
             "DIET_BOT_PAYMENTS_ENABLED": "1",
             "DIET_BOT_STORAGE_BACKEND": "postgres",
             "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(tmp_path / "payments.jsonl"),
         },
     )
 

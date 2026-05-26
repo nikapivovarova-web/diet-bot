@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,10 +47,15 @@ _REQUIRED_SERIALIZED_FIELDS = (
 _MAX_SAFE_TEXT_LENGTH = 512
 _PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _CURRENCY_RE = re.compile(r"^[A-Z0-9]{3,12}$")
+_SPOOL_READY_PROBE_BYTES = b"diet-bot-payment-recovery-spool-startup-probe\n"
 
 
 class PaymentRecoveryRecordError(ValueError):
     """Raised when a payment recovery record fails validation."""
+
+
+class PaymentRecoverySpoolUnavailable(RuntimeError):
+    """Raised when the recovery spool cannot safely accept startup writes."""
 
 
 @dataclass(frozen=True)
@@ -231,6 +237,86 @@ def read_payment_recovery_records(path: str | Path, *, dedupe: bool = True) -> P
         malformed_lines=tuple(malformed_lines),
         duplicates_skipped=duplicates_skipped,
     )
+
+
+def validate_payment_recovery_spool_ready(path: str | Path) -> None:
+    spool_path = Path(path)
+    if not spool_path.is_absolute():
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool path must be absolute")
+
+    parent = spool_path.parent
+    if not parent.exists():
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool parent directory does not exist")
+    if not parent.is_dir():
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool parent path is not a directory")
+    if spool_path.is_dir():
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool target path is a directory")
+
+    if spool_path.exists():
+        _validate_existing_spool_ready(spool_path)
+    _probe_spool_directory(parent, spool_path.name)
+
+
+def _validate_existing_spool_ready(path: Path) -> None:
+    flags = os.O_APPEND | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as spool:
+            fd = None
+            spool.flush()
+            os.fsync(spool.fileno())
+    except OSError as exc:
+        raise PaymentRecoverySpoolUnavailable("existing spool is not append/fsync ready") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _probe_spool_directory(parent: Path, target_name: str) -> None:
+    fd: int | None = None
+    probe_path: Path | None = None
+    failure: OSError | None = None
+    try:
+        fd, raw_probe_path = tempfile.mkstemp(
+            prefix=f".{_safe_probe_filename(target_name)}.startup-",
+            suffix=".tmp",
+            dir=parent,
+        )
+        probe_path = Path(raw_probe_path)
+        with os.fdopen(fd, "wb") as probe:
+            fd = None
+            probe.write(_SPOOL_READY_PROBE_BYTES)
+            probe.flush()
+            os.fsync(probe.fileno())
+    except OSError as exc:
+        failure = exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                if failure is None:
+                    failure = exc
+        if probe_path is not None:
+            try:
+                probe_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if failure is None:
+                    failure = exc
+
+    if failure is not None:
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool directory probe failed") from failure
+
+
+def _safe_probe_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return safe or "payment-recovery-spool"
 
 
 def _build_record_id(

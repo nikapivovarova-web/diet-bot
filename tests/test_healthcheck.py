@@ -140,3 +140,47 @@ def test_healthcheck_does_not_import_telegram_or_touch_db_or_files(monkeypatch, 
 
     assert exit_code == 0
     assert "runtime config healthcheck" in capsys.readouterr().out
+
+
+def test_healthcheck_payment_spool_check_is_config_only_by_default(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.startswith("diet_bot.payment_recovery_spool"):
+            raise AssertionError("healthcheck must not import payment recovery spool readiness")
+        return real_import(name, *args, **kwargs)
+
+    def fail_write_text(self, *args, **kwargs):
+        raise AssertionError(f"healthcheck wrote to {self}")
+
+    def fail_unlink(self, *args, **kwargs):
+        raise AssertionError(f"healthcheck unlinked {self}")
+
+    missing_parent_spool = tmp_path / "missing-parent" / "payments.jsonl"
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(Path, "write_text", fail_write_text)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    sys.modules.pop("diet_bot.healthcheck", None)
+    sys.modules.pop("diet_bot.payment_recovery_spool", None)
+
+    from diet_bot.healthcheck import main
+
+    exit_code = main(
+        [],
+        env={
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(missing_parent_spool),
+        },
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "issues: none" in output
+    assert not missing_parent_spool.exists()

@@ -12,8 +12,10 @@ from diet_bot.payment_recovery_spool import (
     ALLOWED_SERIALIZED_FIELDS,
     PaymentRecoveryRecord,
     PaymentRecoveryRecordError,
+    PaymentRecoverySpoolUnavailable,
     append_payment_recovery_record,
     read_payment_recovery_records,
+    validate_payment_recovery_spool_ready,
 )
 
 
@@ -206,3 +208,127 @@ def test_append_uses_restrictive_permissions_where_supported(tmp_path: Path) -> 
         return
     mode = stat.S_IMODE(path.stat().st_mode)
     assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
+
+
+def test_spool_readiness_accepts_absolute_path_and_does_not_create_target(tmp_path: Path) -> None:
+    path = tmp_path / "payments.jsonl"
+
+    validate_payment_recovery_spool_ready(path)
+
+    assert not path.exists()
+
+
+def test_spool_readiness_preserves_existing_target_contents(tmp_path: Path) -> None:
+    path = tmp_path / "payments.jsonl"
+    existing = '{"existing":true}\n'
+    path.write_text(existing, encoding="utf-8")
+
+    validate_payment_recovery_spool_ready(path)
+
+    assert path.read_text(encoding="utf-8") == existing
+
+
+def test_spool_readiness_rejects_relative_path() -> None:
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="absolute"):
+        validate_payment_recovery_spool_ready(Path("payments.jsonl"))
+
+
+def test_spool_readiness_rejects_missing_parent(tmp_path: Path) -> None:
+    path = tmp_path / "missing" / "payments.jsonl"
+
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="parent directory does not exist"):
+        validate_payment_recovery_spool_ready(path)
+
+    assert not path.parent.exists()
+
+
+def test_spool_readiness_rejects_parent_that_is_file(tmp_path: Path) -> None:
+    parent = tmp_path / "not-a-directory"
+    parent.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="parent path is not a directory"):
+        validate_payment_recovery_spool_ready(parent / "payments.jsonl")
+
+
+def test_spool_readiness_rejects_target_directory(tmp_path: Path) -> None:
+    path = tmp_path / "payments.jsonl"
+    path.mkdir()
+
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="target path is a directory"):
+        validate_payment_recovery_spool_ready(path)
+
+
+def test_spool_readiness_fails_when_existing_target_cannot_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "payments.jsonl"
+    path.write_text("", encoding="utf-8")
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("fsync blocked")
+
+    monkeypatch.setattr("diet_bot.payment_recovery_spool.os.fsync", fail_fsync)
+
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="existing spool is not append/fsync ready"):
+        validate_payment_recovery_spool_ready(path)
+
+
+def test_spool_readiness_fails_when_temp_probe_cannot_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "payments.jsonl"
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("fsync blocked")
+
+    monkeypatch.setattr("diet_bot.payment_recovery_spool.os.fsync", fail_fsync)
+
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="directory probe failed"):
+        validate_payment_recovery_spool_ready(path)
+
+    assert not any(tmp_path.iterdir())
+
+
+def test_spool_readiness_temp_probe_writes_only_non_sensitive_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    written: list[bytes] = []
+    flushes: list[str] = []
+    real_fdopen = os.fdopen
+
+    class TrackingFile:
+        def __init__(self, wrapped) -> None:
+            self._wrapped = wrapped
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._wrapped.__exit__(exc_type, exc, traceback)
+
+        def write(self, data: bytes) -> int:
+            written.append(data)
+            return self._wrapped.write(data)
+
+        def flush(self) -> None:
+            flushes.append("flush")
+            self._wrapped.flush()
+
+        def fileno(self) -> int:
+            return self._wrapped.fileno()
+
+    def tracking_fdopen(*args, **kwargs):
+        return TrackingFile(real_fdopen(*args, **kwargs))
+
+    monkeypatch.setattr("diet_bot.payment_recovery_spool.os.fdopen", tracking_fdopen)
+
+    validate_payment_recovery_spool_ready(tmp_path / "payments.jsonl")
+
+    assert written == [b"diet-bot-payment-recovery-spool-startup-probe\n"]
+    assert flushes == ["flush"]
+    assert b"secret" not in b"".join(written).lower()
+    assert not any(tmp_path.iterdir())

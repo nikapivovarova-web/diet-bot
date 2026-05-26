@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -87,6 +88,7 @@ def test_disabled_payment_startup_validation_does_not_import_postgres(
 
 def test_enabled_payment_startup_validation_checks_postgres_schema(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from diet_bot.payment_runtime import validate_payment_runtime_for_startup
 
@@ -107,6 +109,7 @@ def test_enabled_payment_startup_validation_checks_postgres_schema(
             "DIET_BOT_PAYMENTS_ENABLED": "1",
             "DIET_BOT_STORAGE_BACKEND": "postgres",
             "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/test",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(tmp_path / "payments.jsonl"),
         },
     )
 
@@ -118,8 +121,81 @@ def test_enabled_payment_startup_validation_checks_postgres_schema(
     ]
 
 
+def test_enabled_payment_startup_validation_checks_spool_before_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import diet_bot.payment_runtime as payment_runtime
+    from diet_bot.payment_runtime import validate_payment_runtime_for_startup
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_validate_spool(path: Path) -> None:
+        calls.append(("validate_spool", str(path)))
+
+    class FakePostgresPaymentStore:
+        def __init__(self, dsn: str) -> None:
+            calls.append(("init", dsn))
+
+        def validate_schema(self) -> None:
+            calls.append(("validate_schema", "called"))
+
+    module = types.ModuleType("diet_bot.postgres_payment_store")
+    module.PostgresPaymentStore = FakePostgresPaymentStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_payment_store", module)
+    monkeypatch.setattr(payment_runtime, "validate_payment_recovery_spool_ready", fake_validate_spool)
+    config = load_runtime_config(
+        {
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/test",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(tmp_path / "payments.jsonl"),
+        },
+    )
+
+    validate_payment_runtime_for_startup(config)
+
+    assert calls == [
+        ("validate_spool", str(tmp_path / "payments.jsonl")),
+        ("init", "postgresql://user:secret@example/test"),
+        ("validate_schema", "called"),
+    ]
+
+
+def test_enabled_payment_startup_validation_accepts_absolute_spool_when_probe_passes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from diet_bot.payment_runtime import validate_payment_runtime_for_startup
+
+    class FakePostgresPaymentStore:
+        def __init__(self, _dsn: str) -> None:
+            pass
+
+        def validate_schema(self) -> None:
+            pass
+
+    module = types.ModuleType("diet_bot.postgres_payment_store")
+    module.PostgresPaymentStore = FakePostgresPaymentStore
+    monkeypatch.setitem(sys.modules, "diet_bot.postgres_payment_store", module)
+    spool_path = tmp_path / "payments.jsonl"
+    config = load_runtime_config(
+        {
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/test",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(spool_path),
+        },
+    )
+
+    validate_payment_runtime_for_startup(config)
+
+    assert not spool_path.exists()
+
+
 def test_enabled_payment_startup_validation_wraps_schema_failure(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from diet_bot.payment_runtime import PaymentLedgerUnavailable, validate_payment_runtime_for_startup
 
@@ -138,6 +214,7 @@ def test_enabled_payment_startup_validation_wraps_schema_failure(
             "DIET_BOT_PAYMENTS_ENABLED": "1",
             "DIET_BOT_STORAGE_BACKEND": "postgres",
             "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/test",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(tmp_path / "payments.jsonl"),
         },
     )
 
