@@ -188,6 +188,7 @@ RECENT_RECIPE_REDUCED_LIMIT = 70
 logger = logging.getLogger(__name__)
 ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить доступ. Попробуйте позже."
 CHAT_PROFILE_STORAGE_ERROR_TEXT = "Не удалось сохранить анкету. Попробуйте позже."
+CHAT_STATE_READ_ERROR_TEXT = "Не удалось загрузить данные чата. Попробуйте позже."
 
 
 def _entitlement_service() -> EntitlementService:
@@ -238,6 +239,32 @@ async def _send_entitlement_storage_error(message: Message) -> None:
 
 async def _send_chat_profile_storage_error(message: Message) -> None:
     await message.answer(CHAT_PROFILE_STORAGE_ERROR_TEXT)
+
+
+async def _send_chat_state_read_error(
+    message: Message,
+    *,
+    status_message: Message | None = None,
+) -> None:
+    if status_message is not None:
+        try:
+            await status_message.edit_text(CHAT_STATE_READ_ERROR_TEXT)
+            return
+        except Exception:
+            logger.exception(
+                "Failed to edit chat state read error notice for chat_id=%s",
+                _mask_chat_id(message.chat.id),
+            )
+    await message.answer(CHAT_STATE_READ_ERROR_TEXT)
+
+
+async def _load_profile_for_message_or_notice(message: Message) -> tuple[bool, UserProfile | None]:
+    try:
+        return True, _profile_for_chat(message.chat.id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat profile for chat_id=%s", _mask_chat_id(message.chat.id))
+        await _send_chat_state_read_error(message)
+        return False, None
 
 
 def _mask_chat_id(chat_id: int) -> str:
@@ -999,7 +1026,9 @@ async def plan(message: Message) -> None:
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
         return
-    profile = _profile_for_chat(message.chat.id)
+    profile_loaded, profile = await _load_profile_for_message_or_notice(message)
+    if not profile_loaded:
+        return
     if profile is not None:
         await _send_calculation_options(message, profile)
         return
@@ -1219,7 +1248,9 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
     if data == CALLBACK_ONE_DAY_PLAN:
         await callback.answer()
-        profile = _profile_for_chat(message.chat.id)
+        profile_loaded, profile = await _load_profile_for_message_or_notice(message)
+        if not profile_loaded:
+            return
         if profile is None:
             await _start_questionnaire(message)
             return
@@ -1232,7 +1263,9 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
     if data == CALLBACK_WEEK_PLAN_PDF:
         await callback.answer()
-        profile = _profile_for_chat(message.chat.id)
+        profile_loaded, profile = await _load_profile_for_message_or_notice(message)
+        if not profile_loaded:
+            return
         if profile is None:
             await _start_questionnaire(message)
             return
@@ -1394,7 +1427,9 @@ async def handle_answer(message: Message) -> None:
         )
         return
     if text == ONE_DAY_PLAN_TEXT or text.startswith(SUBSCRIBER_ONE_DAY_PLAN_TEXT):
-        profile = _profile_for_chat(chat_id)
+        profile_loaded, profile = await _load_profile_for_message_or_notice(message)
+        if not profile_loaded:
+            return
         if profile is None:
             await _start_questionnaire(message)
             return
@@ -1405,7 +1440,9 @@ async def handle_answer(message: Message) -> None:
         )
         return
     if text == WEEK_PLAN_PDF_TEXT or text.startswith(SUBSCRIBER_WEEK_PLAN_PDF_TEXT):
-        profile = _profile_for_chat(chat_id)
+        profile_loaded, profile = await _load_profile_for_message_or_notice(message)
+        if not profile_loaded:
+            return
         if profile is None:
             await _start_questionnaire(message)
             return
@@ -1747,7 +1784,9 @@ async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> N
 
 
 async def _repeat_plan(message: Message, *, idempotency_key: str | None = None) -> None:
-    profile = _profile_for_chat(message.chat.id)
+    profile_loaded, profile = await _load_profile_for_message_or_notice(message)
+    if not profile_loaded:
+        return
     if profile is None:
         await _start_questionnaire(message)
         return
@@ -2734,8 +2773,13 @@ async def _send_plan(
     )
     seed = seed_offset + count
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + 1
-    await message.answer("Считаю рацион и проверяю ограничения... 🧮", reply_markup=ReplyKeyboardRemove())
-    _load_chat_history(chat_id)
+    status_message = await message.answer("Считаю рацион и проверяю ограничения... 🧮", reply_markup=ReplyKeyboardRemove())
+    try:
+        _load_chat_history(chat_id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat history for chat_id=%s", _mask_chat_id(chat_id))
+        await _send_chat_state_read_error(message, status_message=status_message)
+        return False
     recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
     recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
     plan_result = build_one_day_plan(
@@ -2820,16 +2864,22 @@ async def _send_week_plan(
         status_message = initial_status_message
         await _edit_week_pdf_status(status_message, WEEK_PDF_STATUS_INITIAL_TEXT)
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
-    recent_avoidance = _load_recent_recipe_avoidance(chat_id)
-    _weekly_pdf_diag(
-        "recent_avoidance_loaded",
-        chat_id=chat_id,
-        full_ids=len(recent_avoidance.full_recipe_ids),
-        full_keys=len(recent_avoidance.full_recipe_keys),
-        reduced_ids=len(recent_avoidance.reduced_recipe_ids),
-        reduced_keys=len(recent_avoidance.reduced_recipe_keys),
-    )
     try:
+        try:
+            recent_avoidance = _load_recent_recipe_avoidance(chat_id)
+        except ChatStateStorageError:
+            logger.exception("Failed to load weekly PDF chat history for chat_id=%s", _mask_chat_id(chat_id))
+            await _stop_week_pdf_status(status_task)
+            await _edit_week_pdf_status(status_message, CHAT_STATE_READ_ERROR_TEXT)
+            return False
+        _weekly_pdf_diag(
+            "recent_avoidance_loaded",
+            chat_id=chat_id,
+            full_ids=len(recent_avoidance.full_recipe_ids),
+            full_keys=len(recent_avoidance.full_recipe_keys),
+            reduced_ids=len(recent_avoidance.reduced_recipe_ids),
+            reduced_keys=len(recent_avoidance.reduced_recipe_keys),
+        )
         selection_started_at = time.perf_counter()
         _weekly_pdf_diag("selection_start", chat_id=chat_id, seed=seed)
         build_result = await asyncio.to_thread(
@@ -4167,7 +4217,13 @@ def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
 
 
 def _load_state() -> dict[str, dict[str, object]]:
-    return _chat_state_store().load_all()
+    try:
+        return _chat_state_store().load_all()
+    except ChatStateStorageError:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected chat state load failure")
+        raise ChatStateStorageError("Could not load chat state") from exc
 
 
 def _save_state(state: dict[str, dict[str, object]]) -> None:
