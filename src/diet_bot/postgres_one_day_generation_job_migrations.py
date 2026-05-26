@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class PostgresMigration:
+    version: str
+    description: str
+    statements: tuple[str, ...]
+
+
+SCHEMA_MIGRATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+
+
+MIGRATIONS = (
+    PostgresMigration(
+        version="202605260002",
+        description="Create one-day generation job tables",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS one_day_generation_jobs (
+                job_id UUID PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                consumption_source TEXT,
+                refund_status TEXT NOT NULL DEFAULT 'not_required',
+                delivery_status TEXT NOT NULL DEFAULT 'not_started',
+                expected_value_messages INTEGER NOT NULL DEFAULT 0,
+                delivered_value_messages INTEGER NOT NULL DEFAULT 0,
+                send_started_at TIMESTAMPTZ,
+                first_value_delivered_at TIMESTAMPTZ,
+                delivered_at TIMESTAMPTZ,
+                stale_after TIMESTAMPTZ NOT NULL,
+                failure_reason TEXT,
+                finalization_error TEXT,
+                requires_manual_review BOOLEAN NOT NULL DEFAULT false,
+                metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                started_at TIMESTAMPTZ,
+                heartbeat_at TIMESTAMPTZ,
+                finished_at TIMESTAMPTZ,
+                CONSTRAINT chk_one_day_generation_jobs_idempotency_key_non_empty CHECK (idempotency_key <> ''),
+                CONSTRAINT chk_one_day_generation_jobs_status CHECK (
+                    status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                ),
+                CONSTRAINT chk_one_day_generation_jobs_consumption_source CHECK (
+                    consumption_source IS NULL
+                    OR consumption_source IN ('monthly', 'extra', 'free_trial', 'test_access')
+                ),
+                CONSTRAINT chk_one_day_generation_jobs_refund_status CHECK (
+                    refund_status IN ('not_required', 'pending', 'refunded')
+                ),
+                CONSTRAINT chk_one_day_generation_jobs_delivery_status CHECK (
+                    delivery_status IN ('not_started', 'send_started', 'partial', 'delivered', 'unknown')
+                ),
+                CONSTRAINT chk_one_day_generation_jobs_value_message_counts CHECK (
+                    expected_value_messages >= 0
+                    AND delivered_value_messages >= 0
+                    AND delivered_value_messages <= expected_value_messages
+                ),
+                CONSTRAINT chk_one_day_generation_jobs_metadata_object CHECK (
+                    jsonb_typeof(metadata_json) = 'object'
+                )
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS one_day_generation_job_value_messages (
+                job_id UUID NOT NULL REFERENCES one_day_generation_jobs(job_id) ON DELETE CASCADE,
+                value_message_key TEXT NOT NULL,
+                delivered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (job_id, value_message_key),
+                CONSTRAINT chk_one_day_generation_job_value_key_non_empty CHECK (value_message_key <> '')
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_day_generation_jobs_active_chat_unique
+                ON one_day_generation_jobs(chat_id)
+                WHERE status IN ('queued', 'running')
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_day_generation_jobs_idempotency_key_unique
+                ON one_day_generation_jobs(idempotency_key)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_one_day_generation_jobs_stale
+                ON one_day_generation_jobs(stale_after)
+                WHERE status IN ('queued', 'running')
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_one_day_generation_job_value_messages_job
+                ON one_day_generation_job_value_messages(job_id, delivered_at)
+            """,
+        ),
+    ),
+)
+
+
+def run_one_day_generation_job_schema_migrations(cur: Any) -> None:
+    cur.execute(SCHEMA_MIGRATIONS_SQL)
+    cur.execute("SELECT version FROM schema_migrations")
+    applied_versions = {str(row["version"]) for row in cur.fetchall()}
+    for migration in MIGRATIONS:
+        if migration.version in applied_versions:
+            continue
+        for statement in migration.statements:
+            statement = statement.strip()
+            if statement:
+                cur.execute(statement)
+        cur.execute(
+            """
+            INSERT INTO schema_migrations (version, description)
+            VALUES (%s, %s)
+            ON CONFLICT (version) DO NOTHING
+            """,
+            (migration.version, migration.description),
+        )
