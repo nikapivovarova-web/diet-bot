@@ -97,6 +97,116 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605260001",
+        description="Track weekly PDF delivery review state",
+        statements=(
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS delivery_status TEXT
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS requires_manual_review BOOLEAN NOT NULL DEFAULT false
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS manual_review_reason TEXT
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS manual_reviewed_at TIMESTAMPTZ
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ADD COLUMN IF NOT EXISTS manual_review_resolution TEXT
+            """,
+            """
+            UPDATE weekly_pdf_jobs
+            SET delivery_status = 'delivered',
+                requires_manual_review = false,
+                manual_review_reason = NULL,
+                manual_reviewed_at = NULL,
+                manual_review_resolution = NULL
+            WHERE delivered_at IS NOT NULL
+            """,
+            """
+            UPDATE weekly_pdf_jobs
+            SET delivery_status = 'unknown',
+                requires_manual_review = true,
+                manual_review_reason = COALESCE(NULLIF(finalization_error, ''), 'send_started_without_delivery_confirmation')
+            WHERE send_started_at IS NOT NULL
+              AND delivered_at IS NULL
+              AND status = 'succeeded'
+              AND finalization_error IS NOT NULL
+            """,
+            """
+            UPDATE weekly_pdf_jobs
+            SET delivery_status = 'send_started',
+                requires_manual_review = false,
+                manual_review_reason = NULL
+            WHERE delivery_status IS NULL
+              AND send_started_at IS NOT NULL
+              AND delivered_at IS NULL
+              AND status IN ('queued', 'running')
+            """,
+            """
+            UPDATE weekly_pdf_jobs
+            SET delivery_status = 'not_started',
+                requires_manual_review = false,
+                manual_review_reason = NULL
+            WHERE delivery_status IS NULL
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ALTER COLUMN delivery_status SET DEFAULT 'not_started'
+            """,
+            """
+            ALTER TABLE weekly_pdf_jobs
+            ALTER COLUMN delivery_status SET NOT NULL
+            """,
+            """
+            DO $$
+            BEGIN
+                ALTER TABLE weekly_pdf_jobs
+                ADD CONSTRAINT chk_weekly_pdf_jobs_delivery_status CHECK (
+                    delivery_status IN ('not_started', 'send_started', 'delivered', 'unknown')
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                ALTER TABLE weekly_pdf_jobs
+                ADD CONSTRAINT chk_weekly_pdf_jobs_manual_review_reason CHECK (
+                    requires_manual_review = false OR manual_review_reason IS NOT NULL
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                ALTER TABLE weekly_pdf_jobs
+                ADD CONSTRAINT chk_weekly_pdf_jobs_unknown_requires_review CHECK (
+                    delivery_status <> 'unknown' OR requires_manual_review = true
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                ALTER TABLE weekly_pdf_jobs
+                ADD CONSTRAINT chk_weekly_pdf_jobs_delivered_without_review CHECK (
+                    delivery_status <> 'delivered' OR requires_manual_review = false
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+            """,
+        ),
+    ),
 )
 
 

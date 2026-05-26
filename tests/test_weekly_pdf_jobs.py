@@ -79,11 +79,27 @@ def test_job_tracks_delivery_and_finalization_fields() -> None:
         send_started_at=send_started_at,
         delivered_at=delivered_at,
         finalization_error="stale_after_delivery",
+        delivery_status="delivered",
     )
 
     assert job.send_started_at == send_started_at
     assert job.delivered_at == delivered_at
     assert job.finalization_error == "stale_after_delivery"
+    assert job.delivery_status == "delivered"
+    assert job.requires_manual_review is False
+    assert job.manual_review_reason is None
+
+
+def test_job_defaults_to_not_started_delivery_without_manual_review() -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+
+    job = _job(status=JOB_STATUS_QUEUED, now=now)
+
+    assert job.delivery_status == "not_started"
+    assert job.requires_manual_review is False
+    assert job.manual_review_reason is None
+    assert job.manual_reviewed_at is None
+    assert job.manual_review_resolution is None
 
 
 def test_result_wrappers_expose_explicit_statuses() -> None:

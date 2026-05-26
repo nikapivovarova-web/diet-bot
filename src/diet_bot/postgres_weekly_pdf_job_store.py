@@ -18,6 +18,9 @@ from .weekly_pdf_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus,
     CleanupStaleResult,
+    DELIVERY_STATUS_DELIVERED,
+    DELIVERY_STATUS_SEND_STARTED,
+    DELIVERY_STATUS_UNKNOWN,
     FinishJobResult,
     FinishJobResultStatus,
     JOB_STATUS_QUEUED,
@@ -56,6 +59,11 @@ WEEKLY_PDF_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "send_started_at",
             "delivered_at",
             "finalization_error",
+            "delivery_status",
+            "requires_manual_review",
+            "manual_review_reason",
+            "manual_reviewed_at",
+            "manual_review_resolution",
             "created_at",
             "updated_at",
             "started_at",
@@ -264,11 +272,16 @@ class PostgresWeeklyPdfJobStore:
                         """
                         UPDATE weekly_pdf_jobs
                         SET delivered_at = %s,
+                            delivery_status = %s,
+                            requires_manual_review = false,
+                            manual_review_reason = NULL,
+                            manual_reviewed_at = NULL,
+                            manual_review_resolution = NULL,
                             updated_at = %s
                         WHERE job_id = %s
                         RETURNING *
                         """,
-                        (current_time, current_time, job.job_id),
+                        (current_time, DELIVERY_STATUS_DELIVERED, current_time, job.job_id),
                     )
                     return MarkDeliveredResult(MarkDeliveredResultStatus.DELIVERED, _job_from_row(cur.fetchone()))
 
@@ -288,11 +301,16 @@ class PostgresWeeklyPdfJobStore:
                         """
                         UPDATE weekly_pdf_jobs
                         SET send_started_at = %s,
+                            delivery_status = %s,
+                            requires_manual_review = false,
+                            manual_review_reason = NULL,
+                            manual_reviewed_at = NULL,
+                            manual_review_resolution = NULL,
                             updated_at = %s
                         WHERE job_id = %s
                         RETURNING *
                         """,
-                        (current_time, current_time, job.job_id),
+                        (current_time, DELIVERY_STATUS_SEND_STARTED, current_time, job.job_id),
                     )
                     return MarkSendStartedResult(
                         MarkSendStartedResultStatus.SEND_STARTED,
@@ -316,12 +334,44 @@ class PostgresWeeklyPdfJobStore:
                         UPDATE weekly_pdf_jobs
                         SET status = 'succeeded',
                             refund_status = 'not_required',
+                            delivery_status = CASE
+                                WHEN delivered_at IS NOT NULL THEN %s
+                                WHEN send_started_at IS NOT NULL THEN %s
+                                ELSE delivery_status
+                            END,
+                            requires_manual_review = CASE
+                                WHEN delivered_at IS NOT NULL THEN false
+                                WHEN send_started_at IS NOT NULL THEN true
+                                ELSE false
+                            END,
+                            manual_review_reason = CASE
+                                WHEN delivered_at IS NOT NULL THEN NULL
+                                WHEN send_started_at IS NOT NULL THEN COALESCE(
+                                    NULLIF(finalization_error, ''),
+                                    'send_started_without_delivery_confirmation'
+                                )
+                                ELSE NULL
+                            END,
+                            manual_reviewed_at = CASE
+                                WHEN delivered_at IS NOT NULL OR send_started_at IS NOT NULL THEN NULL
+                                ELSE manual_reviewed_at
+                            END,
+                            manual_review_resolution = CASE
+                                WHEN delivered_at IS NOT NULL OR send_started_at IS NOT NULL THEN NULL
+                                ELSE manual_review_resolution
+                            END,
                             finished_at = COALESCE(finished_at, %s),
                             updated_at = %s
                         WHERE job_id = %s
                         RETURNING *
                         """,
-                        (current_time, current_time, job.job_id),
+                        (
+                            DELIVERY_STATUS_DELIVERED,
+                            DELIVERY_STATUS_UNKNOWN,
+                            current_time,
+                            current_time,
+                            job.job_id,
+                        ),
                     )
                     return FinishJobResult(FinishJobResultStatus.SUCCEEDED, _job_from_row(cur.fetchone()))
 
@@ -446,6 +496,23 @@ class PostgresWeeklyPdfJobStore:
             with conn.cursor() as cur:
                 return self._get_active_job_for_chat_cur(cur, chat_id)
 
+    def get_unresolved_manual_review_jobs(self, *, limit: int = 100) -> list[WeeklyPdfJob]:
+        bounded_limit = min(500, max(1, int(limit)))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM weekly_pdf_jobs
+                    WHERE requires_manual_review = true
+                      AND manual_reviewed_at IS NULL
+                    ORDER BY updated_at, created_at, job_id
+                    LIMIT %s
+                    """,
+                    (bounded_limit,),
+                )
+                return [_job_from_row(row) for row in cur.fetchall()]
+
     def _get_job_by_idempotency_key(self, idempotency_key: str) -> WeeklyPdfJob | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -544,12 +611,24 @@ class PostgresWeeklyPdfJobStore:
             SET status = %s,
                 refund_status = 'not_required',
                 finalization_error = COALESCE(%s, finalization_error),
+                delivery_status = %s,
+                requires_manual_review = false,
+                manual_review_reason = NULL,
+                manual_reviewed_at = NULL,
+                manual_review_resolution = NULL,
                 finished_at = COALESCE(finished_at, %s),
                 updated_at = %s
             WHERE job_id = %s
             RETURNING *
             """,
-            (JOB_STATUS_SUCCEEDED, _optional_text(finalization_error), now, now, job.job_id),
+            (
+                JOB_STATUS_SUCCEEDED,
+                _optional_text(finalization_error),
+                DELIVERY_STATUS_DELIVERED,
+                now,
+                now,
+                job.job_id,
+            ),
         )
         return _job_from_row(cur.fetchone())
 
@@ -567,6 +646,15 @@ class PostgresWeeklyPdfJobStore:
             SET status = %s,
                 refund_status = 'not_required',
                 finalization_error = COALESCE(%s, finalization_error),
+                delivery_status = %s,
+                requires_manual_review = true,
+                manual_review_reason = COALESCE(
+                    NULLIF(%s, ''),
+                    NULLIF(finalization_error, ''),
+                    'send_started_without_delivery_confirmation'
+                ),
+                manual_reviewed_at = NULL,
+                manual_review_resolution = NULL,
                 finished_at = COALESCE(finished_at, %s),
                 updated_at = %s
             WHERE job_id = %s
@@ -574,6 +662,8 @@ class PostgresWeeklyPdfJobStore:
             """,
             (
                 JOB_STATUS_SUCCEEDED,
+                _optional_text(finalization_error),
+                DELIVERY_STATUS_UNKNOWN,
                 _optional_text(finalization_error),
                 now,
                 now,
@@ -793,6 +883,11 @@ def _job_from_row(row: Any) -> WeeklyPdfJob:
         send_started_at=_datetime_or_none(row["send_started_at"]),
         delivered_at=_datetime_or_none(row["delivered_at"]),
         finalization_error=_optional_text(row["finalization_error"]),
+        delivery_status=str(row["delivery_status"]),
+        requires_manual_review=bool(row["requires_manual_review"]),
+        manual_review_reason=_optional_text(row["manual_review_reason"]),
+        manual_reviewed_at=_datetime_or_none(row["manual_reviewed_at"]),
+        manual_review_resolution=_optional_text(row["manual_review_resolution"]),
     )
 
 

@@ -13,7 +13,7 @@ import pytest
 import diet_bot.postgres_weekly_pdf_job_store as weekly_pdf_job_store
 from diet_bot.postgres_chat_state_store import PostgresChatStateStore
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
-from diet_bot.postgres_weekly_pdf_job_migrations import MIGRATIONS
+from diet_bot.postgres_weekly_pdf_job_migrations import MIGRATIONS, SCHEMA_MIGRATIONS_SQL
 from diet_bot.postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore, WEEKLY_PDF_JOB_SCHEMA_EXPECTATION
 from diet_bot.subscriptions import Entitlement, apply_subscription_payment, grant_test_access
 from diet_bot.weekly_pdf_jobs import (
@@ -46,6 +46,16 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     assert "send_started_at TIMESTAMPTZ" in statements
     assert "delivered_at TIMESTAMPTZ" in statements
     assert "finalization_error TEXT" in statements
+    assert "delivery_status TEXT" in statements
+    assert "requires_manual_review BOOLEAN NOT NULL DEFAULT false" in statements
+    assert "manual_review_reason TEXT" in statements
+    assert "manual_reviewed_at TIMESTAMPTZ" in statements
+    assert "manual_review_resolution TEXT" in statements
+    assert "delivery_status = 'delivered'" in statements
+    assert "delivery_status = 'unknown'" in statements
+    assert "delivery_status = 'send_started'" in statements
+    assert "send_started_at IS NOT NULL" in statements
+    assert "delivered_at IS NULL" in statements
     assert "idx_weekly_pdf_jobs_active_chat_unique" in statements
     assert "WHERE status IN ('queued', 'running')" in statements
     assert "idx_weekly_pdf_jobs_idempotency_key_unique" in statements
@@ -61,9 +71,15 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert hasattr(PostgresWeeklyPdfJobStore, "cancel_queued")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_send_started")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_delivered")
+    assert hasattr(PostgresWeeklyPdfJobStore, "get_unresolved_manual_review_jobs")
     assert "send_started_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "delivered_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "finalization_error" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "delivery_status" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "requires_manual_review" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "manual_review_reason" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "manual_reviewed_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "manual_review_resolution" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
 
 
 @pytest.fixture
@@ -140,7 +156,16 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
                 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND table_name = 'weekly_pdf_jobs'
-                  AND column_name IN ('send_started_at', 'delivered_at', 'finalization_error')
+                  AND column_name IN (
+                    'send_started_at',
+                    'delivered_at',
+                    'finalization_error',
+                    'delivery_status',
+                    'requires_manual_review',
+                    'manual_review_reason',
+                    'manual_reviewed_at',
+                    'manual_review_resolution'
+                  )
                 """
             )
             new_columns = {row["column_name"] for row in cur.fetchall()}
@@ -151,7 +176,120 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "idx_weekly_pdf_jobs_idempotency_key_unique",
         "idx_weekly_pdf_jobs_stale",
     }
-    assert new_columns == {"send_started_at", "delivered_at", "finalization_error"}
+    assert new_columns == {
+        "send_started_at",
+        "delivered_at",
+        "finalization_error",
+        "delivery_status",
+        "requires_manual_review",
+        "manual_review_reason",
+        "manual_reviewed_at",
+        "manual_review_resolution",
+    }
+
+
+def test_migration_backfills_delivery_review_state() -> None:
+    if not TEST_DATABASE_URL:
+        pytest.skip("set DIET_BOT_TEST_DATABASE_URL to run Postgres weekly PDF job integration tests")
+    try:
+        _require_safe_test_database_url(TEST_DATABASE_URL)
+    except ValueError as exc:
+        pytest.fail(str(exc))
+
+    psycopg = pytest.importorskip("psycopg")
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+    from psycopg.rows import dict_row
+
+    schema_name = f"diet_bot_test_{uuid.uuid4().hex}"
+    admin_dsn = make_conninfo(TEST_DATABASE_URL, connect_timeout="1")
+    scoped_dsn = make_conninfo(
+        TEST_DATABASE_URL,
+        connect_timeout="1",
+        options=f"-c search_path={schema_name}",
+    )
+    delivered_job_id = uuid.uuid4()
+    unknown_job_id = uuid.uuid4()
+    not_started_job_id = uuid.uuid4()
+    active_send_job_id = uuid.uuid4()
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+
+    _create_test_schema(psycopg, sql, admin_dsn, schema_name)
+    try:
+        _install_legacy_weekly_pdf_job_schema(psycopg, scoped_dsn)
+        with psycopg.connect(scoped_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO weekly_pdf_jobs (
+                        job_id,
+                        chat_id,
+                        idempotency_key,
+                        status,
+                        refund_status,
+                        stale_after,
+                        send_started_at,
+                        delivered_at,
+                        finalization_error
+                    )
+                    VALUES
+                        (%s, 201, 'legacy-delivered', 'succeeded', 'not_required', %s, %s, %s, NULL),
+                        (%s, 202, 'legacy-unknown', 'succeeded', 'not_required', %s, %s, NULL, 'telegram_upload_failed'),
+                        (%s, 203, 'legacy-not-started', 'queued', 'not_required', %s, NULL, NULL, NULL),
+                        (%s, 204, 'legacy-active-send', 'running', 'pending', %s, %s, NULL, NULL)
+                    """,
+                    (
+                        delivered_job_id,
+                        now + timedelta(minutes=15),
+                        now + timedelta(seconds=1),
+                        now + timedelta(seconds=2),
+                        unknown_job_id,
+                        now + timedelta(minutes=15),
+                        now + timedelta(seconds=3),
+                        not_started_job_id,
+                        now + timedelta(minutes=15),
+                        active_send_job_id,
+                        now + timedelta(minutes=15),
+                        now + timedelta(seconds=4),
+                    ),
+                )
+
+        candidate = PostgresWeeklyPdfJobStore(scoped_dsn, connect_timeout=1, connect_attempts=1)
+        candidate.initialize()
+        candidate.validate_schema()
+
+        with psycopg.connect(scoped_dsn, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        job_id,
+                        delivery_status,
+                        requires_manual_review,
+                        manual_review_reason,
+                        manual_reviewed_at,
+                        manual_review_resolution
+                    FROM weekly_pdf_jobs
+                    WHERE job_id = ANY(%s)
+                    """,
+                    ([delivered_job_id, unknown_job_id, not_started_job_id, active_send_job_id],),
+                )
+                rows = {row["job_id"]: row for row in cur.fetchall()}
+    finally:
+        _drop_test_schema(psycopg, sql, admin_dsn, schema_name)
+
+    assert rows[delivered_job_id]["delivery_status"] == "delivered"
+    assert rows[delivered_job_id]["requires_manual_review"] is False
+    assert rows[delivered_job_id]["manual_review_reason"] is None
+    assert rows[unknown_job_id]["delivery_status"] == "unknown"
+    assert rows[unknown_job_id]["requires_manual_review"] is True
+    assert rows[unknown_job_id]["manual_review_reason"] == "telegram_upload_failed"
+    assert rows[unknown_job_id]["manual_reviewed_at"] is None
+    assert rows[unknown_job_id]["manual_review_resolution"] is None
+    assert rows[not_started_job_id]["delivery_status"] == "not_started"
+    assert rows[not_started_job_id]["requires_manual_review"] is False
+    assert rows[active_send_job_id]["delivery_status"] == "send_started"
+    assert rows[active_send_job_id]["requires_manual_review"] is False
 
 
 def test_weekly_then_chat_state_migrations_create_both_schemas(store: PostgresWeeklyPdfJobStore) -> None:
@@ -267,6 +405,23 @@ def test_queued_job_does_not_consume_entitlement(store: PostgresWeeklyPdfJobStor
     assert _weekly_remaining(store, chat_id) == 1
 
 
+def test_new_jobs_default_to_not_started_delivery_without_manual_review(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 119
+
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="new-job-delivery-review-defaults",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+
+    assert job.delivery_status == "not_started"
+    assert job.requires_manual_review is False
+    assert job.manual_review_reason is None
+    assert job.manual_reviewed_at is None
+    assert job.manual_review_resolution is None
+
+
 def test_start_job_consumes_once(store: PostgresWeeklyPdfJobStore) -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     chat_id = 104
@@ -374,6 +529,9 @@ def test_finish_failure_after_send_started_closes_without_refund(monkeypatch) ->
     assert result.job.delivered_at is None
     assert result.job.failure_reason is None
     assert result.job.finalization_error == "telegram_upload_failed"
+    assert result.job.delivery_status == "unknown"
+    assert result.job.requires_manual_review is True
+    assert result.job.manual_review_reason == "telegram_upload_failed"
 
 
 def test_finish_failure_after_send_started_preserves_consumed_quota(
@@ -411,6 +569,9 @@ def test_finish_failure_after_send_started_preserves_consumed_quota(
     assert failed_result.job.delivered_at is None
     assert failed_result.job.failure_reason is None
     assert failed_result.job.finalization_error == "telegram_upload_failed"
+    assert failed_result.job.delivery_status == "unknown"
+    assert failed_result.job.requires_manual_review is True
+    assert failed_result.job.manual_review_reason == "telegram_upload_failed"
     assert failed_again_result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
     assert store.get_active_job_for_chat(chat_id) is None
     assert _weekly_remaining(store, chat_id) == 0
@@ -442,6 +603,9 @@ def test_delivered_failure_closes_successfully_without_refund(store: PostgresWee
     assert failed_result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
     assert failed_result.job.delivered_at == delivered_at
     assert failed_result.job.finalization_error == "status_done_failed"
+    assert failed_result.job.delivery_status == "delivered"
+    assert failed_result.job.requires_manual_review is False
+    assert failed_result.job.manual_review_reason is None
     assert _weekly_remaining(store, chat_id) == 0
 
 
@@ -462,6 +626,8 @@ def test_mark_send_started_sets_timestamp(store: PostgresWeeklyPdfJobStore) -> N
     assert result.status == MarkSendStartedResultStatus.SEND_STARTED
     assert result.job.status == JOB_STATUS_RUNNING
     assert result.job.send_started_at == send_started_at
+    assert result.job.delivery_status == "send_started"
+    assert result.job.requires_manual_review is False
     assert result.job.delivered_at is None
 
 
@@ -483,6 +649,115 @@ def test_mark_send_started_is_idempotent(store: PostgresWeeklyPdfJobStore) -> No
     assert first.status == MarkSendStartedResultStatus.SEND_STARTED
     assert second.status == MarkSendStartedResultStatus.ALREADY_SEND_STARTED
     assert second.job.send_started_at == send_started_at
+    assert second.job.delivery_status == "send_started"
+
+
+def test_mark_delivered_updates_delivery_status_and_clears_manual_review(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 120
+    delivered_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="mark-delivered-clears-review",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE weekly_pdf_jobs
+                SET delivery_status = 'unknown',
+                    requires_manual_review = true,
+                    manual_review_reason = 'previously_unknown'
+                WHERE job_id = %s
+                """,
+                (started.job_id,),
+            )
+
+    result = store.mark_delivered(started.job_id, now=delivered_at)
+
+    assert result.status == MarkDeliveredResultStatus.DELIVERED
+    assert result.job.delivered_at == delivered_at
+    assert result.job.delivery_status == "delivered"
+    assert result.job.requires_manual_review is False
+    assert result.job.manual_review_reason is None
+    assert result.job.manual_reviewed_at is None
+    assert result.job.manual_review_resolution is None
+
+
+def test_unresolved_manual_review_query_returns_only_open_reviews(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    open_first_job_id = uuid.uuid4()
+    open_second_job_id = uuid.uuid4()
+    reviewed_job_id = uuid.uuid4()
+    clean_job_id = uuid.uuid4()
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO weekly_pdf_jobs (
+                    job_id,
+                    chat_id,
+                    idempotency_key,
+                    status,
+                    refund_status,
+                    stale_after,
+                    delivery_status,
+                    requires_manual_review,
+                    manual_review_reason,
+                    manual_reviewed_at,
+                    manual_review_resolution,
+                    created_at,
+                    updated_at,
+                    finished_at
+                )
+                VALUES
+                    (%s, 301, 'manual-open-1', 'succeeded', 'not_required', %s, 'unknown', true,
+                        'telegram_upload_failed', NULL, NULL, %s, %s, %s),
+                    (%s, 302, 'manual-reviewed', 'succeeded', 'not_required', %s, 'unknown', true,
+                        'telegram_upload_failed', %s, 'delivered_confirmed', %s, %s, %s),
+                    (%s, 303, 'manual-clean', 'succeeded', 'not_required', %s, 'delivered', false,
+                        NULL, NULL, NULL, %s, %s, %s),
+                    (%s, 304, 'manual-open-2', 'succeeded', 'not_required', %s, 'unknown', true,
+                        'stale_after_send_attempt_unconfirmed', NULL, NULL, %s, %s, %s)
+                """,
+                (
+                    open_first_job_id,
+                    now + timedelta(minutes=15),
+                    now,
+                    now,
+                    now,
+                    reviewed_job_id,
+                    now + timedelta(minutes=15),
+                    now + timedelta(minutes=5),
+                    now + timedelta(seconds=1),
+                    now + timedelta(seconds=1),
+                    now + timedelta(seconds=1),
+                    clean_job_id,
+                    now + timedelta(minutes=15),
+                    now + timedelta(seconds=2),
+                    now + timedelta(seconds=2),
+                    now + timedelta(seconds=2),
+                    open_second_job_id,
+                    now + timedelta(minutes=15),
+                    now + timedelta(seconds=3),
+                    now + timedelta(seconds=3),
+                    now + timedelta(seconds=3),
+                ),
+            )
+
+    unresolved = store.get_unresolved_manual_review_jobs(limit=10)
+
+    assert [job.job_id for job in unresolved] == [open_first_job_id, open_second_job_id]
+    assert [job.delivery_status for job in unresolved] == ["unknown", "unknown"]
+    assert all(job.requires_manual_review for job in unresolved)
+    assert [job.manual_review_reason for job in unresolved] == [
+        "telegram_upload_failed",
+        "stale_after_send_attempt_unconfirmed",
+    ]
+    assert all(job.manual_reviewed_at is None for job in unresolved)
 
 
 def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
@@ -533,6 +808,9 @@ def test_cleanup_stale_send_started_running_job_succeeds_without_refund(
     assert cleaned.jobs[0].send_started_at == send_started_at
     assert cleaned.jobs[0].delivered_at is None
     assert cleaned.jobs[0].finalization_error == "stale_after_send_attempt_unconfirmed"
+    assert cleaned.jobs[0].delivery_status == "unknown"
+    assert cleaned.jobs[0].requires_manual_review is True
+    assert cleaned.jobs[0].manual_review_reason == "stale_after_send_attempt_unconfirmed"
     assert cleaned_again.jobs == []
     assert store.get_active_job_for_chat(chat_id) is None
     assert _weekly_remaining(store, chat_id) == 0
@@ -560,6 +838,9 @@ def test_cleanup_stale_delivered_running_job_succeeds_without_refund(store: Post
     assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
     assert cleaned.jobs[0].delivered_at == delivered_at
     assert cleaned.jobs[0].finalization_error == "stale_after_delivery"
+    assert cleaned.jobs[0].delivery_status == "delivered"
+    assert cleaned.jobs[0].requires_manual_review is False
+    assert cleaned.jobs[0].manual_review_reason is None
     assert cleaned_again.jobs == []
     assert _weekly_remaining(store, chat_id) == 0
 
@@ -667,6 +948,32 @@ def test_finish_success_allows_running_job(store: PostgresWeeklyPdfJobStore) -> 
     assert result.status == FinishJobResultStatus.SUCCEEDED
     assert result.job.status == JOB_STATUS_SUCCEEDED
     assert result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert result.job.delivery_status == "not_started"
+    assert result.job.requires_manual_review is False
+
+
+def test_finish_success_after_send_started_requires_manual_review(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    chat_id = 121
+    send_started_at = now + timedelta(seconds=5)
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="success-send-started-without-delivery",
+        stale_after=now + timedelta(minutes=15),
+    ).job
+    started = store.start_job_and_consume(job.job_id, now=now).job
+    store.mark_send_started(started.job_id, now=send_started_at)
+
+    result = store.finish_success(started.job_id, now=now + timedelta(seconds=6))
+
+    assert result.status == FinishJobResultStatus.SUCCEEDED
+    assert result.job.status == JOB_STATUS_SUCCEEDED
+    assert result.job.delivery_status == "unknown"
+    assert result.job.requires_manual_review is True
+    assert result.job.manual_review_reason == "send_started_without_delivery_confirmation"
+    assert result.job.delivered_at is None
+    assert _weekly_remaining(store, chat_id) == 0
 
 
 def test_finish_success_preserves_delivered_marker(store: PostgresWeeklyPdfJobStore) -> None:
@@ -690,6 +997,8 @@ def test_finish_success_preserves_delivered_marker(store: PostgresWeeklyPdfJobSt
     assert result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
     assert result.job.delivered_at == delivered_at
     assert result.job.finalization_error is None
+    assert result.job.delivery_status == "delivered"
+    assert result.job.requires_manual_review is False
     assert _weekly_remaining(store, chat_id) == 0
 
 
@@ -723,13 +1032,18 @@ class FakeJobCursor:
 
     def execute(self, query: str, params: tuple) -> None:
         assert "refund_status = 'not_required'" in query
-        status, finalization_error, finished_at, updated_at, job_id = params
+        status, finalization_error, delivery_status, manual_review_reason, finished_at, updated_at, job_id = params
         assert job_id == self.job.job_id
         self.row = _job_row(
             self.job,
             status=status,
             refund_status=REFUND_STATUS_NOT_REQUIRED,
             finalization_error=finalization_error,
+            delivery_status=delivery_status,
+            requires_manual_review=True,
+            manual_review_reason=manual_review_reason,
+            manual_reviewed_at=None,
+            manual_review_resolution=None,
             finished_at=finished_at,
             updated_at=updated_at,
         )
@@ -757,6 +1071,11 @@ def _job_row(job: WeeklyPdfJob, **overrides):
         "send_started_at": job.send_started_at,
         "delivered_at": job.delivered_at,
         "finalization_error": job.finalization_error,
+        "delivery_status": job.delivery_status,
+        "requires_manual_review": job.requires_manual_review,
+        "manual_review_reason": job.manual_review_reason,
+        "manual_reviewed_at": job.manual_reviewed_at,
+        "manual_review_resolution": job.manual_review_resolution,
     }
     row.update(overrides)
     return row
@@ -855,6 +1174,24 @@ def _split_schema_names(value: str) -> list[str]:
         if name and name not in {"$user", "public"}:
             names.append(name)
     return names
+
+
+def _install_legacy_weekly_pdf_job_schema(psycopg: object, database_url: str) -> None:
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_MIGRATIONS_SQL)
+            for migration in MIGRATIONS[:-1]:
+                for statement in migration.statements:
+                    statement = statement.strip()
+                    if statement:
+                        cur.execute(statement)
+                cur.execute(
+                    """
+                    INSERT INTO schema_migrations (version, description)
+                    VALUES (%s, %s)
+                    """,
+                    (migration.version, migration.description),
+                )
 
 
 def _create_test_schema(psycopg: object, sql: object, database_url: str, schema_name: str) -> None:
