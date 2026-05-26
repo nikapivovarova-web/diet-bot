@@ -150,6 +150,7 @@ from diet_bot.questionnaire import start_session
 
 PRIVACY_URL = "https://foodbalance.example/privacy"
 PRIVACY_POLICY_TEXT = "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438"
+CHAT_STATE_READ_ERROR_TEXT = "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0434\u0430\u043d\u043d\u044b\u0435 \u0447\u0430\u0442\u0430. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
 
 
 def _set_payments_enabled_from_env(monkeypatch) -> None:
@@ -2196,6 +2197,25 @@ class _FailingChatHistoryStore:
         raise ChatStateStorageError("history save failed")
 
 
+class _FailingChatStateLoadStore:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.load_calls = 0
+
+    def load_all(self):
+        self.load_calls += 1
+        raise self.exc
+
+    def save_chat_state(self, chat_id: int, chat_state) -> None:
+        raise AssertionError("read failure tests must not write chat state")
+
+
+def _install_failing_chat_state_load(monkeypatch, exc: Exception) -> _FailingChatStateLoadStore:
+    store = _FailingChatStateLoadStore(exc)
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    return store
+
+
 def _history_item(recipe_id: str, recipe_key: str) -> telegram_app.RecipeHistoryItem:
     return telegram_app.RecipeHistoryItem(recipe_id=recipe_id, recipe_key=recipe_key)
 
@@ -2378,6 +2398,128 @@ def test_weekly_recipe_history_order_remains_day_then_meal(monkeypatch) -> None:
     finally:
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        ChatStateStorageError("json profile load failed"),
+        RuntimeError("postgres profile load failed"),
+    ],
+)
+async def test_plan_chat_state_read_failure_sends_notice_without_questionnaire(monkeypatch, load_error) -> None:
+    chat_id = 92_010
+    store = _install_failing_chat_state_load(monkeypatch, load_error)
+    questionnaire_started = False
+    calculation_sent = False
+
+    async def fail_start_questionnaire(*_args, **_kwargs) -> None:
+        nonlocal questionnaire_started
+        questionnaire_started = True
+        raise AssertionError("profile read failure must not start questionnaire")
+
+    async def fail_send_calculation_options(*_args, **_kwargs) -> None:
+        nonlocal calculation_sent
+        calculation_sent = True
+        raise AssertionError("profile read failure must not send calculation options")
+
+    monkeypatch.setattr(telegram_app, "_start_questionnaire", fail_start_questionnaire)
+    monkeypatch.setattr(telegram_app, "_send_calculation_options", fail_send_calculation_options)
+    message = FakeMessage(chat_id)
+
+    try:
+        await telegram_app.plan(message)
+
+        assert message.texts == [(CHAT_STATE_READ_ERROR_TEXT, None)]
+        assert store.load_calls == 1
+        assert not questionnaire_started
+        assert not calculation_sent
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("entry_text", "load_error"),
+    [
+        (ONE_DAY_PLAN_TEXT, ChatStateStorageError("json profile load failed")),
+        (telegram_app.REPEAT_PLAN_TEXT, RuntimeError("postgres profile load failed")),
+    ],
+)
+async def test_one_day_profile_read_failure_sends_notice_without_generation_or_consumption(
+    monkeypatch,
+    entry_text,
+    load_error,
+) -> None:
+    chat_id = 92_011
+    store = _install_failing_chat_state_load(monkeypatch, load_error)
+    generation_called = False
+    consumption_called = False
+
+    async def fail_send_one_day_plan_with_access(*_args, **_kwargs) -> bool:
+        nonlocal generation_called
+        generation_called = True
+        raise AssertionError("profile read failure must not generate a one-day plan")
+
+    def fail_consume_generation_attempt(*_args, **_kwargs):
+        nonlocal consumption_called
+        consumption_called = True
+        raise AssertionError("profile read failure must not consume an attempt")
+
+    monkeypatch.setattr(telegram_app, "_send_one_day_plan_with_access", fail_send_one_day_plan_with_access)
+    monkeypatch.setattr(telegram_app, "_consume_generation_attempt", fail_consume_generation_attempt)
+    message = FakeMessage(chat_id, text=entry_text)
+
+    try:
+        await handle_answer(message)
+
+        assert message.texts == [(CHAT_STATE_READ_ERROR_TEXT, None)]
+        assert store.load_calls == 1
+        assert not generation_called
+        assert not consumption_called
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        ChatStateStorageError("json profile load failed"),
+        RuntimeError("postgres profile load failed"),
+    ],
+)
+async def test_weekly_profile_read_failure_sends_notice_without_queue(monkeypatch, load_error) -> None:
+    chat_id = 92_012
+    store = _install_failing_chat_state_load(monkeypatch, load_error)
+    queue_called = False
+
+    async def fail_send_week_plan_with_access(*_args, **_kwargs) -> bool:
+        nonlocal queue_called
+        queue_called = True
+        raise AssertionError("profile read failure must not enqueue a weekly PDF")
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan_with_access", fail_send_week_plan_with_access)
+    message = FakeMessage(chat_id, text=WEEK_PLAN_PDF_TEXT)
+
+    try:
+        await handle_answer(message)
+
+        assert message.texts == [(CHAT_STATE_READ_ERROR_TEXT, None)]
+        assert store.load_calls == 1
+        assert not queue_called
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in PROFILE_BY_CHAT_ID
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
 
 
 @pytest.mark.anyio
@@ -2585,6 +2727,38 @@ async def test_week_plan_pdf_failure_does_not_send_text_fallback(monkeypatch, tm
         assert "PDF" in sent_text
         assert "\u0414\u0435\u043d\u044c 1" not in sent_text
         assert "\u041e\u0431\u0449\u0438\u0439 \u0441\u043f\u0438\u0441\u043e\u043a \u043f\u043e\u043a\u0443\u043f\u043e\u043a" not in sent_text
+    finally:
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_week_plan_history_read_failure_stops_status_and_returns_false(monkeypatch, tmp_path) -> None:
+    chat_id = 92_003
+    store = _install_failing_chat_state_load(monkeypatch, RuntimeError("postgres history load failed"))
+
+    def fail_build_week_plans_with_recent_fallback(*_args, **_kwargs):
+        raise AssertionError("weekly history read failure must not fallback to empty history")
+
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        fail_build_week_plans_with_recent_fallback,
+    )
+    message = FakeMessage(chat_id)
+    try:
+        sent = await _send_week_plan(message, profile_with())
+
+        assert sent is False
+        assert store.load_calls == 1
+        assert message.documents == []
+        assert message.texts[0][0] == telegram_app.WEEK_PDF_STATUS_INITIAL_TEXT
+        assert message.edits
+        assert message.edits[-1][0] == CHAT_STATE_READ_ERROR_TEXT
     finally:
         PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
@@ -3277,6 +3451,69 @@ async def test_one_day_json_backend_preserves_legacy_consume_refund_behavior(mon
     assert sent is True
     assert send_calls == 1
     assert entitlement.monthly_one_day_remaining == 0
+
+
+@pytest.mark.anyio
+async def test_one_day_history_read_failure_returns_false_and_refunds_json_attempt(monkeypatch, tmp_path) -> None:
+    chat_id = 91_045
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    store = _install_failing_chat_state_load(monkeypatch, ChatStateStorageError("json history load failed"))
+
+    def fail_build_one_day_plan(*_args, **_kwargs):
+        raise AssertionError("one-day history read failure must not fallback to empty history")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", fail_build_one_day_plan)
+    message = FakeMessage(chat_id)
+
+    sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+    entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert sent is False
+    assert store.load_calls == 1
+    assert entitlement.monthly_one_day_remaining == 1
+    assert message.texts[0][0] == "Считаю рацион и проверяю ограничения... 🧮"
+    assert message.edits
+    assert message.edits[-1][0] == CHAT_STATE_READ_ERROR_TEXT
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_history_read_failure_uses_runtime_failure_not_legacy_refund(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 91_046
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    runtime = FakeOneDayGenerationRuntime()
+    _install_one_day_runtime(monkeypatch, runtime)
+    store = _install_failing_chat_state_load(monkeypatch, RuntimeError("postgres history load failed"))
+
+    def fail_build_one_day_plan(*_args, **_kwargs):
+        raise AssertionError("one-day history read failure must not fallback to empty history")
+
+    def fail_legacy_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres one-day read failures must use runtime finalization")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", fail_build_one_day_plan)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_legacy_refund)
+    message = FakeMessage(chat_id, message_id=229)
+
+    sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+    assert sent is False
+    assert store.load_calls == 1
+    assert runtime.events == [
+        "runtime:cleanup_stale",
+        "runtime:admit",
+        "runtime:start_job_and_consume",
+        "runtime:finish_failure:one_day_not_sent",
+    ]
+    assert message.texts[0][0] == "Считаю рацион и проверяю ограничения... 🧮"
+    assert message.edits
+    assert message.edits[-1][0] == CHAT_STATE_READ_ERROR_TEXT
 
 
 @pytest.mark.anyio
