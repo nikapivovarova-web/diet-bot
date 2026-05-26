@@ -2814,7 +2814,12 @@ async def _send_plan(
         await _send_meal_card(message, meal)
         if on_value_message_delivered is not None:
             on_value_message_delivered(_one_day_meal_value_message_key(meal_index, meal))
-    _remember_recipes(chat_id, plan_result)
+    _remember_recipe_history_items_best_effort(
+        chat_id,
+        _recipe_history_items_from_plan(plan_result, "one_day"),
+        ration_kind="one_day",
+        context="after_one_day_meal_delivery",
+    )
     plan_reply_markup = final_reply_markup
     if plan_reply_markup is None and include_default_after_plan_keyboard:
         plan_reply_markup = _after_plan_keyboard(message.chat.id)
@@ -3759,6 +3764,26 @@ def _remember_recipe_history_items(
     RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = id_history
     RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = key_history
 
+
+def _remember_recipe_history_items_best_effort(
+    chat_id: int,
+    entries: Sequence[RecipeHistoryItem],
+    *,
+    ration_kind: RationKind,
+    context: str,
+) -> None:
+    try:
+        _remember_recipe_history_items(chat_id, entries)
+    except ChatStateStorageError:
+        logger.exception(
+            "Failed to save recipe history in delivery context chat_id=%s ration_kind=%s context=%s entries=%d",
+            _mask_chat_id(chat_id),
+            ration_kind,
+            context,
+            len(entries),
+        )
+
+
 def _history_generation_id(consumption: AttemptConsumption) -> int | None:
     del consumption
     return None
@@ -4181,13 +4206,18 @@ def _save_chat_history(
         if recipe_keys is None
         else recipe_keys
     )
-    _chat_state_store().save_chat_state(
-        chat_id,
-        {
-            "recipe_ids": list(stored_recipe_ids)[-RECENT_RECIPE_LIMIT:],
-            "recipe_keys": list(stored_recipe_keys)[-RECENT_RECIPE_LIMIT:],
-        },
-    )
+    try:
+        _chat_state_store().save_chat_state(
+            chat_id,
+            {
+                "recipe_ids": list(stored_recipe_ids)[-RECENT_RECIPE_LIMIT:],
+                "recipe_keys": list(stored_recipe_keys)[-RECENT_RECIPE_LIMIT:],
+            },
+        )
+    except ChatStateStorageError:
+        raise
+    except Exception as exc:
+        raise ChatStateStorageError("Could not save chat history") from exc
 
 
 def _profile_for_chat(chat_id: int) -> UserProfile | None:
@@ -5088,7 +5118,12 @@ def _record_successful_generation_history(
     entries: Sequence[RecipeHistoryItem],
 ) -> None:
     if consumption.allowed:
-        _remember_recipe_history_items(chat_id, entries)
+        _remember_recipe_history_items_best_effort(
+            chat_id,
+            entries,
+            ration_kind=consumption.ration_kind,
+            context="after_successful_generation_delivery",
+        )
 
 def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
     del chat_id, consumption

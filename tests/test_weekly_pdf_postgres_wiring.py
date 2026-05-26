@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 import diet_bot.telegram_app as telegram_app
+from diet_bot.chat_state_storage import ChatStateStorageError
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
 from diet_bot.entitlement_storage import EntitlementStorageError
 from diet_bot.weekly_pdf_jobs import (
@@ -325,6 +326,52 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
         ("delivered", runtime.job.job_id),
         ("success", runtime.job.job_id),
     ]
+
+
+@pytest.mark.anyio
+async def test_postgres_history_save_failure_after_pdf_delivery_is_best_effort(monkeypatch) -> None:
+    chat_id = 201_019
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    store = FailingChatHistorySaveStore(ChatStateStorageError("history save failed"))
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
+
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
+        events.append(("send",))
+        kwargs["on_document_send_started"]()
+        kwargs["on_document_delivered"]()
+        kwargs["recipe_history_entries"].append(
+            telegram_app.RecipeHistoryItem(recipe_id="weekly-id", recipe_key="weekly:key")
+        )
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_with_access(
+        FakeMessage(chat_id),
+        profile_with(),
+        idempotency_key="idem-history-save-failure",
+    )
+
+    assert sent is True
+    assert events == [
+        ("cleanup", chat_id),
+        ("admit", chat_id, "idem-history-save-failure"),
+        ("start", runtime.job.job_id, False),
+        ("send",),
+        ("send_started", runtime.job.job_id),
+        ("delivered", runtime.job.job_id),
+        ("success", runtime.job.job_id),
+    ]
+    assert ("failure", runtime.job.job_id, "weekly_pdf_exception") not in events
+    assert ("failure", runtime.job.job_id, "weekly_pdf_not_sent") not in events
+    assert runtime.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert store.save_calls == 1
+    assert chat_id not in telegram_app.RECENT_RECIPE_IDS_BY_CHAT_ID
+    assert chat_id not in telegram_app.RECENT_RECIPE_KEYS_BY_CHAT_ID
 
 
 @pytest.mark.anyio
@@ -743,6 +790,62 @@ async def test_send_week_pdf_document_does_not_mark_delivery_before_upload_succe
         )
 
     assert events == ["send_started", "answer_document"]
+
+
+@pytest.mark.anyio
+async def test_json_history_save_failure_after_pdf_delivery_returns_success_without_refund_or_notice(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 201_020
+    subscriptions_path = tmp_path / "subscriptions.json"
+    store = FailingChatHistorySaveStore(ChatStateStorageError("history save failed"))
+    message = FakeMessage(chat_id)
+    events: list[tuple] = []
+    entitlement = telegram_app.Entitlement()
+    telegram_app.apply_subscription_payment(
+        entitlement,
+        f"charge-{chat_id}",
+        now=datetime(2026, 5, 23, tzinfo=UTC),
+    )
+    entitlement.monthly_weekly_pdf_remaining = 1
+    telegram_app.save_entitlements(subscriptions_path, {chat_id: entitlement})
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+
+    async def fake_send_week_plan(_message, *_args, **kwargs) -> bool:
+        events.append(("send",))
+        kwargs["recipe_history_entries"].append(
+            telegram_app.RecipeHistoryItem(recipe_id="weekly-id", recipe_key="weekly:key")
+        )
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_after_queue_admission(message, profile_with())
+
+    saved_entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert sent is True
+    assert events == [("send",)]
+    assert saved_entitlement.monthly_weekly_pdf_remaining == 0
+    assert message.texts == []
+    assert store.save_calls == 1
+    assert chat_id not in telegram_app.RECENT_RECIPE_IDS_BY_CHAT_ID
+    assert chat_id not in telegram_app.RECENT_RECIPE_KEYS_BY_CHAT_ID
+
+
+class FailingChatHistorySaveStore:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.save_calls = 0
+
+    def load_all(self):
+        return {}
+
+    def save_chat_state(self, chat_id: int, chat_state) -> None:
+        self.save_calls += 1
+        raise self.exc
 
 
 class FakeWeeklyPdfRuntime:

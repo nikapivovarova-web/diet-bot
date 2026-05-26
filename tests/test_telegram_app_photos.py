@@ -2197,6 +2197,21 @@ class _FailingChatHistoryStore:
         raise ChatStateStorageError("history save failed")
 
 
+class _FailingChatHistorySaveStore:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.load_calls = 0
+        self.save_calls = 0
+
+    def load_all(self):
+        self.load_calls += 1
+        return {}
+
+    def save_chat_state(self, chat_id: int, chat_state) -> None:
+        self.save_calls += 1
+        raise self.exc
+
+
 class _FailingChatStateLoadStore:
     def __init__(self, exc: Exception) -> None:
         self.exc = exc
@@ -2283,6 +2298,44 @@ def test_remember_recipe_history_save_failure_does_not_create_partial_cache(monk
 
         assert chat_id not in RECENT_RECIPE_IDS_BY_CHAT_ID
         assert chat_id not in RECENT_RECIPE_KEYS_BY_CHAT_ID
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+def test_save_chat_history_wraps_raw_backend_exceptions(monkeypatch) -> None:
+    chat_id = 91_053
+    store = _FailingChatHistorySaveStore(RuntimeError("raw history save failed"))
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+
+    with pytest.raises(ChatStateStorageError, match="Could not save chat history") as exc_info:
+        telegram_app._save_chat_history(
+            chat_id,
+            recipe_ids=["new-id"],
+            recipe_keys=["new-key"],
+        )
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert store.save_calls == 1
+
+
+def test_remember_recipe_history_raw_save_failure_leaves_memory_unchanged(monkeypatch) -> None:
+    chat_id = 91_054
+    store = _FailingChatHistorySaveStore(RuntimeError("raw history save failed"))
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = ["old-id"]
+    RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = ["old-key"]
+
+    try:
+        with pytest.raises(ChatStateStorageError, match="Could not save chat history"):
+            telegram_app._remember_recipe_history_items(
+                chat_id,
+                [_history_item("new-id", "new-key")],
+            )
+
+        assert RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] == ["old-id"]
+        assert RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] == ["old-key"]
+        assert store.save_calls == 1
     finally:
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
@@ -3454,6 +3507,53 @@ async def test_one_day_json_backend_preserves_legacy_consume_refund_behavior(mon
 
 
 @pytest.mark.anyio
+async def test_one_day_json_history_save_failure_after_meals_is_best_effort(monkeypatch, tmp_path) -> None:
+    chat_id = 91_055
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    store = _FailingChatHistorySaveStore(ChatStateStorageError("history save failed"))
+    plan = _one_day_plan_for_runtime_tests(
+        meals=(
+            Meal("Breakfast", (), "Recipe 1", recipe_id="r1", recipe_key="breakfast:key"),
+            Meal("Lunch", (), "Recipe 2", recipe_id="r2", recipe_key="lunch:key"),
+        )
+    )
+    sent_meals: list[str] = []
+    sent_summaries: list[str] = []
+
+    async def fake_send_meal_card(_message, meal) -> None:
+        sent_meals.append(meal.name)
+
+    async def fake_send_text_chunks(_message, text, _reply_markup=None) -> None:
+        sent_summaries.append(text)
+
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fake_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_send_text_chunks", fake_send_text_chunks)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+
+    try:
+        sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id), profile_with())
+
+        entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert sent is True
+        assert sent_meals == ["Breakfast", "Lunch"]
+        assert len(sent_summaries) == 2
+        assert entitlement.monthly_one_day_remaining == 0
+        assert store.load_calls == 1
+        assert store.save_calls == 1
+        assert RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []) == []
+        assert RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []) == []
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
 async def test_one_day_history_read_failure_returns_false_and_refunds_json_attempt(monkeypatch, tmp_path) -> None:
     chat_id = 91_045
     subscriptions_path = tmp_path / "subscriptions.json"
@@ -3620,6 +3720,59 @@ async def test_postgres_one_day_successful_callback_marks_value_delivery(monkeyp
         assert runtime.events[-1] == "runtime:finish_success"
     finally:
         PROFILE_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_history_save_failure_after_meals_finishes_success(monkeypatch, tmp_path) -> None:
+    chat_id = 91_056
+    runtime = FakeOneDayGenerationRuntime()
+    store = _FailingChatHistorySaveStore(ChatStateStorageError("history save failed"))
+    message = FakeMessage(chat_id, message_id=413)
+    plan = _one_day_plan_for_runtime_tests(
+        meals=(
+            Meal("Breakfast", (), "Recipe 1", recipe_id="r1", recipe_key="breakfast:key"),
+            Meal("Lunch", (), "Recipe 2", recipe_id="r2", recipe_key="lunch:key"),
+        )
+    )
+    sent_meals: list[str] = []
+    sent_summaries: list[str] = []
+
+    _install_one_day_runtime(monkeypatch, runtime)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status-text")
+
+    async def fake_send_meal_card(_message, meal) -> None:
+        sent_meals.append(meal.name)
+
+    async def fake_send_text_chunks(_message, text, _reply_markup=None) -> None:
+        sent_summaries.append(text)
+
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fake_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_send_text_chunks", fake_send_text_chunks)
+
+    try:
+        sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+        assert sent is True
+        assert sent_meals == ["Breakfast", "Lunch"]
+        assert len(sent_summaries) == 2
+        assert runtime.delivered_keys == [
+            "meal:00:r1",
+            "meal:01:r2",
+            "summary:daily_totals",
+            "summary:shopping",
+        ]
+        assert "runtime:finish_success" in runtime.events
+        assert not any(event.startswith("runtime:finish_failure:") for event in runtime.events)
+        assert store.load_calls == 1
+        assert store.save_calls == 1
+        assert RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []) == []
+        assert RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []) == []
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
 
 
 @pytest.mark.anyio
