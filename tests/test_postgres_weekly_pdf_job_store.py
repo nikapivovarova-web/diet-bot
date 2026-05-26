@@ -65,12 +65,15 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
 def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     start_signature = signature(PostgresWeeklyPdfJobStore.start_job_and_consume)
     cleanup_signature = signature(PostgresWeeklyPdfJobStore.cleanup_stale)
+    manual_review_signature = signature(PostgresWeeklyPdfJobStore.get_manual_review_jobs)
 
     assert "test_access" in start_signature.parameters
     assert "chat_id" in cleanup_signature.parameters
+    assert "include_reviewed" in manual_review_signature.parameters
     assert hasattr(PostgresWeeklyPdfJobStore, "cancel_queued")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_send_started")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_delivered")
+    assert hasattr(PostgresWeeklyPdfJobStore, "get_manual_review_jobs")
     assert hasattr(PostgresWeeklyPdfJobStore, "get_unresolved_manual_review_jobs")
     assert "send_started_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "delivered_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
@@ -758,6 +761,67 @@ def test_unresolved_manual_review_query_returns_only_open_reviews(store: Postgre
         "stale_after_send_attempt_unconfirmed",
     ]
     assert all(job.manual_reviewed_at is None for job in unresolved)
+
+
+def test_manual_review_query_can_include_reviewed_jobs(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    open_job_id = uuid.uuid4()
+    reviewed_job_id = uuid.uuid4()
+    clean_job_id = uuid.uuid4()
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO weekly_pdf_jobs (
+                    job_id,
+                    chat_id,
+                    idempotency_key,
+                    status,
+                    refund_status,
+                    stale_after,
+                    delivery_status,
+                    requires_manual_review,
+                    manual_review_reason,
+                    manual_reviewed_at,
+                    manual_review_resolution,
+                    created_at,
+                    updated_at,
+                    finished_at
+                )
+                VALUES
+                    (%s, 311, 'manual-include-open', 'succeeded', 'not_required', %s, 'unknown', true,
+                        'telegram_upload_failed', NULL, NULL, %s, %s, %s),
+                    (%s, 312, 'manual-include-reviewed', 'succeeded', 'not_required', %s, 'unknown', true,
+                        'telegram_upload_failed', %s, 'operator_confirmed_delivery', %s, %s, %s),
+                    (%s, 313, 'manual-include-clean', 'succeeded', 'not_required', %s, 'delivered', false,
+                        NULL, NULL, NULL, %s, %s, %s)
+                """,
+                (
+                    open_job_id,
+                    now + timedelta(minutes=15),
+                    now,
+                    now,
+                    now,
+                    reviewed_job_id,
+                    now + timedelta(minutes=15),
+                    now + timedelta(minutes=5),
+                    now + timedelta(seconds=1),
+                    now + timedelta(seconds=1),
+                    now + timedelta(seconds=1),
+                    clean_job_id,
+                    now + timedelta(minutes=15),
+                    now + timedelta(seconds=2),
+                    now + timedelta(seconds=2),
+                    now + timedelta(seconds=2),
+                ),
+            )
+
+    jobs = store.get_manual_review_jobs(limit=10, include_reviewed=True)
+
+    assert [job.job_id for job in jobs] == [open_job_id, reviewed_job_id]
+    assert jobs[0].manual_reviewed_at is None
+    assert jobs[1].manual_reviewed_at == now + timedelta(minutes=5)
+    assert jobs[1].manual_review_resolution == "operator_confirmed_delivery"
 
 
 def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
