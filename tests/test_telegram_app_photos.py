@@ -2168,6 +2168,218 @@ def _trial_cta_messages(message: FakeMessage) -> list[str]:
     return [text for text, _ in message.texts if text.startswith(TRIAL_SUBSCRIPTION_TEXT)]
 
 
+class _RecordingChatHistoryStore:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, dict[str, list[str]]]] = []
+        self.memory_snapshots: list[tuple[list[str], list[str]]] = []
+
+    def save_chat_state(self, chat_id: int, chat_state) -> None:
+        self.memory_snapshots.append(
+            (
+                list(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, [])),
+                list(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, [])),
+            )
+        )
+        self.calls.append(
+            (
+                chat_id,
+                {
+                    "recipe_ids": list(chat_state.get("recipe_ids", [])),
+                    "recipe_keys": list(chat_state.get("recipe_keys", [])),
+                },
+            )
+        )
+
+
+class _FailingChatHistoryStore:
+    def save_chat_state(self, chat_id: int, chat_state) -> None:
+        raise ChatStateStorageError("history save failed")
+
+
+def _history_item(recipe_id: str, recipe_key: str) -> telegram_app.RecipeHistoryItem:
+    return telegram_app.RecipeHistoryItem(recipe_id=recipe_id, recipe_key=recipe_key)
+
+
+def test_remember_recipe_history_saves_next_history_before_cache_update(monkeypatch) -> None:
+    chat_id = 91_047
+    store = _RecordingChatHistoryStore()
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = ["old-id"]
+    RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = ["old-key"]
+
+    try:
+        telegram_app._remember_recipe_history_items(
+            chat_id,
+            [_history_item("new-id", "new-key")],
+        )
+
+        assert store.calls == [
+            (
+                chat_id,
+                {
+                    "recipe_ids": ["old-id", "new-id"],
+                    "recipe_keys": ["old-key", "new-key"],
+                },
+            )
+        ]
+        assert store.memory_snapshots == [(["old-id"], ["old-key"])]
+        assert RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] == ["old-id", "new-id"]
+        assert RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] == ["old-key", "new-key"]
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+def test_remember_recipe_history_save_failure_leaves_memory_unchanged(monkeypatch) -> None:
+    chat_id = 91_048
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: _FailingChatHistoryStore())
+    RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = ["old-id"]
+    RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = ["old-key"]
+
+    try:
+        with pytest.raises(ChatStateStorageError, match="history save failed"):
+            telegram_app._remember_recipe_history_items(
+                chat_id,
+                [_history_item("new-id", "new-key")],
+            )
+
+        assert RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] == ["old-id"]
+        assert RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] == ["old-key"]
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+def test_remember_recipe_history_save_failure_does_not_create_partial_cache(monkeypatch) -> None:
+    chat_id = 91_049
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: _FailingChatHistoryStore())
+
+    try:
+        with pytest.raises(ChatStateStorageError, match="history save failed"):
+            telegram_app._remember_recipe_history_items(
+                chat_id,
+                [_history_item("new-id", "new-key")],
+            )
+
+        assert chat_id not in RECENT_RECIPE_IDS_BY_CHAT_ID
+        assert chat_id not in RECENT_RECIPE_KEYS_BY_CHAT_ID
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+def test_remember_recipe_history_keeps_bounded_window(monkeypatch) -> None:
+    chat_id = 91_050
+    store = _RecordingChatHistoryStore()
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    old_ids = [f"old-id-{index}" for index in range(telegram_app.RECENT_RECIPE_LIMIT - 1)]
+    old_keys = [f"old-key-{index}" for index in range(telegram_app.RECENT_RECIPE_LIMIT - 1)]
+    RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = list(old_ids)
+    RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = list(old_keys)
+
+    try:
+        telegram_app._remember_recipe_history_items(
+            chat_id,
+            [
+                _history_item("new-id-1", "new-key-1"),
+                _history_item("new-id-2", "new-key-2"),
+            ],
+        )
+
+        expected_ids = (old_ids + ["new-id-1", "new-id-2"])[-telegram_app.RECENT_RECIPE_LIMIT:]
+        expected_keys = (old_keys + ["new-key-1", "new-key-2"])[-telegram_app.RECENT_RECIPE_LIMIT:]
+        assert store.calls == [(chat_id, {"recipe_ids": expected_ids, "recipe_keys": expected_keys})]
+        assert RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] == expected_ids
+        assert RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] == expected_keys
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+def test_one_day_recipe_history_order_remains_meal_order(monkeypatch) -> None:
+    chat_id = 91_051
+    store = _RecordingChatHistoryStore()
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    plan = _one_day_plan_for_runtime_tests(
+        meals=(
+            Meal("Breakfast", (), "Recipe 1", recipe_id="breakfast-id", recipe_key="breakfast:key"),
+            Meal("Lunch", (), "Recipe 2", recipe_id="lunch-id", recipe_key="lunch:key"),
+            Meal("Dinner", (), "Recipe 3", recipe_id="dinner-id", recipe_key="dinner:key"),
+        )
+    )
+
+    try:
+        telegram_app._remember_recipes(chat_id, plan)
+
+        assert store.calls == [
+            (
+                chat_id,
+                {
+                    "recipe_ids": ["breakfast-id", "lunch-id", "dinner-id"],
+                    "recipe_keys": ["breakfast:key", "lunch:key", "dinner:key"],
+                },
+            )
+        ]
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+def test_weekly_recipe_history_order_remains_day_then_meal(monkeypatch) -> None:
+    chat_id = 91_052
+    store = _RecordingChatHistoryStore()
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    plans = (
+        _one_day_plan_for_runtime_tests(
+            meals=(
+                Meal("Day 1 Breakfast", (), "Recipe 1", recipe_id="day-1-breakfast", recipe_key="d1:breakfast"),
+                Meal("Day 1 Dinner", (), "Recipe 2", recipe_id="day-1-dinner", recipe_key="d1:dinner"),
+            )
+        ),
+        _one_day_plan_for_runtime_tests(
+            meals=(
+                Meal("Day 2 Breakfast", (), "Recipe 3", recipe_id="day-2-breakfast", recipe_key="d2:breakfast"),
+                Meal("Day 2 Dinner", (), "Recipe 4", recipe_id="day-2-dinner", recipe_key="d2:dinner"),
+            )
+        ),
+    )
+    entries: list[telegram_app.RecipeHistoryItem] = []
+    for day_index, plan_result in enumerate(plans):
+        entries.extend(
+            telegram_app._recipe_history_items_from_plan(
+                plan_result,
+                "weekly_pdf",
+                day_index=day_index,
+            )
+        )
+
+    try:
+        telegram_app._remember_recipe_history_items(chat_id, entries)
+
+        assert store.calls == [
+            (
+                chat_id,
+                {
+                    "recipe_ids": [
+                        "day-1-breakfast",
+                        "day-1-dinner",
+                        "day-2-breakfast",
+                        "day-2-dinner",
+                    ],
+                    "recipe_keys": [
+                        "d1:breakfast",
+                        "d1:dinner",
+                        "d2:breakfast",
+                        "d2:dinner",
+                    ],
+                },
+            )
+        ]
+    finally:
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
 @pytest.mark.anyio
 async def test_set_bot_commands_registers_start_menu_commands() -> None:
     bot = FakeBot()
