@@ -5,6 +5,7 @@ from collections import Counter
 from diet_bot import (
     postgres_chat_state_migrations,
     postgres_entitlement_migrations,
+    postgres_one_day_generation_job_migrations,
     postgres_payment_migrations,
     postgres_weekly_pdf_job_migrations,
 )
@@ -14,6 +15,7 @@ POSTGRES_MIGRATION_MODULES = (
     postgres_entitlement_migrations,
     postgres_payment_migrations,
     postgres_weekly_pdf_job_migrations,
+    postgres_one_day_generation_job_migrations,
     postgres_chat_state_migrations,
 )
 
