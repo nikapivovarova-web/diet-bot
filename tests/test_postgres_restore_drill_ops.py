@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +38,46 @@ def test_restore_refuses_unsafe_generated_database_name_before_subprocess(
     assert calls == []
 
 
+def test_restore_missing_client_tools_report_actionable_error_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup_file = _write_backup(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(postgres_restore_drill, "_generate_restore_database_name", lambda: "diet_bot_restore_drill_unit_004")
+    monkeypatch.setattr(postgres_restore_drill, "_verify_restored_database", lambda _url: _verification())
+    monkeypatch.setattr(postgres_restore_drill.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    with pytest.raises(SystemExit) as excinfo:
+        postgres_restore_drill.main(
+            [
+                "--backup-file",
+                str(backup_file),
+                "--admin-url-env",
+                "DIET_BOT_RESTORE_ADMIN_DATABASE_URL",
+            ],
+            env={"DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN, "PATH": ""},
+        )
+
+    message = str(excinfo.value)
+    assert "createdb" in message
+    assert "pg_restore" in message
+    assert "dropdb" in message
+    assert "DIET_BOT_CREATEDB_PATH" in message
+    assert "DIET_BOT_PG_RESTORE_PATH" in message
+    assert "DIET_BOT_DROPDB_PATH" in message
+    assert "PostgreSQL client" in message
+    assert "fake-admin-password" not in message
+    assert calls == []
+
+
 def test_restore_cleanup_runs_dropdb_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     backup_file = _write_backup(tmp_path)
+    tool_env, tools = _tool_env(tmp_path)
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(postgres_restore_drill, "_generate_restore_database_name", lambda: "diet_bot_restore_drill_unit_001")
     monkeypatch.setattr(postgres_restore_drill, "_verify_restored_database", lambda _url: _verification())
@@ -55,13 +91,12 @@ def test_restore_cleanup_runs_dropdb_by_default(
                 "--admin-url-env",
                 "DIET_BOT_RESTORE_ADMIN_DATABASE_URL",
             ],
-            env={"DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN},
+            env={"DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN, **tool_env},
         )
         == 0
     )
 
-    command_names = [call["cmd"][0] for call in calls]
-    assert command_names == ["createdb", "pg_restore", "dropdb"]
+    _assert_tool_paths(calls, [tools["createdb"], tools["pg_restore"], tools["dropdb"]])
     assert "diet_bot_restore_drill_unit_001" in calls[-1]["cmd"]
     assert ADMIN_DSN not in _joined_commands(calls)
     assert "fake-admin-password" not in _joined_commands(calls)
@@ -83,12 +118,98 @@ def test_restore_cleanup_runs_dropdb_by_default(
     assert payload["restore_database"] == "diet_bot_restore_drill_unit_001"
 
 
+def test_restore_uses_explicit_client_tool_path_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backup_file = _write_backup(tmp_path)
+    createdb = _fake_tool(tmp_path, "createdb")
+    pg_restore = _fake_tool(tmp_path, "pg_restore")
+    dropdb = _fake_tool(tmp_path, "dropdb")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(postgres_restore_drill, "_generate_restore_database_name", lambda: "diet_bot_restore_drill_unit_005")
+    monkeypatch.setattr(postgres_restore_drill, "_verify_restored_database", lambda _url: _verification())
+    monkeypatch.setattr(postgres_restore_drill.subprocess, "run", _fake_runner(calls))
+
+    assert (
+        postgres_restore_drill.main(
+            [
+                "--backup-file",
+                str(backup_file),
+                "--admin-url-env",
+                "DIET_BOT_RESTORE_ADMIN_DATABASE_URL",
+            ],
+            env={
+                "DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN,
+                "DIET_BOT_CREATEDB_PATH": str(createdb),
+                "DIET_BOT_PG_RESTORE_PATH": str(pg_restore),
+                "DIET_BOT_DROPDB_PATH": str(dropdb),
+                "PATH": "",
+            },
+        )
+        == 0
+    )
+
+    _assert_tool_paths(calls, [createdb, pg_restore, dropdb])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cleanup"] == {"dropdb": "ran", "kept_restore_db": False}
+
+
+def test_restore_discovers_client_tools_from_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup_file = _write_backup(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    createdb = _fake_tool(bin_dir, "createdb")
+    pg_restore = _fake_tool(bin_dir, "pg_restore")
+    dropdb = _fake_tool(bin_dir, "dropdb")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(postgres_restore_drill, "_generate_restore_database_name", lambda: "diet_bot_restore_drill_unit_006")
+    monkeypatch.setattr(postgres_restore_drill, "_verify_restored_database", lambda _url: _verification())
+    monkeypatch.setattr(postgres_restore_drill.subprocess, "run", _fake_runner(calls))
+
+    assert (
+        postgres_restore_drill.main(
+            [
+                "--backup-file",
+                str(backup_file),
+                "--admin-url-env",
+                "DIET_BOT_RESTORE_ADMIN_DATABASE_URL",
+            ],
+            env={
+                "DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN,
+                "PATH": str(bin_dir),
+                "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+            },
+        )
+        == 0
+    )
+
+    _assert_tool_paths(calls, [createdb, pg_restore, dropdb])
+
+
+def test_restore_script_help_runs_when_executed_directly() -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/ops/postgres_restore_drill.py", "--help"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Restore a PostgreSQL backup into a generated drill database." in result.stdout
+
+
 def test_restore_keep_flag_skips_dropdb_with_safe_generated_database_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     backup_file = _write_backup(tmp_path)
+    tool_env, tools = _tool_env(tmp_path, include_dropdb=False)
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(postgres_restore_drill, "_generate_restore_database_name", lambda: "diet_bot_restore_drill_unit_002")
     monkeypatch.setattr(postgres_restore_drill, "_verify_restored_database", lambda _url: _verification())
@@ -103,12 +224,12 @@ def test_restore_keep_flag_skips_dropdb_with_safe_generated_database_name(
                 "DIET_BOT_RESTORE_ADMIN_DATABASE_URL",
                 "--keep-restore-db",
             ],
-            env={"DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN},
+            env={"DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN, **tool_env},
         )
         == 0
     )
 
-    assert [call["cmd"][0] for call in calls] == ["createdb", "pg_restore"]
+    _assert_tool_paths(calls, [tools["createdb"], tools["pg_restore"]])
     payload = json.loads(capsys.readouterr().out)
     assert payload["cleanup"] == {"dropdb": "skipped", "kept_restore_db": True}
     assert payload["restore_database"] == "diet_bot_restore_drill_unit_002"
@@ -142,6 +263,7 @@ def test_restore_output_redacts_admin_and_compare_dsns(
 ) -> None:
     backup_file = _write_backup(tmp_path)
     compare_dsn = "postgresql://backup_user:fake-backup-password@db.example.invalid/diet_bot"
+    tool_env, _tools = _tool_env(tmp_path)
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(postgres_restore_drill, "_generate_restore_database_name", lambda: "diet_bot_restore_drill_unit_003")
     monkeypatch.setattr(postgres_restore_drill, "_verify_restored_database", lambda _url: _verification())
@@ -161,6 +283,7 @@ def test_restore_output_redacts_admin_and_compare_dsns(
             env={
                 "DIET_BOT_RESTORE_ADMIN_DATABASE_URL": ADMIN_DSN,
                 "DIET_BOT_BACKUP_DATABASE_URL": compare_dsn,
+                **tool_env,
             },
         )
         == 0
@@ -183,6 +306,8 @@ def test_runbook_documents_postgres_backup_restore_drill_env_vars() -> None:
     assert "DIET_BOT_RESTORE_ADMIN_DATABASE_URL" in runbook
     assert "scripts\\ops\\postgres_backup.py" in runbook
     assert "scripts\\ops\\postgres_restore_drill.py" in runbook
+    assert "DIET_BOT_PG_DUMP_PATH" in runbook
+    assert "DIET_BOT_PG_RESTORE_PATH" in runbook
     assert "freeze writes" in runbook.lower()
 
 
@@ -198,6 +323,38 @@ def _fake_runner(calls: list[dict[str, object]]):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return fake_run
+
+
+def _fake_tool(directory: Path, name: str) -> Path:
+    suffix = ".cmd" if os.name == "nt" else ""
+    path = directory / f"{name}{suffix}"
+    path.write_text("@echo off\r\nexit /b 0\r\n" if os.name == "nt" else "#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _tool_env(tmp_path: Path, *, include_dropdb: bool = True) -> tuple[dict[str, str], dict[str, Path]]:
+    tools = {
+        "createdb": _fake_tool(tmp_path, "createdb"),
+        "pg_restore": _fake_tool(tmp_path, "pg_restore"),
+    }
+    env = {
+        "DIET_BOT_CREATEDB_PATH": str(tools["createdb"]),
+        "DIET_BOT_PG_RESTORE_PATH": str(tools["pg_restore"]),
+    }
+    if include_dropdb:
+        tools["dropdb"] = _fake_tool(tmp_path, "dropdb")
+        env["DIET_BOT_DROPDB_PATH"] = str(tools["dropdb"])
+    return env, tools
+
+
+def _assert_tool_paths(calls: list[dict[str, object]], expected: list[Path]) -> None:
+    actual = [Path(str(call["cmd"][0])) for call in calls]
+    if os.name == "nt":
+        for actual_path, expected_path in zip(actual, expected, strict=True):
+            assert actual_path.samefile(expected_path)
+    else:
+        assert actual == expected
 
 
 def _verification() -> dict[str, Any]:

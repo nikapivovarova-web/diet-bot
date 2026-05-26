@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 
+try:
+    from scripts.ops.postgres_client_tools import resolve_required_postgres_tools
+except ModuleNotFoundError:
+    from postgres_client_tools import resolve_required_postgres_tools
+
 
 DEFAULT_ADMIN_URL_ENV = "DIET_BOT_RESTORE_ADMIN_DATABASE_URL"
 DEFAULT_COMPARE_SOURCE_URL_ENV = "DIET_BOT_BACKUP_DATABASE_URL"
@@ -79,6 +84,9 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
         compare_source_url = _required_env(source_env, args.compare_source_url_env)
         _refuse_same_database(compare_source_url, restore_url)
 
+    required_tool_names = ("createdb", "pg_restore") if args.keep_restore_db else ("createdb", "pg_restore", "dropdb")
+    tools = resolve_required_postgres_tools(required_tool_names, env=source_env)
+
     admin_env = _connection_env_from_dsn(admin_url)
     restore_env = _connection_env_from_dsn(admin_url, database=restore_database)
     started_at = _now().isoformat()
@@ -88,11 +96,11 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     comparison: dict[str, Any] | None = None
 
     try:
-        _run_tool(["createdb", restore_database], env=admin_env, tool_name="createdb")
+        _run_tool([tools["createdb"], restore_database], env=admin_env, tool_name="createdb")
         created = True
         _run_tool(
             [
-                "pg_restore",
+                tools["pg_restore"],
                 "--no-owner",
                 "--no-privileges",
                 "--dbname",
@@ -112,7 +120,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             }
     finally:
         if created and not args.keep_restore_db:
-            _run_tool(["dropdb", "--if-exists", restore_database], env=admin_env, tool_name="dropdb")
+            _run_tool([tools["dropdb"], "--if-exists", restore_database], env=admin_env, tool_name="dropdb")
             cleanup = {"dropdb": "ran", "kept_restore_db": False}
         elif created:
             cleanup = {"dropdb": "skipped", "kept_restore_db": True}
@@ -182,13 +190,19 @@ def _refuse_same_database(source_url: str, restore_url: str) -> None:
 def _run_tool(command: list[str], *, env: dict[str, str], tool_name: str) -> None:
     child_env = dict(os.environ)
     child_env.update(env)
-    result = subprocess.run(
-        command,
-        env=child_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"{tool_name} executable was not found at run time; "
+            "install PostgreSQL client tools or set the explicit executable path override.",
+        ) from exc
     if result.returncode != 0:
         raise SystemExit(f"{tool_name} failed with exit code {result.returncode}; stderr redacted.")
 
