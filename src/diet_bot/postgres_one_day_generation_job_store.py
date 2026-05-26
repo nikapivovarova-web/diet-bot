@@ -587,6 +587,22 @@ class PostgresOneDayGenerationJobStore:
                                         ),
                                     )
                                 )
+                            elif (
+                                job.send_started_at is not None
+                                and job.first_value_delivered_at is None
+                                and job.delivered_value_messages == 0
+                            ):
+                                job_results.append(
+                                    FinishJobResult(
+                                        FinishJobResultStatus.SUCCEEDED,
+                                        self._finish_send_started_unconfirmed_job_cur(
+                                            cur,
+                                            job,
+                                            finalization_error="stale_after_send_attempt_unconfirmed",
+                                            now=current_time,
+                                        ),
+                                    )
+                                )
                             else:
                                 job_results.append(
                                     self._finish_failure_and_refund_once_cur(
@@ -728,6 +744,38 @@ class PostgresOneDayGenerationJobStore:
         )
         return _job_from_row(cur.fetchone())
 
+    def _finish_send_started_unconfirmed_job_cur(
+        self,
+        cur: Any,
+        job: OneDayGenerationJob,
+        *,
+        finalization_error: str | None,
+        now: datetime,
+    ) -> OneDayGenerationJob:
+        cur.execute(
+            """
+            UPDATE one_day_generation_jobs
+            SET status = %s,
+                refund_status = 'not_required',
+                finalization_error = COALESCE(%s, finalization_error),
+                delivery_status = %s,
+                requires_manual_review = true,
+                finished_at = COALESCE(finished_at, %s),
+                updated_at = %s
+            WHERE job_id = %s
+            RETURNING *
+            """,
+            (
+                JOB_STATUS_SUCCEEDED,
+                _optional_text(finalization_error),
+                DELIVERY_STATUS_UNKNOWN,
+                now,
+                now,
+                job.job_id,
+            ),
+        )
+        return _job_from_row(cur.fetchone())
+
     def _finish_partial_delivery_failure_cur(
         self,
         cur: Any,
@@ -780,6 +828,16 @@ class PostgresOneDayGenerationJobStore:
                     cur,
                     job,
                     reason=reason,
+                    now=now,
+                ),
+            )
+        if job.send_started_at is not None:
+            return FinishJobResult(
+                FinishJobResultStatus.SUCCEEDED,
+                self._finish_send_started_unconfirmed_job_cur(
+                    cur,
+                    job,
+                    finalization_error=reason,
                     now=now,
                 ),
             )

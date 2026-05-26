@@ -10,6 +10,24 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
+import diet_bot.postgres_one_day_generation_job_store as one_day_job_store
+from diet_bot.one_day_generation_jobs import (
+    AdmitJobResultStatus,
+    FinishJobResultStatus,
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_QUEUED,
+    JOB_STATUS_RUNNING,
+    JOB_STATUS_SUCCEEDED,
+    MarkSendStartedResultStatus,
+    MarkValueMessageDeliveredResultStatus,
+    OneDayGenerationJob,
+    REFUND_STATUS_NOT_REQUIRED,
+    REFUND_STATUS_PENDING,
+    REFUND_STATUS_REFUNDED,
+    SetExpectedValueMessagesResultStatus,
+    StartJobResultStatus,
+)
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_one_day_generation_job_migrations import MIGRATIONS
 from diet_bot.postgres_one_day_generation_job_store import (
@@ -17,21 +35,6 @@ from diet_bot.postgres_one_day_generation_job_store import (
     PostgresOneDayGenerationJobStore,
 )
 from diet_bot.subscriptions import Entitlement, apply_subscription_payment
-from diet_bot.one_day_generation_jobs import (
-    AdmitJobResultStatus,
-    FinishJobResultStatus,
-    JOB_STATUS_FAILED,
-    JOB_STATUS_QUEUED,
-    JOB_STATUS_RUNNING,
-    JOB_STATUS_SUCCEEDED,
-    MarkSendStartedResultStatus,
-    MarkValueMessageDeliveredResultStatus,
-    REFUND_STATUS_NOT_REQUIRED,
-    REFUND_STATUS_PENDING,
-    REFUND_STATUS_REFUNDED,
-    SetExpectedValueMessagesResultStatus,
-    StartJobResultStatus,
-)
 
 
 TEST_DATABASE_URL = os.getenv("DIET_BOT_TEST_DATABASE_URL")
@@ -433,6 +436,56 @@ def test_finish_failure_after_partial_delivery_keeps_consumption_and_requires_re
     assert _one_day_remaining(store, chat_id) == 0
 
 
+def test_finish_failure_after_send_started_without_value_delivery_closes_unknown_without_refund(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    send_started_at = now + timedelta(seconds=1)
+    job = OneDayGenerationJob(
+        job_id=uuid.uuid4(),
+        chat_id=113,
+        idempotency_key="one-day-send-started-no-delivery-no-refund",
+        status=JOB_STATUS_RUNNING,
+        consumption_source="monthly",
+        refund_status=REFUND_STATUS_PENDING,
+        delivery_status="send_started",
+        expected_value_messages=2,
+        delivered_value_messages=0,
+        stale_after=now + timedelta(minutes=15),
+        started_at=now,
+        send_started_at=send_started_at,
+    )
+
+    def fail_refund_path(*_args, **_kwargs):
+        raise AssertionError("send-started failures must not enter entitlement refund handling")
+
+    monkeypatch.setattr(one_day_job_store, "_lock_entitlement_map_cur", fail_refund_path)
+    monkeypatch.setattr(one_day_job_store, "_load_entitlement_cur", fail_refund_path)
+    monkeypatch.setattr(one_day_job_store, "refund_attempt", fail_refund_path)
+    monkeypatch.setattr(one_day_job_store, "_upsert_entitlement_cur", fail_refund_path)
+
+    cursor = FakeOneDayJobCursor(job)
+    store = PostgresOneDayGenerationJobStore("postgresql://unit-test")
+
+    result = store._finish_failure_and_refund_once_cur(
+        cursor,
+        job,
+        reason="telegram_upload_failed",
+        now=now + timedelta(seconds=2),
+    )
+
+    assert result.status == FinishJobResultStatus.SUCCEEDED
+    assert result.job.status == JOB_STATUS_SUCCEEDED
+    assert result.job.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert result.job.send_started_at == send_started_at
+    assert result.job.delivered_value_messages == 0
+    assert result.job.delivered_at is None
+    assert result.job.failure_reason is None
+    assert result.job.finalization_error == "telegram_upload_failed"
+    assert result.job.delivery_status == "unknown"
+    assert result.job.requires_manual_review is True
+
+
 def test_free_trial_failure_before_delivery_resets_trial_flag(store: PostgresOneDayGenerationJobStore) -> None:
     now = datetime(2026, 5, 26, tzinfo=UTC)
     chat_id = 110
@@ -477,6 +530,195 @@ def test_mark_send_started_sets_timestamp(store: PostgresOneDayGenerationJobStor
     assert second.job.send_started_at == now + timedelta(seconds=1)
 
 
+def test_cleanup_stale_queued_job_cancels_without_refund(store: PostgresOneDayGenerationJobStore) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 114
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    job = store.admit_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-stale-queued-cancel",
+        stale_after=now - timedelta(seconds=1),
+    ).job
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now)
+
+    assert [cleaned_job.job_id for cleaned_job in cleaned.jobs] == [job.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.CANCELLED
+    assert cleaned.jobs[0].status == JOB_STATUS_CANCELLED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert cleaned.jobs[0].failure_reason == "one_day_generation_job_stale"
+    assert _one_day_remaining(store, chat_id) == 1
+    assert store.get_active_job_for_chat(chat_id) is None
+
+
+def test_cleanup_stale_running_before_send_start_refunds(store: PostgresOneDayGenerationJobStore) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 115
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    started = _running_job_with_expected_count(
+        store,
+        chat_id,
+        "one-day-stale-running-refund",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now)
+    cleaned_again = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(minutes=1))
+
+    assert [cleaned_job.job_id for cleaned_job in cleaned.jobs] == [started.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.FAILED
+    assert cleaned.jobs[0].status == JOB_STATUS_FAILED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_REFUNDED
+    assert cleaned.jobs[0].send_started_at is None
+    assert cleaned.jobs[0].delivery_status == "not_started"
+    assert cleaned.jobs[0].requires_manual_review is False
+    assert cleaned_again.jobs == []
+    assert _one_day_remaining(store, chat_id) == 1
+
+
+def test_cleanup_stale_running_after_send_start_without_delivery_closes_unknown_no_refund(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 116
+    send_started_at = now + timedelta(seconds=1)
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    started = _running_job_with_expected_count(
+        store,
+        chat_id,
+        "one-day-stale-send-started-no-delivery",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+    store.mark_send_started(started.job_id, now=send_started_at)
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(seconds=2))
+    cleaned_again = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(minutes=1))
+
+    assert [cleaned_job.job_id for cleaned_job in cleaned.jobs] == [started.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.SUCCEEDED
+    assert cleaned.jobs[0].status == JOB_STATUS_SUCCEEDED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert cleaned.jobs[0].send_started_at == send_started_at
+    assert cleaned.jobs[0].delivered_value_messages == 0
+    assert cleaned.jobs[0].delivered_at is None
+    assert cleaned.jobs[0].finalization_error == "stale_after_send_attempt_unconfirmed"
+    assert cleaned.jobs[0].delivery_status == "unknown"
+    assert cleaned.jobs[0].requires_manual_review is True
+    assert cleaned_again.jobs == []
+    assert store.get_active_job_for_chat(chat_id) is None
+    assert _one_day_remaining(store, chat_id) == 0
+
+
+def test_cleanup_stale_partial_delivery_keeps_consumption_and_requires_review(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 117
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    started = _running_job_with_expected_count(
+        store,
+        chat_id,
+        "one-day-stale-partial-delivery",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+    store.mark_value_message_delivered(
+        started.job_id,
+        value_message_key="meal-breakfast",
+        now=now + timedelta(seconds=1),
+    )
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(seconds=2))
+
+    assert [cleaned_job.job_id for cleaned_job in cleaned.jobs] == [started.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.FAILED
+    assert cleaned.jobs[0].status == JOB_STATUS_FAILED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert cleaned.jobs[0].delivered_value_messages == 1
+    assert cleaned.jobs[0].finalization_error == "one_day_generation_job_stale"
+    assert cleaned.jobs[0].delivery_status == "unknown"
+    assert cleaned.jobs[0].requires_manual_review is True
+    assert _one_day_remaining(store, chat_id) == 0
+
+
+def test_cleanup_stale_complete_delivery_succeeds_without_refund(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 118
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    started = _running_job_with_expected_count(
+        store,
+        chat_id,
+        "one-day-stale-complete-delivery",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+    store.mark_value_message_delivered(
+        started.job_id,
+        value_message_key="meal-breakfast",
+        now=now + timedelta(seconds=1),
+    )
+    store.mark_value_message_delivered(
+        started.job_id,
+        value_message_key="meal-lunch",
+        now=now + timedelta(seconds=2),
+    )
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now + timedelta(seconds=3))
+
+    assert [cleaned_job.job_id for cleaned_job in cleaned.jobs] == [started.job_id]
+    assert cleaned.job_results[0].status == FinishJobResultStatus.SUCCEEDED
+    assert cleaned.jobs[0].status == JOB_STATUS_SUCCEEDED
+    assert cleaned.jobs[0].refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert cleaned.jobs[0].delivered_value_messages == 2
+    assert cleaned.jobs[0].finalization_error == "stale_after_complete_delivery"
+    assert cleaned.jobs[0].delivery_status == "delivered"
+    assert cleaned.jobs[0].requires_manual_review is False
+    assert _one_day_remaining(store, chat_id) == 0
+
+
+def test_list_stale_candidates_selects_active_stale_jobs_only(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    queued = store.admit_job(
+        chat_id=119,
+        idempotency_key="one-day-list-stale-queued",
+        stale_after=now - timedelta(minutes=3),
+    ).job
+    _save_subscription(store, 120, now=now, one_day_remaining=1)
+    running = _running_job_with_expected_count(
+        store,
+        120,
+        "one-day-list-stale-running",
+        now,
+        expected=1,
+        stale_after=now - timedelta(minutes=2),
+    )
+    store.admit_job(
+        chat_id=121,
+        idempotency_key="one-day-list-non-stale-queued",
+        stale_after=now + timedelta(minutes=1),
+    )
+    cancelled = store.admit_job(
+        chat_id=122,
+        idempotency_key="one-day-list-terminal-cancelled",
+        stale_after=now - timedelta(minutes=1),
+    ).job
+    store.cancel_queued(cancelled.job_id, reason="test-terminal", now=now)
+
+    candidates = store.list_stale_candidates(now=now, limit=10)
+
+    assert [candidate.job_id for candidate in candidates] == [queued.job_id, running.job_id]
+
+
 def _running_job_with_expected_count(
     store: PostgresOneDayGenerationJobStore,
     chat_id: int,
@@ -484,13 +726,18 @@ def _running_job_with_expected_count(
     now: datetime,
     *,
     expected: int,
+    stale_after: datetime | None = None,
 ):
     job = store.admit_job(
         chat_id=chat_id,
         idempotency_key=idempotency_key,
-        stale_after=now + timedelta(minutes=15),
+        stale_after=stale_after or now + timedelta(minutes=15),
     ).job
-    started = store.start_job_and_consume(job.job_id, now=now).job
+    started = store.start_job_and_consume(
+        job.job_id,
+        now=now,
+        stale_after=stale_after,
+    ).job
     set_result = store.set_expected_value_messages(started.job_id, expected, now=now + timedelta(seconds=1))
     assert set_result.status == SetExpectedValueMessagesResultStatus.SET
     return set_result.job
@@ -532,6 +779,59 @@ def _active_job_count(store: PostgresOneDayGenerationJobStore, chat_id: int) -> 
                 (chat_id,),
             )
             return int(cur.fetchone()["count"])
+
+
+class FakeOneDayJobCursor:
+    def __init__(self, job: OneDayGenerationJob) -> None:
+        self.job = job
+        self.row = _one_day_job_row(job)
+
+    def execute(self, query: str, params: tuple) -> None:
+        assert "refund_status = 'not_required'" in query
+        status, finalization_error, delivery_status, finished_at, updated_at, job_id = params
+        assert job_id == self.job.job_id
+        self.row = _one_day_job_row(
+            self.job,
+            status=status,
+            refund_status=REFUND_STATUS_NOT_REQUIRED,
+            finalization_error=finalization_error,
+            delivery_status=delivery_status,
+            requires_manual_review=True,
+            finished_at=finished_at,
+            updated_at=updated_at,
+        )
+
+    def fetchone(self):
+        return self.row
+
+
+def _one_day_job_row(job: OneDayGenerationJob, **overrides):
+    row = {
+        "job_id": job.job_id,
+        "chat_id": job.chat_id,
+        "idempotency_key": job.idempotency_key,
+        "status": job.status,
+        "consumption_source": job.consumption_source,
+        "refund_status": job.refund_status,
+        "delivery_status": job.delivery_status,
+        "expected_value_messages": job.expected_value_messages,
+        "delivered_value_messages": job.delivered_value_messages,
+        "stale_after": job.stale_after,
+        "metadata_json": job.metadata,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "started_at": job.started_at,
+        "heartbeat_at": job.heartbeat_at,
+        "finished_at": job.finished_at,
+        "send_started_at": job.send_started_at,
+        "first_value_delivered_at": job.first_value_delivered_at,
+        "delivered_at": job.delivered_at,
+        "failure_reason": job.failure_reason,
+        "finalization_error": job.finalization_error,
+        "requires_manual_review": job.requires_manual_review,
+    }
+    row.update(overrides)
+    return row
 
 
 def _require_safe_test_database_url(database_url: str) -> None:
