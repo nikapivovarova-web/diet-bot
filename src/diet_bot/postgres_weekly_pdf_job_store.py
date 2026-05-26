@@ -497,16 +497,24 @@ class PostgresWeeklyPdfJobStore:
                 return self._get_active_job_for_chat_cur(cur, chat_id)
 
     def get_unresolved_manual_review_jobs(self, *, limit: int = 100) -> list[WeeklyPdfJob]:
+        return self.get_manual_review_jobs(limit=limit, include_reviewed=False)
+
+    def get_manual_review_jobs(self, *, limit: int = 100, include_reviewed: bool = False) -> list[WeeklyPdfJob]:
         bounded_limit = min(500, max(1, int(limit)))
+        reviewed_filter = "" if include_reviewed else "AND manual_reviewed_at IS NULL"
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT *
                     FROM weekly_pdf_jobs
                     WHERE requires_manual_review = true
-                      AND manual_reviewed_at IS NULL
-                    ORDER BY updated_at, created_at, job_id
+                      {reviewed_filter}
+                    ORDER BY
+                        CASE WHEN manual_reviewed_at IS NULL THEN 0 ELSE 1 END,
+                        updated_at,
+                        created_at,
+                        job_id
                     LIMIT %s
                     """,
                     (bounded_limit,),

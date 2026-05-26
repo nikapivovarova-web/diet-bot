@@ -298,6 +298,54 @@ Bot startup validates runtime configuration and Postgres schema readiness. It
 must fail fast if required production config or schema is missing. Startup does
 not apply migrations.
 
+## Weekly PDF Manual-Review Report
+
+Run this report when reviewing weekly PDF delivery health. It is read-only and
+lists unresolved jobs where the bot recorded a weekly PDF send attempt that
+still needs operator evidence.
+
+```powershell
+$env:DIET_BOT_DATABASE_URL = "<postgres-dsn-from-secret-manager>"
+.\.venv\Scripts\python.exe -m scripts.ops.weekly_pdf_manual_review_report --limit 50
+```
+
+For ticket attachment or structured review, use JSON output:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.ops.weekly_pdf_manual_review_report --json --limit 50
+```
+
+If the deployment secret manager exposes the DSN under a different variable,
+pass `--database-url-env <env-name>` instead of copying the DSN into the command.
+
+The report does not print the DSN, bot tokens, provider tokens, raw chat IDs, or
+idempotency keys. Chat IDs are shown only as stable `chat:sha256:<prefix>`
+hashes so operators can compare repeated rows without exposing the raw
+identifier.
+
+Interpretation:
+
+- `delivery_status=unknown` means Telegram upload was started, but the bot does
+  not have a delivered marker. The user may or may not have received the PDF.
+- `manual_review_reason` and `finalization_error` explain why the row entered
+  manual review, for example stale finalization after a send attempt.
+- `refund_status=not_required` on unknown delivery is intentional. Do not
+  auto-refund or auto-credit from this report because delivery is ambiguous.
+- Clean delivered successes are excluded. Rows with `manual_reviewed_at` are
+  excluded by default; use `--include-reviewed` only for audit comparison.
+
+Recovery workflow:
+
+1. Capture the report output and the review time in the operator ticket.
+2. Check application logs and existing operator/support evidence for the hashed
+   chat/job pair. Do not use Telegram `getUpdates`, ad hoc Telegram QA, provider
+   token changes, or production DB writes to investigate.
+3. For unknown delivery, decide the customer action outside the bot: manual
+   credit, manual refund, or no action. Record the evidence and decision in the
+   operator ticket.
+4. Do not mutate `weekly_pdf_jobs` manually and do not mark rows resolved until
+   approved resolution tooling exists.
+
 ## One Poller Only
 
 Run exactly one long-polling bot process for a bot token.
