@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -2074,15 +2075,20 @@ class FakeOneDayGenerationRuntime:
         admit_status: OneDayAdmitJobResultStatus = OneDayAdmitJobResultStatus.ADMITTED,
         start_status: OneDayStartJobResultStatus = OneDayStartJobResultStatus.STARTED,
         fail_mark_send_started: bool = False,
+        duplicate_on_existing_idempotency: bool = False,
+        consumption_source: str | None = "free_trial",
     ) -> None:
         self.admit_status = admit_status
         self.start_status = start_status
         self.fail_mark_send_started = fail_mark_send_started
+        self.duplicate_on_existing_idempotency = duplicate_on_existing_idempotency
+        self.consumption_source = consumption_source
         self.calls: list[tuple[str, object]] = []
         self.events: list[str] = []
         self.expected_counts: list[int] = []
         self.delivered_keys: list[str] = []
         self.job = self._job(chat_id=0, idempotency_key="initial")
+        self.jobs_by_idempotency_key: dict[str, OneDayGenerationJob] = {}
 
     def _job(self, *, chat_id: int, idempotency_key: str) -> OneDayGenerationJob:
         return OneDayGenerationJob(
@@ -2105,12 +2111,22 @@ class FakeOneDayGenerationRuntime:
     def admit(self, *, chat_id: int, idempotency_key: str, metadata=None):
         self.events.append("runtime:admit")
         self.calls.append(("admit", {"chat_id": chat_id, "idempotency_key": idempotency_key, "metadata": metadata}))
+        if self.duplicate_on_existing_idempotency and idempotency_key in self.jobs_by_idempotency_key:
+            self.job = self.jobs_by_idempotency_key[idempotency_key]
+            return AdmitJobResult(OneDayAdmitJobResultStatus.EXISTING_IDEMPOTENCY, self.job)
         self.job = self._job(chat_id=chat_id, idempotency_key=idempotency_key)
+        self.jobs_by_idempotency_key[idempotency_key] = self.job
         return AdmitJobResult(self.admit_status, self.job)
 
     def start_job_and_consume(self, job_id, *, test_access: bool = False):
         self.events.append("runtime:start_job_and_consume")
         self.calls.append(("start_job_and_consume", {"job_id": job_id, "test_access": test_access}))
+        self.job = replace(
+            self.job,
+            status="running",
+            consumption_source=self.consumption_source,
+            refund_status="pending" if self.consumption_source == "free_trial" else "not_required",
+        )
         return StartJobResult(self.start_status, self.job)
 
     def set_expected_value_messages(self, job_id, expected_count: int):
@@ -2145,6 +2161,10 @@ class FakeOneDayGenerationRuntime:
 
 def _install_one_day_runtime(monkeypatch, runtime: FakeOneDayGenerationRuntime | None) -> None:
     monkeypatch.setattr(telegram_app, "_ONE_DAY_GENERATION_JOB_RUNTIME", runtime, raising=False)
+
+
+def _trial_cta_messages(message: FakeMessage) -> list[str]:
+    return [text for text, _ in message.texts if text.startswith(TRIAL_SUBSCRIPTION_TEXT)]
 
 
 @pytest.mark.anyio
@@ -3244,9 +3264,8 @@ async def test_postgres_one_day_partial_delivery_failure_uses_runtime_no_legacy_
 async def test_send_trial_plan_keeps_legacy_path_without_one_day_job_runtime(monkeypatch, tmp_path) -> None:
     chat_id = 91_036
     subscriptions_path = tmp_path / "subscriptions.json"
-    runtime = FakeOneDayGenerationRuntime()
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
-    _install_one_day_runtime(monkeypatch, runtime)
+    _install_one_day_runtime(monkeypatch, None)
     message = FakeMessage(chat_id, message_id=229)
 
     async def fake_send_plan(*_args, **_kwargs) -> bool:
@@ -3262,8 +3281,297 @@ async def test_send_trial_plan_keeps_legacy_path_without_one_day_job_runtime(mon
 
     entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
     assert entitlement.free_trial_used is True
-    assert runtime.calls == []
     assert message.texts[-1][0].startswith(TRIAL_SUBSCRIPTION_TEXT)
+
+
+@pytest.mark.anyio
+async def test_postgres_trial_success_marks_value_delivery_and_sends_cta_after_success(monkeypatch, tmp_path) -> None:
+    chat_id = 91_037
+    runtime = FakeOneDayGenerationRuntime()
+    message = FakeMessage(chat_id, message_id=230)
+    plan = _one_day_plan_for_runtime_tests()
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def fake_send_calculation_report(message, *_args, **kwargs) -> None:
+        runtime.events.append("telegram:calculation")
+        await message.answer("calculation-report", reply_markup=kwargs.get("reply_markup"))
+
+    async def fake_send_meal_card(_message, meal) -> None:
+        runtime.events.append(f"telegram:meal:{meal.recipe_id or meal.recipe_key}")
+
+    async def fake_send_text_chunks(_message, text, _reply_markup=None) -> None:
+        runtime.events.append(f"telegram:summary:{text.splitlines()[0]}")
+
+    original_answer = message.answer
+
+    async def tracking_answer(text, reply_markup=None):
+        if text.startswith(TRIAL_SUBSCRIPTION_TEXT):
+            runtime.events.append("telegram:trial_cta")
+        return await original_answer(text, reply_markup=reply_markup)
+
+    message.answer = tracking_answer
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_calculation_report", fake_send_calculation_report)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fake_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_send_text_chunks", fake_send_text_chunks)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "trial-status")
+
+    await telegram_app._send_trial_plan(
+        message,
+        profile_with(),
+        idempotency_key="telegram_trial_session:91037:trial-token:one_day",
+    )
+
+    admit_call = next(payload for name, payload in runtime.calls if name == "admit")
+    start_call = next(payload for name, payload in runtime.calls if name == "start_job_and_consume")
+    assert admit_call == {
+        "chat_id": chat_id,
+        "idempotency_key": "telegram_trial_session:91037:trial-token:one_day",
+        "metadata": {"source": "telegram_trial"},
+    }
+    assert start_call["test_access"] is False
+    assert runtime.events.index("telegram:calculation") < runtime.events.index("runtime:set_expected:4")
+    assert runtime.expected_counts == [len(plan.meals) + 2]
+    assert runtime.events.index("runtime:mark_send_started") < runtime.events.index("telegram:meal:r1")
+    assert runtime.delivered_keys == [
+        "meal:00:r1",
+        "meal:01:lunch:curated:r2",
+        "summary:daily_totals",
+        "summary:shopping",
+    ]
+    assert runtime.events.index("runtime:finish_success") < runtime.events.index("telegram:trial_cta")
+    assert _trial_cta_messages(message) == [TRIAL_SUBSCRIPTION_TEXT + "\n\ntrial-status"]
+
+
+@pytest.mark.anyio
+async def test_postgres_trial_duplicate_idempotency_does_not_consume_or_generate_twice(monkeypatch, tmp_path) -> None:
+    chat_id = 91_038
+    runtime = FakeOneDayGenerationRuntime(duplicate_on_existing_idempotency=True)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+    calculation_calls = 0
+    plan_calls = 0
+
+    async def fake_send_calculation_report(*_args, **_kwargs) -> None:
+        nonlocal calculation_calls
+        calculation_calls += 1
+
+    async def fake_send_plan(
+        *_args,
+        on_expected_value_messages=None,
+        on_value_send_start=None,
+        on_value_message_delivered=None,
+        **_kwargs,
+    ) -> bool:
+        nonlocal plan_calls
+        plan_calls += 1
+        on_expected_value_messages(1)
+        on_value_send_start()
+        on_value_message_delivered("summary:daily_totals")
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_calculation_report", fake_send_calculation_report)
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "trial-status")
+
+    await telegram_app._send_trial_plan(FakeMessage(chat_id, message_id=231), profile_with(), idempotency_key="trial-key")
+    await telegram_app._send_trial_plan(FakeMessage(chat_id, message_id=232), profile_with(), idempotency_key="trial-key")
+
+    assert [name for name, _ in runtime.calls].count("start_job_and_consume") == 1
+    assert calculation_calls == 1
+    assert plan_calls == 1
+
+
+@pytest.mark.anyio
+async def test_postgres_trial_denied_start_sends_existing_paywall_without_cta(monkeypatch, tmp_path) -> None:
+    chat_id = 91_039
+    runtime = FakeOneDayGenerationRuntime(start_status=OneDayStartJobResultStatus.DENIED)
+    message = FakeMessage(chat_id, message_id=233)
+    paywalls: list[str] = []
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def fake_send_limit_paywall(message, ration_kind) -> None:
+        paywalls.append(ration_kind)
+        await message.answer(f"paywall:{ration_kind}")
+
+    async def fail_send_calculation_report(*_args, **_kwargs) -> None:
+        raise AssertionError("Denied trial runtime start must not send calculation report")
+
+    async def fail_send_plan(*_args, **_kwargs) -> bool:
+        raise AssertionError("Denied trial runtime start must not generate a plan")
+
+    monkeypatch.setattr(telegram_app, "_send_limit_paywall", fake_send_limit_paywall)
+    monkeypatch.setattr(telegram_app, "_send_calculation_report", fail_send_calculation_report)
+    monkeypatch.setattr(telegram_app, "_send_plan", fail_send_plan)
+
+    await telegram_app._send_trial_plan(message, profile_with(), idempotency_key="denied-trial-key")
+
+    assert paywalls == ["one_day"]
+    assert [name for name, _ in runtime.calls] == ["cleanup_stale", "admit", "start_job_and_consume"]
+    assert _trial_cta_messages(message) == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "plan",
+    [
+        _one_day_plan_for_runtime_tests(meals=(), can_generate=True),
+        _one_day_plan_for_runtime_tests(meals=(), can_generate=False),
+    ],
+)
+async def test_postgres_trial_generation_failure_before_send_start_refunds_with_runtime(
+    monkeypatch,
+    tmp_path,
+    plan,
+) -> None:
+    chat_id = 91_040
+    runtime = FakeOneDayGenerationRuntime()
+    message = FakeMessage(chat_id, message_id=234)
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    def fail_old_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres trial failures must not use legacy JSON refund path")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_old_refund)
+
+    await telegram_app._send_trial_plan(message, profile_with(), idempotency_key="pre-send-failure-trial-key")
+
+    assert "runtime:mark_send_started" not in runtime.events
+    assert runtime.events[-1] == "runtime:finish_failure:trial_one_day_not_sent"
+    assert _trial_cta_messages(message) == []
+
+
+@pytest.mark.anyio
+async def test_postgres_trial_send_start_marker_failure_refunds_before_value_send(monkeypatch, tmp_path) -> None:
+    chat_id = 91_041
+    runtime = FakeOneDayGenerationRuntime(fail_mark_send_started=True)
+    message = FakeMessage(chat_id, message_id=235)
+    plan = _one_day_plan_for_runtime_tests(meals=(Meal("Breakfast", (), "Recipe 1", recipe_id="r1"),))
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def fail_send_meal_card(*_args, **_kwargs) -> None:
+        raise AssertionError("Value message must not send when trial send-start marker fails")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fail_send_meal_card)
+
+    with pytest.raises(RuntimeError, match="send-start marker failed"):
+        await telegram_app._send_trial_plan(message, profile_with(), idempotency_key="marker-failure-trial-key")
+
+    assert runtime.events[-1] == "runtime:finish_failure:trial_one_day_exception"
+    assert runtime.delivered_keys == []
+    assert _trial_cta_messages(message) == []
+
+
+@pytest.mark.anyio
+async def test_postgres_trial_send_failure_after_send_start_uses_runtime_no_cta(monkeypatch, tmp_path) -> None:
+    chat_id = 91_042
+    runtime = FakeOneDayGenerationRuntime()
+    message = FakeMessage(chat_id, message_id=236)
+    plan = _one_day_plan_for_runtime_tests(meals=(Meal("Breakfast", (), "Recipe 1", recipe_id="r1"),))
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def fail_send_meal_card(*_args, **_kwargs) -> None:
+        raise RuntimeError("telegram send failed")
+
+    def fail_old_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres trial failures must not use legacy JSON refund path")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fail_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_old_refund)
+
+    with pytest.raises(RuntimeError, match="telegram send failed"):
+        await telegram_app._send_trial_plan(message, profile_with(), idempotency_key="post-start-failure-trial-key")
+
+    assert "runtime:mark_send_started" in runtime.events
+    assert runtime.delivered_keys == []
+    assert runtime.events[-1] == "runtime:finish_failure:trial_one_day_exception"
+    assert _trial_cta_messages(message) == []
+
+
+@pytest.mark.anyio
+async def test_postgres_trial_partial_delivery_failure_uses_runtime_no_cta(monkeypatch, tmp_path) -> None:
+    chat_id = 91_043
+    runtime = FakeOneDayGenerationRuntime()
+    message = FakeMessage(chat_id, message_id=237)
+    plan = _one_day_plan_for_runtime_tests()
+    sent_meals = 0
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def flaky_send_meal_card(_message, _meal) -> None:
+        nonlocal sent_meals
+        sent_meals += 1
+        if sent_meals == 2:
+            raise RuntimeError("second value failed")
+
+    def fail_old_refund(*_args, **_kwargs):
+        raise AssertionError("Postgres trial partial delivery must not use legacy JSON refund path")
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", flaky_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_old_refund)
+
+    with pytest.raises(RuntimeError, match="second value failed"):
+        await telegram_app._send_trial_plan(message, profile_with(), idempotency_key="partial-failure-trial-key")
+
+    assert runtime.delivered_keys == ["meal:00:r1"]
+    assert runtime.events[-1] == "runtime:finish_failure:trial_one_day_exception"
+    assert _trial_cta_messages(message) == []
+
+
+@pytest.mark.anyio
+async def test_trial_questionnaire_completion_uses_session_token_for_postgres_idempotency(monkeypatch, tmp_path) -> None:
+    chat_id = 91_044
+    runtime = FakeOneDayGenerationRuntime()
+    message = FakeMessage(chat_id, message_id=238)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    monkeypatch.setattr(telegram_app.secrets, "token_urlsafe", lambda _size: "trial-token")
+    _install_one_day_runtime(monkeypatch, runtime)
+
+    async def fake_send_calculation_report(*_args, **_kwargs) -> None:
+        return None
+
+    async def fake_send_plan(
+        *_args,
+        on_expected_value_messages=None,
+        on_value_send_start=None,
+        on_value_message_delivered=None,
+        **_kwargs,
+    ) -> bool:
+        on_expected_value_messages(1)
+        on_value_send_start()
+        on_value_message_delivered("summary:daily_totals")
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_calculation_report", fake_send_calculation_report)
+    monkeypatch.setattr(telegram_app, "_send_plan", fake_send_plan)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "trial-status")
+    try:
+        await telegram_app._start_questionnaire(message, is_trial=True)
+        while chat_id in SESSION_BY_CHAT_ID:
+            session = SESSION_BY_CHAT_ID[chat_id]
+            await _handle_questionnaire_answer(message, _sample_questionnaire_answer(session.current_question))
+
+        admit_call = next(payload for name, payload in runtime.calls if name == "admit")
+        assert admit_call["idempotency_key"] == f"telegram_trial_session:{chat_id}:trial-token:one_day"
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
 
 
 @pytest.mark.anyio
