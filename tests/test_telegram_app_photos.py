@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile, FSInputFile
 
 import diet_bot.telegram_app as telegram_app
+from diet_bot.chat_state_storage import ChatStateStorageError
 from diet_bot.domain import (
     ActivityLevel,
     CookingTimePreference,
@@ -2424,6 +2425,63 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
 
 
 @pytest.mark.anyio
+async def test_questionnaire_completion_save_failure_preserves_state_without_plan(
+    monkeypatch, tmp_path
+) -> None:
+    chat_id = 91_045
+    save_saw_cached_profile = None
+    load_history_called = False
+    calculation_options_called = False
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    SESSION_BY_CHAT_ID[chat_id] = start_session()
+    PLAN_COUNT_BY_CHAT_ID[chat_id] = 7
+    PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = 11
+    message = FakeMessage(chat_id)
+
+    def failing_save_chat_profile(saved_chat_id, profile) -> None:
+        nonlocal save_saw_cached_profile
+        assert saved_chat_id == chat_id
+        save_saw_cached_profile = saved_chat_id in PROFILE_BY_CHAT_ID
+        raise ChatStateStorageError("profile save failed")
+
+    def fake_load_chat_history(_chat_id) -> None:
+        nonlocal load_history_called
+        load_history_called = True
+
+    async def fake_send_calculation_options(*_args, **_kwargs) -> None:
+        nonlocal calculation_options_called
+        calculation_options_called = True
+
+    monkeypatch.setattr(telegram_app, "_save_chat_profile", failing_save_chat_profile)
+    monkeypatch.setattr(telegram_app, "_load_chat_history", fake_load_chat_history)
+    monkeypatch.setattr(telegram_app, "_send_calculation_options", fake_send_calculation_options)
+
+    try:
+        await _advance_questionnaire_to(message, "excluded_foods")
+        sent_before_completion = len(message.texts)
+        final_answer = _sample_questionnaire_answer(SESSION_BY_CHAT_ID[chat_id].current_question)
+        await _handle_questionnaire_answer(message, final_answer)
+
+        new_texts = [text for text, _ in message.texts[sent_before_completion:]]
+        assert new_texts == ["Не удалось сохранить анкету. Попробуйте позже."]
+        assert save_saw_cached_profile is False
+        assert chat_id not in PROFILE_BY_CHAT_ID
+        assert chat_id in SESSION_BY_CHAT_ID
+        assert PLAN_COUNT_BY_CHAT_ID[chat_id] == 7
+        assert PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] == 11
+        assert not load_history_called
+        assert not calculation_options_called
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
 async def test_current_questionnaire_callback_advances_normally(monkeypatch, tmp_path) -> None:
     chat_id = 91_031
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
@@ -3632,6 +3690,76 @@ async def test_trial_questionnaire_completion_sends_one_day_plan_and_subscriptio
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_trial_questionnaire_completion_save_failure_preserves_trial_state_without_plan(
+    monkeypatch, tmp_path
+) -> None:
+    chat_id = 91_046
+    save_saw_cached_profile = None
+    load_history_called = False
+    trial_plan_called = False
+    calculation_options_called = False
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    SESSION_BY_CHAT_ID[chat_id] = start_session()
+    TRIAL_CHAT_IDS.add(chat_id)
+    telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[chat_id] = "trial-token"
+    PLAN_COUNT_BY_CHAT_ID[chat_id] = 7
+    PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = 11
+    message = FakeMessage(chat_id)
+
+    def failing_save_chat_profile(saved_chat_id, profile) -> None:
+        nonlocal save_saw_cached_profile
+        assert saved_chat_id == chat_id
+        save_saw_cached_profile = saved_chat_id in PROFILE_BY_CHAT_ID
+        raise ChatStateStorageError("profile save failed")
+
+    def fake_load_chat_history(_chat_id) -> None:
+        nonlocal load_history_called
+        load_history_called = True
+
+    async def fake_send_trial_plan(*_args, **_kwargs) -> None:
+        nonlocal trial_plan_called
+        trial_plan_called = True
+
+    async def fake_send_calculation_options(*_args, **_kwargs) -> None:
+        nonlocal calculation_options_called
+        calculation_options_called = True
+
+    monkeypatch.setattr(telegram_app, "_save_chat_profile", failing_save_chat_profile)
+    monkeypatch.setattr(telegram_app, "_load_chat_history", fake_load_chat_history)
+    monkeypatch.setattr(telegram_app, "_send_trial_plan", fake_send_trial_plan)
+    monkeypatch.setattr(telegram_app, "_send_calculation_options", fake_send_calculation_options)
+
+    try:
+        await _advance_questionnaire_to(message, "excluded_foods")
+        sent_before_completion = len(message.texts)
+        final_answer = _sample_questionnaire_answer(SESSION_BY_CHAT_ID[chat_id].current_question)
+        await _handle_questionnaire_answer(message, final_answer)
+
+        new_texts = [text for text, _ in message.texts[sent_before_completion:]]
+        assert new_texts == ["Не удалось сохранить анкету. Попробуйте позже."]
+        assert save_saw_cached_profile is False
+        assert chat_id in TRIAL_CHAT_IDS
+        assert chat_id in SESSION_BY_CHAT_ID
+        assert telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[chat_id] == "trial-token"
+        assert chat_id not in PROFILE_BY_CHAT_ID
+        assert PLAN_COUNT_BY_CHAT_ID[chat_id] == 7
+        assert PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] == 11
+        assert not load_history_called
+        assert not trial_plan_called
+        assert not calculation_options_called
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+        PROFILE_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.pop(chat_id, None)
 
 
 @pytest.mark.anyio

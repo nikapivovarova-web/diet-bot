@@ -52,6 +52,7 @@ from .builder import (
 )
 from .catalog import built_in_foods
 from .calculator import calculate_targets
+from .chat_state_storage import ChatStateStorageError
 from .chat_state_runtime import (
     ChatStateStore,
     create_chat_state_store,
@@ -186,6 +187,7 @@ RECENT_RECIPE_REDUCED_DAYS = 14
 RECENT_RECIPE_REDUCED_LIMIT = 70
 logger = logging.getLogger(__name__)
 ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить доступ. Попробуйте позже."
+CHAT_PROFILE_STORAGE_ERROR_TEXT = "Не удалось сохранить анкету. Попробуйте позже."
 
 
 def _entitlement_service() -> EntitlementService:
@@ -232,6 +234,10 @@ def _validate_entitlement_storage(config) -> None:
 
 async def _send_entitlement_storage_error(message: Message) -> None:
     await message.answer(ENTITLEMENT_STORAGE_ERROR_TEXT)
+
+
+async def _send_chat_profile_storage_error(message: Message) -> None:
+    await message.answer(CHAT_PROFILE_STORAGE_ERROR_TEXT)
 
 
 def _mask_chat_id(chat_id: int) -> str:
@@ -1446,13 +1452,19 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
         return
 
     profile = next_session.build_profile()
+    is_trial = chat_id in TRIAL_CHAT_IDS
+    trial_session_token = QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(chat_id) if is_trial else None
+    try:
+        _save_chat_profile(chat_id, profile)
+    except ChatStateStorageError:
+        logger.exception("Failed to save questionnaire profile for chat_id=%s", _mask_chat_id(chat_id))
+        await _send_chat_profile_storage_error(message)
+        return
+
     PROFILE_BY_CHAT_ID[chat_id] = profile
-    _save_chat_profile(chat_id, profile)
     PLAN_COUNT_BY_CHAT_ID[chat_id] = 0
     PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = random.SystemRandom().randrange(1, 1_000_000_000)
     _load_chat_history(chat_id)
-    is_trial = chat_id in TRIAL_CHAT_IDS
-    trial_session_token = QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(chat_id) if is_trial else None
     trial_idempotency_key = _trial_plan_idempotency_key(chat_id, trial_session_token, profile) if is_trial else None
     _clear_questionnaire_session(chat_id)
     TRIAL_CHAT_IDS.discard(chat_id)
@@ -4128,7 +4140,12 @@ def _profile_for_chat(chat_id: int) -> UserProfile | None:
 
 
 def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
-    _chat_state_store().save_chat_state(chat_id, {"profile": _profile_to_dict(profile)})
+    try:
+        _chat_state_store().save_chat_state(chat_id, {"profile": _profile_to_dict(profile)})
+    except ChatStateStorageError:
+        raise
+    except Exception as exc:
+        raise ChatStateStorageError("Could not save chat profile") from exc
 
 
 def _load_state() -> dict[str, dict[str, object]]:
