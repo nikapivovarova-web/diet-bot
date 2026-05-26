@@ -2459,8 +2459,11 @@ async def test_questionnaire_completion_save_failure_preserves_state_without_pla
 
     try:
         await _advance_questionnaire_to(message, "excluded_foods")
+        original_session = SESSION_BY_CHAT_ID[chat_id]
+        assert original_session.current_question is not None
+        assert original_session.current_question.key == "excluded_foods"
         sent_before_completion = len(message.texts)
-        final_answer = _sample_questionnaire_answer(SESSION_BY_CHAT_ID[chat_id].current_question)
+        final_answer = _sample_questionnaire_answer(original_session.current_question)
         await _handle_questionnaire_answer(message, final_answer)
 
         new_texts = [text for text, _ in message.texts[sent_before_completion:]]
@@ -2468,6 +2471,12 @@ async def test_questionnaire_completion_save_failure_preserves_state_without_pla
         assert save_saw_cached_profile is False
         assert chat_id not in PROFILE_BY_CHAT_ID
         assert chat_id in SESSION_BY_CHAT_ID
+        stored_session = SESSION_BY_CHAT_ID[chat_id]
+        assert stored_session is original_session
+        assert stored_session == original_session
+        assert not stored_session.is_complete
+        assert stored_session.current_question is not None
+        assert stored_session.current_question.key == "excluded_foods"
         assert PLAN_COUNT_BY_CHAT_ID[chat_id] == 7
         assert PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] == 11
         assert not load_history_called
@@ -3735,8 +3744,11 @@ async def test_trial_questionnaire_completion_save_failure_preserves_trial_state
 
     try:
         await _advance_questionnaire_to(message, "excluded_foods")
+        original_session = SESSION_BY_CHAT_ID[chat_id]
+        assert original_session.current_question is not None
+        assert original_session.current_question.key == "excluded_foods"
         sent_before_completion = len(message.texts)
-        final_answer = _sample_questionnaire_answer(SESSION_BY_CHAT_ID[chat_id].current_question)
+        final_answer = _sample_questionnaire_answer(original_session.current_question)
         await _handle_questionnaire_answer(message, final_answer)
 
         new_texts = [text for text, _ in message.texts[sent_before_completion:]]
@@ -3744,6 +3756,12 @@ async def test_trial_questionnaire_completion_save_failure_preserves_trial_state
         assert save_saw_cached_profile is False
         assert chat_id in TRIAL_CHAT_IDS
         assert chat_id in SESSION_BY_CHAT_ID
+        stored_session = SESSION_BY_CHAT_ID[chat_id]
+        assert stored_session is original_session
+        assert stored_session == original_session
+        assert not stored_session.is_complete
+        assert stored_session.current_question is not None
+        assert stored_session.current_question.key == "excluded_foods"
         assert telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[chat_id] == "trial-token"
         assert chat_id not in PROFILE_BY_CHAT_ID
         assert PLAN_COUNT_BY_CHAT_ID[chat_id] == 7

@@ -1443,8 +1443,8 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
         await message.answer(early_stop, reply_markup=_main_menu_keyboard(chat_id))
         return
 
-    SESSION_BY_CHAT_ID[chat_id] = next_session
     if not next_session.is_complete:
+        SESSION_BY_CHAT_ID[chat_id] = next_session
         await message.answer(
             next_session.current_question.prompt,
             reply_markup=_question_keyboard_for_session(chat_id, next_session),
@@ -1461,6 +1461,7 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
         await _send_chat_profile_storage_error(message)
         return
 
+    SESSION_BY_CHAT_ID[chat_id] = next_session
     PROFILE_BY_CHAT_ID[chat_id] = profile
     PLAN_COUNT_BY_CHAT_ID[chat_id] = 0
     PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = random.SystemRandom().randrange(1, 1_000_000_000)
