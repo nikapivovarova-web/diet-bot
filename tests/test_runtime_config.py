@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from diet_bot.runtime_config import (
+    DEFAULT_PAYMENT_RECOVERY_SPOOL,
     DEFAULT_PROMO_CODES_STATE_FILE,
     DEFAULT_STATE_FILE,
     DEFAULT_SUBSCRIPTIONS_STATE_FILE,
@@ -54,6 +55,49 @@ def test_payments_enabled_only_by_one() -> None:
 
     for raw in ("", "0", "true", "yes", "on", "2"):
         assert load_runtime_config({"DIET_BOT_PAYMENTS_ENABLED": raw}).payments_enabled is False
+
+
+def test_payments_enabled_requires_explicit_payment_recovery_spool() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert config.payment_recovery_spool == DEFAULT_PAYMENT_RECOVERY_SPOOL
+    assert config.payment_recovery_spool_configured is False
+    assert any("DIET_BOT_PAYMENT_RECOVERY_SPOOL is required" in issue for issue in issues)
+
+
+def test_payments_enabled_rejects_relative_payment_recovery_spool() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": "var/payment-recovery/payments.jsonl",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert config.payment_recovery_spool == Path("var/payment-recovery/payments.jsonl")
+    assert config.payment_recovery_spool_configured is True
+    assert any("DIET_BOT_PAYMENT_RECOVERY_SPOOL must be an absolute path" in issue for issue in issues)
+
+
+def test_payments_disabled_does_not_require_explicit_payment_recovery_spool() -> None:
+    config = load_runtime_config({"DIET_BOT_TOKEN": "fake-token"})
+
+    assert config.payment_recovery_spool == DEFAULT_PAYMENT_RECOVERY_SPOOL
+    assert config.payment_recovery_spool_configured is False
+    assert validate_startup(config) == ()
 
 
 def test_provider_token_alone_does_not_enable_payments() -> None:
@@ -226,18 +270,22 @@ def test_state_paths_use_existing_defaults_and_overrides() -> None:
     assert default_config.state_file == DEFAULT_STATE_FILE
     assert default_config.subscriptions_state_file == DEFAULT_SUBSCRIPTIONS_STATE_FILE
     assert default_config.promo_codes_state_file == DEFAULT_PROMO_CODES_STATE_FILE
+    assert default_config.payment_recovery_spool == DEFAULT_PAYMENT_RECOVERY_SPOOL
 
     override_config = load_runtime_config(
         {
             "DIET_BOT_STATE_FILE": "state/history.json",
             "DIET_BOT_SUBSCRIPTIONS_STATE_FILE": "state/subscriptions.json",
             "DIET_BOT_PROMO_CODES_STATE_FILE": "state/promo_codes.json",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": "state/payment-recovery.jsonl",
         },
     )
 
     assert override_config.state_file == Path("state/history.json")
     assert override_config.subscriptions_state_file == Path("state/subscriptions.json")
     assert override_config.promo_codes_state_file == Path("state/promo_codes.json")
+    assert override_config.payment_recovery_spool == Path("state/payment-recovery.jsonl")
+    assert override_config.payment_recovery_spool_configured is True
 
 
 def test_safe_summary_redacts_secrets() -> None:
@@ -267,6 +315,16 @@ def test_safe_summary_redacts_secrets() -> None:
     assert "provider-super-secret" not in encoded
     assert "db-super-secret" not in encoded
     assert "123456" not in encoded
+
+
+def test_runbook_documents_payment_recovery_spool_startup_requirements() -> None:
+    runbook = Path("docs/production-runbook.md").read_text(encoding="utf-8")
+
+    assert "DIET_BOT_PAYMENT_RECOVERY_SPOOL" in runbook
+    assert "durable absolute" in runbook
+    assert "parent directory" in runbook
+    assert "backup and restore" in runbook
+    assert "PR45" in runbook
 
 
 def test_strict_production_reports_missing_db_support_privacy_and_non_json_storage() -> None:

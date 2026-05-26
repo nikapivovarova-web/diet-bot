@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from .payment_recovery_spool import (
+    PaymentRecoverySpoolUnavailable,
+    validate_payment_recovery_spool_ready,
+)
 from .payment_service import PaymentService
 from .runtime_config import RuntimeConfig, load_runtime_config
 
@@ -18,6 +22,19 @@ def validate_payment_runtime_for_startup(config: RuntimeConfig | None = None) ->
     runtime_config = load_runtime_config() if config is None else config
     if not runtime_config.payments_enabled:
         return
+
+    if not runtime_config.payment_recovery_spool_configured:
+        raise PaymentLedgerUnavailable(
+            "payment_recovery_spool_unconfigured",
+            "DIET_BOT_PAYMENT_RECOVERY_SPOOL is required when payments are enabled.",
+        )
+    try:
+        validate_payment_recovery_spool_ready(runtime_config.payment_recovery_spool)
+    except PaymentRecoverySpoolUnavailable as exc:
+        raise PaymentLedgerUnavailable(
+            "payment_recovery_spool_unavailable",
+            "Payment recovery spool is not ready; configure an absolute writable fsync-able spool path.",
+        ) from exc
 
     store = create_payment_store(runtime_config)
     validate_schema = getattr(store, "validate_schema", None)
