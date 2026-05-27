@@ -246,8 +246,13 @@ def test_production_preflight_import_does_not_import_telegram_runtime(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     del capsys
-    sys.modules.pop("diet_bot.production_preflight", None)
-    sys.modules.pop("diet_bot.telegram_app", None)
+    import diet_bot
+
+    previous_preflight = sys.modules.pop("diet_bot.production_preflight", None)
+    had_preflight_attr = hasattr(diet_bot, "production_preflight")
+    previous_preflight_attr = getattr(diet_bot, "production_preflight", None)
+    if had_preflight_attr:
+        delattr(diet_bot, "production_preflight")
     real_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
@@ -257,9 +262,15 @@ def test_production_preflight_import_does_not_import_telegram_runtime(
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-    from diet_bot import production_preflight as preflight
+    try:
+        from diet_bot import production_preflight as preflight
 
-    assert preflight is not None
+        assert preflight is not None
+    finally:
+        if previous_preflight is not None:
+            sys.modules["diet_bot.production_preflight"] = previous_preflight
+        if had_preflight_attr:
+            setattr(diet_bot, "production_preflight", previous_preflight_attr)
 
 
 def test_runbook_documents_production_preflight_cli() -> None:
