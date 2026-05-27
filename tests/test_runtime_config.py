@@ -281,6 +281,75 @@ def test_postgres_pool_config_reports_invalid_sizes() -> None:
     assert any("DIET_BOT_POSTGRES_POOL_MAX_SIZE" in issue for issue in issues)
 
 
+def test_one_day_worker_config_defaults_to_disabled_single_worker() -> None:
+    config = load_runtime_config({})
+
+    assert config.one_day_worker_enabled is False
+    assert config.one_day_worker_concurrency == 1
+    assert config.one_day_worker_lease_seconds == 300
+    assert config.one_day_worker_heartbeat_seconds == 60
+    assert config.one_day_worker_retry_delay_seconds == 30
+    assert config.one_day_worker_max_attempts == 3
+    assert config.one_day_worker_idle_sleep_seconds == 1.0
+
+
+def test_one_day_worker_config_accepts_conservative_overrides() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_STORAGE_BACKEND": "postgres",
+            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_ONE_DAY_WORKER_ENABLED": "true",
+            "DIET_BOT_ONE_DAY_WORKER_CONCURRENCY": "3",
+            "DIET_BOT_ONE_DAY_WORKER_LEASE_SECONDS": "120",
+            "DIET_BOT_ONE_DAY_WORKER_HEARTBEAT_SECONDS": "15",
+            "DIET_BOT_ONE_DAY_WORKER_RETRY_DELAY_SECONDS": "10",
+            "DIET_BOT_ONE_DAY_WORKER_MAX_ATTEMPTS": "4",
+            "DIET_BOT_ONE_DAY_WORKER_IDLE_SLEEP_SECONDS": "0.25",
+        },
+    )
+
+    assert config.one_day_worker_enabled is True
+    assert config.one_day_worker_concurrency == 3
+    assert config.one_day_worker_lease_seconds == 120
+    assert config.one_day_worker_heartbeat_seconds == 15
+    assert config.one_day_worker_retry_delay_seconds == 10
+    assert config.one_day_worker_max_attempts == 4
+    assert config.one_day_worker_idle_sleep_seconds == 0.25
+    assert validate_startup(config) == ()
+
+
+def test_one_day_worker_enabled_requires_postgres_storage_and_database_url() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ONE_DAY_WORKER_ENABLED": "1",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_ONE_DAY_WORKER_ENABLED requires postgres" in issue for issue in issues)
+    assert any("DIET_BOT_DATABASE_URL is required when the one-day worker is enabled" in issue for issue in issues)
+
+
+def test_one_day_worker_config_reports_invalid_values() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ONE_DAY_WORKER_CONCURRENCY": "0",
+            "DIET_BOT_ONE_DAY_WORKER_LEASE_SECONDS": "0",
+            "DIET_BOT_ONE_DAY_WORKER_IDLE_SLEEP_SECONDS": "0",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_ONE_DAY_WORKER_CONCURRENCY" in issue for issue in issues)
+    assert any("DIET_BOT_ONE_DAY_WORKER_LEASE_SECONDS" in issue for issue in issues)
+    assert any("DIET_BOT_ONE_DAY_WORKER_IDLE_SLEEP_SECONDS" in issue for issue in issues)
+
+
 def test_production_requires_database_url() -> None:
     config = load_runtime_config(
         {

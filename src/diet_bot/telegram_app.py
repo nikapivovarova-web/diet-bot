@@ -115,16 +115,17 @@ from .payment_runtime import (
 )
 from .payment_recovery_spool import PaymentRecoveryRecord, append_payment_recovery_record
 from .one_day_generation_job_runtime import (
+    OneDayGenerationDelivery,
     OneDayGenerationJobRuntime,
+    OneDayGenerationValueMessage,
+    OneDayGenerationWorker,
+    OneDayGenerationWorkerSettings,
     validate_one_day_generation_job_store_for_startup,
 )
 from .one_day_generation_jobs import (
-    AdmitJobResultStatus as OneDayAdmitJobResultStatus,
-    FinishJobResultStatus as OneDayFinishJobResultStatus,
-    MarkSendStartedResultStatus as OneDayMarkSendStartedResultStatus,
-    MarkValueMessageDeliveredResultStatus as OneDayMarkValueMessageDeliveredResultStatus,
-    SetExpectedValueMessagesResultStatus as OneDaySetExpectedValueMessagesResultStatus,
-    StartJobResultStatus as OneDayStartJobResultStatus,
+    OneDayGenerationJob,
+    OneDayGenerationRequestSnapshot,
+    QueuedJobAdmissionResultStatus as OneDayQueuedJobAdmissionResultStatus,
 )
 from .payments import (
     PRODUCT_EXTRA_ONE_DAY,
@@ -960,7 +961,10 @@ WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
 WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0444\u0430\u0439\u043b \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e PDF \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
-ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
+ONE_DAY_PLAN_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u0440\u0430\u0446\u0438\u043e\u043d. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+ONE_DAY_PLAN_NO_PLAN_FOLLOW_UP_TEXT = "\u041d\u0435 \u0441\u043c\u043e\u0433 \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u0440\u0430\u0446\u0438\u043e\u043d \u043f\u043e \u0442\u0435\u043a\u0443\u0449\u0438\u043c \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f\u043c. \u042f \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u043b \u044d\u0442\u043e \u043a\u0430\u043a \u043e\u0448\u0438\u0431\u043a\u0443 \u0438 \u043d\u0435 \u0431\u0443\u0434\u0443 \u0441\u043f\u0438\u0441\u044b\u0432\u0430\u0442\u044c \u043f\u043e\u043f\u044b\u0442\u043a\u0443."
 WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
@@ -1709,14 +1713,55 @@ async def run_bot() -> None:
     validate_one_day_generation_job_store_for_startup(config)
     validate_payment_runtime_for_startup(config)
     single_poller_guard = _acquire_postgres_single_poller_guard(config)
+    one_day_worker_task: asyncio.Task | None = None
     try:
         bot = Bot(config.bot_token)
         await _set_bot_commands(bot)
         dispatcher = create_dispatcher()
-        await dispatcher.start_polling(bot)
+        one_day_worker_task = _start_one_day_generation_worker_if_configured(config, bot)
+        try:
+            await dispatcher.start_polling(bot)
+        finally:
+            if one_day_worker_task is not None:
+                one_day_worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await one_day_worker_task
     finally:
         if single_poller_guard is not None:
             single_poller_guard.close()
+
+
+def _start_one_day_generation_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
+    if not getattr(config, "one_day_worker_enabled", False):
+        return None
+    runtime = _one_day_generation_job_runtime()
+    if runtime is None:
+        logger.warning("One-day worker enabled but Postgres job runtime is unavailable")
+        return None
+    settings = OneDayGenerationWorkerSettings.from_config(config)
+    worker = OneDayGenerationWorker(runtime, _TelegramOneDayGenerationJobProcessor(bot), settings)
+    task = asyncio.create_task(worker.run_forever(), name="one-day-generation-worker")
+    _observe_one_day_generation_worker_task(task)
+    return task
+
+
+def _observe_one_day_generation_worker_task(task: asyncio.Task) -> None:
+    def log_unexpected_stop(done_task: asyncio.Task) -> None:
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        logger.error(
+            "One-day worker task stopped unexpectedly; task_name=%s error_type=%s",
+            done_task.get_name(),
+            type(exc).__name__,
+        )
+
+    task.add_done_callback(log_unexpected_stop)
 
 
 def _acquire_postgres_single_poller_guard(config):
@@ -2006,7 +2051,7 @@ async def _send_trial_plan(
 ) -> None:
     runtime = _one_day_generation_job_runtime()
     if runtime is not None:
-        sent = await _send_trial_plan_with_postgres_job(
+        await _send_trial_plan_with_postgres_job(
             message,
             profile,
             runtime=runtime,
@@ -2017,8 +2062,6 @@ async def _send_trial_plan(
                 profile,
             ),
         )
-        if sent:
-            await _send_trial_subscription_cta(message)
         return
 
     try:
@@ -2094,10 +2137,31 @@ async def _send_trial_plan_with_postgres_job(
         logger.exception("Failed to cleanup stale trial one-day generation jobs")
 
     try:
-        job_admission = runtime.admit(
+        await _load_chat_history_async(chat_id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat history for queued trial one-day job chat_id=%s", _mask_chat_id(chat_id))
+        status_message = await message.answer(ONE_DAY_PLAN_STATUS_TEXT, reply_markup=ReplyKeyboardRemove())
+        await _send_chat_state_read_error(message, status_message=status_message)
+        return False
+
+    try:
+        job_admission = runtime.admit_queued(
             chat_id=chat_id,
             idempotency_key=idempotency_key,
+            request_snapshot=_one_day_request_snapshot(
+                chat_id,
+                profile,
+                request_kind="telegram_trial",
+                request_payload={
+                    "source": "telegram_trial",
+                    "include_calculation_report": True,
+                    "include_default_after_plan_keyboard": False,
+                    "include_entitlement_status": False,
+                    "include_trial_subscription_cta": True,
+                },
+            ),
             metadata={"source": "telegram_trial"},
+            test_access=False,
         )
     except Exception:
         logger.exception("Failed to admit trial one-day generation Postgres job")
@@ -2105,112 +2169,22 @@ async def _send_trial_plan_with_postgres_job(
         return False
 
     if job_admission.status in {
-        OneDayAdmitJobResultStatus.ACTIVE_DUPLICATE,
-        OneDayAdmitJobResultStatus.EXISTING_IDEMPOTENCY,
+        OneDayQueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+        OneDayQueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
     }:
         await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
-    try:
-        start_result = runtime.start_job_and_consume(job_admission.job.job_id, test_access=False)
-    except Exception:
-        logger.exception("Failed to start trial one-day generation Postgres job")
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_admission.job.job_id,
-            chat_id=chat_id,
-            reason="trial_one_day_start_exception",
-        )
+    if job_admission.status == OneDayQueuedJobAdmissionResultStatus.DENIED:
+        await _send_limit_paywall(message, "one_day")
+        return False
+
+    if job_admission.status != OneDayQueuedJobAdmissionResultStatus.ADMITTED or job_admission.job is None:
         await _send_entitlement_storage_error(message)
         return False
 
-    if start_result.status == OneDayStartJobResultStatus.DENIED:
-        await _send_limit_paywall(message, "one_day")
-        return False
-
-    if start_result.status != OneDayStartJobResultStatus.STARTED or start_result.job is None:
-        await message.answer(
-            ONE_DAY_PLAN_ALREADY_RUNNING_TEXT
-            if start_result.status == OneDayStartJobResultStatus.ALREADY_RUNNING
-            else ENTITLEMENT_STORAGE_ERROR_TEXT
-        )
-        return False
-
-    job_id = start_result.job.job_id
-    if start_result.job.consumption_source != "free_trial":
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="trial_one_day_non_free_trial_source",
-        )
-        await _send_limit_paywall(message, "one_day")
-        return False
-
-    def set_expected_value_messages(expected_count: int) -> None:
-        result = runtime.set_expected_value_messages(job_id, expected_count)
-        if result.status not in {
-            OneDaySetExpectedValueMessagesResultStatus.SET,
-            OneDaySetExpectedValueMessagesResultStatus.ALREADY_SET,
-        }:
-            raise RuntimeError(f"Trial one-day expected message count was not persisted: {result.status.value}")
-
-    def mark_send_started() -> None:
-        result = runtime.mark_send_started(job_id)
-        if result.status not in {
-            OneDayMarkSendStartedResultStatus.SEND_STARTED,
-            OneDayMarkSendStartedResultStatus.ALREADY_SEND_STARTED,
-        }:
-            raise RuntimeError(f"Trial one-day send-start marker was not persisted: {result.status.value}")
-
-    def mark_value_message_delivered(value_message_key: str) -> None:
-        result = runtime.mark_value_message_delivered(job_id, value_message_key=value_message_key)
-        if result.status not in {
-            OneDayMarkValueMessageDeliveredResultStatus.DELIVERED,
-            OneDayMarkValueMessageDeliveredResultStatus.ALREADY_DELIVERED,
-        }:
-            raise RuntimeError(f"Trial one-day value delivery marker was not persisted: {result.status.value}")
-
-    try:
-        await _send_calculation_report(message, profile)
-        sent = await _send_plan(
-            message,
-            profile,
-            include_default_after_plan_keyboard=False,
-            on_expected_value_messages=set_expected_value_messages,
-            on_value_send_start=mark_send_started,
-            on_value_message_delivered=mark_value_message_delivered,
-        )
-    except Exception:
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="trial_one_day_exception",
-        )
-        raise
-
-    if not sent:
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="trial_one_day_not_sent",
-        )
-        return False
-
-    finish_result = runtime.finish_success(job_id)
-    if finish_result.status not in {
-        OneDayFinishJobResultStatus.SUCCEEDED,
-        OneDayFinishJobResultStatus.ALREADY_TERMINAL,
-    }:
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="trial_one_day_finish_success_invalid",
-        )
-        return False
+    _mark_one_day_generation_seed_admitted(chat_id)
+    await message.answer(ONE_DAY_PLAN_ACCEPTED_TEXT)
     return True
 
 
@@ -2234,20 +2208,20 @@ async def _send_one_day_plan_with_access(
     idempotency_key: str | None = None,
 ) -> bool:
     chat_id = message.chat.id
+    runtime = _one_day_generation_job_runtime()
+    if runtime is not None:
+        return await _send_one_day_plan_with_postgres_job(
+            message,
+            profile,
+            runtime=runtime,
+            idempotency_key=_one_day_request_idempotency_key(message, idempotency_key, event="one_day"),
+        )
+
     if not _try_enter_one_day_plan_generation(chat_id):
         await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
     try:
-        runtime = _one_day_generation_job_runtime()
-        if runtime is not None:
-            return await _send_one_day_plan_with_postgres_job(
-                message,
-                profile,
-                runtime=runtime,
-                idempotency_key=_one_day_request_idempotency_key(message, idempotency_key, event="one_day"),
-            )
-
         try:
             consumption = await _consume_generation_attempt_async(chat_id, "one_day")
         except EntitlementStorageError:
@@ -2289,10 +2263,31 @@ async def _send_one_day_plan_with_postgres_job(
         logger.exception("Failed to cleanup stale one-day generation jobs")
 
     try:
-        job_admission = runtime.admit(
+        await _load_chat_history_async(chat_id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat history for queued one-day job chat_id=%s", _mask_chat_id(chat_id))
+        status_message = await message.answer(ONE_DAY_PLAN_STATUS_TEXT, reply_markup=ReplyKeyboardRemove())
+        await _send_chat_state_read_error(message, status_message=status_message)
+        return False
+
+    try:
+        job_admission = runtime.admit_queued(
             chat_id=chat_id,
             idempotency_key=idempotency_key,
+            request_snapshot=_one_day_request_snapshot(
+                chat_id,
+                profile,
+                request_kind="telegram_one_day",
+                request_payload={
+                    "source": "telegram_one_day",
+                    "include_calculation_report": False,
+                    "include_default_after_plan_keyboard": True,
+                    "include_entitlement_status": True,
+                    "include_trial_subscription_cta": False,
+                },
+            ),
             metadata={"source": "telegram_one_day"},
+            test_access=chat_id in TESTER_CHAT_IDS,
         )
     except Exception:
         logger.exception("Failed to admit one-day generation Postgres job")
@@ -2300,105 +2295,22 @@ async def _send_one_day_plan_with_postgres_job(
         return False
 
     if job_admission.status in {
-        OneDayAdmitJobResultStatus.ACTIVE_DUPLICATE,
-        OneDayAdmitJobResultStatus.EXISTING_IDEMPOTENCY,
+        OneDayQueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+        OneDayQueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
     }:
         await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
-    try:
-        start_result = runtime.start_job_and_consume(
-            job_admission.job.job_id,
-            test_access=chat_id in TESTER_CHAT_IDS,
-        )
-    except Exception:
-        logger.exception("Failed to start one-day generation Postgres job")
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_admission.job.job_id,
-            chat_id=chat_id,
-            reason="one_day_start_exception",
-        )
-        await _send_entitlement_storage_error(message)
-        return False
-
-    if start_result.status == OneDayStartJobResultStatus.DENIED:
+    if job_admission.status == OneDayQueuedJobAdmissionResultStatus.DENIED:
         await _send_limit_paywall(message, "one_day")
         return False
 
-    if start_result.status != OneDayStartJobResultStatus.STARTED or start_result.job is None:
-        await message.answer(
-            ONE_DAY_PLAN_ALREADY_RUNNING_TEXT
-            if start_result.status == OneDayStartJobResultStatus.ALREADY_RUNNING
-            else ENTITLEMENT_STORAGE_ERROR_TEXT
-        )
+    if job_admission.status != OneDayQueuedJobAdmissionResultStatus.ADMITTED or job_admission.job is None:
+        await _send_entitlement_storage_error(message)
         return False
 
-    job_id = start_result.job.job_id
-
-    def set_expected_value_messages(expected_count: int) -> None:
-        result = runtime.set_expected_value_messages(job_id, expected_count)
-        if result.status not in {
-            OneDaySetExpectedValueMessagesResultStatus.SET,
-            OneDaySetExpectedValueMessagesResultStatus.ALREADY_SET,
-        }:
-            raise RuntimeError(f"One-day expected message count was not persisted: {result.status.value}")
-
-    def mark_send_started() -> None:
-        result = runtime.mark_send_started(job_id)
-        if result.status not in {
-            OneDayMarkSendStartedResultStatus.SEND_STARTED,
-            OneDayMarkSendStartedResultStatus.ALREADY_SEND_STARTED,
-        }:
-            raise RuntimeError(f"One-day send-start marker was not persisted: {result.status.value}")
-
-    def mark_value_message_delivered(value_message_key: str) -> None:
-        result = runtime.mark_value_message_delivered(job_id, value_message_key=value_message_key)
-        if result.status not in {
-            OneDayMarkValueMessageDeliveredResultStatus.DELIVERED,
-            OneDayMarkValueMessageDeliveredResultStatus.ALREADY_DELIVERED,
-        }:
-            raise RuntimeError(f"One-day value delivery marker was not persisted: {result.status.value}")
-
-    try:
-        sent = await _send_plan(
-            message,
-            profile,
-            status_text=await _format_entitlement_status_async(chat_id),
-            on_expected_value_messages=set_expected_value_messages,
-            on_value_send_start=mark_send_started,
-            on_value_message_delivered=mark_value_message_delivered,
-        )
-    except Exception:
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="one_day_exception",
-        )
-        raise
-
-    if not sent:
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="one_day_not_sent",
-        )
-        return False
-
-    finish_result = runtime.finish_success(job_id)
-    if finish_result.status not in {
-        OneDayFinishJobResultStatus.SUCCEEDED,
-        OneDayFinishJobResultStatus.ALREADY_TERMINAL,
-    }:
-        _finish_one_day_postgres_job_failure(
-            runtime,
-            job_id,
-            chat_id=chat_id,
-            reason="one_day_finish_success_invalid",
-        )
-        return False
+    _mark_one_day_generation_seed_admitted(chat_id)
+    await message.answer(ONE_DAY_PLAN_ACCEPTED_TEXT)
     return True
 
 
@@ -2416,6 +2328,38 @@ def _finish_one_day_postgres_job_failure(
             "Failed to finalize failed one-day generation Postgres job for chat_id=%s",
             _mask_chat_id(chat_id),
         )
+
+
+def _one_day_request_snapshot(
+    chat_id: int,
+    profile: UserProfile,
+    *,
+    request_kind: str,
+    request_payload: Mapping[str, object] | None = None,
+) -> OneDayGenerationRequestSnapshot:
+    payload = dict(request_payload or {})
+    payload["recent_recipe_keys"] = list(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, ()))
+    seed = _one_day_generation_seed_candidate(chat_id)
+    return OneDayGenerationRequestSnapshot(
+        request_kind=request_kind,
+        request_payload=payload,
+        profile=_profile_to_dict(profile),
+        recent_recipe_ids=tuple(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, ())),
+        generation_seed=str(seed),
+    )
+
+
+def _one_day_generation_seed_candidate(chat_id: int) -> int:
+    count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
+    seed_offset = PLAN_SEED_OFFSET_BY_CHAT_ID.setdefault(
+        chat_id,
+        random.SystemRandom().randrange(1, 1_000_000_000),
+    )
+    return seed_offset + count
+
+
+def _mark_one_day_generation_seed_admitted(chat_id: int) -> None:
+    PLAN_COUNT_BY_CHAT_ID[chat_id] = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0) + 1
 
 
 def _one_day_callback_idempotency_key(callback: CallbackQuery) -> str | None:
@@ -2956,7 +2900,7 @@ async def _send_plan(
     )
     seed = seed_offset + count
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + 1
-    status_message = await message.answer("Считаю рацион и проверяю ограничения... 🧮", reply_markup=ReplyKeyboardRemove())
+    status_message = await message.answer(ONE_DAY_PLAN_STATUS_TEXT, reply_markup=ReplyKeyboardRemove())
     try:
         await _load_chat_history_async(chat_id)
     except ChatStateStorageError:
@@ -3022,6 +2966,139 @@ def _one_day_meal_value_message_key(index: int, meal: Meal) -> str:
         name_hash = hashlib.sha256(meal.name.encode("utf-8")).hexdigest()[:16]
         recipe_key = f"name_hash:{name_hash}"
     return f"meal:{index:02d}:{recipe_key}"
+
+
+class _TelegramOneDayGenerationJobProcessor:
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+
+    async def prepare_delivery(self, job: OneDayGenerationJob) -> OneDayGenerationDelivery:
+        return await _prepare_one_day_generation_delivery(job, self.bot)
+
+
+class _OneDayJobChat:
+    def __init__(self, chat_id: int) -> None:
+        self.id = chat_id
+        self.type = "private"
+
+
+class _OneDayJobMessage:
+    def __init__(self, *, bot: Bot, chat_id: int) -> None:
+        self.bot = bot
+        self.chat = _OneDayJobChat(chat_id)
+        self.message_id = None
+
+    async def answer(self, text: str, reply_markup=None):
+        return await self.bot.send_message(chat_id=self.chat.id, text=text, reply_markup=reply_markup)
+
+    async def answer_photo(self, **kwargs):
+        return await self.bot.send_photo(chat_id=self.chat.id, **kwargs)
+
+
+async def _prepare_one_day_generation_delivery(job: OneDayGenerationJob, bot: Bot) -> OneDayGenerationDelivery:
+    snapshot = job.request_snapshot
+    if snapshot is None:
+        raise RuntimeError("one-day job snapshot is missing")
+    profile = _profile_from_dict(snapshot.profile)
+    if profile is None:
+        raise RuntimeError("one-day job profile snapshot is invalid")
+
+    request_payload = dict(snapshot.request_payload)
+    message = _OneDayJobMessage(bot=bot, chat_id=job.chat_id)
+    plan_result = build_one_day_plan(
+        profile,
+        variety_seed=_generation_seed_from_snapshot(snapshot),
+        avoided_recipe_ids=set(snapshot.recent_recipe_ids),
+        avoided_recipe_keys=set(_recent_recipe_keys_from_snapshot(snapshot)),
+        recipe_source="curated_only",
+    )
+    plan_result = _annotate_batch_prep(plan_result)
+    if not plan_result.safety.can_generate_plan or not plan_result.meals:
+        async def failure_follow_up() -> None:
+            reply_markup = None
+            if request_payload.get("include_default_after_plan_keyboard", True):
+                reply_markup = _after_plan_keyboard(job.chat_id)
+            await message.answer(ONE_DAY_PLAN_NO_PLAN_FOLLOW_UP_TEXT, reply_markup=reply_markup)
+
+        return OneDayGenerationDelivery(value_messages=(), failure_follow_up=failure_follow_up)
+
+    validation = validate_plan(plan_result)
+    messages = list(format_plan_messages(plan_result, validation))
+    if request_payload.get("include_entitlement_status") and len(messages) > 2:
+        messages[-1] = f"{messages[-1]}\n\n{await _format_entitlement_status_async(job.chat_id)}"
+
+    async def before_value_messages() -> None:
+        if request_payload.get("include_calculation_report"):
+            await _send_calculation_report(message, profile)
+
+    plan_reply_markup = None
+    if request_payload.get("include_default_after_plan_keyboard", True):
+        plan_reply_markup = _after_plan_keyboard(job.chat_id)
+
+    value_messages: list[OneDayGenerationValueMessage] = []
+    for meal_index, meal in enumerate(plan_result.meals):
+        value_messages.append(
+            OneDayGenerationValueMessage(
+                value_message_key=_one_day_meal_value_message_key(meal_index, meal),
+                send=lambda meal=meal: _send_meal_card(message, meal),
+            )
+        )
+
+    summary_keys = ("summary:daily_totals", "summary:shopping")
+    summary_messages = messages[2:]
+    for index, response in enumerate(summary_messages):
+        markup = plan_reply_markup if index == len(summary_messages) - 1 else None
+        value_key = summary_keys[index] if index < len(summary_keys) else f"summary:{index}"
+        value_messages.append(
+            OneDayGenerationValueMessage(
+                value_message_key=value_key,
+                send=lambda response=response, markup=markup: _send_text_chunks(message, response, markup),
+            )
+        )
+
+    async def after_success() -> None:
+        await _remember_recipe_history_items_best_effort_async(
+            job.chat_id,
+            _recipe_history_items_from_plan(plan_result, "one_day"),
+            ration_kind="one_day",
+            context="one_day_worker_success",
+        )
+        if request_payload.get("include_trial_subscription_cta"):
+            await _send_trial_subscription_cta(message)
+
+    return OneDayGenerationDelivery(
+        value_messages=tuple(value_messages),
+        before_value_messages=before_value_messages,
+        after_success=after_success,
+    )
+
+
+def _generation_seed_from_snapshot(snapshot: OneDayGenerationRequestSnapshot) -> int:
+    if snapshot.generation_seed:
+        try:
+            return int(snapshot.generation_seed)
+        except ValueError:
+            pass
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "request_kind": snapshot.request_kind,
+                "request_payload": snapshot.request_payload,
+                "profile": snapshot.profile,
+                "recent_recipe_ids": list(snapshot.recent_recipe_ids),
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return int(digest[:12], 16)
+
+
+def _recent_recipe_keys_from_snapshot(snapshot: OneDayGenerationRequestSnapshot) -> tuple[str, ...]:
+    raw_keys = snapshot.request_payload.get("recent_recipe_keys", ())
+    if not isinstance(raw_keys, Sequence) or isinstance(raw_keys, (str, bytes)):
+        return ()
+    return tuple(str(key).strip() for key in raw_keys if str(key).strip())
 
 
 async def _send_week_plan(
