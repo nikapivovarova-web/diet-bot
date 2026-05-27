@@ -58,6 +58,7 @@ from .chat_state_runtime import (
     create_chat_state_store,
     validate_chat_state_store_for_startup,
 )
+from .db_executor import DbExecutorBusy, run_db_call
 from .domain import (
     ActivityLevel,
     BatchPrep,
@@ -259,9 +260,151 @@ async def _send_chat_state_read_error(
     await message.answer(CHAT_STATE_READ_ERROR_TEXT)
 
 
+async def _run_entitlement_db_call(func: Callable[..., object], /, *args: object, **kwargs: object) -> object:
+    if not _should_dispatch_storage_db_calls():
+        return func(*args, **kwargs)
+    try:
+        return await run_db_call(func, *args, **kwargs)
+    except DbExecutorBusy as exc:
+        logger.warning("DB executor is busy during entitlement operation: %s", getattr(func, "__name__", func))
+        raise EntitlementStorageError("DB executor is busy.") from exc
+
+
+async def _run_chat_state_db_call(func: Callable[..., object], /, *args: object, **kwargs: object) -> object:
+    if not _should_dispatch_storage_db_calls():
+        return func(*args, **kwargs)
+    try:
+        return await run_db_call(func, *args, **kwargs)
+    except DbExecutorBusy as exc:
+        logger.warning("DB executor is busy during chat state operation: %s", getattr(func, "__name__", func))
+        raise ChatStateStorageError("DB executor is busy.") from exc
+
+
+def _should_dispatch_storage_db_calls() -> bool:
+    return load_runtime_config().storage_backend == "postgres"
+
+
+async def _profile_for_chat_async(chat_id: int) -> UserProfile | None:
+    return await _run_chat_state_db_call(_profile_for_chat, chat_id)  # type: ignore[return-value]
+
+
+async def _load_chat_history_async(chat_id: int) -> None:
+    await _run_chat_state_db_call(_load_chat_history, chat_id)
+
+
+async def _save_chat_profile_async(chat_id: int, profile: UserProfile) -> None:
+    await _run_chat_state_db_call(_save_chat_profile, chat_id, profile)
+
+
+async def _load_recent_recipe_avoidance_async(chat_id: int) -> _RecentRecipeAvoidance:
+    return await _run_chat_state_db_call(_load_recent_recipe_avoidance, chat_id)  # type: ignore[return-value]
+
+
+async def _remember_recipe_history_items_best_effort_async(
+    chat_id: int,
+    entries: Sequence[RecipeHistoryItem],
+    *,
+    ration_kind: RationKind,
+    context: str,
+) -> None:
+    try:
+        await _run_chat_state_db_call(
+            _remember_recipe_history_items_best_effort,
+            chat_id,
+            entries,
+            ration_kind=ration_kind,
+            context=context,
+        )
+    except ChatStateStorageError:
+        logger.exception(
+            "Failed to save recipe history in delivery context chat_id=%s ration_kind=%s context=%s entries=%d",
+            _mask_chat_id(chat_id),
+            ration_kind,
+            context,
+            len(entries),
+        )
+
+
+async def _record_successful_generation_history_async(
+    chat_id: int,
+    consumption: AttemptConsumption,
+    entries: Sequence[RecipeHistoryItem],
+) -> None:
+    try:
+        await _run_chat_state_db_call(_record_successful_generation_history, chat_id, consumption, entries)
+    except ChatStateStorageError:
+        logger.exception(
+            "Failed to save successful generation history chat_id=%s ration_kind=%s entries=%d",
+            _mask_chat_id(chat_id),
+            consumption.ration_kind,
+            len(entries),
+        )
+
+
+async def _format_entitlement_status_async(chat_id: int) -> str:
+    return await _run_entitlement_db_call(_format_entitlement_status, chat_id)  # type: ignore[return-value]
+
+
+async def _has_active_paid_access_async(chat_id: int) -> bool:
+    return await _run_entitlement_db_call(_has_active_paid_access, chat_id)  # type: ignore[return-value]
+
+
+async def _subscriber_cabinet_text_async(chat_id: int) -> str:
+    return await _run_entitlement_db_call(_subscriber_cabinet_text, chat_id)  # type: ignore[return-value]
+
+
+async def _subscriber_cabinet_keyboard_async(chat_id: int) -> InlineKeyboardMarkup:
+    return await _run_entitlement_db_call(_subscriber_cabinet_keyboard, chat_id)  # type: ignore[return-value]
+
+
+async def _main_menu_keyboard_async(chat_id: int) -> InlineKeyboardMarkup:
+    return await _run_entitlement_db_call(_main_menu_keyboard, chat_id)  # type: ignore[return-value]
+
+
+async def _ration_choice_keyboard_for_chat_async(chat_id: int) -> InlineKeyboardMarkup:
+    return await _run_entitlement_db_call(_ration_choice_keyboard_for_chat, chat_id)  # type: ignore[return-value]
+
+
+async def _payment_result_keyboard_async(chat_id: int, result: PaymentApplication) -> InlineKeyboardMarkup:
+    return await _run_entitlement_db_call(_payment_result_keyboard, chat_id, result)  # type: ignore[return-value]
+
+
+async def _weekly_pdf_attempt_available_async(chat_id: int) -> bool:
+    return await _run_entitlement_db_call(_weekly_pdf_attempt_available, chat_id)  # type: ignore[return-value]
+
+
+async def _consume_generation_attempt_async(chat_id: int, ration_kind: RationKind) -> AttemptConsumption:
+    return await _run_entitlement_db_call(_consume_generation_attempt, chat_id, ration_kind)  # type: ignore[return-value]
+
+
+async def _refund_generation_attempt_async(chat_id: int, consumption: AttemptConsumption) -> None:
+    await _run_entitlement_db_call(_refund_generation_attempt, chat_id, consumption)
+
+
+async def _is_valid_pre_checkout_async(pre_checkout_query: PreCheckoutQuery) -> bool:
+    try:
+        return await run_db_call(_is_valid_pre_checkout, pre_checkout_query)
+    except DbExecutorBusy:
+        logger.warning("DB executor is busy during pre_checkout validation")
+        return False
+
+
+async def _apply_successful_payment_async(
+    chat_id: int,
+    payment: SuccessfulPayment,
+    *,
+    user_id: int | None,
+) -> PaymentApplication:
+    try:
+        return await run_db_call(_apply_successful_payment, chat_id, payment, user_id=user_id)
+    except DbExecutorBusy as exc:
+        logger.warning("DB executor is busy during successful_payment application")
+        raise PaymentLedgerUnavailable("db_executor_busy", "Payment DB executor is busy.") from exc
+
+
 async def _load_profile_for_message_or_notice(message: Message) -> tuple[bool, UserProfile | None]:
     try:
-        return True, _profile_for_chat(message.chat.id)
+        return True, await _profile_for_chat_async(message.chat.id)
     except ChatStateStorageError:
         logger.exception("Failed to load chat profile for chat_id=%s", _mask_chat_id(message.chat.id))
         await _send_chat_state_read_error(message)
@@ -999,16 +1142,49 @@ async def start(message: Message) -> None:
     if _is_support_chat(message.chat.id):
         return
     await _send_welcome_photo(message)
-    if _has_active_paid_access(message.chat.id):
+    try:
+        has_paid_access = await _has_active_paid_access_async(message.chat.id)
+    except EntitlementStorageError:
+        logger.exception("Failed to check active access due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
+    if has_paid_access:
+        try:
+            subscriber_text = await _subscriber_cabinet_text_async(message.chat.id)
+            subscriber_keyboard = await _subscriber_cabinet_keyboard_async(message.chat.id)
+        except EntitlementStorageError:
+            logger.exception("Failed to render subscriber cabinet due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return
+        except ChatStateStorageError:
+            logger.exception("Failed to render subscriber cabinet due to chat state storage error")
+            await _send_chat_state_read_error(message)
+            return
         await message.answer(
-            _subscriber_cabinet_text(message.chat.id),
-            reply_markup=_subscriber_cabinet_keyboard(message.chat.id),
+            subscriber_text,
+            reply_markup=subscriber_keyboard,
         )
         return
-    if _profile_for_chat(message.chat.id) is not None:
+    try:
+        profile = await _profile_for_chat_async(message.chat.id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat profile for chat_id=%s", _mask_chat_id(message.chat.id))
+        await _send_chat_state_read_error(message)
+        return
+    if profile is not None:
+        try:
+            reply_markup = await _main_menu_keyboard_async(message.chat.id)
+        except EntitlementStorageError:
+            logger.exception("Failed to render main menu due to entitlement storage error")
+            await _send_entitlement_storage_error(message)
+            return
+        except ChatStateStorageError:
+            logger.exception("Failed to render main menu due to chat state storage error")
+            await _send_chat_state_read_error(message)
+            return
         await message.answer(
             "Анкета уже сохранена. Можно сразу составить рацион или изменить анкету.",
-            reply_markup=_main_menu_keyboard(message.chat.id),
+            reply_markup=reply_markup,
         )
         return
     await message.answer(WELCOME_TEXT, reply_markup=_start_keyboard())
@@ -1308,7 +1484,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
 @router.pre_checkout_query()
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
-    if _is_valid_pre_checkout(pre_checkout_query):
+    if await _is_valid_pre_checkout_async(pre_checkout_query):
         await pre_checkout_query.answer(ok=True)
         return
     await pre_checkout_query.answer(
@@ -1326,7 +1502,7 @@ async def handle_successful_payment(message: Message) -> None:
         return
 
     try:
-        result = _apply_successful_payment(
+        result = await _apply_successful_payment_async(
             message.chat.id,
             payment,
             user_id=_message_user_id(message),
@@ -1341,7 +1517,8 @@ async def handle_successful_payment(message: Message) -> None:
         return
     if result.duplicate:
         try:
-            duplicate_status_text = _format_entitlement_status(message.chat.id)
+            duplicate_status_text = await _format_entitlement_status_async(message.chat.id)
+            reply_markup = await _payment_result_keyboard_async(message.chat.id, result)
         except EntitlementStorageError:
             logger.exception("Failed to render duplicate payment status due to entitlement storage error")
             await _send_entitlement_storage_error(message)
@@ -1349,7 +1526,7 @@ async def handle_successful_payment(message: Message) -> None:
         await message.answer(
             "Этот платеж уже был обработан. Текущие остатки:\n\n"
             f"{duplicate_status_text}",
-            reply_markup=_payment_result_keyboard(message.chat.id, result),
+            reply_markup=reply_markup,
         )
         return
     if not result.processed:
@@ -1361,17 +1538,18 @@ async def handle_successful_payment(message: Message) -> None:
 
     try:
         status_text = (
-            _subscriber_cabinet_text(message.chat.id)
-            if result.grant == "subscription" or _has_active_paid_access(message.chat.id)
-            else _format_entitlement_status(message.chat.id)
+            await _subscriber_cabinet_text_async(message.chat.id)
+            if result.grant == "subscription" or await _has_active_paid_access_async(message.chat.id)
+            else await _format_entitlement_status_async(message.chat.id)
         )
+        reply_markup = await _payment_result_keyboard_async(message.chat.id, result)
     except EntitlementStorageError:
         logger.exception("Failed to render payment status due to entitlement storage error")
         await _send_entitlement_storage_error(message)
         return
     await message.answer(
         _payment_success_text(result) + "\n\n" + status_text,
-        reply_markup=_payment_result_keyboard(message.chat.id, result),
+        reply_markup=reply_markup,
     )
 
 
@@ -1488,7 +1666,7 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     is_trial = chat_id in TRIAL_CHAT_IDS
     trial_session_token = QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(chat_id) if is_trial else None
     try:
-        _save_chat_profile(chat_id, profile)
+        await _save_chat_profile_async(chat_id, profile)
     except ChatStateStorageError:
         logger.exception("Failed to save questionnaire profile for chat_id=%s", _mask_chat_id(chat_id))
         await _send_chat_profile_storage_error(message)
@@ -1498,7 +1676,12 @@ async def _handle_questionnaire_answer(message: Message, text: str) -> None:
     PROFILE_BY_CHAT_ID[chat_id] = profile
     PLAN_COUNT_BY_CHAT_ID[chat_id] = 0
     PLAN_SEED_OFFSET_BY_CHAT_ID[chat_id] = random.SystemRandom().randrange(1, 1_000_000_000)
-    _load_chat_history(chat_id)
+    try:
+        await _load_chat_history_async(chat_id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat history for chat_id=%s", _mask_chat_id(chat_id))
+        await _send_chat_state_read_error(message)
+        return
     trial_idempotency_key = _trial_plan_idempotency_key(chat_id, trial_session_token, profile) if is_trial else None
     _clear_questionnaire_session(chat_id)
     TRIAL_CHAT_IDS.discard(chat_id)
@@ -1794,7 +1977,11 @@ async def _repeat_plan(message: Message, *, idempotency_key: str | None = None) 
 
 
 async def _send_calculation_options(message: Message, profile: UserProfile) -> None:
-    await _send_calculation_report(message, profile, reply_markup=_ration_choice_keyboard_for_chat(message.chat.id))
+    await _send_calculation_report(
+        message,
+        profile,
+        reply_markup=await _ration_choice_keyboard_for_chat_async(message.chat.id),
+    )
 
 
 async def _send_calculation_report(
@@ -1835,7 +2022,7 @@ async def _send_trial_plan(
         return
 
     try:
-        consumption = _consume_generation_attempt(message.chat.id, "one_day")
+        consumption = await _consume_generation_attempt_async(message.chat.id, "one_day")
     except EntitlementStorageError:
         logger.exception("Failed to consume trial entitlement due to entitlement storage error")
         await _send_entitlement_storage_error(message)
@@ -1848,11 +2035,11 @@ async def _send_trial_plan(
         await _send_calculation_report(message, profile)
         sent = await _send_plan(message, profile, include_default_after_plan_keyboard=False)
     except Exception:
-        _refund_generation_attempt(message.chat.id, consumption)
+        await _refund_generation_attempt_async(message.chat.id, consumption)
         raise
 
     if not sent:
-        _refund_generation_attempt(message.chat.id, consumption)
+        await _refund_generation_attempt_async(message.chat.id, consumption)
         return
 
     if sent:
@@ -1888,7 +2075,7 @@ def _trial_plan_idempotency_key(chat_id: int, session_token: str | None, profile
 
 async def _send_trial_subscription_cta(message: Message) -> None:
     await message.answer(
-        TRIAL_SUBSCRIPTION_TEXT + "\n\n" + _format_entitlement_status(message.chat.id),
+        TRIAL_SUBSCRIPTION_TEXT + "\n\n" + await _format_entitlement_status_async(message.chat.id),
         reply_markup=_trial_subscription_keyboard(),
     )
 
@@ -2062,7 +2249,7 @@ async def _send_one_day_plan_with_access(
             )
 
         try:
-            consumption = _consume_generation_attempt(chat_id, "one_day")
+            consumption = await _consume_generation_attempt_async(chat_id, "one_day")
         except EntitlementStorageError:
             logger.exception("Failed to consume one-day entitlement due to entitlement storage error")
             await _send_entitlement_storage_error(message)
@@ -2075,14 +2262,14 @@ async def _send_one_day_plan_with_access(
             sent = await _send_plan(
                 message,
                 profile,
-                status_text=_format_entitlement_status(chat_id),
+                status_text=await _format_entitlement_status_async(chat_id),
             )
         except Exception:
-            _refund_generation_attempt(chat_id, consumption)
+            await _refund_generation_attempt_async(chat_id, consumption)
             raise
 
         if not sent:
-            _refund_generation_attempt(chat_id, consumption)
+            await _refund_generation_attempt_async(chat_id, consumption)
         return sent
     finally:
         _release_one_day_plan_generation(chat_id)
@@ -2177,7 +2364,7 @@ async def _send_one_day_plan_with_postgres_job(
         sent = await _send_plan(
             message,
             profile,
-            status_text=_format_entitlement_status(chat_id),
+            status_text=await _format_entitlement_status_async(chat_id),
             on_expected_value_messages=set_expected_value_messages,
             on_value_send_start=mark_send_started,
             on_value_message_delivered=mark_value_message_delivered,
@@ -2294,7 +2481,7 @@ async def _send_week_plan_with_access(
         return False
 
     try:
-        weekly_pdf_available = _weekly_pdf_attempt_available(chat_id)
+        weekly_pdf_available = await _weekly_pdf_attempt_available_async(chat_id)
     except EntitlementStorageError:
         logger.exception("Failed to check weekly PDF entitlement due to entitlement storage error")
         _weekly_pdf_diag("access_error_entitlement_storage", chat_id=chat_id)
@@ -2380,7 +2567,7 @@ async def _send_week_plan_with_postgres_jobs(
         return False
 
     try:
-        weekly_pdf_available = _weekly_pdf_attempt_available(chat_id)
+        weekly_pdf_available = await _weekly_pdf_attempt_available_async(chat_id)
     except Exception:
         _cancel_postgres_admitted_job(
             runtime,
@@ -2622,7 +2809,7 @@ async def _send_week_plan_after_postgres_admission(
         sent = await _send_week_plan(
             message,
             profile,
-            status_text=_format_entitlement_status(chat_id),
+            status_text=await _format_entitlement_status_async(chat_id),
             recipe_history_entries=recipe_history_entries,
             pdf_slot_acquired=True,
             initial_status_message=initial_status_message,
@@ -2651,7 +2838,7 @@ async def _send_week_plan_after_postgres_admission(
 
     if not post_upload_finalized:
         runtime.finish_success(job.job_id)
-    _record_successful_generation_history(chat_id, consumption, recipe_history_entries)
+    await _record_successful_generation_history_async(chat_id, consumption, recipe_history_entries)
     return True
 
 
@@ -2680,7 +2867,7 @@ async def _send_week_plan_after_queue_admission(
         consume_started_at = time.perf_counter()
         _weekly_pdf_diag("consume_attempt_start", chat_id=message.chat.id)
         try:
-            consumption = _consume_generation_attempt(message.chat.id, "weekly_pdf")
+            consumption = await _consume_generation_attempt_async(message.chat.id, "weekly_pdf")
         except EntitlementStorageError:
             logger.exception("Failed to consume weekly PDF entitlement due to entitlement storage error")
             await _send_entitlement_storage_error(message)
@@ -2700,21 +2887,21 @@ async def _send_week_plan_after_queue_admission(
         sent = await _send_week_plan(
             message,
             profile,
-            status_text=_format_entitlement_status(message.chat.id),
+            status_text=await _format_entitlement_status_async(message.chat.id),
             recipe_history_entries=recipe_history_entries,
             pdf_slot_acquired=True,
             initial_status_message=initial_status_message,
         )
     except Exception:
         if consumption is not None and consumption.allowed:
-            _refund_generation_attempt(message.chat.id, consumption)
+            await _refund_generation_attempt_async(message.chat.id, consumption)
         raise
 
     if not sent:
-        _refund_generation_attempt(message.chat.id, consumption)
+        await _refund_generation_attempt_async(message.chat.id, consumption)
     else:
         _complete_generation_attempt(message.chat.id, consumption)
-        _record_successful_generation_history(
+        await _record_successful_generation_history_async(
             message.chat.id,
             consumption,
             recipe_history_entries,
@@ -2771,7 +2958,7 @@ async def _send_plan(
     PLAN_COUNT_BY_CHAT_ID[chat_id] = count + 1
     status_message = await message.answer("Считаю рацион и проверяю ограничения... 🧮", reply_markup=ReplyKeyboardRemove())
     try:
-        _load_chat_history(chat_id)
+        await _load_chat_history_async(chat_id)
     except ChatStateStorageError:
         logger.exception("Failed to load chat history for chat_id=%s", _mask_chat_id(chat_id))
         await _send_chat_state_read_error(message, status_message=status_message)
@@ -2810,7 +2997,7 @@ async def _send_plan(
         await _send_meal_card(message, meal)
         if on_value_message_delivered is not None:
             on_value_message_delivered(_one_day_meal_value_message_key(meal_index, meal))
-    _remember_recipe_history_items_best_effort(
+    await _remember_recipe_history_items_best_effort_async(
         chat_id,
         _recipe_history_items_from_plan(plan_result, "one_day"),
         ration_kind="one_day",
@@ -2867,7 +3054,7 @@ async def _send_week_plan(
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
     try:
         try:
-            recent_avoidance = _load_recent_recipe_avoidance(chat_id)
+            recent_avoidance = await _load_recent_recipe_avoidance_async(chat_id)
         except ChatStateStorageError:
             logger.exception("Failed to load weekly PDF chat history for chat_id=%s", _mask_chat_id(chat_id))
             await _stop_week_pdf_status(status_task)
@@ -4484,23 +4671,33 @@ async def _send_payment_activation_delayed_notice(message: Message) -> None:
 
 async def _send_active_subscription_notice_if_needed(message: Message) -> bool:
     try:
-        entitlement = _entitlement_for_chat(message.chat.id)
+        entitlement = await _run_entitlement_db_call(_entitlement_for_chat, message.chat.id)  # type: ignore[assignment]
     except EntitlementStorageError:
         logger.exception("Failed to check active subscription due to entitlement storage error")
         await _send_entitlement_storage_error(message)
         return True
     if not entitlement.is_subscription_active():
         return False
+    try:
+        reply_markup = await _run_entitlement_db_call(
+            _subscriber_cabinet_keyboard,
+            message.chat.id,
+            entitlement=entitlement,
+        )
+    except EntitlementStorageError:
+        logger.exception("Failed to render active subscription keyboard due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return True
     await message.answer(
         _active_subscription_notice_text(entitlement),
-        reply_markup=_subscriber_cabinet_keyboard(message.chat.id, entitlement=entitlement),
+        reply_markup=reply_markup,
     )
     return True
 
 
 async def _send_extra_purchase_subscription_notice_if_needed(message: Message) -> bool:
     try:
-        entitlement = _entitlement_for_chat(message.chat.id)
+        entitlement = await _run_entitlement_db_call(_entitlement_for_chat, message.chat.id)  # type: ignore[assignment]
     except EntitlementStorageError:
         logger.exception("Failed to check extra purchase subscription due to entitlement storage error")
         await _send_entitlement_storage_error(message)
@@ -5179,7 +5376,13 @@ def _format_next_renewal_line(entitlement: Entitlement) -> str | None:
 
 
 async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
-    entitlement = _entitlement_for_chat(message.chat.id)
+    try:
+        entitlement = await _run_entitlement_db_call(_entitlement_for_chat, message.chat.id)  # type: ignore[assignment]
+        status_text = await _format_entitlement_status_async(message.chat.id)
+    except EntitlementStorageError:
+        logger.exception("Failed to render limit paywall due to entitlement storage error")
+        await _send_entitlement_storage_error(message)
+        return
     has_active_subscription = (
         entitlement.is_subscription_active()
         and not _is_free_preview_mode(message.chat.id, entitlement)
@@ -5187,7 +5390,7 @@ async def _send_limit_paywall(message: Message, ration_kind: str) -> None:
     lines = [
         "Лимит для этого типа рациона закончился.",
         "",
-        _format_entitlement_status(message.chat.id),
+        status_text,
     ]
     next_renewal = (
         None
