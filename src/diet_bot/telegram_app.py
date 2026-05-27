@@ -4180,8 +4180,7 @@ def _remember_recipes(chat_id: int, plan_result) -> None:
 
 
 def _load_chat_history(chat_id: int) -> None:
-    state = _load_state()
-    chat_state = state.get(str(chat_id), {})
+    chat_state = _load_chat_state(chat_id)
     RECENT_RECIPE_IDS_BY_CHAT_ID[chat_id] = list(chat_state.get("recipe_ids", []))[-RECENT_RECIPE_LIMIT:]
     RECENT_RECIPE_KEYS_BY_CHAT_ID[chat_id] = list(chat_state.get("recipe_keys", []))[-RECENT_RECIPE_LIMIT:]
 
@@ -4221,8 +4220,8 @@ def _profile_for_chat(chat_id: int) -> UserProfile | None:
     if profile is not None:
         return profile
 
-    state = _load_state()
-    raw_profile = state.get(str(chat_id), {}).get("profile")
+    chat_state = _load_chat_state(chat_id)
+    raw_profile = chat_state.get("profile")
     if not isinstance(raw_profile, dict):
         return None
 
@@ -4240,6 +4239,20 @@ def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
         raise
     except Exception as exc:
         raise ChatStateStorageError("Could not save chat profile") from exc
+
+
+def _load_chat_state(chat_id: int) -> dict[str, object]:
+    try:
+        store = _chat_state_store()
+        load_chat_state = getattr(store, "load_chat_state", None)
+        if callable(load_chat_state):
+            return dict(load_chat_state(chat_id) or {})
+        return dict(store.load_all().get(str(chat_id), {}))
+    except ChatStateStorageError:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected chat state load failure")
+        raise ChatStateStorageError("Could not load chat state") from exc
 
 
 def _load_state() -> dict[str, dict[str, object]]:

@@ -198,6 +198,25 @@ def test_profile_and_history_updates_do_not_overwrite_each_other(store: Postgres
     }
 
 
+def test_row_level_load_chat_state_reads_only_requested_chat(store: PostgresChatStateStore) -> None:
+    chat_id = _chat_id()
+    other_chat_id = _chat_id()
+    requested_state = {
+        "profile": {"age": 41, "goal": "maintain"},
+        "recipe_ids": ["r010"],
+        "recipe_keys": ["main:r010"],
+    }
+    other_state = {
+        "profile": {"age": 29, "goal": "lose"},
+        "recipe_ids": ["r020"],
+        "recipe_keys": ["main:r020"],
+    }
+    store.save_all({str(chat_id): requested_state, str(other_chat_id): other_state})
+
+    assert store.load_chat_state(chat_id) == requested_state
+    assert store.load_chat_state(_chat_id()) == {}
+
+
 def test_json_migration_apply_writes_profile_history_and_is_idempotent(
     tmp_path: Path,
     store: PostgresChatStateStore,

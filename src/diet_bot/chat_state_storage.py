@@ -48,6 +48,13 @@ class JsonChatStateStore:
         with self._lock:
             return self._load_all_locked()
 
+    def load_chat_state(self, chat_id: int) -> ChatState:
+        with self._lock:
+            chat_state = self._load_all_locked().get(str(int(chat_id)))
+            if chat_state is None:
+                return {}
+            return _normalize_chat_state(chat_state, source=self.path)
+
     def save_all(self, state: Mapping[str, Mapping[str, object]]) -> None:
         with self._lock:
             self._load_all_locked()

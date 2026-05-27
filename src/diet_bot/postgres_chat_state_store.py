@@ -105,6 +105,11 @@ class PostgresChatStateStore:
             with conn.cursor() as cur:
                 return self._load_all_cur(cur)
 
+    def load_chat_state(self, chat_id: int) -> ChatState:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._load_chat_state_cur(cur, int(chat_id))
+
     def save_all(self, state: Mapping[str, Mapping[str, object]]) -> None:
         normalized = _normalize_import_chat_state(state)
         with self._connect() as conn:
@@ -243,6 +248,37 @@ class PostgresChatStateStore:
             current["recipe_keys"] = list(row["recipe_keys"] or [])
             state[chat_id] = _normalize_chat_state(current, source=_MEMORY_SOURCE)
         return state
+
+    def _load_chat_state_cur(self, cur: Any, chat_id: int) -> ChatState:
+        current: dict[str, object] = {}
+        cur.execute(
+            """
+            SELECT profile_json
+            FROM chat_profiles
+            WHERE chat_id = %s
+            """,
+            (int(chat_id),),
+        )
+        profile_row = cur.fetchone()
+        if profile_row is not None:
+            current["profile"] = dict(profile_row["profile_json"] or {})
+
+        cur.execute(
+            """
+            SELECT recipe_ids, recipe_keys
+            FROM chat_recipe_history
+            WHERE chat_id = %s
+            """,
+            (int(chat_id),),
+        )
+        history_row = cur.fetchone()
+        if history_row is not None:
+            current["recipe_ids"] = list(history_row["recipe_ids"] or [])
+            current["recipe_keys"] = list(history_row["recipe_keys"] or [])
+
+        if not current:
+            return {}
+        return _normalize_chat_state(current, source=_MEMORY_SOURCE)
 
     def _load_history_cur(self, cur: Any, chat_id: int, *, for_update: bool = False) -> ChatState:
         suffix = " FOR UPDATE" if for_update else ""

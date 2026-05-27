@@ -206,6 +206,41 @@ def test_processed_charge_ids_roundtrip_and_save_is_idempotent(store: PostgresEn
             assert int(cur.fetchone()["count"]) == 2
 
 
+def test_row_level_entitlement_read_write_preserves_other_rows(store: PostgresEntitlementStore) -> None:
+    chat_id = _chat_id()
+    other_chat_id = _chat_id()
+    original = Entitlement(monthly_one_day_remaining=1)
+    other = Entitlement(extra_weekly_pdf_remaining=2)
+    updated = Entitlement(
+        monthly_one_day_remaining=4,
+        processed_payment_charge_ids=["charge-row-1", "charge-row-2"],
+    )
+    store.save_all({chat_id: original, other_chat_id: other})
+
+    store.save_chat_entitlement(chat_id, updated)
+
+    assert store.load_chat_entitlement(chat_id) == updated
+    assert store.load_chat_entitlement(_chat_id()) is None
+    assert store.load_all() == {chat_id: updated, other_chat_id: other}
+
+
+def test_row_level_entitlement_transaction_updates_one_row(store: PostgresEntitlementStore) -> None:
+    chat_id = _chat_id()
+    other_chat_id = _chat_id()
+    other = Entitlement(monthly_weekly_pdf_remaining=3)
+    store.save_all({other_chat_id: other})
+
+    with store.transact_chat_entitlement(chat_id) as entitlement:
+        entitlement.extra_one_day_remaining = 2
+        entitlement.processed_payment_charge_ids.append("charge-row-tx")
+
+    assert store.load_chat_entitlement(chat_id) == Entitlement(
+        extra_one_day_remaining=2,
+        processed_payment_charge_ids=["charge-row-tx"],
+    )
+    assert store.load_chat_entitlement(other_chat_id) == other
+
+
 def test_entitlement_service_works_over_postgres_store(store: PostgresEntitlementStore) -> None:
     now = datetime(2026, 5, 22, tzinfo=UTC)
     chat_id = _chat_id()
