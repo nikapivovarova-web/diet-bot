@@ -162,7 +162,7 @@ def test_enabled_payment_startup_validation_checks_spool_before_postgres(
     ]
 
 
-def test_enabled_payment_startup_validation_accepts_absolute_spool_when_probe_passes(
+def test_enabled_payment_startup_validation_prepares_absolute_spool_when_probe_passes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -190,7 +190,8 @@ def test_enabled_payment_startup_validation_accepts_absolute_spool_when_probe_pa
 
     validate_payment_runtime_for_startup(config)
 
-    assert not spool_path.exists()
+    assert spool_path.is_file()
+    assert spool_path.read_text(encoding="utf-8") == ""
 
 
 def test_enabled_payment_startup_validation_wraps_schema_failure(

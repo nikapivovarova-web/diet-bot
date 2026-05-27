@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import diet_bot.payment_recovery_spool as payment_recovery_spool
 from diet_bot.payment_recovery_spool import (
     ALLOWED_SERIALIZED_FIELDS,
     PaymentRecoveryRecord,
@@ -143,17 +144,53 @@ def test_append_creates_parent_and_writes_one_jsonl_line(tmp_path: Path) -> None
     assert json.loads(lines[0]) == record.to_dict()
 
 
-def test_append_flushes_and_fsyncs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_append_flushes_and_fsyncs_existing_spool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[int] = []
 
     def fake_fsync(fd: int) -> None:
         calls.append(fd)
 
+    def fail_parent_fsync(_path: Path) -> bool:
+        raise AssertionError("existing spool append must not fsync the parent directory")
+
     monkeypatch.setattr("diet_bot.payment_recovery_spool.os.fsync", fake_fsync)
+    monkeypatch.setattr(
+        "diet_bot.payment_recovery_spool._fsync_directory_if_supported",
+        fail_parent_fsync,
+    )
+    path = tmp_path / "payments.jsonl"
+    path.write_text("", encoding="utf-8")
+
+    append_payment_recovery_record(path, make_record())
+
+    assert calls
+
+
+def test_append_to_missing_spool_fsyncs_parent_directory_after_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    def fake_fsync(_fd: int) -> None:
+        events.append("file")
+
+    def fake_fsync_directory(path: Path) -> bool:
+        events.append(("parent", path))
+        return True
+
+    monkeypatch.setattr("diet_bot.payment_recovery_spool.os.fsync", fake_fsync)
+    monkeypatch.setattr(
+        "diet_bot.payment_recovery_spool._fsync_directory_if_supported",
+        fake_fsync_directory,
+    )
 
     append_payment_recovery_record(tmp_path / "payments.jsonl", make_record())
 
-    assert calls
+    assert events == ["file", ("parent", tmp_path)]
 
 
 def test_read_parses_records_and_dedupes_by_record_id(tmp_path: Path) -> None:
@@ -210,12 +247,28 @@ def test_append_uses_restrictive_permissions_where_supported(tmp_path: Path) -> 
     assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
 
 
-def test_spool_readiness_accepts_absolute_path_and_does_not_create_target(tmp_path: Path) -> None:
+def test_spool_readiness_creates_missing_target_and_fsyncs_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_fsyncs: list[Path] = []
+
+    def fake_fsync_directory(path: Path) -> bool:
+        parent_fsyncs.append(path)
+        return True
+
+    monkeypatch.setattr(
+        "diet_bot.payment_recovery_spool._fsync_directory_if_supported",
+        fake_fsync_directory,
+    )
     path = tmp_path / "payments.jsonl"
 
     validate_payment_recovery_spool_ready(path)
 
-    assert not path.exists()
+    assert path.is_file()
+    assert path.read_text(encoding="utf-8") == ""
+    assert parent_fsyncs == [tmp_path]
+    assert sorted(child.name for child in tmp_path.iterdir()) == ["payments.jsonl"]
 
 
 def test_spool_readiness_preserves_existing_target_contents(tmp_path: Path) -> None:
@@ -291,6 +344,26 @@ def test_spool_readiness_fails_when_temp_probe_cannot_fsync(
     assert not any(tmp_path.iterdir())
 
 
+def test_spool_readiness_fails_when_created_target_parent_cannot_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "payments.jsonl"
+
+    def fail_fsync_directory(_path: Path) -> bool:
+        raise OSError("parent fsync blocked")
+
+    monkeypatch.setattr(
+        "diet_bot.payment_recovery_spool._fsync_directory_if_supported",
+        fail_fsync_directory,
+    )
+
+    with pytest.raises(PaymentRecoverySpoolUnavailable, match="parent directory is not fsync ready"):
+        validate_payment_recovery_spool_ready(path)
+
+    assert not path.exists()
+
+
 def test_spool_readiness_temp_probe_writes_only_non_sensitive_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -326,9 +399,25 @@ def test_spool_readiness_temp_probe_writes_only_non_sensitive_bytes(
 
     monkeypatch.setattr("diet_bot.payment_recovery_spool.os.fdopen", tracking_fdopen)
 
-    validate_payment_recovery_spool_ready(tmp_path / "payments.jsonl")
+    path = tmp_path / "payments.jsonl"
+
+    validate_payment_recovery_spool_ready(path)
 
     assert written == [b"diet-bot-payment-recovery-spool-startup-probe\n"]
     assert flushes == ["flush"]
     assert b"secret" not in b"".join(written).lower()
-    assert not any(tmp_path.iterdir())
+    assert path.is_file()
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_directory_fsync_is_explicit_best_effort_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("Windows directory fsync fallback should not open the directory")
+
+    monkeypatch.setattr(payment_recovery_spool.os, "name", "nt")
+    monkeypatch.setattr(payment_recovery_spool.os, "open", fail_open)
+
+    assert payment_recovery_spool._fsync_directory_if_supported(tmp_path) is False
