@@ -191,11 +191,8 @@ def append_payment_recovery_record(path: str | Path, record: PaymentRecoveryReco
     spool_path = Path(path)
     spool_path.parent.mkdir(parents=True, exist_ok=True)
     line = record.to_json_line()
-    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
 
-    fd: int | None = os.open(spool_path, flags, stat.S_IRUSR | stat.S_IWUSR)
+    fd, created_spool = _open_spool_for_append(spool_path)
     try:
         _restrict_file_permissions(spool_path)
         with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as spool:
@@ -206,6 +203,8 @@ def append_payment_recovery_record(path: str | Path, record: PaymentRecoveryReco
     finally:
         if fd is not None:
             os.close(fd)
+    if created_spool:
+        _fsync_directory_if_supported(spool_path.parent)
 
 
 def read_payment_recovery_records(path: str | Path, *, dedupe: bool = True) -> PaymentRecoveryReadResult:
@@ -254,7 +253,10 @@ def validate_payment_recovery_spool_ready(path: str | Path) -> None:
 
     if spool_path.exists():
         _validate_existing_spool_ready(spool_path)
-    _probe_spool_directory(parent, spool_path.name)
+        _probe_spool_directory(parent, spool_path.name)
+    else:
+        _probe_spool_directory(parent, spool_path.name)
+        _create_empty_spool_file_durably(spool_path)
 
 
 def _validate_existing_spool_ready(path: Path) -> None:
@@ -271,6 +273,87 @@ def _validate_existing_spool_ready(path: Path) -> None:
             os.fsync(spool.fileno())
     except OSError as exc:
         raise PaymentRecoverySpoolUnavailable("existing spool is not append/fsync ready") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _open_spool_for_append(path: Path) -> tuple[int, bool]:
+    flags = os.O_APPEND | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+
+    create_flags = flags | os.O_CREAT | os.O_EXCL
+    try:
+        return os.open(path, create_flags, stat.S_IRUSR | stat.S_IWUSR), True
+    except FileExistsError:
+        return os.open(path, flags), False
+
+
+def _create_empty_spool_file_durably(path: Path) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+
+    fd: int | None = None
+    created_spool = False
+    failure: OSError | None = None
+    try:
+        fd = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
+        created_spool = True
+        _restrict_file_permissions(path)
+        os.fsync(fd)
+    except FileExistsError:
+        _validate_existing_spool_ready(path)
+    except OSError as exc:
+        failure = exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    if failure is not None:
+        if created_spool:
+            _remove_created_empty_spool(path)
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool file creation failed") from failure
+
+    if not created_spool:
+        return
+
+    try:
+        _fsync_directory_if_supported(path.parent)
+    except OSError as exc:
+        _remove_created_empty_spool(path)
+        raise PaymentRecoverySpoolUnavailable("payment recovery spool parent directory is not fsync ready") from exc
+
+
+def _remove_created_empty_spool(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _fsync_directory_if_supported(path: Path) -> bool:
+    """Fsync a directory when the platform exposes a safe directory handle.
+
+    Windows does not provide a reliable directory fsync path through Python's
+    os.open/os.fsync APIs, so callers get best-available file fsync behavior
+    there and this helper returns False.
+    """
+    if os.name == "nt":
+        return False
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        os.fsync(fd)
+        return True
     finally:
         if fd is not None:
             os.close(fd)
