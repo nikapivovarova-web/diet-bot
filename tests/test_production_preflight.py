@@ -24,6 +24,20 @@ def _valid_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
     return env
 
 
+def _controlled_qa_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "DIET_BOT_TOKEN": "test-bot-super-secret",
+        "DIET_BOT_ENV": "controlled-qa",
+        "DIET_BOT_STORAGE_BACKEND": "postgres",
+        "DIET_BOT_DATABASE_URL": "postgresql://qa_user:qa-db-super-secret@example.test/diet_bot_controlled_qa",
+        "DIET_BOT_TESTER_CHAT_IDS": "111,222",
+        "DIET_BOT_CONTROLLED_QA_BOT_TOKEN_MARKER": "test",
+        "DIET_BOT_CONTROLLED_QA_DATABASE_MARKER": "staging",
+    }
+    env.update(overrides)
+    return env
+
+
 def _patch_successful_runtime_checks(monkeypatch: pytest.MonkeyPatch, preflight) -> list[str]:
     calls: list[str] = []
 
@@ -85,6 +99,231 @@ def test_production_preflight_success_reports_pass_and_uses_existing_validators(
     assert "bot-super-secret" not in output
     assert "db-super-secret" not in output
     assert "postgresql://user:" not in output
+
+
+def test_controlled_qa_preflight_success_reports_pass_and_uses_existing_safe_validators(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    calls = _patch_successful_runtime_checks(monkeypatch, preflight)
+
+    exit_code = preflight.main(["--mode", "controlled-qa"], env=_controlled_qa_env())
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "controlled QA preflight" in output
+    assert "result: PASS" in output
+    assert "PASS controlled QA runtime config" in output
+    assert "tester_chat_ids_count=2" in output
+    assert "PASS Postgres connectivity" in output
+    assert "PASS entitlement schema" in output
+    assert "PASS payment ledger schema" in output
+    assert "PASS single-poller guard acquire/release" in output
+    assert calls == [
+        "postgres_connectivity",
+        "chat_state_schema",
+        "entitlement_schema",
+        "weekly_pdf_schema",
+        "one_day_schema",
+        "payment_ledger_schema",
+        "single_poller_guard",
+    ]
+    assert "test-bot-super-secret" not in output
+    assert "qa-db-super-secret" not in output
+    assert "postgresql://qa_user:" not in output
+    assert "111" not in output
+    assert "222" not in output
+
+
+def test_controlled_qa_preflight_rejects_production_environment_before_db_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+
+    exit_code = preflight.main(["--mode", "controlled-qa"], env=_controlled_qa_env(DIET_BOT_ENV="production"))
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "result: FAIL" in output
+    assert "FAIL controlled QA runtime config" in output
+    assert "DIET_BOT_ENV must not be production or prod for controlled QA" in output
+    assert "qa-db-super-secret" not in output
+    assert "postgresql://qa_user:" not in output
+
+
+def test_controlled_qa_preflight_rejects_enabled_payments(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+
+    exit_code = preflight.main(
+        ["--mode", "controlled-qa"],
+        env=_controlled_qa_env(DIET_BOT_PAYMENTS_ENABLED="1"),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_PAYMENTS_ENABLED must be unset or disabled for controlled QA" in output
+    assert "test-bot-super-secret" not in output
+    assert "qa-db-super-secret" not in output
+
+
+def test_controlled_qa_preflight_rejects_provider_token_without_printing_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+
+    exit_code = preflight.main(
+        ["--mode", "controlled-qa"],
+        env=_controlled_qa_env(TELEGRAM_PROVIDER_TOKEN="provider-super-secret"),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "TELEGRAM_PROVIDER_TOKEN must be absent for controlled QA" in output
+    assert "provider-super-secret" not in output
+    assert "test-bot-super-secret" not in output
+    assert "qa-db-super-secret" not in output
+
+
+def test_controlled_qa_preflight_rejects_missing_database_config(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+    env = _controlled_qa_env()
+    env.pop("DIET_BOT_DATABASE_URL")
+
+    exit_code = preflight.main(["--mode", "controlled-qa"], env=env)
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_DATABASE_URL is required for controlled QA Postgres storage" in output
+    assert "postgresql://" not in output
+    assert "test-bot-super-secret" not in output
+
+
+def test_controlled_qa_preflight_rejects_missing_tester_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+
+    exit_code = preflight.main(
+        ["--mode", "controlled-qa"],
+        env=_controlled_qa_env(DIET_BOT_TESTER_CHAT_IDS=""),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_TESTER_CHAT_IDS must contain at least one tester chat ID" in output
+    assert "test-bot-super-secret" not in output
+    assert "qa-db-super-secret" not in output
+
+
+def test_controlled_qa_preflight_requires_explicit_nonprod_database_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+    env = _controlled_qa_env()
+    env.pop("DIET_BOT_CONTROLLED_QA_DATABASE_MARKER")
+
+    exit_code = preflight.main(["--mode", "controlled-qa"], env=env)
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_CONTROLLED_QA_DATABASE_MARKER" in output
+    assert "qa-db-super-secret" not in output
+    assert "postgresql://qa_user:" not in output
+
+
+def test_controlled_qa_preflight_requires_explicit_test_bot_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid QA config")),
+    )
+    env = _controlled_qa_env()
+    env.pop("DIET_BOT_CONTROLLED_QA_BOT_TOKEN_MARKER")
+
+    exit_code = preflight.main(["--mode", "controlled-qa"], env=env)
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_CONTROLLED_QA_BOT_TOKEN_MARKER" in output
+    assert "test-bot-super-secret" not in output
+    assert "qa-db-super-secret" not in output
+
+
+def test_controlled_qa_preflight_redacts_secrets_from_dependency_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    _patch_successful_runtime_checks(monkeypatch, preflight)
+
+    def fail_connectivity(config) -> None:
+        raise RuntimeError(f"could not connect with {config.database_url} {config.bot_token}")
+
+    monkeypatch.setattr(preflight, "_validate_postgres_connectivity", fail_connectivity)
+
+    exit_code = preflight.main(["--mode", "controlled-qa"], env=_controlled_qa_env())
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "FAIL Postgres connectivity" in output
+    assert "test-bot-super-secret" not in output
+    assert "qa-db-super-secret" not in output
+    assert "postgresql://qa_user:" not in output
+    assert "<redacted>" in output
 
 
 def test_production_preflight_fails_closed_on_invalid_config(
@@ -282,3 +521,18 @@ def test_runbook_documents_production_preflight_cli() -> None:
     assert "payment ledger schema/migration expectations" in runbook
     assert "single-poller advisory guard can be acquired and released" in runbook
     assert "must not contain full" in runbook
+
+
+def test_runbook_documents_controlled_qa_guardrails() -> None:
+    runbook = Path("docs/controlled-qa-runbook.md").read_text(encoding="utf-8")
+
+    assert "DIET_BOT_CONTROLLED_QA_BOT_TOKEN_MARKER" in runbook
+    assert "DIET_BOT_CONTROLLED_QA_DATABASE_MARKER" in runbook
+    assert "DIET_BOT_TESTER_CHAT_IDS" in runbook
+    assert "TELEGRAM_PROVIDER_TOKEN" in runbook
+    assert "python.exe -m scripts.ops.production_preflight --mode controlled-qa" in runbook
+    assert "must not call Telegram API" in runbook
+    assert "must not start the bot runtime or poller" in runbook
+    assert "must not contain full DSNs, bot tokens, provider tokens, or raw tester chat IDs" in runbook
+    assert "weekly_pdf_manual_review_report" in runbook
+    assert "one_day_manual_review_report" in runbook
