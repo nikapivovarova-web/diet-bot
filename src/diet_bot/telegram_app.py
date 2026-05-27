@@ -106,6 +106,7 @@ from .safety import evaluate_safety
 from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
 from .entitlement_service import EntitlementService
 from .entitlement_storage import EntitlementStorageError
+from .log_redaction import redact_identifier, redact_log_identifiers
 from .payment_runtime import (
     PaymentLedgerUnavailable,
     create_payment_service,
@@ -268,12 +269,7 @@ async def _load_profile_for_message_or_notice(message: Message) -> tuple[bool, U
 
 
 def _mask_chat_id(chat_id: int) -> str:
-    text = str(chat_id)
-    sign = "-" if text.startswith("-") else ""
-    digits = text[1:] if sign else text
-    if len(digits) <= 4:
-        return f"{sign}...{digits}"
-    return f"{sign}...{digits[-4:]}"
+    return redact_identifier("chat", chat_id)
 
 
 def _weekly_pdf_diag(
@@ -288,7 +284,7 @@ def _weekly_pdf_diag(
         safe_fields["chat_id"] = _mask_chat_id(chat_id)
     if elapsed_s is not None:
         safe_fields["elapsed_s"] = f"{elapsed_s:.3f}"
-    safe_fields.update(fields)
+    safe_fields.update(redact_log_identifiers(fields))
     details = " ".join(f"{key}={value}" for key, value in safe_fields.items())
     logger.warning("weekly_pdf_diag event=%s %s", event, details)
 
@@ -2553,8 +2549,8 @@ async def _send_week_plan_after_postgres_admission(
         except Exception as exc:
             logger.exception(
                 "Failed to mark weekly PDF job send-start before Telegram upload chat_id=%s job_id=%s",
-                chat_id,
-                job.job_id,
+                _mask_chat_id(chat_id),
+                redact_identifier("job", job.job_id),
             )
             _weekly_pdf_diag(
                 "postgres_mark_send_started_failed_before_upload",
@@ -2584,8 +2580,8 @@ async def _send_week_plan_after_postgres_admission(
             marker_error = type(exc).__name__
             logger.exception(
                 "Failed to mark weekly PDF job delivered after Telegram upload chat_id=%s job_id=%s",
-                chat_id,
-                job.job_id,
+                _mask_chat_id(chat_id),
+                redact_identifier("job", job.job_id),
             )
             _weekly_pdf_diag(
                 "postgres_mark_delivered_failed_after_upload",
@@ -2599,8 +2595,8 @@ async def _send_week_plan_after_postgres_admission(
                 logger.exception(
                     "Failed to finalize weekly PDF job as succeeded after delivered marker failure "
                     "chat_id=%s job_id=%s",
-                    chat_id,
-                    job.job_id,
+                    _mask_chat_id(chat_id),
+                    redact_identifier("job", job.job_id),
                 )
                 _weekly_pdf_diag(
                     "postgres_finish_success_failed_after_mark_delivered_failed",
@@ -4820,7 +4816,7 @@ def _payment_recovery_log_extra(
     exc: PaymentLedgerUnavailable,
     record: PaymentRecoveryRecord | None,
 ) -> dict[str, object]:
-    return {
+    return redact_log_identifiers({
         "record_id": record.record_id if record is not None else None,
         "payment_provider": record.provider if record is not None else _payment_provider_for_payment(payment),
         "chat_id": int(message.chat.id),
@@ -4829,7 +4825,7 @@ def _payment_recovery_log_extra(
         "telegram_payment_charge_id": getattr(payment, "telegram_payment_charge_id", None),
         "provider_payment_charge_id": getattr(payment, "provider_payment_charge_id", None),
         "ledger_failure_reason": exc.reason,
-    }
+    })
 
 
 def _payment_order_id_for_log(invoice_payload: object) -> str | None:

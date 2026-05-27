@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from .log_redaction import redact_optional_identifier
 from .payment_recovery_spool import (
     ALLOWED_SERIALIZED_FIELDS,
     PaymentRecoveryRecord,
@@ -113,14 +114,14 @@ class PaymentReplayRecordReport:
             amount=record.total_amount,
             currency=record.currency,
             created_at=record.created_at,
-            chat_id=_redact_identifier("chat", record.chat_id),
-            user_id=_redact_identifier("user", record.user_id),
-            telegram_payment_charge_id=_redact_identifier(
-                "telegram_payment_charge_id",
+            chat_id=redact_optional_identifier("chat", record.chat_id),
+            user_id=redact_optional_identifier("user", record.user_id),
+            telegram_payment_charge_id=redact_optional_identifier(
+                "telegram_payment_charge",
                 record.telegram_payment_charge_id,
             ),
-            provider_payment_charge_id=_redact_identifier(
-                "provider_payment_charge_id",
+            provider_payment_charge_id=redact_optional_identifier(
+                "provider_payment_charge",
                 record.provider_payment_charge_id,
             ),
             has_subscription_expiration_date=record.subscription_expiration_date is not None,
@@ -874,16 +875,6 @@ def _normalize_spool_fingerprint(value: str) -> str:
     if re.fullmatch(r"[a-f0-9]{64}", text):
         return f"sha256:{text}"
     return text
-
-
-def _redact_identifier(label: str, value: object | None) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    digest = hashlib.sha256(f"{label}:{text}".encode("utf-8")).hexdigest()
-    return f"redacted:{digest[:12]}"
 
 
 def _safe_result_reason(reason: str | None) -> str | None:

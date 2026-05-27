@@ -1486,6 +1486,7 @@ def test_static_legacy_successful_payment_records_unknown_without_grant(monkeypa
 async def test_successful_payment_ledger_failure_spools_recovery_record_before_notice(
     monkeypatch,
     tmp_path,
+    caplog,
 ) -> None:
     service = FailingSuccessfulPaymentService(
         telegram_app.PaymentLedgerUnavailable("payment_ledger_unavailable", "ledger down"),
@@ -1500,6 +1501,7 @@ async def test_successful_payment_ledger_failure_spools_recovery_record_before_n
         write_payment_recovery_record(path, record)
 
     monkeypatch.setattr(telegram_app, "append_payment_recovery_record", tracking_append, raising=False)
+    caplog.set_level(logging.CRITICAL, logger=telegram_app.logger.name)
 
     class RecordingMessage(FakeMessage):
         async def answer(self, text, reply_markup=None):
@@ -1538,6 +1540,21 @@ async def test_successful_payment_ledger_failure_spools_recovery_record_before_n
     assert "private@example.test" not in json.dumps(record.to_dict(), sort_keys=True)
     assert "secret" not in json.dumps(record.to_dict(), sort_keys=True)
     assert [event[0] for event in events] == ["append", "answer"]
+    critical_records = [record for record in caplog.records if record.levelno >= logging.CRITICAL]
+    assert critical_records
+    recovery_record = critical_records[-1]
+    assert getattr(recovery_record, "chat_id") != 202
+    assert getattr(recovery_record, "user_id") != 101
+    for field_name, raw_value in {
+        "chat_id": "202",
+        "user_id": "101",
+        "order_id": "order_12345678",
+        "telegram_payment_charge_id": "tg-charge-1",
+        "provider_payment_charge_id": "provider-charge-1",
+    }.items():
+        value = str(getattr(recovery_record, field_name))
+        assert value.startswith("<redacted:")
+        assert raw_value not in value
 
     sent_text = message.texts[-1][0]
     assert "\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430" in sent_text
@@ -1607,7 +1624,13 @@ async def test_successful_payment_spool_append_failure_logs_critical_and_sends_s
 
     critical_records = [record for record in caplog.records if record.levelno >= logging.CRITICAL]
     assert critical_records
-    assert any(getattr(record, "telegram_payment_charge_id", None) == "tg-charge-critical" for record in critical_records)
+    assert not any(getattr(record, "chat_id", None) == 202 for record in critical_records)
+    assert not any(getattr(record, "user_id", None) == 101 for record in critical_records)
+    assert not any(getattr(record, "telegram_payment_charge_id", None) == "tg-charge-critical" for record in critical_records)
+    assert any(
+        str(getattr(record, "telegram_payment_charge_id", "")).startswith("<redacted:")
+        for record in critical_records
+    )
     assert not any("diet:order:v1" in record.getMessage() for record in critical_records)
     sent_text = message.texts[-1][0]
     assert "\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430" in sent_text
