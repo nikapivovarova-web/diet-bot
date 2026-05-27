@@ -95,12 +95,39 @@ class PostgresEntitlementStore:
             with conn.cursor() as cur:
                 return self._load_all_cur(cur)
 
+    def load_chat_entitlement(self, chat_id: int) -> Entitlement | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._load_chat_entitlement_cur(cur, int(chat_id))
+
+    def save_chat_entitlement(self, chat_id: int, entitlement: Entitlement) -> None:
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    self._upsert_entitlement_cur(cur, int(chat_id), entitlement)
+
     def save_all(self, entitlements: Mapping[int, Entitlement]) -> None:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     self._lock_entitlement_map_cur(cur)
                     self._replace_entitlements_cur(cur, entitlements)
+
+    @contextmanager
+    def transact_chat_entitlement(self, chat_id: int) -> Iterator[Entitlement]:
+        chat_id = int(chat_id)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO entitlements (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
+                        (chat_id,),
+                    )
+                    entitlement = self._load_chat_entitlement_cur(cur, chat_id, for_update=True)
+                    if entitlement is None:
+                        entitlement = Entitlement()
+                    yield entitlement
+                    self._upsert_entitlement_cur(cur, chat_id, entitlement)
 
     @contextmanager
     def transact(self) -> Iterator[dict[int, Entitlement]]:
@@ -205,18 +232,7 @@ class PostgresEntitlementStore:
         entitlements: dict[int, Entitlement] = {}
         for row in cur.fetchall():
             chat_id = int(row["chat_id"])
-            entitlements[chat_id] = Entitlement(
-                free_trial_used=bool(row["free_trial_used"]),
-                subscription_period_start=_optional_text(row["subscription_period_start"]),
-                subscription_period_end=_optional_text(row["subscription_period_end"]),
-                test_access_until=_optional_text(row["test_access_until"]),
-                test_access_enabled=bool(row["test_access_enabled"]),
-                monthly_one_day_remaining=int(row["monthly_one_day_remaining"]),
-                monthly_weekly_pdf_remaining=int(row["monthly_weekly_pdf_remaining"]),
-                extra_one_day_remaining=int(row["extra_one_day_remaining"]),
-                extra_weekly_pdf_remaining=int(row["extra_weekly_pdf_remaining"]),
-                processed_payment_charge_ids=[],
-            )
+            entitlements[chat_id] = _entitlement_from_row(row)
 
         if not entitlements:
             return {}
@@ -234,6 +250,49 @@ class PostgresEntitlementStore:
             entitlements[int(row["chat_id"])].processed_payment_charge_ids.append(str(row["charge_id"]))
         return entitlements
 
+    def _load_chat_entitlement_cur(
+        self,
+        cur: Any,
+        chat_id: int,
+        *,
+        for_update: bool = False,
+    ) -> Entitlement | None:
+        suffix = " FOR UPDATE" if for_update else ""
+        cur.execute(
+            f"""
+            SELECT
+                chat_id,
+                free_trial_used,
+                subscription_period_start,
+                subscription_period_end,
+                test_access_until,
+                test_access_enabled,
+                monthly_one_day_remaining,
+                monthly_weekly_pdf_remaining,
+                extra_one_day_remaining,
+                extra_weekly_pdf_remaining
+            FROM entitlements
+            WHERE chat_id = %s{suffix}
+            """,
+            (int(chat_id),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        entitlement = _entitlement_from_row(row)
+        cur.execute(
+            """
+            SELECT charge_id
+            FROM entitlement_processed_charge_ids
+            WHERE chat_id = %s
+            ORDER BY position, recorded_at, charge_id
+            """,
+            (int(chat_id),),
+        )
+        entitlement.processed_payment_charge_ids = [str(charge["charge_id"]) for charge in cur.fetchall()]
+        return entitlement
+
     def _replace_entitlements_cur(self, cur: Any, entitlements: Mapping[int, Entitlement]) -> None:
         normalized = _normalize_entitlements(entitlements)
         chat_ids = sorted(normalized)
@@ -243,62 +302,67 @@ class PostgresEntitlementStore:
             cur.execute("DELETE FROM entitlements")
 
         for chat_id in chat_ids:
-            entitlement = normalized[chat_id]
+            self._upsert_entitlement_cur(cur, chat_id, normalized[chat_id])
+
+    def _upsert_entitlement_cur(self, cur: Any, chat_id: int, entitlement: Entitlement) -> None:
+        normalized = _normalize_entitlements({int(chat_id): entitlement})
+        chat_id = next(iter(normalized))
+        entitlement = normalized[chat_id]
+        cur.execute(
+            """
+            INSERT INTO entitlements (
+                chat_id,
+                free_trial_used,
+                subscription_period_start,
+                subscription_period_end,
+                test_access_until,
+                test_access_enabled,
+                monthly_one_day_remaining,
+                monthly_weekly_pdf_remaining,
+                extra_one_day_remaining,
+                extra_weekly_pdf_remaining
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                free_trial_used = EXCLUDED.free_trial_used,
+                subscription_period_start = EXCLUDED.subscription_period_start,
+                subscription_period_end = EXCLUDED.subscription_period_end,
+                test_access_until = EXCLUDED.test_access_until,
+                test_access_enabled = EXCLUDED.test_access_enabled,
+                monthly_one_day_remaining = EXCLUDED.monthly_one_day_remaining,
+                monthly_weekly_pdf_remaining = EXCLUDED.monthly_weekly_pdf_remaining,
+                extra_one_day_remaining = EXCLUDED.extra_one_day_remaining,
+                extra_weekly_pdf_remaining = EXCLUDED.extra_weekly_pdf_remaining,
+                updated_at = now(),
+                version = entitlements.version + 1
+            """,
+            (
+                chat_id,
+                entitlement.free_trial_used,
+                entitlement.subscription_period_start,
+                entitlement.subscription_period_end,
+                entitlement.test_access_until,
+                entitlement.test_access_enabled,
+                entitlement.monthly_one_day_remaining,
+                entitlement.monthly_weekly_pdf_remaining,
+                entitlement.extra_one_day_remaining,
+                entitlement.extra_weekly_pdf_remaining,
+            ),
+        )
+        cur.execute(
+            "DELETE FROM entitlement_processed_charge_ids WHERE chat_id = %s",
+            (chat_id,),
+        )
+        for position, charge_id in enumerate(_unique_charge_ids(entitlement.processed_payment_charge_ids)):
             cur.execute(
                 """
-                INSERT INTO entitlements (
-                    chat_id,
-                    free_trial_used,
-                    subscription_period_start,
-                    subscription_period_end,
-                    test_access_until,
-                    test_access_enabled,
-                    monthly_one_day_remaining,
-                    monthly_weekly_pdf_remaining,
-                    extra_one_day_remaining,
-                    extra_weekly_pdf_remaining
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (chat_id) DO UPDATE SET
-                    free_trial_used = EXCLUDED.free_trial_used,
-                    subscription_period_start = EXCLUDED.subscription_period_start,
-                    subscription_period_end = EXCLUDED.subscription_period_end,
-                    test_access_until = EXCLUDED.test_access_until,
-                    test_access_enabled = EXCLUDED.test_access_enabled,
-                    monthly_one_day_remaining = EXCLUDED.monthly_one_day_remaining,
-                    monthly_weekly_pdf_remaining = EXCLUDED.monthly_weekly_pdf_remaining,
-                    extra_one_day_remaining = EXCLUDED.extra_one_day_remaining,
-                    extra_weekly_pdf_remaining = EXCLUDED.extra_weekly_pdf_remaining,
-                    updated_at = now(),
-                    version = entitlements.version + 1
+                INSERT INTO entitlement_processed_charge_ids (chat_id, charge_id, position)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (chat_id, charge_id) DO UPDATE SET
+                    position = EXCLUDED.position
                 """,
-                (
-                    chat_id,
-                    entitlement.free_trial_used,
-                    entitlement.subscription_period_start,
-                    entitlement.subscription_period_end,
-                    entitlement.test_access_until,
-                    entitlement.test_access_enabled,
-                    entitlement.monthly_one_day_remaining,
-                    entitlement.monthly_weekly_pdf_remaining,
-                    entitlement.extra_one_day_remaining,
-                    entitlement.extra_weekly_pdf_remaining,
-                ),
+                (chat_id, charge_id, position),
             )
-            cur.execute(
-                "DELETE FROM entitlement_processed_charge_ids WHERE chat_id = %s",
-                (chat_id,),
-            )
-            for position, charge_id in enumerate(_unique_charge_ids(entitlement.processed_payment_charge_ids)):
-                cur.execute(
-                    """
-                    INSERT INTO entitlement_processed_charge_ids (chat_id, charge_id, position)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (chat_id, charge_id) DO UPDATE SET
-                        position = EXCLUDED.position
-                    """,
-                    (chat_id, charge_id, position),
-                )
 
     def _lock_entitlement_map_cur(self, cur: Any) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
@@ -352,6 +416,21 @@ class PostgresEntitlementStore:
         if last_error is not None:
             raise last_error
         raise RuntimeError("Could not connect to PostgreSQL.")
+
+
+def _entitlement_from_row(row: Mapping[str, Any]) -> Entitlement:
+    return Entitlement(
+        free_trial_used=bool(row["free_trial_used"]),
+        subscription_period_start=_optional_text(row["subscription_period_start"]),
+        subscription_period_end=_optional_text(row["subscription_period_end"]),
+        test_access_until=_optional_text(row["test_access_until"]),
+        test_access_enabled=bool(row["test_access_enabled"]),
+        monthly_one_day_remaining=int(row["monthly_one_day_remaining"]),
+        monthly_weekly_pdf_remaining=int(row["monthly_weekly_pdf_remaining"]),
+        extra_one_day_remaining=int(row["extra_one_day_remaining"]),
+        extra_weekly_pdf_remaining=int(row["extra_weekly_pdf_remaining"]),
+        processed_payment_charge_ids=[],
+    )
 
 
 def _normalize_entitlements(entitlements: Mapping[int, Entitlement]) -> dict[int, Entitlement]:

@@ -25,10 +25,19 @@ class EntitlementStore(Protocol):
     def load_all(self) -> dict[int, Entitlement]:
         ...
 
+    def load_chat_entitlement(self, chat_id: int) -> Entitlement | None:
+        ...
+
+    def save_chat_entitlement(self, chat_id: int, entitlement: Entitlement) -> None:
+        ...
+
     def save_all(self, entitlements: Mapping[int, Entitlement]) -> None:
         ...
 
     def transact(self) -> Iterator[dict[int, Entitlement]]:
+        ...
+
+    def transact_chat_entitlement(self, chat_id: int) -> Iterator[Entitlement]:
         ...
 
 
@@ -45,6 +54,19 @@ class JsonEntitlementStore:
         with self._lock:
             return self._load_path(self.path, missing_ok=True)
 
+    def load_chat_entitlement(self, chat_id: int) -> Entitlement | None:
+        entitlements = self.load_all()
+        entitlement = entitlements.get(int(chat_id))
+        if entitlement is None:
+            return None
+        return Entitlement.from_dict(entitlement.to_dict())
+
+    def save_chat_entitlement(self, chat_id: int, entitlement: Entitlement) -> None:
+        if not isinstance(entitlement, Entitlement):
+            raise EntitlementStorageError(f"Invalid entitlement value for chat_id {int(chat_id)}")
+        with self.transact() as entitlements:
+            entitlements[int(chat_id)] = Entitlement.from_dict(entitlement.to_dict())
+
     def save_all(self, entitlements: Mapping[int, Entitlement]) -> None:
         with self._lock:
             primary_exists = self.path.exists()
@@ -58,6 +80,14 @@ class JsonEntitlementStore:
             entitlements = self.load_all()
             yield entitlements
             self.save_all(entitlements)
+
+    @contextmanager
+    def transact_chat_entitlement(self, chat_id: int) -> Iterator[Entitlement]:
+        with self.transact() as entitlements:
+            chat_id = int(chat_id)
+            entitlement = entitlements.get(chat_id, Entitlement())
+            yield entitlement
+            entitlements[chat_id] = entitlement
 
     def recover_from_backup(self) -> dict[int, Entitlement]:
         with self._lock:
