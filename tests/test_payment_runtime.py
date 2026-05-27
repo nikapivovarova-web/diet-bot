@@ -44,7 +44,14 @@ def test_enabled_postgres_payment_runtime_is_lazy(monkeypatch: pytest.MonkeyPatc
     created: list[tuple[str, int, int]] = []
 
     class FakePostgresPaymentStore:
-        def __init__(self, dsn: str, *, connect_timeout: int = 5, connect_attempts: int = 3) -> None:
+        def __init__(
+            self,
+            dsn: str,
+            *,
+            connect_timeout: int = 5,
+            connect_attempts: int = 3,
+            **_kwargs,
+        ) -> None:
             created.append((dsn, connect_timeout, connect_attempts))
 
         def create_order(self, order):
@@ -95,7 +102,7 @@ def test_enabled_payment_startup_validation_checks_postgres_schema(
     calls: list[tuple[str, str]] = []
 
     class FakePostgresPaymentStore:
-        def __init__(self, dsn: str) -> None:
+        def __init__(self, dsn: str, **_kwargs) -> None:
             calls.append(("init", dsn))
 
         def validate_schema(self) -> None:
@@ -134,7 +141,7 @@ def test_enabled_payment_startup_validation_checks_spool_before_postgres(
         calls.append(("validate_spool", str(path)))
 
     class FakePostgresPaymentStore:
-        def __init__(self, dsn: str) -> None:
+        def __init__(self, dsn: str, **_kwargs) -> None:
             calls.append(("init", dsn))
 
         def validate_schema(self) -> None:
@@ -169,7 +176,7 @@ def test_enabled_payment_startup_validation_prepares_absolute_spool_when_probe_p
     from diet_bot.payment_runtime import validate_payment_runtime_for_startup
 
     class FakePostgresPaymentStore:
-        def __init__(self, _dsn: str) -> None:
+        def __init__(self, _dsn: str, **_kwargs) -> None:
             pass
 
         def validate_schema(self) -> None:
@@ -201,7 +208,7 @@ def test_enabled_payment_startup_validation_wraps_schema_failure(
     from diet_bot.payment_runtime import PaymentLedgerUnavailable, validate_payment_runtime_for_startup
 
     class FakePostgresPaymentStore:
-        def __init__(self, _dsn: str) -> None:
+        def __init__(self, _dsn: str, **_kwargs) -> None:
             pass
 
         def validate_schema(self) -> None:

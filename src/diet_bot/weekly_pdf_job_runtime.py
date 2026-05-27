@@ -171,6 +171,10 @@ def _create_postgres_weekly_pdf_job_store(config: object):
     if not database_url:
         raise RuntimeError("DIET_BOT_DATABASE_URL is required for weekly PDF Postgres jobs.")
 
+    from .postgres_connection import get_shared_postgres_connection_provider
     from .postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore
 
-    return PostgresWeeklyPdfJobStore(str(database_url))
+    return PostgresWeeklyPdfJobStore(
+        str(database_url),
+        connection_provider=get_shared_postgres_connection_provider(config),
+    )

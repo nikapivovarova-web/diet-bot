@@ -123,7 +123,7 @@ def test_chat_state_runtime_postgres_validates_schema_without_initializing(monke
     )
 
     class FakePostgresChatStateStore:
-        def __init__(self, database_url: str) -> None:
+        def __init__(self, database_url: str, **_kwargs) -> None:
             calls.append(("init", database_url))
 
         def initialize(self) -> None:
@@ -158,7 +158,7 @@ def test_telegram_app_uses_postgres_chat_state_store_when_backend_is_postgres(mo
     )
 
     class FakePostgresChatStateStore:
-        def __init__(self, database_url: str) -> None:
+        def __init__(self, database_url: str, **_kwargs) -> None:
             calls.append(("init", database_url))
 
     fake_module = types.ModuleType("diet_bot.postgres_chat_state_store")
