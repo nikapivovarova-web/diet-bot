@@ -68,6 +68,14 @@ class OneDayGenerationJobStore(Protocol):
         now: datetime | None = None,
     ) -> FinishJobResult: ...
 
+    def cancel_queued(
+        self,
+        job_id: UUID | str,
+        *,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> FinishJobResult: ...
+
     def cleanup_stale(
         self,
         *,
@@ -145,6 +153,13 @@ class OneDayGenerationJobRuntime:
 
     def finish_failure_and_refund_once(self, job_id: UUID | str, *, reason: str | None = None) -> FinishJobResult:
         return self.store.finish_failure_and_refund_once(
+            job_id,
+            reason=reason,
+            now=_normalize_datetime(self.now()),
+        )
+
+    def cancel_admitted_job(self, job_id: UUID | str, *, reason: str | None = None) -> FinishJobResult:
+        return self.store.cancel_queued(
             job_id,
             reason=reason,
             now=_normalize_datetime(self.now()),

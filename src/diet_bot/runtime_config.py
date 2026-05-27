@@ -13,6 +13,8 @@ DEFAULT_STATE_FILE = PROJECT_ROOT / ".diet_bot_state" / "history.json"
 DEFAULT_SUBSCRIPTIONS_STATE_FILE = DEFAULT_STATE_FILE.with_name("subscriptions.json")
 DEFAULT_PROMO_CODES_STATE_FILE = DEFAULT_STATE_FILE.with_name("promo_codes.json")
 DEFAULT_PAYMENT_RECOVERY_SPOOL = DEFAULT_SUBSCRIPTIONS_STATE_FILE.with_name("payment_recovery.jsonl")
+DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY = 4
+DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED = 32
 
 MISSING_BOT_TOKEN_ERROR = "Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN."
 PAYMENT_RECOVERY_SPOOL_ENV = "DIET_BOT_PAYMENT_RECOVERY_SPOOL"
@@ -35,6 +37,8 @@ class RuntimeConfig:
     postgres_pool_min_size: int
     postgres_pool_max_size: int
     postgres_pool_timeout: float
+    one_day_generation_max_concurrency: int
+    one_day_generation_max_queued: int
     state_file: Path
     subscriptions_state_file: Path
     promo_codes_state_file: Path
@@ -62,6 +66,8 @@ class RuntimeConfig:
             "postgres_pool_min_size": self.postgres_pool_min_size,
             "postgres_pool_max_size": self.postgres_pool_max_size,
             "postgres_pool_timeout": self.postgres_pool_timeout,
+            "one_day_generation_max_concurrency": self.one_day_generation_max_concurrency,
+            "one_day_generation_max_queued": self.one_day_generation_max_queued,
             "state_file": str(self.state_file),
             "subscriptions_state_file": str(self.subscriptions_state_file),
             "promo_codes_state_file": str(self.promo_codes_state_file),
@@ -157,6 +163,18 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             "DIET_BOT_POSTGRES_POOL_MAX_SIZE must be greater than or equal to "
             "DIET_BOT_POSTGRES_POOL_MIN_SIZE.",
         )
+    one_day_generation_max_concurrency, one_day_concurrency_errors = _int_from_env(
+        source,
+        "DIET_BOT_ONE_DAY_GENERATION_MAX_CONCURRENCY",
+        DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY,
+        minimum=1,
+    )
+    one_day_generation_max_queued, one_day_queued_errors = _int_from_env(
+        source,
+        "DIET_BOT_ONE_DAY_GENERATION_MAX_QUEUED",
+        DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED,
+        minimum=0,
+    )
     state_file = _path_from_env(source, "DIET_BOT_STATE_FILE", DEFAULT_STATE_FILE)
     subscriptions_state_file = _path_from_env(
         source,
@@ -186,6 +204,8 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         postgres_pool_min_size=postgres_pool_min_size,
         postgres_pool_max_size=postgres_pool_max_size,
         postgres_pool_timeout=postgres_pool_timeout,
+        one_day_generation_max_concurrency=one_day_generation_max_concurrency,
+        one_day_generation_max_queued=one_day_generation_max_queued,
         state_file=state_file,
         subscriptions_state_file=subscriptions_state_file,
         promo_codes_state_file=promo_codes_state_file,
@@ -197,7 +217,7 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         weekly_selection_diagnostics_enabled=weekly_selection_diagnostics_enabled(source),
         privacy_policy_url=_text_from_env(source, "DIET_BOT_PRIVACY_POLICY_URL"),
         storage_backend=storage_backend,
-        config_errors=postgres_config_errors,
+        config_errors=postgres_config_errors + one_day_concurrency_errors + one_day_queued_errors,
     )
 
 

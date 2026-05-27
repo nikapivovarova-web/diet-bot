@@ -94,6 +94,8 @@ from .promo_codes import (
 )
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import (
+    DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY,
+    DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED,
     DEFAULT_PROMO_CODES_STATE_FILE,
     DEFAULT_STATE_FILE,
     DEFAULT_SUBSCRIPTIONS_STATE_FILE,
@@ -118,6 +120,7 @@ from .one_day_generation_job_runtime import (
     OneDayGenerationJobRuntime,
     validate_one_day_generation_job_store_for_startup,
 )
+from .one_day_generation_queue import OneDayGenerationQueue
 from .one_day_generation_jobs import (
     AdmitJobResultStatus as OneDayAdmitJobResultStatus,
     FinishJobResultStatus as OneDayFinishJobResultStatus,
@@ -769,6 +772,19 @@ def _configure_weekly_pdf_concurrency(max_concurrency: int) -> None:
     WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
 
 
+def _configure_one_day_generation_queue(max_concurrency: int, max_queued: int) -> None:
+    global ONE_DAY_GENERATION_MAX_CONCURRENCY
+    global ONE_DAY_GENERATION_MAX_QUEUED
+    global ONE_DAY_GENERATION_QUEUE
+
+    ONE_DAY_GENERATION_MAX_CONCURRENCY = max(1, int(max_concurrency))
+    ONE_DAY_GENERATION_MAX_QUEUED = max(0, int(max_queued))
+    ONE_DAY_GENERATION_QUEUE = OneDayGenerationQueue(
+        max_concurrency=ONE_DAY_GENERATION_MAX_CONCURRENCY,
+        max_queued=ONE_DAY_GENERATION_MAX_QUEUED,
+    )
+
+
 @dataclass
 class _WeeklyRecipeTraitLookup:
     recipes_by_id: Mapping[str, RecipeTemplate] = field(default_factory=dict)
@@ -961,6 +977,7 @@ WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправл
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
 WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0444\u0430\u0439\u043b \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e PDF \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+ONE_DAY_PLAN_QUEUE_FULL_TEXT = "\u0421\u0435\u0439\u0447\u0430\u0441 \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u043c\u043d\u043e\u0433\u043e \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432 \u043d\u0430 \u0440\u0430\u0446\u0438\u043e\u043d. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435, \u043f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u0447\u0443\u0442\u044c \u043f\u043e\u0437\u0436\u0435."
 WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
@@ -979,6 +996,12 @@ RECENT_RECIPE_LIMIT = 160
 DATA_DIR = Path(__file__).with_name("data")
 WELCOME_PHOTO_PATH = DATA_DIR / "welcome_foodbalance.png"
 _RUNTIME_CONFIG = load_runtime_config()
+ONE_DAY_GENERATION_MAX_CONCURRENCY = _RUNTIME_CONFIG.one_day_generation_max_concurrency
+ONE_DAY_GENERATION_MAX_QUEUED = _RUNTIME_CONFIG.one_day_generation_max_queued
+ONE_DAY_GENERATION_QUEUE = OneDayGenerationQueue(
+    max_concurrency=ONE_DAY_GENERATION_MAX_CONCURRENCY,
+    max_queued=ONE_DAY_GENERATION_MAX_QUEUED,
+)
 STATE_FILE = _RUNTIME_CONFIG.state_file
 SUBSCRIPTIONS_STATE_FILE = _RUNTIME_CONFIG.subscriptions_state_file
 PROMO_CODES_STATE_FILE = _RUNTIME_CONFIG.promo_codes_state_file
@@ -2004,46 +2027,57 @@ async def _send_trial_plan(
     *,
     idempotency_key: str | None = None,
 ) -> None:
-    runtime = _one_day_generation_job_runtime()
-    if runtime is not None:
-        sent = await _send_trial_plan_with_postgres_job(
-            message,
-            profile,
-            runtime=runtime,
-            idempotency_key=idempotency_key
-            or _trial_plan_idempotency_key(
-                message.chat.id,
-                QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
+    chat_id = message.chat.id
+    if not _try_enter_one_day_plan_generation(chat_id):
+        await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
+        return
+
+    try:
+        runtime = _one_day_generation_job_runtime()
+        if runtime is not None:
+            sent = await _send_trial_plan_with_postgres_job(
+                message,
                 profile,
-            ),
-        )
+                runtime=runtime,
+                idempotency_key=idempotency_key
+                or _trial_plan_idempotency_key(
+                    message.chat.id,
+                    QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
+                    profile,
+                ),
+            )
+            if sent:
+                await _send_trial_subscription_cta(message)
+            return
+
+        async def run_trial_one_day_job() -> bool:
+            try:
+                consumption = await _consume_generation_attempt_async(message.chat.id, "one_day")
+            except EntitlementStorageError:
+                logger.exception("Failed to consume trial entitlement due to entitlement storage error")
+                await _send_entitlement_storage_error(message)
+                return False
+            if not consumption.allowed:
+                await _send_limit_paywall(message, "one_day")
+                return False
+
+            try:
+                await _send_calculation_report(message, profile)
+                sent = await _send_plan(message, profile, include_default_after_plan_keyboard=False)
+            except Exception:
+                await _refund_generation_attempt_async(message.chat.id, consumption)
+                raise
+
+            if not sent:
+                await _refund_generation_attempt_async(message.chat.id, consumption)
+                return False
+            return True
+
+        sent = await _submit_one_day_generation_or_notice(message, run_trial_one_day_job)
         if sent:
             await _send_trial_subscription_cta(message)
-        return
-
-    try:
-        consumption = await _consume_generation_attempt_async(message.chat.id, "one_day")
-    except EntitlementStorageError:
-        logger.exception("Failed to consume trial entitlement due to entitlement storage error")
-        await _send_entitlement_storage_error(message)
-        return
-    if not consumption.allowed:
-        await _send_limit_paywall(message, "one_day")
-        return
-
-    try:
-        await _send_calculation_report(message, profile)
-        sent = await _send_plan(message, profile, include_default_after_plan_keyboard=False)
-    except Exception:
-        await _refund_generation_attempt_async(message.chat.id, consumption)
-        raise
-
-    if not sent:
-        await _refund_generation_attempt_async(message.chat.id, consumption)
-        return
-
-    if sent:
-        await _send_trial_subscription_cta(message)
+    finally:
+        _release_one_day_plan_generation(chat_id)
 
 
 def _trial_plan_idempotency_key(chat_id: int, session_token: str | None, profile: UserProfile) -> str:
@@ -2111,13 +2145,80 @@ async def _send_trial_plan_with_postgres_job(
         await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
+    postgres_start_attempted = False
+
+    async def run_trial_one_day_job() -> bool:
+        nonlocal postgres_start_attempted
+        postgres_start_attempted = True
+        return await _send_trial_plan_after_postgres_admission(
+            message,
+            profile,
+            runtime=runtime,
+            job_id=job_admission.job.job_id,
+        )
+
     try:
-        start_result = runtime.start_job_and_consume(job_admission.job.job_id, test_access=False)
+        local_admission = ONE_DAY_GENERATION_QUEUE.submit(run_trial_one_day_job)
+    except Exception:
+        _cancel_one_day_postgres_admitted_job(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="local_queue_submit_failed",
+        )
+        logger.exception("Failed to submit trial one-day generation job to local queue")
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if not local_admission.accepted:
+        _cancel_one_day_postgres_admitted_job(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="local_queue_full",
+        )
+        await message.answer(ONE_DAY_PLAN_QUEUE_FULL_TEXT)
+        return False
+
+    if local_admission.future is None:
+        _cancel_one_day_postgres_admitted_job(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="local_queue_submit_failed",
+        )
+        await _send_entitlement_storage_error(message)
+        return False
+
+    try:
+        return await local_admission.future
+    except asyncio.CancelledError:
+        ONE_DAY_GENERATION_QUEUE.cancel(local_admission.future)
+        if not postgres_start_attempted:
+            _cancel_one_day_postgres_admitted_job(
+                runtime,
+                job_admission.job.job_id,
+                chat_id=chat_id,
+                reason="local_queue_wait_cancelled",
+            )
+        raise
+
+
+async def _send_trial_plan_after_postgres_admission(
+    message: Message,
+    profile: UserProfile,
+    *,
+    runtime: OneDayGenerationJobRuntime,
+    job_id: object,
+) -> bool:
+    chat_id = message.chat.id
+    try:
+        start_result = runtime.start_job_and_consume(job_id, test_access=False)
     except Exception:
         logger.exception("Failed to start trial one-day generation Postgres job")
         _finish_one_day_postgres_job_failure(
             runtime,
-            job_admission.job.job_id,
+            job_id,
             chat_id=chat_id,
             reason="trial_one_day_start_exception",
         )
@@ -2227,6 +2328,32 @@ def _release_one_day_plan_generation(chat_id: int) -> None:
         _ONE_DAY_PLAN_IN_FLIGHT_CHAT_IDS.discard(chat_id)
 
 
+async def _submit_one_day_generation_or_notice(
+    message: Message,
+    runner: Callable[[], Awaitable[bool]],
+) -> bool:
+    try:
+        local_admission = ONE_DAY_GENERATION_QUEUE.submit(runner)
+    except Exception:
+        logger.exception("Failed to submit one-day generation job to local queue")
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if not local_admission.accepted:
+        await message.answer(ONE_DAY_PLAN_QUEUE_FULL_TEXT)
+        return False
+
+    if local_admission.future is None:
+        await _send_entitlement_storage_error(message)
+        return False
+
+    try:
+        return await local_admission.future
+    except asyncio.CancelledError:
+        ONE_DAY_GENERATION_QUEUE.cancel(local_admission.future)
+        raise
+
+
 async def _send_one_day_plan_with_access(
     message: Message,
     profile: UserProfile,
@@ -2248,29 +2375,32 @@ async def _send_one_day_plan_with_access(
                 idempotency_key=_one_day_request_idempotency_key(message, idempotency_key, event="one_day"),
             )
 
-        try:
-            consumption = await _consume_generation_attempt_async(chat_id, "one_day")
-        except EntitlementStorageError:
-            logger.exception("Failed to consume one-day entitlement due to entitlement storage error")
-            await _send_entitlement_storage_error(message)
-            return False
-        if not consumption.allowed:
-            await _send_limit_paywall(message, "one_day")
-            return False
+        async def run_one_day_job() -> bool:
+            try:
+                consumption = await _consume_generation_attempt_async(chat_id, "one_day")
+            except EntitlementStorageError:
+                logger.exception("Failed to consume one-day entitlement due to entitlement storage error")
+                await _send_entitlement_storage_error(message)
+                return False
+            if not consumption.allowed:
+                await _send_limit_paywall(message, "one_day")
+                return False
 
-        try:
-            sent = await _send_plan(
-                message,
-                profile,
-                status_text=await _format_entitlement_status_async(chat_id),
-            )
-        except Exception:
-            await _refund_generation_attempt_async(chat_id, consumption)
-            raise
+            try:
+                sent = await _send_plan(
+                    message,
+                    profile,
+                    status_text=await _format_entitlement_status_async(chat_id),
+                )
+            except Exception:
+                await _refund_generation_attempt_async(chat_id, consumption)
+                raise
 
-        if not sent:
-            await _refund_generation_attempt_async(chat_id, consumption)
-        return sent
+            if not sent:
+                await _refund_generation_attempt_async(chat_id, consumption)
+            return sent
+
+        return await _submit_one_day_generation_or_notice(message, run_one_day_job)
     finally:
         _release_one_day_plan_generation(chat_id)
 
@@ -2306,16 +2436,83 @@ async def _send_one_day_plan_with_postgres_job(
         await message.answer(ONE_DAY_PLAN_ALREADY_RUNNING_TEXT)
         return False
 
+    postgres_start_attempted = False
+
+    async def run_one_day_job() -> bool:
+        nonlocal postgres_start_attempted
+        postgres_start_attempted = True
+        return await _send_one_day_plan_after_postgres_admission(
+            message,
+            profile,
+            runtime=runtime,
+            job_id=job_admission.job.job_id,
+        )
+
+    try:
+        local_admission = ONE_DAY_GENERATION_QUEUE.submit(run_one_day_job)
+    except Exception:
+        _cancel_one_day_postgres_admitted_job(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="local_queue_submit_failed",
+        )
+        logger.exception("Failed to submit one-day generation job to local queue")
+        await _send_entitlement_storage_error(message)
+        return False
+
+    if not local_admission.accepted:
+        _cancel_one_day_postgres_admitted_job(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="local_queue_full",
+        )
+        await message.answer(ONE_DAY_PLAN_QUEUE_FULL_TEXT)
+        return False
+
+    if local_admission.future is None:
+        _cancel_one_day_postgres_admitted_job(
+            runtime,
+            job_admission.job.job_id,
+            chat_id=chat_id,
+            reason="local_queue_submit_failed",
+        )
+        await _send_entitlement_storage_error(message)
+        return False
+
+    try:
+        return await local_admission.future
+    except asyncio.CancelledError:
+        ONE_DAY_GENERATION_QUEUE.cancel(local_admission.future)
+        if not postgres_start_attempted:
+            _cancel_one_day_postgres_admitted_job(
+                runtime,
+                job_admission.job.job_id,
+                chat_id=chat_id,
+                reason="local_queue_wait_cancelled",
+            )
+        raise
+
+
+async def _send_one_day_plan_after_postgres_admission(
+    message: Message,
+    profile: UserProfile,
+    *,
+    runtime: OneDayGenerationJobRuntime,
+    job_id: object,
+) -> bool:
+    chat_id = message.chat.id
     try:
         start_result = runtime.start_job_and_consume(
-            job_admission.job.job_id,
+            job_id,
             test_access=chat_id in TESTER_CHAT_IDS,
         )
     except Exception:
         logger.exception("Failed to start one-day generation Postgres job")
         _finish_one_day_postgres_job_failure(
             runtime,
-            job_admission.job.job_id,
+            job_id,
             chat_id=chat_id,
             reason="one_day_start_exception",
         )
@@ -2414,6 +2611,22 @@ def _finish_one_day_postgres_job_failure(
     except Exception:
         logger.exception(
             "Failed to finalize failed one-day generation Postgres job for chat_id=%s",
+            _mask_chat_id(chat_id),
+        )
+
+
+def _cancel_one_day_postgres_admitted_job(
+    runtime: OneDayGenerationJobRuntime,
+    job_id: object,
+    *,
+    chat_id: int,
+    reason: str,
+) -> None:
+    try:
+        runtime.cancel_admitted_job(job_id, reason=reason)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception(
+            "Failed to cancel admitted one-day generation Postgres job for chat_id=%s",
             _mask_chat_id(chat_id),
         )
 
@@ -2965,7 +3178,8 @@ async def _send_plan(
         return False
     recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
     recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
-    plan_result = build_one_day_plan(
+    plan_result = await asyncio.to_thread(
+        build_one_day_plan,
         profile,
         variety_seed=seed,
         avoided_recipe_ids=recent_recipe_ids,

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 from diet_bot.runtime_config import (
+    DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY,
+    DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED,
     DEFAULT_PAYMENT_RECOVERY_SPOOL,
     DEFAULT_PROMO_CODES_STATE_FILE,
     DEFAULT_STATE_FILE,
@@ -279,6 +281,45 @@ def test_postgres_pool_config_reports_invalid_sizes() -> None:
     issues = validate_startup(config)
 
     assert any("DIET_BOT_POSTGRES_POOL_MAX_SIZE" in issue for issue in issues)
+
+
+def test_one_day_generation_queue_config_defaults_are_conservative() -> None:
+    config = load_runtime_config({})
+
+    assert config.one_day_generation_max_concurrency == DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY
+    assert config.one_day_generation_max_queued == DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED
+    assert config.one_day_generation_max_concurrency >= 1
+    assert config.one_day_generation_max_queued >= 0
+
+
+def test_one_day_generation_queue_config_accepts_overrides() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_ONE_DAY_GENERATION_MAX_CONCURRENCY": "2",
+            "DIET_BOT_ONE_DAY_GENERATION_MAX_QUEUED": "7",
+        },
+    )
+
+    assert config.one_day_generation_max_concurrency == 2
+    assert config.one_day_generation_max_queued == 7
+    assert validate_startup(config) == ("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.",)
+
+
+def test_one_day_generation_queue_config_reports_invalid_values() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ONE_DAY_GENERATION_MAX_CONCURRENCY": "0",
+            "DIET_BOT_ONE_DAY_GENERATION_MAX_QUEUED": "-1",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert config.one_day_generation_max_concurrency == DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY
+    assert config.one_day_generation_max_queued == DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED
+    assert any("DIET_BOT_ONE_DAY_GENERATION_MAX_CONCURRENCY" in issue for issue in issues)
+    assert any("DIET_BOT_ONE_DAY_GENERATION_MAX_QUEUED" in issue for issue in issues)
 
 
 def test_production_requires_database_url() -> None:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -2183,6 +2184,11 @@ class FakeOneDayGenerationRuntime:
         self.calls.append(("finish_failure_and_refund_once", {"job_id": job_id, "reason": reason}))
         return FinishJobResult(OneDayFinishJobResultStatus.FAILED, self.job)
 
+    def cancel_admitted_job(self, job_id, *, reason: str | None = None):
+        self.events.append(f"runtime:cancel:{reason}")
+        self.calls.append(("cancel_admitted_job", {"job_id": job_id, "reason": reason}))
+        return FinishJobResult(OneDayFinishJobResultStatus.CANCELLED, self.job)
+
 
 def _install_one_day_runtime(monkeypatch, runtime: FakeOneDayGenerationRuntime | None) -> None:
     monkeypatch.setattr(telegram_app, "_ONE_DAY_GENERATION_JOB_RUNTIME", runtime, raising=False)
@@ -3530,6 +3536,124 @@ async def test_one_day_json_backend_preserves_legacy_consume_refund_behavior(mon
 
 
 @pytest.mark.anyio
+async def test_one_day_queue_full_rejects_json_request_without_consuming_quota(monkeypatch, tmp_path) -> None:
+    chat_id = 91_057
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    telegram_app._configure_one_day_generation_queue(max_concurrency=1, max_queued=0)
+    blocker_started = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def blocker() -> bool:
+        blocker_started.set()
+        await release_blocker.wait()
+        return True
+
+    async def fail_send_plan(*_args, **_kwargs) -> bool:
+        raise AssertionError("Rejected one-day queue requests must not generate or consume quota")
+
+    blocker_admission = telegram_app.ONE_DAY_GENERATION_QUEUE.submit(blocker)
+    monkeypatch.setattr(telegram_app, "_send_plan", fail_send_plan)
+    try:
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        message = FakeMessage(chat_id)
+
+        sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+        entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert sent is False
+        assert entitlement.monthly_one_day_remaining == 1
+        assert message.texts == [(telegram_app.ONE_DAY_PLAN_QUEUE_FULL_TEXT, None)]
+    finally:
+        release_blocker.set()
+        if blocker_admission.future is not None:
+            await asyncio.gather(blocker_admission.future, return_exceptions=True)
+        telegram_app._configure_one_day_generation_queue(
+            telegram_app.DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY,
+            telegram_app.DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED,
+        )
+
+
+@pytest.mark.anyio
+async def test_postgres_one_day_queue_full_cancels_admitted_job_without_start(monkeypatch) -> None:
+    chat_id = 91_059
+    runtime = FakeOneDayGenerationRuntime()
+    _install_one_day_runtime(monkeypatch, runtime)
+    telegram_app._configure_one_day_generation_queue(max_concurrency=1, max_queued=0)
+    blocker_started = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def blocker() -> bool:
+        blocker_started.set()
+        await release_blocker.wait()
+        return True
+
+    async def fail_send_plan(*_args, **_kwargs) -> bool:
+        raise AssertionError("Rejected Postgres one-day jobs must not start or generate")
+
+    blocker_admission = telegram_app.ONE_DAY_GENERATION_QUEUE.submit(blocker)
+    monkeypatch.setattr(telegram_app, "_send_plan", fail_send_plan)
+    try:
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        message = FakeMessage(chat_id, message_id=414)
+
+        sent = await telegram_app._send_one_day_plan_with_access(message, profile_with())
+
+        assert sent is False
+        assert message.texts == [(telegram_app.ONE_DAY_PLAN_QUEUE_FULL_TEXT, None)]
+        assert [name for name, _ in runtime.calls] == ["cleanup_stale", "admit", "cancel_admitted_job"]
+        assert runtime.calls[-1] == (
+            "cancel_admitted_job",
+            {"job_id": runtime.job.job_id, "reason": "local_queue_full"},
+        )
+    finally:
+        release_blocker.set()
+        if blocker_admission.future is not None:
+            await asyncio.gather(blocker_admission.future, return_exceptions=True)
+        telegram_app._configure_one_day_generation_queue(
+            telegram_app.DEFAULT_ONE_DAY_GENERATION_MAX_CONCURRENCY,
+            telegram_app.DEFAULT_ONE_DAY_GENERATION_MAX_QUEUED,
+        )
+
+
+@pytest.mark.anyio
+async def test_one_day_planner_build_runs_off_event_loop_thread(monkeypatch, tmp_path) -> None:
+    chat_id = 91_061
+    subscriptions_path = tmp_path / "subscriptions.json"
+    main_thread_id = threading.get_ident()
+    build_thread_ids: list[int] = []
+    plan = _one_day_plan_for_runtime_tests()
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+
+    def fake_build_one_day_plan(*_args, **_kwargs):
+        build_thread_ids.append(threading.get_ident())
+        return plan
+
+    async def fake_send_meal_card(*_args, **_kwargs) -> None:
+        return None
+
+    async def fake_send_text_chunks(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", fake_build_one_day_plan)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fake_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_send_text_chunks", fake_send_text_chunks)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+
+    sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id), profile_with())
+
+    assert sent is True
+    assert build_thread_ids
+    assert all(thread_id != main_thread_id for thread_id in build_thread_ids)
+
+
+@pytest.mark.anyio
 async def test_one_day_json_history_save_failure_after_meals_is_best_effort(monkeypatch, tmp_path) -> None:
     chat_id = 91_055
     subscriptions_path = tmp_path / "subscriptions.json"
@@ -3974,6 +4098,55 @@ async def test_send_trial_plan_keeps_legacy_path_without_one_day_job_runtime(mon
     entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
     assert entitlement.free_trial_used is True
     assert message.texts[-1][0].startswith(TRIAL_SUBSCRIPTION_TEXT)
+
+
+@pytest.mark.anyio
+async def test_concurrent_trial_requests_same_chat_consume_once(monkeypatch, tmp_path) -> None:
+    chat_id = 91_062
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    first_message = FakeMessage(chat_id, message_id=415)
+    second_message = FakeMessage(chat_id, message_id=416)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    send_calls = 0
+
+    async def fake_send_calculation_report(*_args, **_kwargs) -> None:
+        return None
+
+    async def controlled_send_plan(*_args, **_kwargs) -> bool:
+        nonlocal send_calls
+        send_calls += 1
+        if send_calls == 1:
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_calculation_report", fake_send_calculation_report)
+    monkeypatch.setattr(telegram_app, "_send_plan", controlled_send_plan)
+
+    first_task = None
+    try:
+        first_task = asyncio.create_task(telegram_app._send_trial_plan(first_message, profile_with()))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        await telegram_app._send_trial_plan(second_message, profile_with())
+
+        entitlement_after_duplicate = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert send_calls == 1
+        assert entitlement_after_duplicate.free_trial_used is True
+        assert second_message.texts == [(telegram_app.ONE_DAY_PLAN_ALREADY_RUNNING_TEXT, None)]
+
+        release_first.set()
+        await first_task
+        final_entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+        assert final_entitlement.free_trial_used is True
+        assert send_calls == 1
+    finally:
+        release_first.set()
+        if first_task is not None and not first_task.done():
+            await asyncio.gather(first_task, return_exceptions=True)
 
 
 @pytest.mark.anyio

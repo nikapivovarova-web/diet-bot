@@ -95,6 +95,7 @@ def test_runtime_wrapper_methods_delegate_timestamps_and_stale_settings() -> Non
         "mark_value_message_delivered": object(),
         "finish_success": object(),
         "finish_failure_and_refund_once": object(),
+        "cancel_queued": object(),
         "cleanup_stale": object(),
     }
     calls: list[tuple[str, dict[str, object]]] = []
@@ -133,6 +134,10 @@ def test_runtime_wrapper_methods_delegate_timestamps_and_stale_settings() -> Non
             calls.append(("finish_failure_and_refund_once", {"job_id": job_id, **kwargs}))
             return returns["finish_failure_and_refund_once"]
 
+        def cancel_queued(self, job_id, **kwargs):
+            calls.append(("cancel_queued", {"job_id": job_id, **kwargs}))
+            return returns["cancel_queued"]
+
         def cleanup_stale(self, **kwargs):
             calls.append(("cleanup_stale", kwargs))
             return returns["cleanup_stale"]
@@ -157,6 +162,7 @@ def test_runtime_wrapper_methods_delegate_timestamps_and_stale_settings() -> Non
         runtime.finish_failure_and_refund_once("job-1", reason="one_day_failed")
         is returns["finish_failure_and_refund_once"]
     )
+    assert runtime.cancel_admitted_job("job-1", reason="local_queue_full") is returns["cancel_queued"]
     assert runtime.cleanup_stale(chat_id=123) is returns["cleanup_stale"]
 
     assert calls == [
@@ -186,6 +192,7 @@ def test_runtime_wrapper_methods_delegate_timestamps_and_stale_settings() -> Non
         ),
         ("finish_success", {"job_id": "job-1", "now": now}),
         ("finish_failure_and_refund_once", {"job_id": "job-1", "reason": "one_day_failed", "now": now}),
+        ("cancel_queued", {"job_id": "job-1", "reason": "local_queue_full", "now": now}),
         ("cleanup_stale", {"chat_id": 123, "now": now, "limit": 4}),
     ]
 
