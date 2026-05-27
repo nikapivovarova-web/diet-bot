@@ -36,6 +36,36 @@ REFUNDABLE_CONSUMPTION_SOURCES = frozenset({"monthly", "extra", "free_trial"})
 
 
 @dataclass(frozen=True)
+class OneDayGenerationRequestSnapshot:
+    request_kind: str
+    request_payload: dict[str, Any] = field(default_factory=dict)
+    profile: dict[str, Any] = field(default_factory=dict)
+    recent_recipe_ids: Sequence[str] = field(default_factory=tuple)
+    generation_seed: str | None = None
+
+    def __post_init__(self) -> None:
+        request_kind = str(self.request_kind).strip()
+        if not request_kind:
+            raise ValueError("request_kind must not be empty")
+        generation_seed = None
+        if self.generation_seed is not None:
+            generation_seed = str(self.generation_seed).strip() or None
+        object.__setattr__(self, "request_kind", request_kind)
+        object.__setattr__(self, "request_payload", dict(self.request_payload or {}))
+        object.__setattr__(self, "profile", dict(self.profile or {}))
+        object.__setattr__(
+            self,
+            "recent_recipe_ids",
+            tuple(
+                recipe_id
+                for recipe_id in (str(item).strip() for item in self.recent_recipe_ids or ())
+                if recipe_id
+            ),
+        )
+        object.__setattr__(self, "generation_seed", generation_seed)
+
+
+@dataclass(frozen=True)
 class OneDayGenerationJob:
     job_id: UUID
     chat_id: int
@@ -59,6 +89,12 @@ class OneDayGenerationJob:
     failure_reason: str | None = None
     finalization_error: str | None = None
     requires_manual_review: bool = False
+    request_snapshot: OneDayGenerationRequestSnapshot | None = None
+    worker_id: str | None = None
+    leased_until: datetime | None = None
+    attempt_count: int = 0
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata))
@@ -78,6 +114,57 @@ class AdmitJobResultStatus(str, Enum):
 class AdmitJobResult:
     status: AdmitJobResultStatus
     job: OneDayGenerationJob
+
+
+class QueuedJobAdmissionResultStatus(str, Enum):
+    ADMITTED = "admitted"
+    EXISTING_IDEMPOTENCY = "existing_idempotency"
+    ACTIVE_DUPLICATE = "active_duplicate"
+    DENIED = "denied"
+
+
+@dataclass(frozen=True)
+class QueuedJobAdmissionResult:
+    status: QueuedJobAdmissionResultStatus
+    job: OneDayGenerationJob | None = None
+    denial_reason: str | None = None
+
+
+class ClaimQueuedJobResultStatus(str, Enum):
+    CLAIMED = "claimed"
+    EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class ClaimQueuedJobResult:
+    status: ClaimQueuedJobResultStatus
+    job: OneDayGenerationJob | None = None
+
+
+class ExtendLeaseResultStatus(str, Enum):
+    EXTENDED = "extended"
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
+    WORKER_MISMATCH = "worker_mismatch"
+
+
+@dataclass(frozen=True)
+class ExtendLeaseResult:
+    status: ExtendLeaseResultStatus
+    job: OneDayGenerationJob | None = None
+
+
+class MarkRetryableFailureResultStatus(str, Enum):
+    MARKED = "marked"
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
+    WORKER_MISMATCH = "worker_mismatch"
+
+
+@dataclass(frozen=True)
+class MarkRetryableFailureResult:
+    status: MarkRetryableFailureResultStatus
+    job: OneDayGenerationJob | None = None
 
 
 class StartJobResultStatus(str, Enum):
