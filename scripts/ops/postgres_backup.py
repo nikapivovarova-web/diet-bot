@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
+try:
+    from scripts.ops.postgres_client_tools import resolve_required_postgres_tools
+except ModuleNotFoundError:
+    from postgres_client_tools import resolve_required_postgres_tools
+
 
 DEFAULT_SOURCE_URL_ENV = "DIET_BOT_BACKUP_DATABASE_URL"
 _QUERY_ENV_MAP = {
@@ -36,6 +41,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
 
     source_env = dict(os.environ if env is None else env)
     source_url = _required_env(source_env, args.source_url_env)
+    tools = resolve_required_postgres_tools(("pg_dump",), env=source_env)
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -43,7 +49,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
 
     started_at = _now().isoformat()
     command = [
-        "pg_dump",
+        tools["pg_dump"],
         "--format=custom",
         "--no-owner",
         "--no-privileges",
@@ -85,13 +91,19 @@ def _now() -> datetime:
 
 
 def _run_tool(command: list[str], *, env: dict[str, str], tool_name: str) -> None:
-    result = subprocess.run(
-        command,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"{tool_name} executable was not found at run time; "
+            "install PostgreSQL client tools or set the explicit executable path override.",
+        ) from exc
     if result.returncode != 0:
         raise SystemExit(f"{tool_name} failed with exit code {result.returncode}; stderr redacted.")
 

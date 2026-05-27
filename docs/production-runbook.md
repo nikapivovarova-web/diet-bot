@@ -84,6 +84,19 @@ generated disposable database. The drill prints sanitized JSON only: it reports
 env var names, generated database names, backup file metadata, and table counts,
 never raw DSNs, passwords, Telegram tokens, profile JSON, or payment payloads.
 
+The machine running the drill must have PostgreSQL client tools installed:
+`pg_dump` for backup and `createdb`, `pg_restore`, and `dropdb` for restore.
+The scripts discover these tools from `PATH`, including Windows `.exe` and
+`.cmd` executables. If `PATH` discovery is not suitable, set explicit executable
+path overrides before running the scripts:
+
+```powershell
+$env:DIET_BOT_PG_DUMP_PATH = "C:\Program Files\PostgreSQL\16\bin\pg_dump.exe"
+$env:DIET_BOT_CREATEDB_PATH = "C:\Program Files\PostgreSQL\16\bin\createdb.exe"
+$env:DIET_BOT_PG_RESTORE_PATH = "C:\Program Files\PostgreSQL\16\bin\pg_restore.exe"
+$env:DIET_BOT_DROPDB_PATH = "C:\Program Files\PostgreSQL\16\bin\dropdb.exe"
+```
+
 Create the backup with a dedicated backup URL env var. Do not use
 `DIET_BOT_DATABASE_URL`; the script intentionally does not fall back to the
 runtime database URL.
