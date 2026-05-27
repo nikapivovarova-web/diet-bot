@@ -12,17 +12,26 @@ from .one_day_generation_jobs import (
     DELIVERY_STATUS_UNKNOWN,
     AdmitJobResult,
     AdmitJobResultStatus,
+    ClaimQueuedJobResult,
+    ClaimQueuedJobResultStatus,
     CleanupStaleResult,
+    ExtendLeaseResult,
+    ExtendLeaseResultStatus,
     FinishJobResult,
     FinishJobResultStatus,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    MarkRetryableFailureResult,
+    MarkRetryableFailureResultStatus,
     MarkSendStartedResult,
     MarkSendStartedResultStatus,
     MarkValueMessageDeliveredResult,
     MarkValueMessageDeliveredResultStatus,
     OneDayGenerationJob,
+    OneDayGenerationRequestSnapshot,
+    QueuedJobAdmissionResult,
+    QueuedJobAdmissionResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -70,6 +79,16 @@ ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "finalization_error",
             "requires_manual_review",
             "metadata_json",
+            "request_payload_json",
+            "request_kind",
+            "profile_json",
+            "recent_recipe_ids_json",
+            "generation_seed",
+            "worker_id",
+            "leased_until",
+            "attempt_count",
+            "next_attempt_at",
+            "last_error",
             "created_at",
             "updated_at",
             "started_at",
@@ -86,6 +105,8 @@ ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
         "idx_one_day_generation_jobs_active_chat_unique",
         "idx_one_day_generation_jobs_idempotency_key_unique",
         "idx_one_day_generation_jobs_stale",
+        "idx_one_day_generation_jobs_queue_claim",
+        "idx_one_day_generation_jobs_lease_reclaim",
         "idx_one_day_generation_job_value_messages_job",
     ),
     remediation="Run one-day generation job migrations before use.",
@@ -178,6 +199,146 @@ class PostgresOneDayGenerationJobStore:
 
         raise RuntimeError("One-day generation job admission conflict could not be resolved.")
 
+    def admit_queued_job(
+        self,
+        *,
+        chat_id: int,
+        idempotency_key: str,
+        stale_after: datetime,
+        request_snapshot: OneDayGenerationRequestSnapshot,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        test_access: bool = False,
+        job_id: UUID | str | None = None,
+    ) -> QueuedJobAdmissionResult:
+        idempotency_key = _required_text(idempotency_key, "idempotency_key")
+        snapshot = _coerce_request_snapshot(request_snapshot)
+        current_time = _normalize_datetime(now)
+        candidate_job_id = _coerce_uuid(job_id) if job_id is not None else uuid4()
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_entitlement_map_cur(cur)
+
+                    existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
+                    if existing_idempotency is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
+                            existing_idempotency,
+                        )
+
+                    active_duplicate = self._get_active_job_for_chat_cur(cur, chat_id)
+                    if active_duplicate is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+                            active_duplicate,
+                        )
+
+                    entitlement: Entitlement | None = None
+                    consumption_source: str | None
+                    if test_access:
+                        consumption_source = "test_access"
+                    else:
+                        entitlement = _load_entitlement_cur(cur, chat_id)
+                        consumption = consume_one_day_attempt(entitlement, current_time)
+                        if not consumption.allowed:
+                            return QueuedJobAdmissionResult(
+                                QueuedJobAdmissionResultStatus.DENIED,
+                                None,
+                                "one_day_entitlement_unavailable",
+                            )
+                        consumption_source = consumption.source
+                        _upsert_entitlement_cur(cur, chat_id, entitlement)
+
+                    refund_status = refund_status_for_consumption_source(consumption_source)
+                    cur.execute(
+                        """
+                        INSERT INTO one_day_generation_jobs (
+                            job_id,
+                            chat_id,
+                            idempotency_key,
+                            status,
+                            consumption_source,
+                            refund_status,
+                            stale_after,
+                            metadata_json,
+                            request_payload_json,
+                            request_kind,
+                            profile_json,
+                            recent_recipe_ids_json,
+                            generation_seed,
+                            next_attempt_at,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            %s,
+                            %s,
+                            %s,
+                            'queued',
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            NULL,
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING *
+                        """,
+                        (
+                            candidate_job_id,
+                            int(chat_id),
+                            idempotency_key,
+                            consumption_source,
+                            refund_status,
+                            _normalize_datetime(stale_after),
+                            _jsonb(dict(metadata or {})),
+                            _jsonb(snapshot.request_payload),
+                            snapshot.request_kind,
+                            _jsonb(snapshot.profile),
+                            _jsonb(list(snapshot.recent_recipe_ids)),
+                            snapshot.generation_seed,
+                            current_time,
+                            current_time,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.ADMITTED,
+                            _job_from_row(row),
+                        )
+
+                    if entitlement is not None and consumption_source in {"monthly", "extra", "free_trial"}:
+                        refund_attempt(
+                            entitlement,
+                            AttemptConsumption(True, "one_day", consumption_source),
+                        )
+                        _upsert_entitlement_cur(cur, chat_id, entitlement)
+
+                    existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
+                    if existing_idempotency is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
+                            existing_idempotency,
+                        )
+
+                    active_duplicate = self._get_active_job_for_chat_cur(cur, chat_id)
+                    if active_duplicate is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+                            active_duplicate,
+                        )
+
+        raise RuntimeError("Durable one-day generation job admission conflict could not be resolved.")
+
     def get_job(self, job_id: UUID | str) -> OneDayGenerationJob | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -187,6 +348,162 @@ class PostgresOneDayGenerationJobStore:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 return self._get_active_job_for_chat_cur(cur, chat_id)
+
+    def claim_next_queued_job(
+        self,
+        *,
+        worker_id: str,
+        lease_until: datetime,
+        now: datetime | None = None,
+    ) -> ClaimQueuedJobResult:
+        worker_id = _required_text(worker_id, "worker_id")
+        current_time = _normalize_datetime(now)
+        lease_until = _normalize_datetime(lease_until)
+        if lease_until <= current_time:
+            raise ValueError("lease_until must be after now")
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        WITH candidate AS (
+                            SELECT job_id
+                            FROM one_day_generation_jobs
+                            WHERE request_kind IS NOT NULL
+                              AND (
+                                (
+                                    status = 'queued'
+                                    AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
+                                    AND (leased_until IS NULL OR leased_until <= %s)
+                                )
+                                OR (
+                                    status = 'running'
+                                    AND leased_until IS NOT NULL
+                                    AND leased_until <= %s
+                                    AND send_started_at IS NULL
+                                    AND first_value_delivered_at IS NULL
+                                    AND delivered_value_messages = 0
+                                )
+                              )
+                            ORDER BY
+                                COALESCE(next_attempt_at, created_at),
+                                created_at,
+                                job_id
+                            LIMIT 1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE one_day_generation_jobs
+                        SET status = 'running',
+                            worker_id = %s,
+                            leased_until = %s,
+                            next_attempt_at = NULL,
+                            started_at = COALESCE(started_at, %s),
+                            heartbeat_at = %s,
+                            stale_after = GREATEST(stale_after, %s),
+                            updated_at = %s
+                        WHERE job_id = (SELECT job_id FROM candidate)
+                        RETURNING *
+                        """,
+                        (
+                            current_time,
+                            current_time,
+                            current_time,
+                            worker_id,
+                            lease_until,
+                            current_time,
+                            current_time,
+                            lease_until,
+                            current_time,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return ClaimQueuedJobResult(ClaimQueuedJobResultStatus.EMPTY, None)
+                    return ClaimQueuedJobResult(ClaimQueuedJobResultStatus.CLAIMED, _job_from_row(row))
+
+    def extend_lease(
+        self,
+        job_id: UUID | str,
+        *,
+        worker_id: str,
+        lease_until: datetime,
+        now: datetime | None = None,
+    ) -> ExtendLeaseResult:
+        worker_id = _required_text(worker_id, "worker_id")
+        current_time = _normalize_datetime(now)
+        lease_until = _normalize_datetime(lease_until)
+        if lease_until <= current_time:
+            raise ValueError("lease_until must be after now")
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return ExtendLeaseResult(ExtendLeaseResultStatus.NOT_FOUND, None)
+                    if job.status != JOB_STATUS_RUNNING or job.leased_until is None:
+                        return ExtendLeaseResult(ExtendLeaseResultStatus.INVALID_STATE, job)
+                    if job.worker_id != worker_id:
+                        return ExtendLeaseResult(ExtendLeaseResultStatus.WORKER_MISMATCH, job)
+                    cur.execute(
+                        """
+                        UPDATE one_day_generation_jobs
+                        SET leased_until = %s,
+                            heartbeat_at = %s,
+                            stale_after = GREATEST(stale_after, %s),
+                            updated_at = %s
+                        WHERE job_id = %s
+                        RETURNING *
+                        """,
+                        (lease_until, current_time, lease_until, current_time, job.job_id),
+                    )
+                    return ExtendLeaseResult(ExtendLeaseResultStatus.EXTENDED, _job_from_row(cur.fetchone()))
+
+    def mark_retryable_failure(
+        self,
+        job_id: UUID | str,
+        *,
+        worker_id: str,
+        error: str | None,
+        next_attempt_at: datetime,
+        now: datetime | None = None,
+    ) -> MarkRetryableFailureResult:
+        worker_id = _required_text(worker_id, "worker_id")
+        current_time = _normalize_datetime(now)
+        next_attempt_at = _normalize_datetime(next_attempt_at)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return MarkRetryableFailureResult(MarkRetryableFailureResultStatus.NOT_FOUND, None)
+                    if (
+                        job.status != JOB_STATUS_RUNNING
+                        or job.send_started_at is not None
+                        or job.first_value_delivered_at is not None
+                        or job.delivered_value_messages > 0
+                    ):
+                        return MarkRetryableFailureResult(MarkRetryableFailureResultStatus.INVALID_STATE, job)
+                    if job.worker_id != worker_id:
+                        return MarkRetryableFailureResult(MarkRetryableFailureResultStatus.WORKER_MISMATCH, job)
+                    cur.execute(
+                        """
+                        UPDATE one_day_generation_jobs
+                        SET status = 'queued',
+                            worker_id = NULL,
+                            leased_until = NULL,
+                            next_attempt_at = %s,
+                            attempt_count = attempt_count + 1,
+                            last_error = COALESCE(%s, last_error),
+                            updated_at = %s
+                        WHERE job_id = %s
+                        RETURNING *
+                        """,
+                        (next_attempt_at, _optional_text(error), current_time, job.job_id),
+                    )
+                    return MarkRetryableFailureResult(
+                        MarkRetryableFailureResultStatus.MARKED,
+                        _job_from_row(cur.fetchone()),
+                    )
 
     def start_job_and_consume(
         self,
@@ -209,6 +526,28 @@ class PostgresOneDayGenerationJobStore:
                         return StartJobResult(StartJobResultStatus.TERMINAL, job)
                     if job.status != JOB_STATUS_QUEUED:
                         return StartJobResult(StartJobResultStatus.TERMINAL, job)
+
+                    if job.consumption_source is not None:
+                        cur.execute(
+                            """
+                            UPDATE one_day_generation_jobs
+                            SET status = 'running',
+                                stale_after = %s,
+                                started_at = COALESCE(started_at, %s),
+                                heartbeat_at = %s,
+                                updated_at = %s
+                            WHERE job_id = %s
+                            RETURNING *
+                            """,
+                            (
+                                _normalize_datetime(stale_after) if stale_after is not None else job.stale_after,
+                                current_time,
+                                current_time,
+                                current_time,
+                                job.job_id,
+                            ),
+                        )
+                        return StartJobResult(StartJobResultStatus.STARTED, _job_from_row(cur.fetchone()))
 
                     if test_access:
                         consumption_source = "test_access"
@@ -584,17 +923,27 @@ class PostgresOneDayGenerationJobStore:
                     job_results: list[FinishJobResult] = []
                     for job in stale_jobs:
                         if job.status == JOB_STATUS_QUEUED:
-                            job_results.append(
-                                FinishJobResult(
-                                    FinishJobResultStatus.CANCELLED,
-                                    self._cancel_queued_job_cur(
+                            if job.refund_status == REFUND_STATUS_PENDING:
+                                job_results.append(
+                                    self._finish_failure_and_refund_once_cur(
                                         cur,
                                         job,
                                         reason="one_day_generation_job_stale",
                                         now=current_time,
-                                    ),
+                                    )
                                 )
-                            )
+                            else:
+                                job_results.append(
+                                    FinishJobResult(
+                                        FinishJobResultStatus.CANCELLED,
+                                        self._cancel_queued_job_cur(
+                                            cur,
+                                            job,
+                                            reason="one_day_generation_job_stale",
+                                            now=current_time,
+                                        ),
+                                    )
+                                )
                         elif job.status == JOB_STATUS_RUNNING:
                             if (
                                 job.expected_value_messages > 0
@@ -1032,13 +1381,57 @@ def _job_from_row(row: Any) -> OneDayGenerationJob:
         failure_reason=_optional_text(row["failure_reason"]),
         finalization_error=_optional_text(row["finalization_error"]),
         requires_manual_review=bool(row["requires_manual_review"]),
+        request_snapshot=_request_snapshot_from_row(row),
+        worker_id=_optional_text(_row_get(row, "worker_id")),
+        leased_until=_datetime_or_none(_row_get(row, "leased_until")),
+        attempt_count=int(_row_get(row, "attempt_count", 0) or 0),
+        next_attempt_at=_datetime_or_none(_row_get(row, "next_attempt_at")),
+        last_error=_optional_text(_row_get(row, "last_error")),
     )
+
+
+def _request_snapshot_from_row(row: Any) -> OneDayGenerationRequestSnapshot | None:
+    request_kind = _optional_text(_row_get(row, "request_kind"))
+    if request_kind is None:
+        return None
+    return OneDayGenerationRequestSnapshot(
+        request_kind=request_kind,
+        request_payload=_json_object_or_empty(_row_get(row, "request_payload_json")),
+        profile=_json_object_or_empty(_row_get(row, "profile_json")),
+        recent_recipe_ids=_json_list_or_empty(_row_get(row, "recent_recipe_ids_json")),
+        generation_seed=_optional_text(_row_get(row, "generation_seed")),
+    )
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _json_object_or_empty(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _json_list_or_empty(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item) for item in value)
 
 
 def _coerce_uuid(value: UUID | str) -> UUID:
     if isinstance(value, UUID):
         return value
     return UUID(str(value))
+
+
+def _coerce_request_snapshot(value: OneDayGenerationRequestSnapshot) -> OneDayGenerationRequestSnapshot:
+    if isinstance(value, OneDayGenerationRequestSnapshot):
+        return value
+    raise TypeError("request_snapshot must be OneDayGenerationRequestSnapshot")
 
 
 def _required_text(value: str, field_name: str) -> str:

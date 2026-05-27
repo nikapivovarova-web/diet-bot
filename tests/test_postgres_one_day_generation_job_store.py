@@ -13,6 +13,7 @@ import pytest
 import diet_bot.postgres_one_day_generation_job_store as one_day_job_store
 from diet_bot.one_day_generation_jobs import (
     AdmitJobResultStatus,
+    ClaimQueuedJobResultStatus,
     FinishJobResultStatus,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_FAILED,
@@ -20,11 +21,14 @@ from diet_bot.one_day_generation_jobs import (
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
     MarkSendStartedResultStatus,
+    MarkRetryableFailureResultStatus,
     MarkValueMessageDeliveredResultStatus,
     OneDayGenerationJob,
+    OneDayGenerationRequestSnapshot,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
+    QueuedJobAdmissionResultStatus,
     SetExpectedValueMessagesResultStatus,
     StartJobResultStatus,
 )
@@ -54,10 +58,22 @@ def test_migration_defines_required_schema_without_connecting_to_postgres() -> N
     assert "delivered_at TIMESTAMPTZ" in statements
     assert "finalization_error TEXT" in statements
     assert "requires_manual_review BOOLEAN NOT NULL DEFAULT false" in statements
+    assert "request_payload_json JSONB" in statements
+    assert "request_kind TEXT" in statements
+    assert "profile_json JSONB" in statements
+    assert "recent_recipe_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb" in statements
+    assert "generation_seed TEXT" in statements
+    assert "worker_id TEXT" in statements
+    assert "leased_until TIMESTAMPTZ" in statements
+    assert "attempt_count INTEGER NOT NULL DEFAULT 0" in statements
+    assert "next_attempt_at TIMESTAMPTZ" in statements
+    assert "last_error TEXT" in statements
     assert "idx_one_day_generation_jobs_active_chat_unique" in statements
     assert "WHERE status IN ('queued', 'running')" in statements
     assert "idx_one_day_generation_jobs_idempotency_key_unique" in statements
     assert "idx_one_day_generation_jobs_stale" in statements
+    assert "idx_one_day_generation_jobs_queue_claim" in statements
+    assert "idx_one_day_generation_jobs_lease_reclaim" in statements
 
 
 def test_store_contract_without_connecting_to_postgres() -> None:
@@ -69,6 +85,10 @@ def test_store_contract_without_connecting_to_postgres() -> None:
     assert "chat_id" in cleanup_signature.parameters
     assert "value_message_key" in delivered_signature.parameters
     assert hasattr(PostgresOneDayGenerationJobStore, "admit_job")
+    assert hasattr(PostgresOneDayGenerationJobStore, "admit_queued_job")
+    assert hasattr(PostgresOneDayGenerationJobStore, "claim_next_queued_job")
+    assert hasattr(PostgresOneDayGenerationJobStore, "extend_lease")
+    assert hasattr(PostgresOneDayGenerationJobStore, "mark_retryable_failure")
     assert hasattr(PostgresOneDayGenerationJobStore, "get_job")
     assert hasattr(PostgresOneDayGenerationJobStore, "mark_send_started")
     assert hasattr(PostgresOneDayGenerationJobStore, "set_expected_value_messages")
@@ -84,6 +104,12 @@ def test_store_contract_without_connecting_to_postgres() -> None:
         "one_day_generation_jobs"
     ]
     assert "one_day_generation_job_value_messages" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns
+    assert "request_payload_json" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns[
+        "one_day_generation_jobs"
+    ]
+    assert "leased_until" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns["one_day_generation_jobs"]
+    assert "idx_one_day_generation_jobs_queue_claim" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.indexes
+    assert "idx_one_day_generation_jobs_lease_reclaim" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.indexes
 
 
 @pytest.fixture
@@ -154,6 +180,8 @@ def test_schema_init_is_idempotent(store: PostgresOneDayGenerationJobStore) -> N
                     'idx_one_day_generation_jobs_active_chat_unique',
                     'idx_one_day_generation_jobs_idempotency_key_unique',
                     'idx_one_day_generation_jobs_stale',
+                    'idx_one_day_generation_jobs_queue_claim',
+                    'idx_one_day_generation_jobs_lease_reclaim',
                     'idx_one_day_generation_job_value_messages_job'
                   )
                 """
@@ -169,6 +197,8 @@ def test_schema_init_is_idempotent(store: PostgresOneDayGenerationJobStore) -> N
         "idx_one_day_generation_jobs_active_chat_unique",
         "idx_one_day_generation_jobs_idempotency_key_unique",
         "idx_one_day_generation_jobs_stale",
+        "idx_one_day_generation_jobs_queue_claim",
+        "idx_one_day_generation_jobs_lease_reclaim",
         "idx_one_day_generation_job_value_messages_job",
     }
 
@@ -255,6 +285,311 @@ def test_idempotency_key_returns_existing_job(store: PostgresOneDayGenerationJob
     assert second.job == first.job
     assert second.job.chat_id == 103
     assert second.job.metadata == {"request": "original"}
+
+
+def test_admit_queued_job_persists_request_snapshot_and_consumes_quota(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 126
+    _save_subscription(store, chat_id, now=now, one_day_remaining=2)
+    snapshot = OneDayGenerationRequestSnapshot(
+        request_kind="telegram_one_day",
+        request_payload={"callback_query_id": "cb-126", "locale": "ru"},
+        profile={"goal": "balance", "calories": 1800},
+        recent_recipe_ids=("r001", "r002"),
+        generation_seed="seed-126",
+    )
+
+    result = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-admit",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=snapshot,
+        metadata={"source": "durable"},
+        now=now,
+    )
+    job = result.job
+
+    assert result.status == QueuedJobAdmissionResultStatus.ADMITTED
+    assert job is not None
+    assert job.status == JOB_STATUS_QUEUED
+    assert job.consumption_source == "monthly"
+    assert job.refund_status == REFUND_STATUS_PENDING
+    assert job.request_snapshot == snapshot
+    assert job.metadata == {"source": "durable"}
+    assert job.attempt_count == 0
+    assert job.worker_id is None
+    assert job.leased_until is None
+    assert _one_day_remaining(store, chat_id) == 1
+    assert store.get_job(job.job_id) == job
+
+
+def test_admit_queued_job_duplicate_requests_do_not_double_consume(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 127
+    _save_subscription(store, chat_id, now=now, one_day_remaining=3)
+    snapshot = _durable_snapshot("duplicate")
+
+    first = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-duplicate",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=snapshot,
+        now=now,
+    )
+    idempotent = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-duplicate",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("idempotent-retry"),
+        now=now + timedelta(seconds=1),
+    )
+    active_duplicate = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-active-duplicate",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("active-duplicate"),
+        now=now + timedelta(seconds=2),
+    )
+
+    assert first.status == QueuedJobAdmissionResultStatus.ADMITTED
+    assert idempotent.status == QueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY
+    assert active_duplicate.status == QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE
+    assert idempotent.job == first.job
+    assert active_duplicate.job == first.job
+    assert _active_job_count(store, chat_id) == 1
+    assert _one_day_remaining(store, chat_id) == 2
+
+
+def test_admit_queued_job_denied_without_queued_job_or_quota_mutation(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 128
+    _save_exhausted_entitlement(store, chat_id)
+
+    result = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-denied",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("denied"),
+        now=now,
+    )
+    saved = PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).load_all()[chat_id]
+
+    assert result.status == QueuedJobAdmissionResultStatus.DENIED
+    assert result.job is None
+    assert result.denial_reason == "one_day_entitlement_unavailable"
+    assert store.get_active_job_for_chat(chat_id) is None
+    assert saved.monthly_one_day_remaining == 0
+    assert saved.extra_one_day_remaining == 0
+    assert saved.free_trial_used is True
+
+
+def test_start_job_and_consume_does_not_double_consume_durable_admission(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 134
+    _save_subscription(store, chat_id, now=now, one_day_remaining=2)
+    admitted = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-start-compat",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("start-compat"),
+        now=now,
+    ).job
+
+    started = store.start_job_and_consume(
+        admitted.job_id,
+        now=now + timedelta(seconds=1),
+        stale_after=now + timedelta(minutes=31),
+    )
+
+    assert started.status == StartJobResultStatus.STARTED
+    assert started.job.status == JOB_STATUS_RUNNING
+    assert started.job.consumption_source == "monthly"
+    assert started.job.refund_status == REFUND_STATUS_PENDING
+    assert _one_day_remaining(store, chat_id) == 1
+
+
+def test_claim_next_queued_job_respects_order_and_lease(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    _save_subscription(store, 129, now=now, one_day_remaining=1)
+    _save_subscription(store, 130, now=now, one_day_remaining=1)
+    first = store.admit_queued_job(
+        chat_id=129,
+        idempotency_key="one-day-durable-claim-first",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("claim-first"),
+        now=now,
+    ).job
+    second = store.admit_queued_job(
+        chat_id=130,
+        idempotency_key="one-day-durable-claim-second",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("claim-second"),
+        now=now + timedelta(seconds=1),
+    ).job
+
+    claimed_first = store.claim_next_queued_job(
+        worker_id="worker-a",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=2),
+    )
+    claimed_second = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=3),
+    )
+    empty = store.claim_next_queued_job(
+        worker_id="worker-c",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=4),
+    )
+
+    assert claimed_first.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert claimed_first.job is not None
+    assert claimed_first.job.job_id == first.job_id
+    assert claimed_first.job.status == JOB_STATUS_RUNNING
+    assert claimed_first.job.worker_id == "worker-a"
+    assert claimed_first.job.leased_until == now + timedelta(minutes=5)
+    assert claimed_second.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert claimed_second.job is not None
+    assert claimed_second.job.job_id == second.job_id
+    assert empty.status == ClaimQueuedJobResultStatus.EMPTY
+    assert empty.job is None
+
+
+def test_claim_does_not_reclaim_active_lease_until_expired(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 131
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    admitted = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-expired-lease",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("expired-lease"),
+        now=now,
+    ).job
+
+    claimed = store.claim_next_queued_job(
+        worker_id="worker-a",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=1),
+    )
+    blocked = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=10),
+        now=now + timedelta(minutes=1),
+    )
+    reclaimed = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=10),
+        now=now + timedelta(minutes=6),
+    )
+
+    assert claimed.job is not None
+    assert claimed.job.job_id == admitted.job_id
+    assert blocked.status == ClaimQueuedJobResultStatus.EMPTY
+    assert reclaimed.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert reclaimed.job is not None
+    assert reclaimed.job.job_id == admitted.job_id
+    assert reclaimed.job.worker_id == "worker-b"
+    assert reclaimed.job.leased_until == now + timedelta(minutes=10)
+
+
+def test_extend_lease_updates_worker_heartbeat(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 132
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-heartbeat",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("heartbeat"),
+        now=now,
+    )
+    claimed = store.claim_next_queued_job(
+        worker_id="worker-a",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=1),
+    ).job
+
+    extended = store.extend_lease(
+        claimed.job_id,
+        worker_id="worker-a",
+        lease_until=now + timedelta(minutes=15),
+        now=now + timedelta(minutes=2),
+    )
+
+    assert extended.status.name == "EXTENDED"
+    assert extended.job is not None
+    assert extended.job.worker_id == "worker-a"
+    assert extended.job.leased_until == now + timedelta(minutes=15)
+    assert extended.job.heartbeat_at == now + timedelta(minutes=2)
+
+
+def test_retryable_failure_requeues_with_next_attempt_and_increments_attempt_count(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    chat_id = 133
+    _save_subscription(store, chat_id, now=now, one_day_remaining=1)
+    store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="one-day-durable-retryable",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=_durable_snapshot("retryable"),
+        now=now,
+    )
+    claimed = store.claim_next_queued_job(
+        worker_id="worker-a",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=1),
+    ).job
+
+    retryable = store.mark_retryable_failure(
+        claimed.job_id,
+        worker_id="worker-a",
+        error="temporary_builder_error",
+        next_attempt_at=now + timedelta(minutes=10),
+        now=now + timedelta(minutes=2),
+    )
+    too_early = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=15),
+        now=now + timedelta(minutes=5),
+    )
+    reclaimed = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=20),
+        now=now + timedelta(minutes=10),
+    )
+
+    assert retryable.status == MarkRetryableFailureResultStatus.MARKED
+    assert retryable.job is not None
+    assert retryable.job.status == JOB_STATUS_QUEUED
+    assert retryable.job.worker_id is None
+    assert retryable.job.leased_until is None
+    assert retryable.job.attempt_count == 1
+    assert retryable.job.next_attempt_at == now + timedelta(minutes=10)
+    assert retryable.job.last_error == "temporary_builder_error"
+    assert too_early.status == ClaimQueuedJobResultStatus.EMPTY
+    assert reclaimed.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert reclaimed.job is not None
+    assert reclaimed.job.job_id == claimed.job_id
+    assert reclaimed.job.worker_id == "worker-b"
+    assert reclaimed.job.attempt_count == 1
 
 
 def test_start_job_consumes_one_day_attempt_once(store: PostgresOneDayGenerationJobStore) -> None:
@@ -832,6 +1167,21 @@ def _save_subscription(
     )
     entitlement.monthly_one_day_remaining = one_day_remaining
     PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).save_all({chat_id: entitlement})
+
+
+def _save_exhausted_entitlement(store: PostgresOneDayGenerationJobStore, chat_id: int) -> None:
+    entitlement = Entitlement(free_trial_used=True)
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).save_all({chat_id: entitlement})
+
+
+def _durable_snapshot(label: str) -> OneDayGenerationRequestSnapshot:
+    return OneDayGenerationRequestSnapshot(
+        request_kind="telegram_one_day",
+        request_payload={"label": label},
+        profile={"goal": "maintenance"},
+        recent_recipe_ids=(f"recent-{label}",),
+        generation_seed=f"seed-{label}",
+    )
 
 
 def _one_day_remaining(store: PostgresOneDayGenerationJobStore, chat_id: int) -> int:

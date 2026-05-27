@@ -8,10 +8,15 @@ from uuid import UUID
 
 from .one_day_generation_jobs import (
     AdmitJobResult,
+    ClaimQueuedJobResult,
     CleanupStaleResult,
+    ExtendLeaseResult,
     FinishJobResult,
+    MarkRetryableFailureResult,
     MarkSendStartedResult,
     MarkValueMessageDeliveredResult,
+    OneDayGenerationRequestSnapshot,
+    QueuedJobAdmissionResult,
     SetExpectedValueMessagesResult,
     StartJobResult,
 )
@@ -30,6 +35,46 @@ class OneDayGenerationJobStore(Protocol):
         stale_after: datetime,
         metadata: Mapping[str, Any] | None = None,
     ) -> AdmitJobResult: ...
+
+    def admit_queued_job(
+        self,
+        *,
+        chat_id: int,
+        idempotency_key: str,
+        stale_after: datetime,
+        request_snapshot: OneDayGenerationRequestSnapshot,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        test_access: bool = False,
+        job_id: UUID | str | None = None,
+    ) -> QueuedJobAdmissionResult: ...
+
+    def claim_next_queued_job(
+        self,
+        *,
+        worker_id: str,
+        lease_until: datetime,
+        now: datetime | None = None,
+    ) -> ClaimQueuedJobResult: ...
+
+    def extend_lease(
+        self,
+        job_id: UUID | str,
+        *,
+        worker_id: str,
+        lease_until: datetime,
+        now: datetime | None = None,
+    ) -> ExtendLeaseResult: ...
+
+    def mark_retryable_failure(
+        self,
+        job_id: UUID | str,
+        *,
+        worker_id: str,
+        error: str | None,
+        next_attempt_at: datetime,
+        now: datetime | None = None,
+    ) -> MarkRetryableFailureResult: ...
 
     def start_job_and_consume(
         self,
