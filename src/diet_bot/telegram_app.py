@@ -964,6 +964,7 @@ WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u04
 ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
 ONE_DAY_PLAN_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u0440\u0430\u0446\u0438\u043e\u043d. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+ONE_DAY_PLAN_NO_PLAN_FOLLOW_UP_TEXT = "\u041d\u0435 \u0441\u043c\u043e\u0433 \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u0440\u0430\u0446\u0438\u043e\u043d \u043f\u043e \u0442\u0435\u043a\u0443\u0449\u0438\u043c \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f\u043c. \u042f \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u043b \u044d\u0442\u043e \u043a\u0430\u043a \u043e\u0448\u0438\u0431\u043a\u0443 \u0438 \u043d\u0435 \u0431\u0443\u0434\u0443 \u0441\u043f\u0438\u0441\u044b\u0432\u0430\u0442\u044c \u043f\u043e\u043f\u044b\u0442\u043a\u0443."
 WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
 TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
@@ -1739,7 +1740,28 @@ def _start_one_day_generation_worker_if_configured(config, bot: Bot) -> asyncio.
         return None
     settings = OneDayGenerationWorkerSettings.from_config(config)
     worker = OneDayGenerationWorker(runtime, _TelegramOneDayGenerationJobProcessor(bot), settings)
-    return asyncio.create_task(worker.run_forever(), name="one-day-generation-worker")
+    task = asyncio.create_task(worker.run_forever(), name="one-day-generation-worker")
+    _observe_one_day_generation_worker_task(task)
+    return task
+
+
+def _observe_one_day_generation_worker_task(task: asyncio.Task) -> None:
+    def log_unexpected_stop(done_task: asyncio.Task) -> None:
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        logger.error(
+            "One-day worker task stopped unexpectedly; task_name=%s error_type=%s",
+            done_task.get_name(),
+            type(exc).__name__,
+        )
+
+    task.add_done_callback(log_unexpected_stop)
 
 
 def _acquire_postgres_single_poller_guard(config):
@@ -2992,7 +3014,13 @@ async def _prepare_one_day_generation_delivery(job: OneDayGenerationJob, bot: Bo
     )
     plan_result = _annotate_batch_prep(plan_result)
     if not plan_result.safety.can_generate_plan or not plan_result.meals:
-        return OneDayGenerationDelivery(value_messages=())
+        async def failure_follow_up() -> None:
+            reply_markup = None
+            if request_payload.get("include_default_after_plan_keyboard", True):
+                reply_markup = _after_plan_keyboard(job.chat_id)
+            await message.answer(ONE_DAY_PLAN_NO_PLAN_FOLLOW_UP_TEXT, reply_markup=reply_markup)
+
+        return OneDayGenerationDelivery(value_messages=(), failure_follow_up=failure_follow_up)
 
     validation = validate_plan(plan_result)
     messages = list(format_plan_messages(plan_result, validation))

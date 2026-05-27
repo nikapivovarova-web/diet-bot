@@ -498,6 +498,35 @@ async def test_run_bot_starts_configured_one_day_worker_without_real_polling(mon
 
 
 @pytest.mark.anyio
+async def test_one_day_worker_task_exception_is_observed_without_secret_leak(monkeypatch, caplog) -> None:
+    fake_runtime = object()
+
+    class CrashingWorker:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def run_forever(self) -> None:
+            raise RuntimeError("bot-token-secret should not be logged")
+
+    monkeypatch.setattr(telegram_app, "_one_day_generation_job_runtime", lambda: fake_runtime)
+    monkeypatch.setattr(telegram_app, "OneDayGenerationWorker", CrashingWorker)
+    caplog.set_level(logging.ERROR, logger="diet_bot.telegram_app")
+
+    task = telegram_app._start_one_day_generation_worker_if_configured(
+        SimpleNamespace(one_day_worker_enabled=True),
+        object(),
+    )
+
+    assert task is not None
+    with pytest.raises(RuntimeError):
+        await task
+    await asyncio.sleep(0)
+    assert "One-day worker task stopped unexpectedly" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "bot-token-secret" not in caplog.text
+
+
+@pytest.mark.anyio
 async def test_promo_code_button_asks_for_code(monkeypatch, tmp_path) -> None:
     chat_id = 80_201
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
@@ -4349,6 +4378,62 @@ async def test_telegram_one_day_worker_processor_sends_trial_delivery_and_cta_af
     assert events[4].startswith("telegram:summary:")
     assert events[-1] == "history:remember"
     assert bot.sent_messages[-1]["text"] == TRIAL_SUBSCRIPTION_TEXT + "\n\ntrial-status"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "plan",
+    [
+        _one_day_plan_for_runtime_tests(meals=(), can_generate=True),
+        _one_day_plan_for_runtime_tests(meals=(), can_generate=False),
+    ],
+)
+async def test_telegram_one_day_worker_processor_sends_no_plan_failure_follow_up(
+    monkeypatch,
+    plan,
+) -> None:
+    chat_id = 91_044
+    bot = FakeInvoiceBot()
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+
+    snapshot = OneDayGenerationRequestSnapshot(
+        request_kind="telegram_one_day",
+        request_payload={
+            "include_default_after_plan_keyboard": True,
+            "recent_recipe_keys": ["breakfast:old"],
+        },
+        profile=telegram_app._profile_to_dict(profile_with(age=44)),
+        recent_recipe_ids=("old-id",),
+        generation_seed="1234",
+    )
+    job = OneDayGenerationJob(
+        job_id=uuid4(),
+        chat_id=chat_id,
+        idempotency_key="telegram_message:91044:1:one_day",
+        status="running",
+        consumption_source="monthly",
+        refund_status="pending",
+        delivery_status="not_started",
+        expected_value_messages=0,
+        delivered_value_messages=0,
+        stale_after=datetime(2026, 5, 8, tzinfo=UTC),
+        request_snapshot=snapshot,
+    )
+
+    delivery = await telegram_app._TelegramOneDayGenerationJobProcessor(bot).prepare_delivery(job)
+
+    assert delivery.value_messages == ()
+    assert delivery.failure_follow_up is not None
+    await delivery.failure_follow_up()
+    assert bot.sent_messages[-1]["chat_id"] == chat_id
+    assert bot.sent_messages[-1]["text"] == telegram_app.ONE_DAY_PLAN_NO_PLAN_FOLLOW_UP_TEXT
+    assert bot.sent_messages[-1]["reply_markup"] is not None
+    lower_text = bot.sent_messages[-1]["text"].lower()
+    assert "попроб" not in lower_text
+    assert "нагруз" not in lower_text
+    assert "очеред" not in lower_text
+    assert "недоступ" not in lower_text
 
 
 @pytest.mark.anyio

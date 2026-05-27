@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -458,6 +459,107 @@ async def test_worker_partial_delivery_failure_requires_manual_review_without_re
 
 
 @pytest.mark.anyio
+async def test_worker_run_forever_recovers_from_transient_claim_exception_and_shuts_down(caplog) -> None:
+    class FlakyClaimStore(_InMemoryOneDayGenerationJobStore):
+        def __init__(self) -> None:
+            super().__init__(default_quota=1)
+            self.claim_attempts = 0
+
+        def claim_next_queued_job(self, **kwargs):
+            self.claim_attempts += 1
+            if self.claim_attempts == 1:
+                raise RuntimeError("postgresql://user:secret@example/db transient outage")
+            return super().claim_next_queued_job(**kwargs)
+
+    store = FlakyClaimStore()
+    runtime = OneDayGenerationJobRuntime(store)
+    admitted = runtime.admit_queued(chat_id=99, idempotency_key="flaky-claim", request_snapshot=_snapshot(99)).job
+    processor = _RecordingProcessor()
+    worker = OneDayGenerationWorker(
+        runtime,
+        processor,
+        OneDayGenerationWorkerSettings(
+            worker_id="worker-a",
+            concurrency=1,
+            heartbeat_interval_seconds=3600,
+            max_attempts=1,
+            idle_sleep_seconds=0.01,
+            error_backoff_seconds=0.01,
+        ),
+    )
+    stop_event = asyncio.Event()
+    caplog.set_level(logging.ERROR, logger="diet_bot.one_day_generation_job_runtime")
+
+    task = asyncio.create_task(worker.run_forever(stop_event))
+    try:
+        for _ in range(100):
+            if store.jobs_by_id[admitted.job_id].status == JOB_STATUS_SUCCEEDED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("worker did not process the queued job after transient claim failure")
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    assert store.claim_attempts >= 2
+    assert store.jobs_by_id[admitted.job_id].status == JOB_STATUS_SUCCEEDED
+    assert processor.sent_keys == [(99, "meal:00:breakfast"), (99, "summary:shopping")]
+    assert "One-day worker iteration failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "postgresql://user:secret@example/db" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_worker_empty_delivery_refunds_before_failure_follow_up() -> None:
+    store = _InMemoryOneDayGenerationJobStore(default_quota=1)
+    runtime = OneDayGenerationJobRuntime(store)
+    admitted = runtime.admit_queued(chat_id=111, idempotency_key="empty-delivery", request_snapshot=_snapshot(111)).job
+    follow_ups: list[tuple[int, str, int]] = []
+    worker = OneDayGenerationWorker(
+        runtime,
+        _EmptyDeliveryProcessor(store, follow_ups),
+        OneDayGenerationWorkerSettings(worker_id="worker-a", concurrency=1, max_attempts=1),
+    )
+
+    processed = await worker.run_once()
+    failed = store.jobs_by_id[admitted.job_id]
+
+    assert processed == 1
+    assert failed.status == JOB_STATUS_FAILED
+    assert failed.refund_status == REFUND_STATUS_REFUNDED
+    assert failed.failure_reason == "one_day_worker_empty_delivery"
+    assert failed.send_started_at is None
+    assert store.quota_by_chat_id[111] == 1
+    assert follow_ups == [(111, REFUND_STATUS_REFUNDED, 1)]
+    assert ("mark_send_started", admitted.job_id) not in store.calls
+
+
+@pytest.mark.anyio
+async def test_worker_empty_trial_delivery_resets_trial_before_failure_follow_up() -> None:
+    store = _InMemoryOneDayGenerationJobStore(default_quota=0, consumption_source="free_trial")
+    runtime = OneDayGenerationJobRuntime(store)
+    admitted = runtime.admit_queued(chat_id=112, idempotency_key="empty-trial", request_snapshot=_snapshot(112)).job
+    follow_ups: list[tuple[int, str, int]] = []
+    worker = OneDayGenerationWorker(
+        runtime,
+        _EmptyDeliveryProcessor(store, follow_ups),
+        OneDayGenerationWorkerSettings(worker_id="worker-a", concurrency=1, max_attempts=1),
+    )
+
+    processed = await worker.run_once()
+    failed = store.jobs_by_id[admitted.job_id]
+
+    assert processed == 1
+    assert failed.status == JOB_STATUS_FAILED
+    assert failed.refund_status == REFUND_STATUS_REFUNDED
+    assert store.free_trial_used_by_chat_id[112] is False
+    assert store.consumed_count_by_chat_id[112] == 1
+    assert follow_ups == [(112, REFUND_STATUS_REFUNDED, 0)]
+    assert ("mark_send_started", admitted.job_id) not in store.calls
+
+
+@pytest.mark.anyio
 async def test_synthetic_1000_user_rehearsal_accepts_dedupes_and_processes_with_bounded_concurrency() -> None:
     store = _InMemoryOneDayGenerationJobStore(default_quota=1)
     runtime = OneDayGenerationJobRuntime(store)
@@ -650,13 +752,28 @@ class _FailingProcessor:
         raise self.exc
 
 
+class _EmptyDeliveryProcessor:
+    def __init__(self, store: "_InMemoryOneDayGenerationJobStore", follow_ups: list[tuple[int, str, int]]) -> None:
+        self.store = store
+        self.follow_ups = follow_ups
+
+    async def prepare_delivery(self, job: OneDayGenerationJob) -> OneDayGenerationDelivery:
+        async def follow_up() -> None:
+            saved = self.store.jobs_by_id[job.job_id]
+            self.follow_ups.append((job.chat_id, saved.refund_status, self.store.quota_by_chat_id.get(job.chat_id, 0)))
+
+        return OneDayGenerationDelivery(value_messages=(), failure_follow_up=follow_up)
+
+
 class _InMemoryOneDayGenerationJobStore:
-    def __init__(self, *, default_quota: int) -> None:
+    def __init__(self, *, default_quota: int, consumption_source: str = "monthly") -> None:
         self.default_quota = default_quota
+        self.consumption_source = consumption_source
         self.jobs_by_id: dict[object, OneDayGenerationJob] = {}
         self.idempotency_index: dict[str, object] = {}
         self.job_by_chat_id: dict[int, OneDayGenerationJob] = {}
         self.quota_by_chat_id: dict[int, int] = {}
+        self.free_trial_used_by_chat_id: dict[int, bool] = {}
         self.consumed_count_by_chat_id: dict[int, int] = {}
         self.calls: list[tuple[str, object]] = []
 
@@ -682,7 +799,18 @@ class _InMemoryOneDayGenerationJobStore:
         active = self.job_by_chat_id.get(chat_id)
         if active is not None and active.status in {JOB_STATUS_QUEUED, JOB_STATUS_RUNNING}:
             return QueuedJobAdmissionResult(QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE, active)
-        if not test_access:
+        if not test_access and self.consumption_source == "free_trial":
+            if self.free_trial_used_by_chat_id.get(chat_id, False):
+                return QueuedJobAdmissionResult(
+                    QueuedJobAdmissionResultStatus.DENIED,
+                    None,
+                    "one_day_entitlement_unavailable",
+                )
+            self.free_trial_used_by_chat_id[chat_id] = True
+            self.consumed_count_by_chat_id[chat_id] = self.consumed_count_by_chat_id.get(chat_id, 0) + 1
+            consumption_source = "free_trial"
+            refund_status = REFUND_STATUS_PENDING
+        elif not test_access:
             quota = self.quota_by_chat_id.setdefault(chat_id, self.default_quota)
             if quota <= 0:
                 return QueuedJobAdmissionResult(
@@ -692,7 +820,7 @@ class _InMemoryOneDayGenerationJobStore:
                 )
             self.quota_by_chat_id[chat_id] = quota - 1
             self.consumed_count_by_chat_id[chat_id] = self.consumed_count_by_chat_id.get(chat_id, 0) + 1
-            consumption_source = "monthly"
+            consumption_source = self.consumption_source
             refund_status = REFUND_STATUS_PENDING
         else:
             consumption_source = "test_access"
@@ -872,7 +1000,10 @@ class _InMemoryOneDayGenerationJobStore:
         else:
             refund_status = REFUND_STATUS_REFUNDED if job.refund_status == REFUND_STATUS_PENDING else REFUND_STATUS_NOT_REQUIRED
             if refund_status == REFUND_STATUS_REFUNDED:
-                self.quota_by_chat_id[job.chat_id] = self.quota_by_chat_id.get(job.chat_id, 0) + 1
+                if job.consumption_source == "free_trial":
+                    self.free_trial_used_by_chat_id[job.chat_id] = False
+                else:
+                    self.quota_by_chat_id[job.chat_id] = self.quota_by_chat_id.get(job.chat_id, 0) + 1
             updated = replace(
                 job,
                 status=JOB_STATUS_FAILED,

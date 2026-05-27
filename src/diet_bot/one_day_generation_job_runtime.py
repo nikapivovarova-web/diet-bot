@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Protocol
 from uuid import UUID
 
+from .log_redaction import redact_identifier
 from .one_day_generation_jobs import (
     AdmitJobResult,
     ClaimQueuedJobResult,
@@ -41,6 +42,7 @@ DEFAULT_ONE_DAY_GENERATION_WORKER_HEARTBEAT_SECONDS = 60
 DEFAULT_ONE_DAY_GENERATION_WORKER_RETRY_DELAY_SECONDS = 30
 DEFAULT_ONE_DAY_GENERATION_WORKER_MAX_ATTEMPTS = 3
 DEFAULT_ONE_DAY_GENERATION_WORKER_IDLE_SLEEP_SECONDS = 1.0
+DEFAULT_ONE_DAY_GENERATION_WORKER_ERROR_BACKOFF_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +160,7 @@ class OneDayGenerationDelivery:
     value_messages: tuple[OneDayGenerationValueMessage, ...]
     before_value_messages: Callable[[], Awaitable[None]] | None = None
     after_success: Callable[[], Awaitable[None]] | None = None
+    failure_follow_up: Callable[[], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "value_messages", tuple(self.value_messages))
@@ -176,6 +179,7 @@ class OneDayGenerationWorkerSettings:
     retry_delay_seconds: int = DEFAULT_ONE_DAY_GENERATION_WORKER_RETRY_DELAY_SECONDS
     max_attempts: int = DEFAULT_ONE_DAY_GENERATION_WORKER_MAX_ATTEMPTS
     idle_sleep_seconds: float = DEFAULT_ONE_DAY_GENERATION_WORKER_IDLE_SLEEP_SECONDS
+    error_backoff_seconds: float = DEFAULT_ONE_DAY_GENERATION_WORKER_ERROR_BACKOFF_SECONDS
 
     @classmethod
     def from_config(cls, config: object, *, worker_id: str | None = None) -> "OneDayGenerationWorkerSettings":
@@ -192,6 +196,10 @@ class OneDayGenerationWorkerSettings:
             idle_sleep_seconds=max(
                 0.1,
                 float(getattr(config, "one_day_worker_idle_sleep_seconds", cls.idle_sleep_seconds)),
+            ),
+            error_backoff_seconds=max(
+                0.1,
+                float(getattr(config, "one_day_worker_error_backoff_seconds", cls.error_backoff_seconds)),
             ),
         )
 
@@ -238,16 +246,31 @@ class OneDayGenerationWorker:
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
         while stop_event is None or not stop_event.is_set():
-            processed = await self.run_once()
+            try:
+                processed = await self.run_once()
+            except Exception as exc:
+                backoff_seconds = max(0.1, float(self.settings.error_backoff_seconds))
+                logger.error(
+                    "One-day worker iteration failed; worker_id=%s error_type=%s backoff_seconds=%.3f",
+                    self.settings.worker_id,
+                    type(exc).__name__,
+                    backoff_seconds,
+                )
+                await self._sleep_or_stop(stop_event, backoff_seconds)
+                continue
             if processed:
                 continue
-            try:
-                if stop_event is None:
-                    await asyncio.sleep(self.settings.idle_sleep_seconds)
-                else:
-                    await asyncio.wait_for(stop_event.wait(), timeout=self.settings.idle_sleep_seconds)
-            except TimeoutError:
-                continue
+            await self._sleep_or_stop(stop_event, self.settings.idle_sleep_seconds)
+
+    async def _sleep_or_stop(self, stop_event: asyncio.Event | None, seconds: float) -> None:
+        delay_seconds = max(0.1, float(seconds))
+        try:
+            if stop_event is None:
+                await asyncio.sleep(delay_seconds)
+            else:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay_seconds)
+        except TimeoutError:
+            return
 
     async def _process_claimed_job(self, job: OneDayGenerationJob) -> None:
         stop_heartbeat = asyncio.Event()
@@ -262,7 +285,10 @@ class OneDayGenerationWorker:
             delivery = await self.processor.prepare_delivery(job)
             value_messages = tuple(delivery.value_messages)
             if not value_messages:
-                self.runtime.finish_failure_and_refund_once(job.job_id, reason="one_day_worker_empty_delivery")
+                self._require_failure(
+                    self.runtime.finish_failure_and_refund_once(job.job_id, reason="one_day_worker_empty_delivery")
+                )
+                await self._send_failure_follow_up(job, delivery.failure_follow_up)
                 return
 
             if delivery.before_value_messages is not None:
@@ -309,13 +335,44 @@ class OneDayGenerationWorker:
                 )
                 return
             except TimeoutError:
-                result = self.runtime.extend_lease(
-                    job_id,
-                    worker_id=self.settings.worker_id,
-                    lease_seconds=self.settings.lease_seconds,
-                )
+                try:
+                    result = self.runtime.extend_lease(
+                        job_id,
+                        worker_id=self.settings.worker_id,
+                        lease_seconds=self.settings.lease_seconds,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "One-day worker lease extension failed; worker_id=%s job_id=%s error_type=%s",
+                        self.settings.worker_id,
+                        redact_identifier("job", job_id),
+                        type(exc).__name__,
+                    )
+                    continue
                 if result.status != ExtendLeaseResultStatus.EXTENDED:
-                    logger.warning("One-day worker lease extension did not extend job_id=%s", job_id)
+                    logger.warning(
+                        "One-day worker lease extension did not extend worker_id=%s job_id=%s status=%s",
+                        self.settings.worker_id,
+                        redact_identifier("job", job_id),
+                        result.status.value,
+                    )
+
+    async def _send_failure_follow_up(
+        self,
+        job: OneDayGenerationJob,
+        follow_up: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        if follow_up is None:
+            return
+        try:
+            await follow_up()
+        except Exception as exc:
+            logger.error(
+                "One-day worker failure follow-up failed; chat_id=%s job_id=%s error_type=%s",
+                redact_identifier("chat", job.chat_id),
+                redact_identifier("job", job.job_id),
+                type(exc).__name__,
+            )
 
     def _handle_processing_failure(
         self,
@@ -375,6 +432,14 @@ class OneDayGenerationWorker:
             FinishJobResultStatus.ALREADY_TERMINAL,
         }:
             raise RuntimeError(f"one-day job was not finalized as success: {result.status.value}")
+
+    @staticmethod
+    def _require_failure(result: FinishJobResult) -> None:
+        if result.status not in {
+            FinishJobResultStatus.FAILED,
+            FinishJobResultStatus.ALREADY_TERMINAL,
+        }:
+            raise RuntimeError(f"one-day job was not finalized as failure: {result.status.value}")
 
 
 @dataclass
