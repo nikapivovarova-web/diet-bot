@@ -25,6 +25,23 @@ FAIL = "FAIL"
 SKIP = "SKIP"
 
 _POSTGRES_DSN_RE = re.compile(r"\bpostgres(?:ql)?://[^\s\"'<>]+", flags=re.IGNORECASE)
+_CONTROLLED_QA_ENVIRONMENTS = {
+    "controlled-qa",
+    "qa",
+    "staging",
+    "stage",
+    "test",
+    "testing",
+    "local",
+    "development",
+    "dev",
+    "sandbox",
+}
+_CONTROLLED_QA_BOT_TOKEN_MARKER_ENV = "DIET_BOT_CONTROLLED_QA_BOT_TOKEN_MARKER"
+_CONTROLLED_QA_BOT_TOKEN_MARKERS = {"test", "sandbox"}
+_CONTROLLED_QA_DATABASE_MARKER_ENV = "DIET_BOT_CONTROLLED_QA_DATABASE_MARKER"
+_CONTROLLED_QA_DATABASE_MARKERS = {"local", "staging", "stage", "test", "testing", "throwaway", "sandbox"}
+_PAYMENTS_DISABLED_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -41,20 +58,35 @@ class PreflightCheck:
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Run safe production readiness checks without starting the Telegram bot, "
+            "Run safe readiness checks without starting the Telegram bot, "
             "poller, or Telegram API clients."
         ),
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--mode",
+        choices=("production", "controlled-qa"),
+        default="production",
+        help="Readiness profile to run. The default preserves the production preflight behavior.",
+    )
+    args = parser.parse_args(argv)
 
     source = os.environ if env is None else env
     config = load_runtime_config(source)
     secrets = _secret_values(config, source)
-    checks = run_preflight(config, secrets=secrets)
+    if args.mode == "controlled-qa":
+        title = "controlled QA preflight"
+        checks = run_controlled_qa_preflight(config, env=source, secrets=secrets)
+    else:
+        title = "production preflight"
+        checks = run_preflight(config, secrets=secrets)
 
-    print("production preflight")
+    print(title)
     print(f"environment={config.environment}")
     print(f"storage_backend={config.storage_backend}")
+    if args.mode == "controlled-qa":
+        print(f"bot_token_marker={_marker_status(source, _CONTROLLED_QA_BOT_TOKEN_MARKER_ENV)}")
+        print(f"database_marker={_marker_status(source, _CONTROLLED_QA_DATABASE_MARKER_ENV)}")
+        print(f"tester_chat_ids_count={len(config.tester_chat_ids)}")
     print("checks:")
     for check in checks:
         print(f"{check.status} {check.name}")
@@ -134,6 +166,61 @@ def run_preflight(
     return tuple(checks)
 
 
+def run_controlled_qa_preflight(
+    config: RuntimeConfig,
+    *,
+    env: Mapping[str, str],
+    secrets: frozenset[str] | None = None,
+) -> tuple[PreflightCheck, ...]:
+    redaction_values = secrets or frozenset()
+    runtime_issues = _controlled_qa_runtime_issues(config, env)
+    if runtime_issues:
+        return (
+            PreflightCheck(
+                "controlled QA runtime config",
+                FAIL,
+                tuple(_redact_text(issue, redaction_values) for issue in runtime_issues),
+            ),
+        )
+
+    checks: list[PreflightCheck] = [
+        PreflightCheck(
+            "controlled QA runtime config",
+            PASS,
+            (
+                "test bot token marker is present",
+                "non-production database marker is present",
+                "payments disabled and provider token absent",
+                f"tester_chat_ids_count={len(config.tester_chat_ids)}",
+            ),
+        ),
+        _check("Postgres connectivity", lambda: _validate_postgres_connectivity(config), redaction_values),
+        _check("chat state schema", lambda: validate_chat_state_store_for_startup(config), redaction_values),
+        _check(
+            "entitlement schema",
+            lambda: validate_entitlement_store_for_startup(config, create_entitlement_store(config)),
+            redaction_values,
+        ),
+        _check(
+            "weekly PDF job schema",
+            lambda: validate_weekly_pdf_job_runtime_for_startup(config),
+            redaction_values,
+        ),
+        _check(
+            "one-day generation job schema",
+            lambda: validate_one_day_generation_job_store_for_startup(config),
+            redaction_values,
+        ),
+        _check("payment ledger schema", lambda: _validate_payment_ledger_schema(config), redaction_values),
+        _check(
+            "single-poller guard acquire/release",
+            lambda: _validate_single_poller_guard(config),
+            redaction_values,
+        ),
+    ]
+    return tuple(checks)
+
+
 def _production_runtime_issues(config: RuntimeConfig) -> tuple[str, ...]:
     issues: list[str] = []
     if not is_production_environment(config.environment):
@@ -142,6 +229,48 @@ def _production_runtime_issues(config: RuntimeConfig) -> tuple[str, ...]:
     issues.extend(validate_strict_production(config))
     if config.payments_enabled and not config.telegram_provider_token.strip():
         issues.append("TELEGRAM_PROVIDER_TOKEN is required when payments are enabled in production.")
+    return _dedupe(issues)
+
+
+def _controlled_qa_runtime_issues(config: RuntimeConfig, env: Mapping[str, str]) -> tuple[str, ...]:
+    issues: list[str] = []
+    raw_environment = _normalized_env_value(env, "DIET_BOT_ENV")
+    if raw_environment is None:
+        issues.append(
+            "DIET_BOT_ENV must be set explicitly to controlled-qa, qa, staging, test, testing, "
+            "local, or development for controlled QA.",
+        )
+    elif is_production_environment(config.environment):
+        issues.append("DIET_BOT_ENV must not be production or prod for controlled QA.")
+    elif config.environment not in _CONTROLLED_QA_ENVIRONMENTS:
+        issues.append("DIET_BOT_ENV must identify a non-production QA environment for controlled QA.")
+
+    issues.extend(validate_startup(config))
+
+    if config.storage_backend != "postgres":
+        issues.append(
+            "Controlled QA requires DIET_BOT_STORAGE_BACKEND=postgres with an isolated non-production database.",
+        )
+    if not config.database_url:
+        issues.append("DIET_BOT_DATABASE_URL is required for controlled QA Postgres storage.")
+
+    payments_raw = _normalized_env_value(env, "DIET_BOT_PAYMENTS_ENABLED")
+    if payments_raw is not None and payments_raw not in _PAYMENTS_DISABLED_VALUES:
+        issues.append("DIET_BOT_PAYMENTS_ENABLED must be unset or disabled for controlled QA.")
+    if config.telegram_provider_token.strip():
+        issues.append("TELEGRAM_PROVIDER_TOKEN must be absent for controlled QA.")
+
+    if _normalized_env_value(env, _CONTROLLED_QA_BOT_TOKEN_MARKER_ENV) not in _CONTROLLED_QA_BOT_TOKEN_MARKERS:
+        issues.append(
+            f"{_CONTROLLED_QA_BOT_TOKEN_MARKER_ENV} must be set to test or sandbox for controlled QA.",
+        )
+    if _normalized_env_value(env, _CONTROLLED_QA_DATABASE_MARKER_ENV) not in _CONTROLLED_QA_DATABASE_MARKERS:
+        issues.append(
+            f"{_CONTROLLED_QA_DATABASE_MARKER_ENV} must be set to local, staging, test, testing, "
+            "throwaway, or sandbox for controlled QA.",
+        )
+    if not config.tester_chat_ids:
+        issues.append("DIET_BOT_TESTER_CHAT_IDS must contain at least one tester chat ID for controlled QA.")
     return _dedupe(issues)
 
 
@@ -222,6 +351,18 @@ def _secret_values(config: RuntimeConfig, env: Mapping[str, str]) -> frozenset[s
         env.get("TELEGRAM_PROVIDER_TOKEN"),
     }
     return frozenset(value for value in candidates if value and len(value) >= 4)
+
+
+def _normalized_env_value(env: Mapping[str, str], key: str) -> str | None:
+    value = env.get(key)
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _marker_status(env: Mapping[str, str], key: str) -> str:
+    return "set" if _normalized_env_value(env, key) else "missing"
 
 
 def _redact_text(text: str, secrets: frozenset[str]) -> str:
