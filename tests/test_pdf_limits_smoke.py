@@ -281,7 +281,7 @@ async def test_busy_weekly_pdf_slots_enqueue_next_user_without_consuming_waiting
     await asyncio.wait_for(first_started.wait(), timeout=1)
 
     second_task = asyncio.create_task(telegram_app._send_week_plan_with_access(second_message, profile_with()))
-    await asyncio.sleep(0)
+    await _wait_for_message_text(second_message)
 
     waiting_entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[second_chat_id]
     assert waiting_entitlement.monthly_weekly_pdf_remaining == 1
@@ -520,6 +520,14 @@ class FakeMessage:
 
     async def answer_document(self, **kwargs) -> None:
         self.documents.append(kwargs)
+
+
+async def _wait_for_message_text(message: FakeMessage, *, timeout: float = 1.0) -> None:
+    async def wait_until_text() -> None:
+        while not message.texts:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_text(), timeout=timeout)
 
 
 class FailingDocumentMessage(FakeMessage):
