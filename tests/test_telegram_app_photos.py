@@ -1607,8 +1607,27 @@ async def test_successful_payment_spool_append_failure_logs_critical_and_sends_s
 
     critical_records = [record for record in caplog.records if record.levelno >= logging.CRITICAL]
     assert critical_records
-    assert any(getattr(record, "telegram_payment_charge_id", None) == "tg-charge-critical" for record in critical_records)
-    assert not any("diet:order:v1" in record.getMessage() for record in critical_records)
+    extra_text = " ".join(
+        str(getattr(record, field, ""))
+        for record in critical_records
+        for field in (
+            "chat_id",
+            "user_id",
+            "order_id",
+            "telegram_payment_charge_id",
+            "provider_payment_charge_id",
+        )
+    )
+    rendered_messages = " ".join(record.getMessage() for record in critical_records)
+    assert any(
+        str(getattr(record, "telegram_payment_charge_id", "")).startswith("<redacted:")
+        for record in critical_records
+    )
+    assert "tg-charge-critical" not in extra_text
+    assert "order_12345678" not in extra_text
+    assert not any(getattr(record, "chat_id", None) == 202 for record in critical_records)
+    assert not any(getattr(record, "user_id", None) == 101 for record in critical_records)
+    assert "diet:order:v1" not in rendered_messages
     sent_text = message.texts[-1][0]
     assert "\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430" in sent_text
     assert "\u043f\u043e\u0434\u0434\u0435\u0440\u0436" in sent_text.lower()

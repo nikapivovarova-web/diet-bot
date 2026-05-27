@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -483,6 +484,45 @@ async def test_postgres_send_start_marker_failure_preserves_pre_upload_refund(mo
     assert runtime.job.refund_status == REFUND_STATUS_REFUNDED
     assert runtime.job.send_started_at is None
     assert runtime.job.delivered_at is None
+
+
+@pytest.mark.anyio
+async def test_postgres_send_start_marker_failure_logs_redacted_identifiers(monkeypatch, caplog) -> None:
+    chat_id = 201_117
+    events: list[tuple] = []
+    runtime = FakeWeeklyPdfRuntime(events=events)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+    _allow_weekly_pdf_preflight(monkeypatch)
+    caplog.set_level(logging.WARNING, logger=telegram_app.logger.name)
+
+    def fail_mark_send_started(job_id):
+        events.append(("send_started", job_id))
+        raise RuntimeError("send-start marker failed")
+
+    runtime.mark_send_started = fail_mark_send_started
+
+    async def fake_send_week_plan(*_args, **kwargs) -> bool:
+        try:
+            kwargs["on_document_send_started"]()
+        except RuntimeError:
+            return False
+        return True
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    await telegram_app._send_week_plan_with_access(
+        FakeMessage(chat_id),
+        profile_with(),
+        idempotency_key="idem-redacted-send-start-failure",
+    )
+
+    raw_job_id = str(runtime.job.job_id)
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(chat_id) not in rendered
+    assert raw_job_id not in rendered
+    assert "chat=<redacted:" in rendered or "chat_id=<redacted:" in rendered
+    assert "job=<redacted:" in rendered or "job_id=<redacted:" in rendered
 
 
 @pytest.mark.anyio

@@ -16,6 +16,7 @@ from .payment_recovery_spool import (
     PaymentRecoveryRecord,
     PaymentRecoveryRecordError,
 )
+from .log_redaction import redact_log_identifier
 from .payments import (
     ORDER_STATUS_GRANTED,
     ORDER_STATUS_PENDING,
@@ -882,8 +883,7 @@ def _redact_identifier(label: str, value: object | None) -> str | None:
     text = str(value).strip()
     if not text:
         return None
-    digest = hashlib.sha256(f"{label}:{text}".encode("utf-8")).hexdigest()
-    return f"redacted:{digest[:12]}"
+    return redact_log_identifier(label, text)
 
 
 def _safe_result_reason(reason: str | None) -> str | None:

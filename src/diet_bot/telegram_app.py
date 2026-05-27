@@ -102,6 +102,7 @@ from .runtime_config import (
     validate_startup,
     weekly_selection_diagnostics_enabled,
 )
+from .log_redaction import redact_log_fields, redact_log_identifier, redact_log_kv
 from .safety import evaluate_safety
 from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
 from .entitlement_service import EntitlementService
@@ -268,12 +269,7 @@ async def _load_profile_for_message_or_notice(message: Message) -> tuple[bool, U
 
 
 def _mask_chat_id(chat_id: int) -> str:
-    text = str(chat_id)
-    sign = "-" if text.startswith("-") else ""
-    digits = text[1:] if sign else text
-    if len(digits) <= 4:
-        return f"{sign}...{digits}"
-    return f"{sign}...{digits[-4:]}"
+    return redact_log_identifier("chat", chat_id)
 
 
 def _weekly_pdf_diag(
@@ -285,10 +281,10 @@ def _weekly_pdf_diag(
 ) -> None:
     safe_fields: dict[str, object] = {}
     if chat_id is not None:
-        safe_fields["chat_id"] = _mask_chat_id(chat_id)
+        safe_fields["chat_id"] = redact_log_identifier("chat", chat_id)
     if elapsed_s is not None:
         safe_fields["elapsed_s"] = f"{elapsed_s:.3f}"
-    safe_fields.update(fields)
+    safe_fields.update(redact_log_fields(fields))
     details = " ".join(f"{key}={value}" for key, value in safe_fields.items())
     logger.warning("weekly_pdf_diag event=%s %s", event, details)
 
@@ -2230,8 +2226,9 @@ def _finish_one_day_postgres_job_failure(
         runtime.finish_failure_and_refund_once(job_id, reason=reason)
     except Exception:
         logger.exception(
-            "Failed to finalize failed one-day generation Postgres job for chat_id=%s",
-            _mask_chat_id(chat_id),
+            "Failed to finalize failed one-day generation Postgres job %s %s",
+            redact_log_kv("chat", chat_id),
+            redact_log_kv("job", job_id),
         )
 
 
@@ -2552,9 +2549,9 @@ async def _send_week_plan_after_postgres_admission(
             result = runtime.mark_send_started(job.job_id)
         except Exception as exc:
             logger.exception(
-                "Failed to mark weekly PDF job send-start before Telegram upload chat_id=%s job_id=%s",
-                chat_id,
-                job.job_id,
+                "Failed to mark weekly PDF job send-start before Telegram upload %s %s",
+                redact_log_kv("chat", chat_id),
+                redact_log_kv("job", job.job_id),
             )
             _weekly_pdf_diag(
                 "postgres_mark_send_started_failed_before_upload",
@@ -2583,9 +2580,9 @@ async def _send_week_plan_after_postgres_admission(
         except Exception as exc:
             marker_error = type(exc).__name__
             logger.exception(
-                "Failed to mark weekly PDF job delivered after Telegram upload chat_id=%s job_id=%s",
-                chat_id,
-                job.job_id,
+                "Failed to mark weekly PDF job delivered after Telegram upload %s %s",
+                redact_log_kv("chat", chat_id),
+                redact_log_kv("job", job.job_id),
             )
             _weekly_pdf_diag(
                 "postgres_mark_delivered_failed_after_upload",
@@ -2598,9 +2595,9 @@ async def _send_week_plan_after_postgres_admission(
             except Exception as finish_exc:
                 logger.exception(
                     "Failed to finalize weekly PDF job as succeeded after delivered marker failure "
-                    "chat_id=%s job_id=%s",
-                    chat_id,
-                    job.job_id,
+                    "%s %s",
+                    redact_log_kv("chat", chat_id),
+                    redact_log_kv("job", job.job_id),
                 )
                 _weekly_pdf_diag(
                     "postgres_finish_success_failed_after_mark_delivered_failed",
@@ -2669,8 +2666,12 @@ def _finish_postgres_job_failure(
     try:
         runtime.finish_failure_and_refund_once(job.job_id, reason=reason)
     except Exception:
-        logger.exception("Failed to finalize failed weekly PDF Postgres job")
-        _weekly_pdf_diag("postgres_finish_failure_failed", chat_id=chat_id, reason=reason)
+        logger.exception(
+            "Failed to finalize failed weekly PDF Postgres job %s %s",
+            redact_log_kv("chat", chat_id),
+            redact_log_kv("job", job.job_id),
+        )
+        _weekly_pdf_diag("postgres_finish_failure_failed", chat_id=chat_id, job_id=str(job.job_id), reason=reason)
 
 
 async def _send_week_plan_after_queue_admission(
@@ -4820,7 +4821,7 @@ def _payment_recovery_log_extra(
     exc: PaymentLedgerUnavailable,
     record: PaymentRecoveryRecord | None,
 ) -> dict[str, object]:
-    return {
+    return redact_log_fields({
         "record_id": record.record_id if record is not None else None,
         "payment_provider": record.provider if record is not None else _payment_provider_for_payment(payment),
         "chat_id": int(message.chat.id),
@@ -4829,7 +4830,7 @@ def _payment_recovery_log_extra(
         "telegram_payment_charge_id": getattr(payment, "telegram_payment_charge_id", None),
         "provider_payment_charge_id": getattr(payment, "provider_payment_charge_id", None),
         "ledger_failure_reason": exc.reason,
-    }
+    })
 
 
 def _payment_order_id_for_log(invoice_payload: object) -> str | None:
