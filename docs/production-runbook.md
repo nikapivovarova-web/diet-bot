@@ -284,11 +284,29 @@ below use placeholders only.
      --apply
    ```
 
-7. Keep payment ledger migrations dormant and optional while payments are off.
+7. Apply one-day generation job migrations explicitly.
 
-   Payment ledger tables are not required for this cutover with payments
-   disabled. Treat any payment ledger migration, provider-token setup, or live
-   payment behavior as a separate approved payment change.
+   ```powershell
+   @'
+   from diet_bot.postgres_one_day_generation_job_store import PostgresOneDayGenerationJobStore
+
+   PostgresOneDayGenerationJobStore("<postgres-dsn>").initialize()
+   '@ | .\.venv\Scripts\python.exe -
+   ```
+
+8. Apply payment ledger migrations with payments still disabled.
+
+   ```powershell
+   @'
+   from diet_bot.postgres_payment_store import PostgresPaymentStore
+
+   PostgresPaymentStore("<postgres-dsn>").initialize()
+   '@ | .\.venv\Scripts\python.exe -
+   ```
+
+   This prepares the ledger schema for production preflight and future payment
+   enablement. It does not enable live payments, does not require
+   `TELEGRAM_PROVIDER_TOKEN`, and does not call Telegram or a payment provider.
 
 ## Healthcheck And Preflight Order
 
@@ -310,6 +328,56 @@ schema/data migrations above are complete.
 Bot startup validates runtime configuration and Postgres schema readiness. It
 must fail fast if required production config or schema is missing. Startup does
 not apply migrations.
+
+## Production Preflight CLI
+
+Run the production preflight after the required migrations and data imports are
+complete, but before any deploy/start/restart action and before starting a
+Telegram poller.
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.ops.production_preflight
+```
+
+The command is safe to run from an operator shell with production configuration
+loaded through the approved secret manager. It never starts the bot runtime,
+never starts polling, never creates a Telegram `Bot`, never calls Telegram API
+methods such as `getUpdates`, and never calls a payment provider.
+
+The preflight proves:
+
+- strict production runtime configuration is present;
+- `DIET_BOT_ENV` is `production` or `prod`;
+- Postgres connectivity works with `DIET_BOT_DATABASE_URL`;
+- entitlements, chat state, weekly PDF jobs, one-day generation jobs, and
+  payment ledger schema/migration expectations are present;
+- payment recovery spool readiness when payments are enabled or
+  `DIET_BOT_PAYMENT_RECOVERY_SPOOL` is configured;
+- the Postgres single-poller advisory guard can be acquired and released.
+
+The preflight intentionally does not prove:
+
+- Telegram bot token validity against Telegram servers;
+- webhook/polling behavior or `getUpdates` behavior;
+- support chat reachability or privacy URL public reachability;
+- payment provider credentials or live payment authorization;
+- that migrations should be applied automatically.
+
+Output is operator-oriented `PASS`/`FAIL`/`SKIP` text and must not contain full
+DSNs, bot tokens, provider tokens, payment payloads, raw chat IDs, or raw payment
+identifiers. A failure exits nonzero and should be treated as a startup blocker
+until the listed remediation is complete.
+
+When `DIET_BOT_PAYMENTS_ENABLED=1`, the preflight requires
+`TELEGRAM_PROVIDER_TOKEN` to be structurally present because production payment
+UI includes provider-backed card payment paths. It only checks presence and does
+not print or use the token. Keep payments disabled and leave the provider token
+unset unless payment enablement is explicitly approved.
+
+The payment recovery spool check may create same-directory probe files and may
+create an empty configured spool file if it does not already exist. The
+single-poller guard check briefly acquires the configured Postgres advisory lock
+and releases it before the command exits.
 
 ## Weekly PDF Manual-Review Report
 
@@ -427,14 +495,16 @@ Run exactly one long-polling bot process for a bot token.
 3. Apply entitlement migrations.
 4. Dry-run and then apply the JSON entitlement import.
 5. Apply weekly PDF job migrations.
-6. Apply chat state schema migrations.
-7. Dry-run and then apply the JSON history/chat-state import.
-8. Leave payment ledger migrations dormant unless separately approved.
-9. Run strict production healthcheck.
-10. Confirm only one poller will run.
-11. Stop the old poller.
-12. Start the new poller once.
-13. Monitor process logs and health signals.
+6. Apply one-day generation job migrations.
+7. Apply chat state schema migrations.
+8. Dry-run and then apply the JSON history/chat-state import.
+9. Apply payment ledger migrations with payments still disabled.
+10. Run strict production healthcheck.
+11. Run production preflight.
+12. Confirm only one poller will run.
+13. Stop the old poller.
+14. Start the new poller once.
+15. Monitor process logs and health signals.
 
 Do not use Telegram API calls or manual Telegram QA as part of this sequence
 unless that QA is separately approved.
