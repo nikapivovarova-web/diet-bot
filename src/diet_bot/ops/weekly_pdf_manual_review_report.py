@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -9,6 +8,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol, TextIO
 
+from diet_bot.log_redaction import stable_identifier_hash
 from diet_bot.weekly_pdf_jobs import WeeklyPdfJob
 
 
@@ -195,8 +195,7 @@ def _format_datetime(value: datetime | None) -> str:
 
 
 def _chat_id_hash(chat_id: int) -> str:
-    digest = hashlib.sha256(str(int(chat_id)).encode("utf-8")).hexdigest()[:16]
-    return f"chat:sha256:{digest}"
+    return stable_identifier_hash("chat", int(chat_id))
 
 
 class _ParserExit(Exception):

@@ -452,6 +452,10 @@ Rollback depends on whether the new poller has processed production traffic.
 ## Operator Safety Notes
 
 - Never print bot tokens, provider tokens, or database DSNs in tickets, chat, logs, or pull requests.
+- Production logs must not contain raw Telegram chat/user IDs, payment order IDs,
+  Telegram/provider charge IDs, or job IDs. Use the centralized redacted
+  fingerprints for correlation; raw identifiers belong only in access-controlled
+  database rows or reviewed recovery tools.
 - Do not put production DSNs or provider tokens into README examples.
 - Use a unique entitlement `--migration-id` for each attempted import.
 - Use a unique history/chat-state `--migration-id` for each attempted import.

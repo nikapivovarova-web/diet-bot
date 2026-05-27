@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -46,6 +47,21 @@ def isolated_telegram_state(monkeypatch, tmp_path):
     telegram_app.RECENT_RECIPE_IDS_BY_CHAT_ID.clear()
     telegram_app.RECENT_RECIPE_KEYS_BY_CHAT_ID.clear()
     telegram_app._configure_weekly_pdf_concurrency(telegram_app.DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY)
+
+
+def test_weekly_pdf_diag_redacts_chat_and_job_identifiers(caplog) -> None:
+    chat_id = 201_014
+    job_id = "7d0e1a90-37cc-4922-a6af-7f452ea92174"
+    caplog.set_level(logging.WARNING, logger=telegram_app.logger.name)
+
+    telegram_app._weekly_pdf_diag("marker_failed", chat_id=chat_id, job_id=job_id, status="failed")
+
+    message = caplog.records[-1].getMessage()
+    assert str(chat_id) not in message
+    assert job_id not in message
+    assert "chat_id=<redacted:" in message
+    assert "job_id=<redacted:" in message
+    assert "status=failed" in message
 
 
 @pytest.mark.anyio
@@ -375,7 +391,7 @@ async def test_postgres_history_save_failure_after_pdf_delivery_is_best_effort(m
 
 
 @pytest.mark.anyio
-async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refundable(monkeypatch) -> None:
+async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refundable(monkeypatch, caplog) -> None:
     chat_id = 201_014
     events: list[tuple] = []
     diag_events: list[tuple[str, dict[str, object]]] = []
@@ -387,6 +403,7 @@ async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refun
         "_weekly_pdf_diag",
         lambda event, **fields: diag_events.append((event, fields)),
     )
+    caplog.set_level(logging.ERROR, logger=telegram_app.logger.name)
     _allow_weekly_pdf_preflight(monkeypatch)
 
     def fail_mark_delivered(job_id):
@@ -433,6 +450,11 @@ async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refun
         )
         in diag_events
     )
+    error_messages = [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR]
+    assert error_messages
+    assert not any(str(chat_id) in message for message in error_messages)
+    assert not any(str(runtime.job.job_id) in message for message in error_messages)
+    assert any("<redacted:" in message for message in error_messages)
 
 
 @pytest.mark.anyio
