@@ -69,6 +69,10 @@ def create_payment_store(config: RuntimeConfig | None = None):
             "DIET_BOT_DATABASE_URL is required when payments are enabled.",
         )
 
+    from .postgres_connection import get_shared_postgres_connection_provider
     from .postgres_payment_store import PostgresPaymentStore
 
-    return PostgresPaymentStore(runtime_config.database_url)
+    return PostgresPaymentStore(
+        runtime_config.database_url,
+        connection_provider=get_shared_postgres_connection_provider(runtime_config),
+    )

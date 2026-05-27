@@ -63,7 +63,7 @@ def test_postgres_runtime_factory_constructs_store_without_initializing(monkeypa
     fake_module = types.ModuleType("diet_bot.postgres_weekly_pdf_job_store")
 
     class FakePostgresWeeklyPdfJobStore:
-        def __init__(self, dsn: str) -> None:
+        def __init__(self, dsn: str, **_kwargs) -> None:
             calls.append(("construct", dsn))
 
         def initialize(self) -> None:
@@ -98,7 +98,7 @@ def test_postgres_startup_validation_validates_schema_without_initializing(monke
     fake_module = types.ModuleType("diet_bot.postgres_weekly_pdf_job_store")
 
     class FakePostgresWeeklyPdfJobStore:
-        def __init__(self, dsn: str) -> None:
+        def __init__(self, dsn: str, **_kwargs) -> None:
             calls.append(("construct", dsn))
 
         def initialize(self) -> None:
@@ -134,7 +134,7 @@ def test_postgres_startup_validation_wraps_schema_failure(monkeypatch) -> None:
     fake_module = types.ModuleType("diet_bot.postgres_weekly_pdf_job_store")
 
     class FakePostgresWeeklyPdfJobStore:
-        def __init__(self, _dsn: str) -> None:
+        def __init__(self, _dsn: str, **_kwargs) -> None:
             pass
 
         def initialize(self) -> None:

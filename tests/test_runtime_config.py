@@ -238,6 +238,49 @@ def test_postgres_backend_requires_database_url() -> None:
     assert any("DIET_BOT_DATABASE_URL is required for postgres storage" in issue for issue in validate_startup(config))
 
 
+def test_postgres_pool_config_defaults_to_direct_connections() -> None:
+    config = load_runtime_config({})
+
+    assert config.postgres_pool_enabled is False
+    assert config.postgres_connect_timeout == 5
+    assert config.postgres_pool_min_size == 1
+    assert config.postgres_pool_max_size == 4
+    assert config.postgres_pool_timeout == 5.0
+
+
+def test_postgres_pool_config_accepts_conservative_overrides() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_POSTGRES_POOL_ENABLED": "true",
+            "DIET_BOT_POSTGRES_CONNECT_TIMEOUT_SECONDS": "3",
+            "DIET_BOT_POSTGRES_POOL_MIN_SIZE": "0",
+            "DIET_BOT_POSTGRES_POOL_MAX_SIZE": "2",
+            "DIET_BOT_POSTGRES_POOL_TIMEOUT_SECONDS": "1.5",
+        },
+    )
+
+    assert config.postgres_pool_enabled is True
+    assert config.postgres_connect_timeout == 3
+    assert config.postgres_pool_min_size == 0
+    assert config.postgres_pool_max_size == 2
+    assert config.postgres_pool_timeout == 1.5
+    assert validate_startup(config) == ("Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN.",)
+
+
+def test_postgres_pool_config_reports_invalid_sizes() -> None:
+    config = load_runtime_config(
+        {
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_POSTGRES_POOL_MIN_SIZE": "5",
+            "DIET_BOT_POSTGRES_POOL_MAX_SIZE": "2",
+        },
+    )
+
+    issues = validate_startup(config)
+
+    assert any("DIET_BOT_POSTGRES_POOL_MAX_SIZE" in issue for issue in issues)
+
+
 def test_production_requires_database_url() -> None:
     config = load_runtime_config(
         {

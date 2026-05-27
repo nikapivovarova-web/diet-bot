@@ -64,7 +64,7 @@ def test_postgres_runtime_from_config_constructs_store(monkeypatch) -> None:
     fake_module = types.ModuleType("diet_bot.postgres_one_day_generation_job_store")
 
     class FakePostgresOneDayGenerationJobStore:
-        def __init__(self, dsn: str) -> None:
+        def __init__(self, dsn: str, **_kwargs) -> None:
             calls.append(("construct", dsn))
 
     fake_module.PostgresOneDayGenerationJobStore = FakePostgresOneDayGenerationJobStore
@@ -195,7 +195,7 @@ def test_postgres_startup_validation_validates_schema_without_initializing(monke
     fake_module = types.ModuleType("diet_bot.postgres_one_day_generation_job_store")
 
     class FakePostgresOneDayGenerationJobStore:
-        def __init__(self, dsn: str) -> None:
+        def __init__(self, dsn: str, **_kwargs) -> None:
             calls.append(("construct", dsn))
 
         def initialize(self) -> None:
@@ -229,7 +229,7 @@ def test_postgres_startup_validation_wraps_schema_failure(monkeypatch) -> None:
     fake_module = types.ModuleType("diet_bot.postgres_one_day_generation_job_store")
 
     class FakePostgresOneDayGenerationJobStore:
-        def __init__(self, _dsn: str) -> None:
+        def __init__(self, _dsn: str, **_kwargs) -> None:
             pass
 
         def initialize(self) -> None:

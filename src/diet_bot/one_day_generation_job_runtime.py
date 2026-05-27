@@ -186,6 +186,10 @@ def _create_postgres_one_day_generation_job_store(config: object):
     if not database_url:
         raise RuntimeError("DIET_BOT_DATABASE_URL is required for one-day generation Postgres jobs.")
 
+    from .postgres_connection import get_shared_postgres_connection_provider
     from .postgres_one_day_generation_job_store import PostgresOneDayGenerationJobStore
 
-    return PostgresOneDayGenerationJobStore(str(database_url))
+    return PostgresOneDayGenerationJobStore(
+        str(database_url),
+        connection_provider=get_shared_postgres_connection_provider(config),
+    )

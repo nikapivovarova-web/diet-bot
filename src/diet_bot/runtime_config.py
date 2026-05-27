@@ -30,6 +30,11 @@ class RuntimeConfig:
     payments_enabled: bool
     telegram_provider_token: str
     database_url: str | None
+    postgres_pool_enabled: bool
+    postgres_connect_timeout: int
+    postgres_pool_min_size: int
+    postgres_pool_max_size: int
+    postgres_pool_timeout: float
     state_file: Path
     subscriptions_state_file: Path
     promo_codes_state_file: Path
@@ -52,6 +57,11 @@ class RuntimeConfig:
             "telegram_provider_token": "set" if self.telegram_provider_token else "missing",
             "database_url": "set" if self.database_url else "missing",
             "database_url_present": bool(self.database_url),
+            "postgres_pool_enabled": self.postgres_pool_enabled,
+            "postgres_connect_timeout": self.postgres_connect_timeout,
+            "postgres_pool_min_size": self.postgres_pool_min_size,
+            "postgres_pool_max_size": self.postgres_pool_max_size,
+            "postgres_pool_timeout": self.postgres_pool_timeout,
             "state_file": str(self.state_file),
             "subscriptions_state_file": str(self.subscriptions_state_file),
             "promo_codes_state_file": str(self.promo_codes_state_file),
@@ -110,7 +120,43 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
     source = os.environ if env is None else env
     bot_token, bot_token_source = _bot_token_from_env(source)
     environment = _environment_from_env(source)
-    storage_backend, config_errors = _storage_backend_from_env(source, environment)
+    storage_backend, storage_config_errors = _storage_backend_from_env(source, environment)
+    postgres_connect_timeout, connect_timeout_errors = _int_from_env(
+        source,
+        "DIET_BOT_POSTGRES_CONNECT_TIMEOUT_SECONDS",
+        5,
+        minimum=1,
+    )
+    postgres_pool_min_size, pool_min_errors = _int_from_env(
+        source,
+        "DIET_BOT_POSTGRES_POOL_MIN_SIZE",
+        1,
+        minimum=0,
+    )
+    postgres_pool_max_size, pool_max_errors = _int_from_env(
+        source,
+        "DIET_BOT_POSTGRES_POOL_MAX_SIZE",
+        4,
+        minimum=1,
+    )
+    postgres_pool_timeout, pool_timeout_errors = _float_from_env(
+        source,
+        "DIET_BOT_POSTGRES_POOL_TIMEOUT_SECONDS",
+        5.0,
+        minimum=0.1,
+    )
+    postgres_config_errors = (
+        storage_config_errors
+        + connect_timeout_errors
+        + pool_min_errors
+        + pool_max_errors
+        + pool_timeout_errors
+    )
+    if postgres_pool_max_size < postgres_pool_min_size:
+        postgres_config_errors += (
+            "DIET_BOT_POSTGRES_POOL_MAX_SIZE must be greater than or equal to "
+            "DIET_BOT_POSTGRES_POOL_MIN_SIZE.",
+        )
     state_file = _path_from_env(source, "DIET_BOT_STATE_FILE", DEFAULT_STATE_FILE)
     subscriptions_state_file = _path_from_env(
         source,
@@ -135,6 +181,11 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         payments_enabled=_text_from_env(source, "DIET_BOT_PAYMENTS_ENABLED") == "1",
         telegram_provider_token=_text_from_env(source, "TELEGRAM_PROVIDER_TOKEN") or "",
         database_url=_text_from_env(source, "DIET_BOT_DATABASE_URL"),
+        postgres_pool_enabled=_bool_from_env(source, "DIET_BOT_POSTGRES_POOL_ENABLED"),
+        postgres_connect_timeout=postgres_connect_timeout,
+        postgres_pool_min_size=postgres_pool_min_size,
+        postgres_pool_max_size=postgres_pool_max_size,
+        postgres_pool_timeout=postgres_pool_timeout,
         state_file=state_file,
         subscriptions_state_file=subscriptions_state_file,
         promo_codes_state_file=promo_codes_state_file,
@@ -146,7 +197,7 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         weekly_selection_diagnostics_enabled=weekly_selection_diagnostics_enabled(source),
         privacy_policy_url=_text_from_env(source, "DIET_BOT_PRIVACY_POLICY_URL"),
         storage_backend=storage_backend,
-        config_errors=config_errors,
+        config_errors=postgres_config_errors,
     )
 
 
@@ -166,6 +217,49 @@ def weekly_selection_diagnostics_enabled(env: Mapping[str, str] | None = None) -
     source = os.environ if env is None else env
     raw = _text_from_env(source, "DIET_BOT_WEEKLY_SELECTION_DIAG")
     return bool(raw and raw.lower() in _TRUTHY_VALUES)
+
+
+def _bool_from_env(env: Mapping[str, str], key: str) -> bool:
+    raw = _text_from_env(env, key)
+    return bool(raw and raw.lower() in _TRUTHY_VALUES)
+
+
+def _int_from_env(
+    env: Mapping[str, str],
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+) -> tuple[int, tuple[str, ...]]:
+    raw = _text_from_env(env, key)
+    if raw is None:
+        return default, ()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default, (f"{key} must be an integer greater than or equal to {minimum}.",)
+    if value < minimum:
+        return default, (f"{key} must be an integer greater than or equal to {minimum}.",)
+    return value, ()
+
+
+def _float_from_env(
+    env: Mapping[str, str],
+    key: str,
+    default: float,
+    *,
+    minimum: float,
+) -> tuple[float, tuple[str, ...]]:
+    raw = _text_from_env(env, key)
+    if raw is None:
+        return default, ()
+    try:
+        value = float(raw)
+    except ValueError:
+        return default, (f"{key} must be greater than or equal to {minimum:g}.",)
+    if value < minimum:
+        return default, (f"{key} must be greater than or equal to {minimum:g}.",)
+    return value, ()
 
 
 def parse_id_set(raw: str | None) -> set[int]:

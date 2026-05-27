@@ -23,9 +23,13 @@ def create_chat_state_store(config: RuntimeConfig) -> ChatStateStore:
     if config.storage_backend == "postgres":
         if not config.database_url:
             raise RuntimeError("DIET_BOT_DATABASE_URL is required for postgres storage.")
+        from .postgres_connection import get_shared_postgres_connection_provider
         from .postgres_chat_state_store import PostgresChatStateStore
 
-        return PostgresChatStateStore(config.database_url)
+        return PostgresChatStateStore(
+            config.database_url,
+            connection_provider=get_shared_postgres_connection_provider(config),
+        )
 
     raise RuntimeError(f"Unsupported chat state storage backend: {config.storage_backend!r}.")
 

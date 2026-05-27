@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -22,6 +21,7 @@ from .payments import (
 )
 from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
 from .postgres_payment_migrations import MIGRATIONS, run_payment_schema_migrations
+from .postgres_connection import DirectPostgresConnectionProvider, PostgresConnectionProvider
 from .postgres_schema_validation import (
     SCHEMA_MIGRATIONS_COLUMNS,
     PostgresSchemaExpectation,
@@ -103,12 +103,20 @@ class PostgresPaymentStore:
         connect_attempts: int = 3,
         retry_base_delay: float = 0.2,
         retry_max_delay: float = 1.0,
+        connection_provider: PostgresConnectionProvider | None = None,
     ) -> None:
         self.dsn = dsn
         self.connect_timeout = connect_timeout
         self.connect_attempts = max(1, connect_attempts)
         self.retry_base_delay = retry_base_delay
         self.retry_max_delay = retry_max_delay
+        self._connection_provider = connection_provider or DirectPostgresConnectionProvider(
+            dsn,
+            connect_timeout=connect_timeout,
+            connect_attempts=self.connect_attempts,
+            retry_base_delay=retry_base_delay,
+            retry_max_delay=retry_max_delay,
+        )
 
     def initialize(self) -> None:
         with self._connect() as conn:
@@ -452,29 +460,10 @@ class PostgresPaymentStore:
         return _order_from_row(row)
 
     def _connect(self):
-        try:
-            import psycopg
-            from psycopg.rows import dict_row
-        except ImportError as exc:
-            raise RuntimeError("Install PostgreSQL driver with `pip install psycopg[binary]`.") from exc
+        return self._connection_provider.connect()
 
-        last_error: Exception | None = None
-        for attempt in range(1, self.connect_attempts + 1):
-            try:
-                return psycopg.connect(
-                    self.dsn,
-                    row_factory=dict_row,
-                    connect_timeout=self.connect_timeout,
-                )
-            except psycopg.OperationalError as exc:
-                last_error = exc
-                if attempt >= self.connect_attempts:
-                    break
-                delay = min(self.retry_max_delay, self.retry_base_delay * (2 ** (attempt - 1)))
-                time.sleep(delay)
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Could not connect to PostgreSQL.")
+    def close(self) -> None:
+        self._connection_provider.close()
 
 
 def _grant_entitlement_cur(
