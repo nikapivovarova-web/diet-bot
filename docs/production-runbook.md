@@ -232,6 +232,25 @@ generated disposable database. The drill prints sanitized JSON only: it reports
 env var names, generated database names, backup file metadata, and table counts,
 never raw DSNs, passwords, Telegram tokens, profile JSON, or payment payloads.
 
+Recommended backup posture:
+
+- Keep managed Postgres backups with point-in-time recovery enabled where the
+  provider supports it.
+- Keep at least daily custom-format logical backups for 30 days, plus an extra
+  backup immediately before migrations, payment enablement, cutover, or manual
+  recovery work.
+- Keep monthly evidence snapshots for 90 days during the launch window.
+- Store backup artifacts and sanitized drill JSON together in operator-owned
+  storage with access limited to the production operations group.
+
+Restore drill frequency:
+
+- Run before mass launch acceptance.
+- Run monthly after launch.
+- Run after any schema migration, backup tooling change, restore tooling
+  change, or incident involving entitlement, payment, chat, weekly PDF, or
+  one-day generation data.
+
 The machine running the drill must have PostgreSQL client tools installed:
 `pg_dump` for backup and `createdb`, `pg_restore`, and `dropdb` for restore.
 The scripts discover these tools from `PATH`, including Windows `.exe` and
@@ -260,28 +279,66 @@ Run the restore drill with an admin URL that is allowed to create and drop only
 the generated drill database. The restore target name is generated with a
 `diet_bot_restore_drill_` marker and is dropped by default.
 
-```powershell
-$env:DIET_BOT_RESTORE_ADMIN_DATABASE_URL = "<postgres-admin-dsn>"
-.\.venv\Scripts\python.exe .\scripts\ops\postgres_restore_drill.py `
-  --backup-file ".\ops-backups\diet-bot-postgres-backup-YYYYMMDDTHHMMSSZ.dump" `
-  --admin-url-env DIET_BOT_RESTORE_ADMIN_DATABASE_URL
-```
-
-For a source-to-restore row-count comparison, freeze writes first and keep them
-frozen until the backup and comparison finish. Without frozen writes, row-count
+For production acceptance evidence, use the source-to-restore row-count
+comparison command below. Freeze writes first and keep them frozen until the
+backup, restore, and comparison finish. Without frozen writes, row-count
 differences can reflect normal traffic rather than restore failure.
 
 ```powershell
+$env:DIET_BOT_RESTORE_ADMIN_DATABASE_URL = "<postgres-admin-dsn>"
 .\.venv\Scripts\python.exe .\scripts\ops\postgres_restore_drill.py `
   --backup-file ".\ops-backups\diet-bot-postgres-backup-YYYYMMDDTHHMMSSZ.dump" `
   --admin-url-env DIET_BOT_RESTORE_ADMIN_DATABASE_URL `
   --compare-source-url-env DIET_BOT_BACKUP_DATABASE_URL
 ```
 
+The required table set is fail-closed. Every table must exist in the restored
+database. With `--compare-source-url-env`, every required table's restored row
+count must match the source row count. Required tables may have zero rows, but
+zero must be explicit on both sides of the comparison.
+
+Required restore coverage:
+
+- `schema_migrations`
+- `entitlements`
+- `entitlement_processed_charge_ids`
+- `entitlement_json_import_runs`
+- `weekly_pdf_jobs`
+- `chat_profiles`
+- `chat_recipe_history`
+- `chat_state_json_import_runs`
+- `one_day_generation_jobs`
+- `one_day_generation_job_value_messages`
+- `payment_orders`
+- `payment_charges`
+- `payment_events`
+
+If the drill reports a missing required table, restore verification failed. If
+the comparison reports a row-count mismatch, restore verification failed unless
+an operator explicitly documents why writes were not frozen or why the
+difference is expected. Do not use a failed drill as launch evidence. Stop
+cutover or payment enablement work, keep the backup and sanitized JSON output,
+and investigate the backup, migration, and restore process before trying again.
+
+`--allow-row-count-mismatch` exists only as an explicit waiver for a documented
+operator exception. It requires `--compare-source-url-env`, records the waiver
+in JSON, and is not acceptable for mass-launch restore evidence unless the
+release owner approves the exception in writing.
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\ops\postgres_restore_drill.py `
+  --backup-file ".\ops-backups\diet-bot-postgres-backup-YYYYMMDDTHHMMSSZ.dump" `
+  --admin-url-env DIET_BOT_RESTORE_ADMIN_DATABASE_URL `
+  --compare-source-url-env DIET_BOT_BACKUP_DATABASE_URL `
+  --allow-row-count-mismatch
+```
+
 Safety rules:
 
 - Do not restore into any existing, production, or manually named database.
 - Use `--keep-restore-db` only for supervised inspection, then drop the generated drill database manually.
+- Do not restore to production without an explicit, written approval path,
+  named operator, reviewed backup artifact, and rollback plan.
 - Do not run migrations, deploys, restarts, bot startup, Telegram API calls, or payment actions as part of this drill.
 - Keep the sanitized JSON summaries with the backup artifact for audit.
 
