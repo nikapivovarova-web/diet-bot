@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiogram.methods import SendDocument
 
 from diet_bot.weekly_pdf_job_runtime import (
     WeeklyPdfDelivery,
@@ -15,6 +17,7 @@ from diet_bot.weekly_pdf_job_runtime import (
     WeeklyPdfWorker,
     WeeklyPdfWorkerSettings,
 )
+from diet_bot.telegram_send import TelegramSendLimiter, TelegramSendSettings, safe_telegram_send
 from diet_bot.weekly_pdf_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus,
@@ -456,6 +459,184 @@ async def test_worker_send_started_failure_requires_manual_review_without_refund
     assert saved.send_started_at is not None
     assert store.quota_by_chat_id[88] == 0
     assert ("mark_retryable_failure", admitted.job_id) not in store.calls
+
+
+@pytest.mark.anyio
+async def test_worker_retryable_telegram_upload_succeeds_and_marks_delivered_once() -> None:
+    store = _InMemoryWeeklyPdfJobStore(default_quota=1)
+    runtime = WeeklyPdfJobRuntime(store)
+    admitted = runtime.admit_queued(
+        chat_id=91,
+        idempotency_key="weekly-retryable-upload",
+        request_snapshot=_weekly_snapshot(91),
+    ).job
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    class RetryableUploadProcessor:
+        async def prepare_delivery(self, job: WeeklyPdfJob) -> WeeklyPdfDelivery:
+            async def send(on_send_started, on_delivered) -> bool:
+                nonlocal attempts
+                on_send_started()
+
+                async def telegram_upload() -> None:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise TelegramRetryAfter(
+                            method=SendDocument(chat_id=job.chat_id, document="file-id"),
+                            message="flood control",
+                            retry_after=3,
+                        )
+
+                await safe_telegram_send(
+                    telegram_upload,
+                    operation_name="weekly_pdf_upload",
+                    settings=TelegramSendSettings(max_attempts=3, jitter_ratio=0),
+                    limiter=TelegramSendLimiter(concurrency=1),
+                    sleep=sleep,
+                )
+                on_delivered()
+                return True
+
+            return WeeklyPdfDelivery(send=send)
+
+    worker = WeeklyPdfWorker(
+        runtime,
+        RetryableUploadProcessor(),
+        WeeklyPdfWorkerSettings(worker_id="weekly-worker-a", concurrency=1, max_attempts=1),
+    )
+
+    processed = await worker.run_once()
+    saved = store.jobs_by_id[admitted.job_id]
+
+    assert processed == 1
+    assert attempts == 2
+    assert sleeps == [3.0]
+    assert saved.status == JOB_STATUS_SUCCEEDED
+    assert saved.delivery_status == "delivered"
+    assert store.calls.count(("mark_delivered", admitted.job_id)) == 1
+
+
+@pytest.mark.anyio
+async def test_worker_retry_exhaustion_after_send_start_requires_manual_review_without_refund() -> None:
+    store = _InMemoryWeeklyPdfJobStore(default_quota=1)
+    runtime = WeeklyPdfJobRuntime(store)
+    admitted = runtime.admit_queued(
+        chat_id=92,
+        idempotency_key="weekly-upload-exhausted",
+        request_snapshot=_weekly_snapshot(92),
+    ).job
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    class ExhaustingUploadProcessor:
+        async def prepare_delivery(self, job: WeeklyPdfJob) -> WeeklyPdfDelivery:
+            async def send(on_send_started, on_delivered) -> bool:
+                nonlocal attempts
+                on_send_started()
+
+                async def telegram_upload() -> None:
+                    nonlocal attempts
+                    attempts += 1
+                    raise TelegramNetworkError(
+                        method=SendDocument(chat_id=job.chat_id, document="file-id"),
+                        message="temporary network error",
+                    )
+
+                await safe_telegram_send(
+                    telegram_upload,
+                    operation_name="weekly_pdf_upload",
+                    settings=TelegramSendSettings(
+                        max_attempts=2,
+                        base_backoff_seconds=0.5,
+                        jitter_ratio=0,
+                    ),
+                    limiter=TelegramSendLimiter(concurrency=1),
+                    sleep=sleep,
+                )
+                on_delivered()
+                return True
+
+            return WeeklyPdfDelivery(send=send)
+
+    worker = WeeklyPdfWorker(
+        runtime,
+        ExhaustingUploadProcessor(),
+        WeeklyPdfWorkerSettings(worker_id="weekly-worker-a", concurrency=1, max_attempts=1),
+    )
+
+    processed = await worker.run_once()
+    saved = store.jobs_by_id[admitted.job_id]
+
+    assert processed == 1
+    assert attempts == 2
+    assert sleeps == [0.5]
+    assert saved.status == JOB_STATUS_SUCCEEDED
+    assert saved.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert saved.delivery_status == "unknown"
+    assert saved.requires_manual_review is True
+    assert saved.delivered_at is None
+    assert ("mark_delivered", admitted.job_id) not in store.calls
+    assert ("mark_retryable_failure", admitted.job_id) not in store.calls
+
+
+@pytest.mark.anyio
+async def test_worker_rate_limit_burst_rehearsal_bounds_concurrent_uploads() -> None:
+    store = _InMemoryWeeklyPdfJobStore(default_quota=1)
+    runtime = WeeklyPdfJobRuntime(store)
+    for chat_id in range(200, 230):
+        runtime.admit_queued(
+            chat_id=chat_id,
+            idempotency_key=f"burst-upload:{chat_id}",
+            request_snapshot=_weekly_snapshot(chat_id),
+        )
+    limiter = TelegramSendLimiter(concurrency=3)
+
+    class BurstUploadProcessor:
+        def __init__(self) -> None:
+            self.active_uploads = 0
+            self.max_active_uploads = 0
+
+        async def prepare_delivery(self, job: WeeklyPdfJob) -> WeeklyPdfDelivery:
+            async def send(on_send_started, on_delivered) -> bool:
+                on_send_started()
+
+                async def telegram_upload() -> None:
+                    self.active_uploads += 1
+                    self.max_active_uploads = max(self.max_active_uploads, self.active_uploads)
+                    await asyncio.sleep(0)
+                    self.active_uploads -= 1
+
+                await safe_telegram_send(
+                    telegram_upload,
+                    operation_name="weekly_pdf_burst_upload",
+                    settings=TelegramSendSettings(max_attempts=1, jitter_ratio=0),
+                    limiter=limiter,
+                )
+                on_delivered()
+                return True
+
+            return WeeklyPdfDelivery(send=send)
+
+    processor = BurstUploadProcessor()
+    worker = WeeklyPdfWorker(
+        runtime,
+        processor,
+        WeeklyPdfWorkerSettings(worker_id="weekly-worker-a", concurrency=10, max_attempts=1),
+    )
+
+    processed = await worker.run_until_empty(max_batches=10)
+
+    assert processed == 30
+    assert processor.max_active_uploads <= 3
+    assert all(job.delivery_status == "delivered" for job in store.jobs_by_id.values())
 
 
 @pytest.mark.anyio
