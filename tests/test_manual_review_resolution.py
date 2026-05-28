@@ -51,6 +51,41 @@ def test_weekly_resolve_dry_run_does_not_mutate_and_redacts_chat_id() -> None:
     assert store.job.manual_reviewed_at is None
 
 
+def test_weekly_resolve_dry_run_redacts_secret_note_from_output() -> None:
+    note = "checked postgresql://ops:super-secret@example.invalid/prod password=cleartext"
+    store = FakeWeeklyStore(_weekly_job(job_id=WEEKLY_JOB_ID, chat_id=701))
+    stdout = StringIO()
+
+    exit_code = resolver.main(
+        [
+            "--job-type",
+            "weekly-pdf",
+            "--job-id",
+            str(WEEKLY_JOB_ID),
+            "--operator",
+            "ops.alex",
+            "--resolution",
+            "confirmed_delivered",
+            "--note",
+            note,
+            "--dry-run",
+        ],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=_factory({"weekly-pdf": store}),
+        stdout=stdout,
+        now=lambda: NOW,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "checked postgresql://" in output
+    assert "example.invalid/prod" in output
+    assert "password=<redacted:secret>" in output
+    assert "super-secret" not in output
+    assert "cleartext" not in output
+    assert store.job.manual_reviewed_at is None
+
+
 def test_weekly_resolve_apply_marks_audit_fields_without_refund_changes() -> None:
     store = FakeWeeklyStore(
         _weekly_job(job_id=WEEKLY_JOB_ID, chat_id=701, refund_status="pending", delivery_status="unknown")
@@ -96,6 +131,41 @@ def test_weekly_resolve_apply_marks_audit_fields_without_refund_changes() -> Non
     assert store.job.manual_review_note == "Ticket MR-7 checked provider export and bot logs."
     assert store.job.delivery_status == "unknown"
     assert store.job.refund_status == "pending"
+
+
+def test_weekly_resolve_apply_redacts_secret_note_from_output_but_stores_raw_note() -> None:
+    note = "Ticket MR-12 checked token=raw-provider-token-123 and secret=raw-secret-456."
+    store = FakeWeeklyStore(_weekly_job(job_id=WEEKLY_JOB_ID, chat_id=701))
+    stdout = StringIO()
+
+    exit_code = resolver.main(
+        [
+            "--job-type",
+            "weekly-pdf",
+            "--job-id",
+            str(WEEKLY_JOB_ID),
+            "--operator",
+            "ops.alex",
+            "--resolution",
+            "confirmed_delivered",
+            "--note",
+            note,
+            "--apply",
+        ],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=_factory({"weekly-pdf": store}),
+        stdout=stdout,
+        now=lambda: NOW,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "Ticket MR-12 checked" in output
+    assert "token=<redacted:secret>" in output
+    assert "secret=<redacted:secret>" in output
+    assert "raw-provider-token-123" not in output
+    assert "raw-secret-456" not in output
+    assert store.job.manual_review_note == note
 
 
 def test_weekly_resolve_apply_is_idempotent() -> None:

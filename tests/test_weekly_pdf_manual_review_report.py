@@ -134,6 +134,37 @@ def test_include_reviewed_uses_read_only_review_query() -> None:
     assert "Ticket MR-302" in output
 
 
+def test_include_reviewed_redacts_secret_note() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000000303"),
+        chat_id=303,
+        created_at=now,
+        updated_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.alex",
+        manual_review_resolution="operator_confirmed_delivery",
+        manual_review_note="Ticket MR-303 checked postgresql://ops:super-secret@example.invalid/prod.",
+    )
+    store = FakeStore(unresolved_jobs=[], all_review_jobs=[reviewed])
+    stdout = StringIO()
+
+    exit_code = report.main(
+        ["--include-reviewed", "--limit", "1"],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "Ticket MR-303 checked" in output
+    assert "postgresql://" in output
+    assert "example.invalid/prod" in output
+    assert "ops:super-secret" not in output
+
+
 def test_missing_database_url_exits_safely_without_store_access() -> None:
     stdout = StringIO()
     stderr = StringIO()

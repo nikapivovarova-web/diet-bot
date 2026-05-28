@@ -155,6 +155,38 @@ def test_include_reviewed_uses_read_only_review_query() -> None:
     assert "999999122" not in output
 
 
+def test_include_reviewed_redacts_secret_note_in_json() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000001123"),
+        chat_id=123,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.mira",
+        manual_review_resolution="no_refund_confirmed",
+        manual_review_note="Ticket MR-1123 checked api_key=raw-api-key-123.",
+    )
+    store = FakeStore(unresolved_jobs=[], all_review_jobs=[reviewed])
+    stdout = StringIO()
+
+    exit_code = report.main(
+        ["--include-reviewed", "--json", "--limit", "1"],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
+    )
+
+    rendered = stdout.getvalue()
+    payload = json.loads(rendered)
+    assert exit_code == 0
+    assert payload["jobs"][0]["manual_review_note"].startswith("Ticket MR-1123 checked")
+    assert "api_key=<redacted:secret>" in rendered
+    assert "raw-api-key-123" not in rendered
+
+
 def test_database_url_env_can_be_overridden() -> None:
     now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
     store = FakeStore(
