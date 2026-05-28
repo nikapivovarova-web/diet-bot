@@ -158,6 +158,7 @@ from .subscriptions import (
     save_entitlements,
     set_test_access_enabled,
 )
+from .telegram_send import TelegramSendError, safe_telegram_send
 from .validation import validate_plan
 from .weekly_pdf_job_runtime import (
     WeeklyPdfDelivery,
@@ -2952,10 +2953,16 @@ class _OneDayJobMessage:
         self.message_id = None
 
     async def answer(self, text: str, reply_markup=None):
-        return await self.bot.send_message(chat_id=self.chat.id, text=text, reply_markup=reply_markup)
+        return await safe_telegram_send(
+            lambda: self.bot.send_message(chat_id=self.chat.id, text=text, reply_markup=reply_markup),
+            operation_name="one_day_worker_send_message",
+        )
 
     async def answer_photo(self, **kwargs):
-        return await self.bot.send_photo(chat_id=self.chat.id, **kwargs)
+        return await safe_telegram_send(
+            lambda: self.bot.send_photo(chat_id=self.chat.id, **kwargs),
+            operation_name="one_day_worker_send_photo",
+        )
 
 
 async def _prepare_one_day_generation_delivery(job: OneDayGenerationJob, bot: Bot) -> OneDayGenerationDelivery:
@@ -3085,10 +3092,16 @@ class _WeeklyPdfJobMessage:
         self.message_id = None
 
     async def answer(self, text: str, reply_markup=None):
-        return await self.bot.send_message(chat_id=self.chat.id, text=text, reply_markup=reply_markup)
+        return await safe_telegram_send(
+            lambda: self.bot.send_message(chat_id=self.chat.id, text=text, reply_markup=reply_markup),
+            operation_name="weekly_pdf_worker_send_message",
+        )
 
     async def answer_document(self, **kwargs):
-        return await self.bot.send_document(chat_id=self.chat.id, **kwargs)
+        return await safe_telegram_send(
+            lambda: self.bot.send_document(chat_id=self.chat.id, **kwargs),
+            operation_name="weekly_pdf_worker_send_document",
+        )
 
 
 async def _prepare_weekly_pdf_delivery(job: WeeklyPdfJob, bot: Bot) -> WeeklyPdfDelivery:
@@ -5721,7 +5734,7 @@ async def _send_meal_card(message: Message, meal: Meal) -> None:
             await message.answer_photo(photo=photo, caption=text)
             return
         await message.answer_photo(photo=photo)
-    except TelegramAPIError:
+    except (TelegramAPIError, TelegramSendError):
         await _send_text_chunks(message, text)
         return
 
