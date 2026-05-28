@@ -11,6 +11,8 @@ output/
 outputs/
 exports/
 tmp/
+build/
+dist/
 *.py[cod]
 *.egg-info/
 .coverage

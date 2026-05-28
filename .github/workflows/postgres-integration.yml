@@ -40,8 +40,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install package and test dependencies
-        run: python -m pip install -e ".[dev]"
+      - name: Install dependency lock tooling
+        run: python -m pip install -r requirements/lock-tools.txt
+      - name: Verify dependency locks
+        run: |
+          python -m piptools compile requirements/lock-tools.in --resolver=backtracking --strip-extras --no-header --no-emit-index-url --allow-unsafe --output-file=requirements/lock-tools.txt
+          python -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --no-header --no-emit-index-url --output-file=requirements/prod.txt
+          python -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --extra=dev --no-header --no-emit-index-url --output-file=requirements/dev.txt
+          git diff --exit-code -- requirements/lock-tools.txt requirements/prod.txt requirements/dev.txt
+      - name: Install package and test dependencies from lock
+        run: |
+          python -m pip install -r requirements/dev.txt
+          python -m pip install --no-deps -e .
+          python -m pip check
       - name: Run PostgreSQL integration tests
         run: python -m pytest -q -p no:cacheprovider -m postgres_integration tests/test_postgres_runtime_preflight.py tests/test_postgres_entitlement_store.py tests/test_postgres_payment_store.py tests/test_postgres_weekly_pdf_job_store.py tests/test_postgres_chat_state_store.py tests/test_postgres_one_day_generation_job_store.py
       - name: Run entitlement JSON migration tests

@@ -62,6 +62,62 @@ Payment recovery spool storage:
 - Recovery replay uses the PR45 payment recovery replay tooling documented
   below. Review and fingerprint the immutable spool before dry-run or apply.
 
+## Dependency Lock and Release Artifact
+
+Production and staging installs must use the committed dependency locks under
+`requirements/`. Do not install production from unconstrained
+`pyproject.toml`, `pip install -e ".[dev]"`, or an operator-local dependency
+cache.
+
+Required release identity:
+
+- git commit SHA;
+- Python minor version used by the runtime;
+- `requirements/prod.txt` SHA256;
+- deploy artifact file name and SHA256, if a wheel or container image is built;
+- external image digest, if deployment wraps the app in a container outside
+  this repository.
+
+This repository does not currently contain a Dockerfile or compose manifest.
+If the deployment platform builds a container externally, the image must be
+tagged with the git SHA and recorded with an immutable image digest. The
+container build must still install from `requirements/prod.txt`.
+
+Before building or packaging, verify the dependency locks from a clean checkout:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements\lock-tools.txt
+.\.venv\Scripts\python.exe -m piptools compile requirements\lock-tools.in --resolver=backtracking --strip-extras --no-header --no-emit-index-url --allow-unsafe --output-file=requirements\lock-tools.txt
+.\.venv\Scripts\python.exe -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --no-header --no-emit-index-url --output-file=requirements\prod.txt
+.\.venv\Scripts\python.exe -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --extra=dev --no-header --no-emit-index-url --output-file=requirements\dev.txt
+git diff --exit-code -- requirements\lock-tools.txt requirements\prod.txt requirements\dev.txt
+```
+
+Build and verify a production-style install without starting the bot:
+
+```powershell
+git rev-parse HEAD
+Get-FileHash .\requirements\prod.txt -Algorithm SHA256
+python -m venv .venv-release
+.\.venv-release\Scripts\python.exe -m pip install -r requirements\prod.txt
+.\.venv-release\Scripts\python.exe -m pip install --no-deps .
+.\.venv-release\Scripts\python.exe -m pip check
+.\.venv-release\Scripts\python.exe -m compileall -q src scripts
+```
+
+If the deploy process uses a wheel artifact, build it from the same clean
+checkout and record its hash:
+
+```powershell
+.\.venv-release\Scripts\python.exe -m pip install -r requirements\lock-tools.txt
+.\.venv-release\Scripts\python.exe -m build --wheel
+Get-FileHash .\dist\*.whl -Algorithm SHA256
+```
+
+Install the wheel by first installing `requirements/prod.txt`, then installing
+the wheel with `--no-deps` so deployment does not perform a second floating
+resolution.
+
 ## Payment Scale Rehearsal
 
 Use this rehearsal before payment enablement work and after payment ledger or
@@ -668,14 +724,56 @@ Run exactly one long-polling bot process for a bot token.
 Do not use Telegram API calls or manual Telegram QA as part of this sequence
 unless that QA is separately approved.
 
+## Staging and Production Parity Checklist
+
+Before production cutover, staging must rehearse the same release inputs without
+touching production services:
+
+- same git SHA, `requirements/prod.txt`, and wheel/container artifact intended
+  for production;
+- same Python minor version and same install pattern:
+  `pip install -r requirements/prod.txt` followed by `pip install --no-deps`
+  for the application artifact;
+- same strict healthcheck and production preflight commands, with staging-safe
+  environment values;
+- isolated staging Postgres database and no production DSN;
+- isolated staging bot token only if a separately approved staging bot run is
+  performed;
+- `TELEGRAM_PROVIDER_TOKEN` unset and payments disabled unless a separate
+  payment QA or payment enablement approval explicitly says otherwise;
+- same worker/poller flags, scheduler flags, and concurrency settings that
+  production will use, with a recorded confirmation that only one poller can
+  run for the token;
+- same migration order rehearsed against staging data;
+- monitoring, log redaction checks, queue-depth dashboards, and operator alert
+  routes armed before the production window;
+- rollback target identified by previous git SHA, previous artifact hash or
+  image digest, and previous runtime configuration.
+
 ## Rollback Notes
 
 Rollback depends on whether the new poller has processed production traffic.
 
-- Before new traffic: stop the new poller, keep the Postgres migration records for audit, and restore the old poller with the original JSON/state files.
-- After new traffic: stop the new poller, preserve a Postgres backup first, then decide whether to keep Postgres as source of truth or perform a supervised data rollback. Do not overwrite JSON/state from stale backups without an explicit data decision.
-- After Postgres writes begin, JSON/state files are stale unless explicitly exported from Postgres. Do not restore stale JSON over Postgres production state; rollback must restore a known-good Postgres backup/snapshot or follow an explicit export/rollback procedure.
-- If weekly PDF job migration succeeds but startup fails, it is safe to leave the dormant table in place while rolling back application code.
+- Before new traffic: stop the new poller, keep the Postgres migration records
+  for audit, and restore the previous known-good application artifact or
+  container image by its recorded SHA/digest.
+- After new traffic: stop the new poller, preserve a fresh Postgres backup
+  first, then decide whether to keep Postgres as source of truth or perform a
+  supervised data rollback. Do not overwrite JSON/state from stale backups
+  without an explicit data decision.
+- After Postgres writes begin, JSON/state files are stale unless explicitly
+  exported from Postgres. Do not restore stale JSON over Postgres production
+  state; rollback must restore a known-good Postgres backup/snapshot or follow
+  an explicit export/rollback procedure.
+- If a schema migration succeeds but application startup fails, prefer rolling
+  back application code/artifact first while leaving compatible dormant tables
+  in place. Revert schema only with a migration-specific data decision and a
+  fresh backup.
+- Keep the previous artifact or image digest, previous git SHA, previous
+  `requirements/prod.txt` SHA256, and previous runtime configuration in the
+  operator ticket before cutover starts.
+- Respect poller order during rollback: stop the failed/new poller first,
+  verify it is not running, then start the previous known-good poller once.
 - If payments remain disabled, no payment ledger rollback should be needed.
 
 ## Operator Safety Notes

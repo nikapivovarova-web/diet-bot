@@ -1,0 +1,26 @@
+build==1.5.0
+    # via pip-tools
+click==8.4.1
+    # via pip-tools
+colorama==0.4.6
+    # via
+    #   build
+    #   click
+packaging==26.2
+    # via
+    #   build
+    #   wheel
+pip-tools==7.5.3
+    # via -r requirements/lock-tools.in
+pyproject-hooks==1.2.0
+    # via
+    #   build
+    #   pip-tools
+wheel==0.47.0
+    # via pip-tools
+
+# The following packages are considered to be unsafe in a requirements file:
+pip==26.1.1
+    # via pip-tools
+setuptools==82.0.1
+    # via pip-tools
