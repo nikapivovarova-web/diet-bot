@@ -158,7 +158,7 @@ from .subscriptions import (
     save_entitlements,
     set_test_access_enabled,
 )
-from .telegram_send import safe_telegram_send
+from .telegram_send import TelegramSendError, safe_telegram_send
 from .validation import validate_plan
 from .weekly_pdf_job_runtime import (
     WeeklyPdfDelivery,
@@ -5734,7 +5734,7 @@ async def _send_meal_card(message: Message, meal: Meal) -> None:
             await message.answer_photo(photo=photo, caption=text)
             return
         await message.answer_photo(photo=photo)
-    except TelegramAPIError:
+    except (TelegramAPIError, TelegramSendError):
         await _send_text_chunks(message, text)
         return
 

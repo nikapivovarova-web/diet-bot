@@ -9,9 +9,11 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
+import diet_bot.telegram_app as telegram_app
+from diet_bot.domain import Meal
 from diet_bot.one_day_generation_jobs import (
     ClaimQueuedJobResult,
     ClaimQueuedJobResultStatus,
@@ -518,6 +520,68 @@ async def test_worker_retryable_telegram_send_succeeds_and_marks_value_delivered
 
 
 @pytest.mark.anyio
+async def test_worker_meal_photo_telegram_send_error_falls_back_to_text_and_marks_delivered() -> None:
+    store = _InMemoryOneDayGenerationJobStore(default_quota=1)
+    runtime = OneDayGenerationJobRuntime(store)
+    admitted = runtime.admit_queued(
+        chat_id=91,
+        idempotency_key="photo-fallback",
+        request_snapshot=_snapshot(91),
+    ).job
+    bot = _PhotoFailureBot()
+    worker = OneDayGenerationWorker(
+        runtime,
+        _MealCardProcessor(bot),
+        OneDayGenerationWorkerSettings(worker_id="worker-a", concurrency=1, max_attempts=1),
+    )
+
+    processed = await worker.run_once()
+    saved = store.jobs_by_id[admitted.job_id]
+
+    assert processed == 1
+    assert len(bot.photo_attempts) == 1
+    assert len(bot.message_attempts) == 1
+    assert bot.message_attempts[0]["chat_id"] == 91
+    assert "Fallback Breakfast" in bot.message_attempts[0]["text"]
+    assert saved.status == JOB_STATUS_SUCCEEDED
+    assert saved.delivery_status == "delivered"
+    assert saved.delivered_value_messages == 1
+    assert saved.requires_manual_review is False
+    assert store.calls.count(("mark_value_message_delivered", admitted.job_id)) == 1
+    assert ("finish_failure_and_refund_once", admitted.job_id) not in store.calls
+
+
+@pytest.mark.anyio
+async def test_worker_meal_text_fallback_failure_still_requires_manual_review() -> None:
+    store = _InMemoryOneDayGenerationJobStore(default_quota=1)
+    runtime = OneDayGenerationJobRuntime(store)
+    admitted = runtime.admit_queued(
+        chat_id=92,
+        idempotency_key="text-fallback-failure",
+        request_snapshot=_snapshot(92),
+    ).job
+    bot = _PhotoFailureBot(fail_messages=True)
+    worker = OneDayGenerationWorker(
+        runtime,
+        _MealCardProcessor(bot),
+        OneDayGenerationWorkerSettings(worker_id="worker-a", concurrency=1, max_attempts=1),
+    )
+
+    processed = await worker.run_once()
+    saved = store.jobs_by_id[admitted.job_id]
+
+    assert processed == 1
+    assert len(bot.photo_attempts) == 1
+    assert len(bot.message_attempts) == 1
+    assert saved.status == JOB_STATUS_FAILED
+    assert saved.delivery_status == "unknown"
+    assert saved.delivered_value_messages == 0
+    assert saved.requires_manual_review is True
+    assert ("mark_value_message_delivered", admitted.job_id) not in store.calls
+    assert ("finish_failure_and_refund_once", admitted.job_id) in store.calls
+
+
+@pytest.mark.anyio
 async def test_worker_run_forever_recovers_from_transient_claim_exception_and_shuts_down(caplog) -> None:
     class FlakyClaimStore(_InMemoryOneDayGenerationJobStore):
         def __init__(self) -> None:
@@ -822,6 +886,45 @@ class _EmptyDeliveryProcessor:
             self.follow_ups.append((job.chat_id, saved.refund_status, self.store.quota_by_chat_id.get(job.chat_id, 0)))
 
         return OneDayGenerationDelivery(value_messages=(), failure_follow_up=follow_up)
+
+
+class _PhotoFailureBot:
+    def __init__(self, *, fail_messages: bool = False) -> None:
+        self.fail_messages = fail_messages
+        self.photo_attempts: list[dict[str, object]] = []
+        self.message_attempts: list[dict[str, object]] = []
+
+    async def send_photo(self, **kwargs) -> None:
+        self.photo_attempts.append(kwargs)
+        raise TelegramAPIError(types.SimpleNamespace(), "photo upload failed")
+
+    async def send_message(self, **kwargs) -> None:
+        self.message_attempts.append(kwargs)
+        if self.fail_messages:
+            raise TelegramAPIError(types.SimpleNamespace(), "text send failed")
+
+
+class _MealCardProcessor:
+    def __init__(self, bot: _PhotoFailureBot) -> None:
+        self.bot = bot
+
+    async def prepare_delivery(self, job: OneDayGenerationJob) -> OneDayGenerationDelivery:
+        message = telegram_app._OneDayJobMessage(bot=self.bot, chat_id=job.chat_id)
+        meal = Meal(
+            name="Fallback Breakfast",
+            portions=(),
+            recipe="Serve as text when the photo upload fails.",
+            image_url="https://example.com/photo.jpg",
+            recipe_id="fallback-breakfast",
+        )
+        return OneDayGenerationDelivery(
+            value_messages=(
+                OneDayGenerationValueMessage(
+                    value_message_key="meal:00:fallback-breakfast",
+                    send=lambda: telegram_app._send_meal_card(message, meal),
+                ),
+            ),
+        )
 
 
 class _InMemoryOneDayGenerationJobStore:
