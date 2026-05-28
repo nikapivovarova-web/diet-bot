@@ -159,6 +159,17 @@ from .subscriptions import (
     set_test_access_enabled,
 )
 from .telegram_send import TelegramSendError, safe_telegram_send
+from .telegram_media_validation import (
+    TELEGRAM_CAPTION_MAX_CHARS,
+    TELEGRAM_DOCUMENT_MAX_BYTES,
+    TELEGRAM_MESSAGE_CHUNK_MAX_CHARS,
+    TelegramMediaValidationError,
+    telegram_text_chunks,
+    validate_local_pdf_document_path,
+    validate_local_photo_path,
+    validate_pdf_document_bytes,
+    validate_telegram_caption,
+)
 from .validation import validate_plan
 from .weekly_pdf_job_runtime import (
     WeeklyPdfDelivery,
@@ -973,7 +984,6 @@ ONE_DAY_PLAN_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u0440\
 ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_NO_PLAN_FOLLOW_UP_TEXT = "\u041d\u0435 \u0441\u043c\u043e\u0433 \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u0440\u0430\u0446\u0438\u043e\u043d \u043f\u043e \u0442\u0435\u043a\u0443\u0449\u0438\u043c \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f\u043c. \u042f \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u043b \u044d\u0442\u043e \u043a\u0430\u043a \u043e\u0448\u0438\u0431\u043a\u0443 \u0438 \u043d\u0435 \u0431\u0443\u0434\u0443 \u0441\u043f\u0438\u0441\u044b\u0432\u0430\u0442\u044c \u043f\u043e\u043f\u044b\u0442\u043a\u0443."
 WEEK_PDF_QUEUE_ESTIMATED_JOB_SECONDS = 90
-TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY = 5
 WEEKLY_PDF_MAX_CONCURRENCY = DEFAULT_WEEKLY_PDF_MAX_CONCURRENCY
 WEEK_PDF_QUEUE_MANAGER = _WeeklyPdfQueueManager(WEEKLY_PDF_MAX_CONCURRENCY)
@@ -1805,18 +1815,8 @@ def main() -> None:
     asyncio.run(run_bot())
 
 
-def _telegram_chunks(text: str, limit: int = 3900) -> list[str]:
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit)
-        if split_at < limit // 2:
-            split_at = limit
-        chunks.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].strip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
+def _telegram_chunks(text: str, limit: int = TELEGRAM_MESSAGE_CHUNK_MAX_CHARS) -> list[str]:
+    return telegram_text_chunks(text, limit=limit)
 
 
 async def _set_bot_commands(bot: Bot) -> None:
@@ -3316,6 +3316,8 @@ async def _send_week_pdf_document(
     caption = "Готово - ваш рацион на неделю в PDF."
     if status_text:
         caption = f"{caption}\n\n{status_text}"
+    _validate_week_pdf_payload_size(pdf_data, pdf_filename)
+    validate_telegram_caption(caption, label="weekly PDF caption")
     document = BufferedInputFile(pdf_data, filename=pdf_filename)
     reply_markup = _after_plan_keyboard(message.chat.id)
     upload_started_at = time.perf_counter()
@@ -3376,6 +3378,11 @@ def _build_week_pdf_payload(
     read_started_at = time.perf_counter()
     _weekly_pdf_diag("temp_pdf_read_start", chat_id=chat_id, temp_pdf=pdf_path.name)
     try:
+        validate_local_pdf_document_path(
+            pdf_path,
+            label="weekly PDF temp file",
+            max_bytes=TELEGRAM_DOCUMENT_MAX_BYTES,
+        )
         pdf_data = pdf_path.read_bytes()
         _weekly_pdf_diag(
             "temp_pdf_read_end",
@@ -3471,12 +3478,7 @@ def _week_pdf_date_range(plan_dates: Sequence[date]) -> str:
     return f"{first_date:%d}_{first_month}_{first_date:%Y}-{last_date:%d}_{last_month}_{last_date:%Y}"
 
 def _validate_week_pdf_payload_size(pdf_data: bytes, pdf_filename: str) -> None:
-    if len(pdf_data) <= TELEGRAM_DOCUMENT_MAX_BYTES:
-        return
-    raise ValueError(
-        f"Weekly PDF {pdf_filename!r} is {len(pdf_data)} bytes; "
-        f"Telegram document limit is {TELEGRAM_DOCUMENT_MAX_BYTES} bytes."
-    )
+    validate_pdf_document_bytes(pdf_data, pdf_filename, max_bytes=TELEGRAM_DOCUMENT_MAX_BYTES)
 
 def _weekly_phase_feasibility(
     profile: UserProfile,
@@ -5714,23 +5716,31 @@ def _question_keyboard(
 
 
 async def _send_welcome_photo(message: Message) -> None:
-    if not WELCOME_PHOTO_PATH.exists():
+    try:
+        photo_path = validate_local_photo_path(WELCOME_PHOTO_PATH, label="welcome photo")
+    except TelegramMediaValidationError as exc:
+        logger.warning("Skipping welcome photo before Telegram send: %s", exc)
         return
     try:
-        await message.answer_photo(photo=FSInputFile(WELCOME_PHOTO_PATH))
+        await message.answer_photo(photo=FSInputFile(photo_path))
     except TelegramAPIError:
         return
 
 
 async def _send_meal_card(message: Message, meal: Meal) -> None:
     text = format_meal_card(meal, include_photo_credit=bool(meal.image_attribution))
-    photo = _photo_input(meal)
+    try:
+        photo = _photo_input(meal)
+    except TelegramMediaValidationError as exc:
+        logger.warning("Skipping meal photo before Telegram send: %s", exc)
+        photo = None
     if photo is None:
         await _send_text_chunks(message, text)
         return
 
     try:
-        if len(text) <= 1024:
+        if len(text) <= TELEGRAM_CAPTION_MAX_CHARS:
+            validate_telegram_caption(text, label="meal photo caption")
             await message.answer_photo(photo=photo, caption=text)
             return
         await message.answer_photo(photo=photo)
@@ -5753,9 +5763,7 @@ def _photo_input(meal: Meal) -> str | FSInputFile | None:
         project_path = Path(__file__).resolve().parents[2] / path
         path = data_path if data_path.exists() else project_path
 
-    if not path.exists():
-        return None
-    return FSInputFile(path)
+    return FSInputFile(validate_local_photo_path(path, label="meal photo"))
 
 
 async def _send_text_chunks(
