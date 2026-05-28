@@ -320,6 +320,62 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605280002",
+        description="Add weekly PDF manual-review operator audit fields",
+        statements=(
+            """
+            ALTER TABLE weekly_pdf_jobs
+                ADD COLUMN IF NOT EXISTS manual_reviewed_by TEXT,
+                ADD COLUMN IF NOT EXISTS manual_review_note TEXT
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_manual_reviewed_by_non_empty'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_manual_reviewed_by_non_empty
+                        CHECK (manual_reviewed_by IS NULL OR manual_reviewed_by <> '');
+                END IF;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_manual_review_resolution_non_empty'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_manual_review_resolution_non_empty
+                        CHECK (manual_review_resolution IS NULL OR manual_review_resolution <> '');
+                END IF;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_manual_review_note_non_empty'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_manual_review_note_non_empty
+                        CHECK (manual_review_note IS NULL OR manual_review_note <> '');
+                END IF;
+            END $$;
+            """,
+        ),
+    ),
 )
 
 

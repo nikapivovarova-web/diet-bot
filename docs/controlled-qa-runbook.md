@@ -101,7 +101,11 @@ manual-review reports against the same isolated QA database:
 
 Review any manual-review rows before closing QA. The reports are read-only and
 must not print the DSN, tokens, raw chat IDs, idempotency keys, or metadata
-payloads.
+payloads. If the QA owner approves closing a manual-review row in the isolated
+QA database, use `scripts.ops.manual_review_resolution --dry-run` first and
+then `--apply` with an operator name and ticket note. The resolver is audit-only:
+it preserves delivery/refund fields and does not call Telegram or perform
+refunds.
 
 ## Cleanup
 

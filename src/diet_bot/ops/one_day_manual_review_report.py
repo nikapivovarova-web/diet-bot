@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, TextIO
 
 from diet_bot.log_redaction import stable_identifier_hash
+from diet_bot.ops.manual_review_text import redact_manual_review_text
 from diet_bot.one_day_generation_jobs import OneDayGenerationJob
 
 
@@ -18,6 +19,9 @@ DEFAULT_LIMIT = 100
 
 class ManualReviewJobStore(Protocol):
     def get_unresolved_manual_review_jobs(self, *, limit: int) -> list[OneDayGenerationJob]:
+        ...
+
+    def get_manual_review_jobs(self, *, limit: int, include_reviewed: bool) -> list[OneDayGenerationJob]:
         ...
 
 
@@ -52,7 +56,10 @@ def main(
     factory = _default_store_factory if store_factory is None else store_factory
     try:
         store = factory(database_url)
-        jobs = store.get_unresolved_manual_review_jobs(limit=args.limit)
+        if args.include_reviewed:
+            jobs = store.get_manual_review_jobs(limit=args.limit, include_reviewed=True)
+        else:
+            jobs = store.get_unresolved_manual_review_jobs(limit=args.limit)
     except Exception:
         print(
             "Failed to read one-day manual-review jobs; database details redacted.",
@@ -61,9 +68,9 @@ def main(
         return 2
 
     if args.json:
-        _write_json_report(jobs, limit=args.limit, stdout=stdout)
+        _write_json_report(jobs, include_reviewed=args.include_reviewed, limit=args.limit, stdout=stdout)
     else:
-        stdout.write(_render_table(jobs))
+        stdout.write(_render_table(jobs, include_reviewed=args.include_reviewed))
     return 0
 
 
@@ -94,6 +101,11 @@ def _build_parser(stderr: TextIO) -> argparse.ArgumentParser:
         help="Maximum number of jobs to list.",
     )
     parser.add_argument("--json", action="store_true", help="Write a JSON report instead of a table.")
+    parser.add_argument(
+        "--include-reviewed",
+        action="store_true",
+        help="Include manual-review rows that already have manual_reviewed_at set.",
+    )
     return parser
 
 
@@ -110,11 +122,13 @@ def _positive_int(value: str) -> int:
 def _write_json_report(
     jobs: list[OneDayGenerationJob],
     *,
+    include_reviewed: bool,
     limit: int,
     stdout: TextIO,
 ) -> None:
     payload = {
         "mode": "one_day_manual_review",
+        "include_reviewed": include_reviewed,
         "limit": limit,
         "count": len(jobs),
         "jobs": report_rows(jobs),
@@ -123,9 +137,10 @@ def _write_json_report(
     stdout.write("\n")
 
 
-def _render_table(jobs: list[OneDayGenerationJob]) -> str:
+def _render_table(jobs: list[OneDayGenerationJob], *, include_reviewed: bool) -> str:
     if not jobs:
-        return "No one-day unresolved manual-review jobs found.\n"
+        scope = "manual-review" if include_reviewed else "unresolved manual-review"
+        return f"No one-day {scope} jobs found.\n"
 
     rows = report_rows(jobs)
     columns = [
@@ -143,6 +158,10 @@ def _render_table(jobs: list[OneDayGenerationJob]) -> str:
         ("finalization_error", "finalization_error"),
         ("requires_manual_review", "requires_review"),
         ("chat_id_hash", "chat"),
+        ("manual_reviewed_at", "reviewed_at"),
+        ("manual_reviewed_by", "reviewed_by"),
+        ("manual_review_resolution", "resolution"),
+        ("manual_review_note", "note"),
     ]
     widths = {
         key: max(len(label), *(len(str(row[key])) for row in rows))
@@ -173,6 +192,10 @@ def _report_row(job: OneDayGenerationJob) -> dict[str, Any]:
         "finalization_error": job.finalization_error or "",
         "requires_manual_review": job.requires_manual_review,
         "chat_id_hash": _chat_id_hash(job.chat_id),
+        "manual_reviewed_at": _format_datetime(job.manual_reviewed_at),
+        "manual_reviewed_by": job.manual_reviewed_by or "",
+        "manual_review_resolution": job.manual_review_resolution or "",
+        "manual_review_note": redact_manual_review_text(job.manual_review_note),
     }
 
 

@@ -89,6 +89,10 @@ class OneDayGenerationJob:
     failure_reason: str | None = None
     finalization_error: str | None = None
     requires_manual_review: bool = False
+    manual_reviewed_at: datetime | None = None
+    manual_reviewed_by: str | None = None
+    manual_review_resolution: str | None = None
+    manual_review_note: str | None = None
     request_snapshot: OneDayGenerationRequestSnapshot | None = None
     worker_id: str | None = None
     leased_until: datetime | None = None
@@ -218,6 +222,19 @@ class MarkSendStartedResultStatus(str, Enum):
 @dataclass(frozen=True)
 class MarkSendStartedResult:
     status: MarkSendStartedResultStatus
+    job: OneDayGenerationJob | None
+
+
+class ManualReviewResolutionResultStatus(str, Enum):
+    RESOLVED = "resolved"
+    ALREADY_RESOLVED = "already_resolved"
+    NOT_FOUND = "not_found"
+    NOT_MANUAL_REVIEW = "not_manual_review"
+
+
+@dataclass(frozen=True)
+class ManualReviewResolutionResult:
+    status: ManualReviewResolutionResultStatus
     job: OneDayGenerationJob | None
 
 

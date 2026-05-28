@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, TextIO
 
 from diet_bot.log_redaction import stable_identifier_hash
+from diet_bot.ops.manual_review_text import redact_manual_review_text
 from diet_bot.weekly_pdf_jobs import WeeklyPdfJob
 
 
@@ -154,7 +155,9 @@ def _render_table(jobs: list[WeeklyPdfJob], *, include_reviewed: bool) -> str:
         ("manual_review_reason", "manual_review_reason"),
         ("finalization_error", "finalization_error"),
         ("manual_reviewed_at", "reviewed_at"),
+        ("manual_reviewed_by", "reviewed_by"),
         ("manual_review_resolution", "resolution"),
+        ("manual_review_note", "note"),
     ]
     widths = {
         key: max(len(label), *(len(str(row[key])) for row in rows))
@@ -182,7 +185,9 @@ def _report_row(job: WeeklyPdfJob) -> dict[str, Any]:
         "consumption_source": job.consumption_source or "",
         "chat_id_hash": _chat_id_hash(job.chat_id),
         "manual_reviewed_at": _format_datetime(job.manual_reviewed_at),
+        "manual_reviewed_by": job.manual_reviewed_by or "",
         "manual_review_resolution": job.manual_review_resolution or "",
+        "manual_review_note": redact_manual_review_text(job.manual_review_note),
     }
 
 

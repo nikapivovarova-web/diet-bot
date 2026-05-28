@@ -616,13 +616,39 @@ For ticket attachment or structured review, use JSON output:
 .\.venv\Scripts\python.exe -m scripts.ops.weekly_pdf_manual_review_report --json --limit 50
 ```
 
+After the operator decision is recorded in the ticket, preview the resolution:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.ops.manual_review_resolution `
+  --job-type weekly-pdf `
+  --job-id "<weekly-pdf-job-uuid>" `
+  --operator "<operator-id-or-name>" `
+  --resolution "confirmed_delivered_no_refund" `
+  --note "Ticket MR-123: checked app logs and support evidence; no refund from this tool." `
+  --dry-run
+```
+
+Apply only after the dry-run output matches the ticket:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.ops.manual_review_resolution `
+  --job-type weekly-pdf `
+  --job-id "<weekly-pdf-job-uuid>" `
+  --operator "<operator-id-or-name>" `
+  --resolution "confirmed_delivered_no_refund" `
+  --note "Ticket MR-123: checked app logs and support evidence; no refund from this tool." `
+  --apply
+```
+
 If the deployment secret manager exposes the DSN under a different variable,
 pass `--database-url-env <env-name>` instead of copying the DSN into the command.
 
 The report does not print the DSN, bot tokens, provider tokens, raw chat IDs, or
 idempotency keys. Chat IDs are shown only as stable `chat:sha256:<prefix>`
 hashes so operators can compare repeated rows without exposing the raw
-identifier.
+identifier. Resolution output uses the same redaction and records
+`manual_reviewed_at`, `manual_reviewed_by`, `manual_review_resolution`, and
+`manual_review_note`.
 
 Interpretation:
 
@@ -634,6 +660,10 @@ Interpretation:
   auto-refund or auto-credit from this report because delivery is ambiguous.
 - Clean delivered successes are excluded. Rows with `manual_reviewed_at` are
   excluded by default; use `--include-reviewed` only for audit comparison.
+- Resolution is idempotent. Re-running `--apply` on an already reviewed row
+  reports `already_resolved` and keeps the original audit metadata.
+- The resolver preserves `delivery_status`, `refund_status`, and consumption
+  fields. It does not call Telegram and does not refund or credit users.
 
 Recovery workflow:
 
@@ -644,8 +674,14 @@ Recovery workflow:
 3. For unknown delivery, decide the customer action outside the bot: manual
    credit, manual refund, or no action. Record the evidence and decision in the
    operator ticket.
-4. Do not mutate `weekly_pdf_jobs` manually and do not mark rows resolved until
-   approved resolution tooling exists.
+4. Resolve only when the ticket has enough evidence for the customer-facing
+   action and the note names that evidence. Do not resolve rows that still need
+   finance/provider confirmation, user-support follow-up, or engineering review.
+5. Run the resolver in `--dry-run`, attach the redacted output to the ticket,
+   then run `--apply` with the same operator, resolution, and note.
+6. Use `--allow-non-manual-review` only for audit-only correction tickets where
+   an incident owner explicitly asks to close a row that is not flagged for
+   manual review. Document the incident approval in `--note`.
 
 ## One-Day Manual-Review Report
 
@@ -664,6 +700,30 @@ For ticket attachment or structured review, use JSON output:
 .\.venv\Scripts\python.exe -m scripts.ops.one_day_manual_review_report --json --limit 50
 ```
 
+After the operator decision is recorded in the ticket, preview the resolution:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.ops.manual_review_resolution `
+  --job-type one-day `
+  --job-id "<one-day-job-uuid>" `
+  --operator "<operator-id-or-name>" `
+  --resolution "partial_delivery_no_refund" `
+  --note "Ticket MR-456: one value message confirmed; no refund from this tool." `
+  --dry-run
+```
+
+Apply only after the dry-run output matches the ticket:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.ops.manual_review_resolution `
+  --job-type one-day `
+  --job-id "<one-day-job-uuid>" `
+  --operator "<operator-id-or-name>" `
+  --resolution "partial_delivery_no_refund" `
+  --note "Ticket MR-456: one value message confirmed; no refund from this tool." `
+  --apply
+```
+
 If the deployment secret manager exposes the DSN under a different variable,
 pass `--database-url-env <env-name>` instead of copying the DSN into the command.
 
@@ -671,6 +731,8 @@ The report does not print the DSN, bot tokens, provider tokens, raw chat IDs,
 idempotency keys, or metadata payloads. Chat IDs are shown only as stable
 `chat:sha256:<prefix>` hashes so operators can compare repeated rows without
 exposing the raw identifier.
+Resolution output uses the same redaction and records `manual_reviewed_at`,
+`manual_reviewed_by`, `manual_review_resolution`, and `manual_review_note`.
 
 Interpretation:
 
@@ -684,8 +746,13 @@ Interpretation:
 - `refund_status=not_required` on unknown or partial delivery is intentional
   when any Telegram delivery may have occurred. Do not auto-refund or
   auto-credit from this report because delivery is ambiguous.
-- Clean delivered successes are excluded. One-day jobs do not currently have
-  reviewed-at or resolution fields, so there is no `--include-reviewed` mode.
+- Clean delivered successes are excluded. Rows with `manual_reviewed_at` are
+  excluded by default; use `--include-reviewed` only for audit comparison.
+- Resolution is idempotent. Re-running `--apply` on an already reviewed row
+  reports `already_resolved` and keeps the original audit metadata.
+- The resolver preserves `delivery_status`, `refund_status`, message counts,
+  and consumption fields. It does not call Telegram and does not refund or
+  credit users.
 
 Recovery workflow:
 
@@ -696,8 +763,14 @@ Recovery workflow:
 3. For unknown or partial delivery, decide the customer action outside the bot:
    manual credit, manual refund, or no action. Record the evidence and decision
    in the operator ticket.
-4. Do not mutate `one_day_generation_jobs` manually and do not mark rows
-   resolved until approved resolution tooling exists.
+4. Resolve only when the ticket has enough evidence for the customer-facing
+   action and the note names that evidence. Do not resolve rows that still need
+   finance/provider confirmation, user-support follow-up, or engineering review.
+5. Run the resolver in `--dry-run`, attach the redacted output to the ticket,
+   then run `--apply` with the same operator, resolution, and note.
+6. Use `--allow-non-manual-review` only for audit-only correction tickets where
+   an incident owner explicitly asks to close a row that is not flagged for
+   manual review. Document the incident approval in `--note`.
 
 ## One Poller Only
 

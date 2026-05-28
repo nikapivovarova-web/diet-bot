@@ -50,6 +50,18 @@ def test_metabase_ops_queries_do_not_expose_raw_chat_ids_or_secret_placeholders(
             assert "chat_id_hash" in sql
 
 
+def test_metabase_manual_review_queries_filter_resolved_backlog() -> None:
+    weekly_sql = (QUERY_DIR / "weekly_pdf_failed_manual_review_rows.sql").read_text(encoding="utf-8").lower()
+    one_day_sql = (QUERY_DIR / "one_day_failed_manual_review_rows.sql").read_text(encoding="utf-8").lower()
+
+    assert "manual_reviewed_at is null" in weekly_sql
+    assert "manual_reviewed_at is null" in one_day_sql
+    assert "manual_reviewed_by" in weekly_sql
+    assert "manual_reviewed_by" in one_day_sql
+    assert "manual_review_note" in weekly_sql
+    assert "manual_review_note" in one_day_sql
+
+
 def test_metabase_pack_and_alert_actions_are_documented_in_runbook() -> None:
     query_doc = Path("docs/ops/metabase-ops-queries.md").read_text(encoding="utf-8")
     runbook = Path("docs/production-runbook.md").read_text(encoding="utf-8")

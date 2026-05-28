@@ -22,6 +22,8 @@ from .one_day_generation_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    ManualReviewResolutionResult,
+    ManualReviewResolutionResultStatus,
     MarkRetryableFailureResult,
     MarkRetryableFailureResultStatus,
     MarkSendStartedResult,
@@ -78,6 +80,10 @@ ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "failure_reason",
             "finalization_error",
             "requires_manual_review",
+            "manual_reviewed_at",
+            "manual_reviewed_by",
+            "manual_review_resolution",
+            "manual_review_note",
             "metadata_json",
             "request_payload_json",
             "request_kind",
@@ -766,6 +772,10 @@ class PostgresOneDayGenerationJobStore:
                             delivered_at = CASE WHEN %s THEN COALESCE(delivered_at, %s) ELSE delivered_at END,
                             delivery_status = %s,
                             requires_manual_review = false,
+                            manual_reviewed_at = NULL,
+                            manual_reviewed_by = NULL,
+                            manual_review_resolution = NULL,
+                            manual_review_note = NULL,
                             updated_at = %s
                         WHERE job_id = %s
                         RETURNING *
@@ -806,6 +816,10 @@ class PostgresOneDayGenerationJobStore:
                             refund_status = 'not_required',
                             delivery_status = %s,
                             requires_manual_review = false,
+                            manual_reviewed_at = NULL,
+                            manual_reviewed_by = NULL,
+                            manual_review_resolution = NULL,
+                            manual_review_note = NULL,
                             delivered_at = COALESCE(delivered_at, %s),
                             finished_at = COALESCE(finished_at, %s),
                             updated_at = %s
@@ -879,20 +893,73 @@ class PostgresOneDayGenerationJobStore:
                 return [_job_from_row(row) for row in cur.fetchall()]
 
     def get_unresolved_manual_review_jobs(self, *, limit: int = 100) -> list[OneDayGenerationJob]:
+        return self.get_manual_review_jobs(limit=limit, include_reviewed=False)
+
+    def get_manual_review_jobs(self, *, limit: int = 100, include_reviewed: bool = False) -> list[OneDayGenerationJob]:
         bounded_limit = min(500, max(1, int(limit)))
+        reviewed_filter = "" if include_reviewed else "AND manual_reviewed_at IS NULL"
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT *
                     FROM one_day_generation_jobs
                     WHERE requires_manual_review = true
+                      {reviewed_filter}
                     ORDER BY updated_at, created_at, job_id
                     LIMIT %s
                     """,
                     (bounded_limit,),
                 )
                 return [_job_from_row(row) for row in cur.fetchall()]
+
+    def resolve_manual_review(
+        self,
+        job_id: UUID | str,
+        *,
+        resolved_by: str,
+        resolution: str,
+        note: str,
+        now: datetime | None = None,
+        allow_non_manual_review: bool = False,
+    ) -> ManualReviewResolutionResult:
+        resolved_by = _required_text(resolved_by, "resolved_by")
+        resolution = _required_text(resolution, "resolution")
+        note = _required_text(note, "note")
+        current_time = _normalize_datetime(now)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return ManualReviewResolutionResult(ManualReviewResolutionResultStatus.NOT_FOUND, None)
+                    if job.manual_reviewed_at is not None:
+                        return ManualReviewResolutionResult(
+                            ManualReviewResolutionResultStatus.ALREADY_RESOLVED,
+                            job,
+                        )
+                    if not job.requires_manual_review and not allow_non_manual_review:
+                        return ManualReviewResolutionResult(
+                            ManualReviewResolutionResultStatus.NOT_MANUAL_REVIEW,
+                            job,
+                        )
+                    cur.execute(
+                        """
+                        UPDATE one_day_generation_jobs
+                        SET manual_reviewed_at = %s,
+                            manual_reviewed_by = %s,
+                            manual_review_resolution = %s,
+                            manual_review_note = %s,
+                            updated_at = %s
+                        WHERE job_id = %s
+                        RETURNING *
+                        """,
+                        (current_time, resolved_by, resolution, note, current_time, job.job_id),
+                    )
+                    return ManualReviewResolutionResult(
+                        ManualReviewResolutionResultStatus.RESOLVED,
+                        _job_from_row(cur.fetchone()),
+                    )
 
     def cleanup_stale(
         self,
@@ -1099,6 +1166,10 @@ class PostgresOneDayGenerationJobStore:
                 finalization_error = COALESCE(%s, finalization_error),
                 delivery_status = %s,
                 requires_manual_review = false,
+                manual_reviewed_at = NULL,
+                manual_reviewed_by = NULL,
+                manual_review_resolution = NULL,
+                manual_review_note = NULL,
                 delivered_at = COALESCE(delivered_at, %s),
                 finished_at = COALESCE(finished_at, %s),
                 updated_at = %s
@@ -1133,6 +1204,10 @@ class PostgresOneDayGenerationJobStore:
                 finalization_error = COALESCE(%s, finalization_error),
                 delivery_status = %s,
                 requires_manual_review = true,
+                manual_reviewed_at = NULL,
+                manual_reviewed_by = NULL,
+                manual_review_resolution = NULL,
+                manual_review_note = NULL,
                 finished_at = COALESCE(finished_at, %s),
                 updated_at = %s
             WHERE job_id = %s
@@ -1165,6 +1240,10 @@ class PostgresOneDayGenerationJobStore:
                 finalization_error = COALESCE(%s, finalization_error),
                 delivery_status = %s,
                 requires_manual_review = true,
+                manual_reviewed_at = NULL,
+                manual_reviewed_by = NULL,
+                manual_review_resolution = NULL,
+                manual_review_note = NULL,
                 finished_at = COALESCE(finished_at, %s),
                 updated_at = %s
             WHERE job_id = %s
@@ -1381,6 +1460,10 @@ def _job_from_row(row: Any) -> OneDayGenerationJob:
         failure_reason=_optional_text(row["failure_reason"]),
         finalization_error=_optional_text(row["finalization_error"]),
         requires_manual_review=bool(row["requires_manual_review"]),
+        manual_reviewed_at=_datetime_or_none(row["manual_reviewed_at"]),
+        manual_reviewed_by=_optional_text(row["manual_reviewed_by"]),
+        manual_review_resolution=_optional_text(row["manual_review_resolution"]),
+        manual_review_note=_optional_text(row["manual_review_note"]),
         request_snapshot=_request_snapshot_from_row(row),
         worker_id=_optional_text(_row_get(row, "worker_id")),
         leased_until=_datetime_or_none(_row_get(row, "leased_until")),

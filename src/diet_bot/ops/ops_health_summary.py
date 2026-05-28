@@ -398,7 +398,7 @@ def fetch_database_health_snapshot(conn: Any) -> DatabaseHealthSnapshot:
             )
         )
         one_day = (
-            _fetch_job_queue_summary(cur, "one_day_generation_jobs", has_reviewed_fields=False)
+            _fetch_job_queue_summary(cur, "one_day_generation_jobs", has_reviewed_fields=True)
             if "one_day_generation_jobs" in present_tables
             else _empty_job_summary()
         )

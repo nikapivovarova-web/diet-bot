@@ -26,6 +26,7 @@ from diet_bot.weekly_pdf_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    ManualReviewResolutionResultStatus,
     MarkRetryableFailureResultStatus,
     MarkDeliveredResultStatus,
     MarkSendStartedResultStatus,
@@ -55,7 +56,9 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     assert "requires_manual_review BOOLEAN NOT NULL DEFAULT false" in statements
     assert "manual_review_reason TEXT" in statements
     assert "manual_reviewed_at TIMESTAMPTZ" in statements
+    assert "manual_reviewed_by TEXT" in statements
     assert "manual_review_resolution TEXT" in statements
+    assert "manual_review_note TEXT" in statements
     assert "request_payload_json JSONB" in statements
     assert "profile_json JSONB" in statements
     assert "recent_recipe_ids_json JSONB" in statements
@@ -82,10 +85,15 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     start_signature = signature(PostgresWeeklyPdfJobStore.start_job_and_consume)
     cleanup_signature = signature(PostgresWeeklyPdfJobStore.cleanup_stale)
     manual_review_signature = signature(PostgresWeeklyPdfJobStore.get_manual_review_jobs)
+    resolve_signature = signature(PostgresWeeklyPdfJobStore.resolve_manual_review)
 
     assert "test_access" in start_signature.parameters
     assert "chat_id" in cleanup_signature.parameters
     assert "include_reviewed" in manual_review_signature.parameters
+    assert "resolved_by" in resolve_signature.parameters
+    assert "resolution" in resolve_signature.parameters
+    assert "note" in resolve_signature.parameters
+    assert "allow_non_manual_review" in resolve_signature.parameters
     assert hasattr(PostgresWeeklyPdfJobStore, "admit_queued_job")
     assert hasattr(PostgresWeeklyPdfJobStore, "claim_next_queued_job")
     assert hasattr(PostgresWeeklyPdfJobStore, "extend_lease")
@@ -95,6 +103,7 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_delivered")
     assert hasattr(PostgresWeeklyPdfJobStore, "get_manual_review_jobs")
     assert hasattr(PostgresWeeklyPdfJobStore, "get_unresolved_manual_review_jobs")
+    assert hasattr(PostgresWeeklyPdfJobStore, "resolve_manual_review")
     assert "send_started_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "delivered_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "finalization_error" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
@@ -102,7 +111,9 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert "requires_manual_review" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "manual_review_reason" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "manual_reviewed_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "manual_reviewed_by" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "manual_review_resolution" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "manual_review_note" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "request_payload_json" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "profile_json" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "recent_recipe_ids_json" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
@@ -200,7 +211,9 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
                     'requires_manual_review',
                     'manual_review_reason',
                     'manual_reviewed_at',
+                    'manual_reviewed_by',
                     'manual_review_resolution',
+                    'manual_review_note',
                     'request_payload_json',
                     'profile_json',
                     'recent_recipe_ids_json',
@@ -231,7 +244,9 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "requires_manual_review",
         "manual_review_reason",
         "manual_reviewed_at",
+        "manual_reviewed_by",
         "manual_review_resolution",
+        "manual_review_note",
         "request_payload_json",
         "profile_json",
         "recent_recipe_ids_json",
@@ -1057,6 +1072,123 @@ def test_manual_review_query_can_include_reviewed_jobs(store: PostgresWeeklyPdfJ
     assert jobs[1].manual_review_resolution == "operator_confirmed_delivery"
 
 
+def test_resolve_manual_review_marks_audit_fields_without_changing_refund_or_delivery(
+    store: PostgresWeeklyPdfJobStore,
+) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    job_id = uuid.uuid4()
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO weekly_pdf_jobs (
+                    job_id,
+                    chat_id,
+                    idempotency_key,
+                    status,
+                    refund_status,
+                    consumption_source,
+                    stale_after,
+                    delivery_status,
+                    requires_manual_review,
+                    manual_review_reason,
+                    created_at,
+                    updated_at,
+                    finished_at
+                )
+                VALUES (%s, 321, 'manual-resolve-weekly', 'succeeded', 'pending', 'monthly',
+                    %s, 'unknown', true, 'send_started_without_delivery_confirmation', %s, %s, %s)
+                """,
+                (
+                    job_id,
+                    now + timedelta(minutes=15),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    result = store.resolve_manual_review(
+        job_id,
+        resolved_by="ops.alex",
+        resolution="confirmed_delivered",
+        note="Ticket MR-321 checked provider export.",
+        now=now + timedelta(minutes=5),
+    )
+    repeated = store.resolve_manual_review(
+        job_id,
+        resolved_by="ops.second",
+        resolution="confirmed_delivered",
+        note="Repeated ticket should not overwrite audit metadata.",
+        now=now + timedelta(minutes=6),
+    )
+    unresolved = store.get_unresolved_manual_review_jobs(limit=10)
+    reviewed = store.get_manual_review_jobs(limit=10, include_reviewed=True)
+
+    assert result.status == ManualReviewResolutionResultStatus.RESOLVED
+    assert result.job.manual_reviewed_at == now + timedelta(minutes=5)
+    assert result.job.manual_reviewed_by == "ops.alex"
+    assert result.job.manual_review_resolution == "confirmed_delivered"
+    assert result.job.manual_review_note == "Ticket MR-321 checked provider export."
+    assert result.job.delivery_status == "unknown"
+    assert result.job.refund_status == "pending"
+    assert repeated.status == ManualReviewResolutionResultStatus.ALREADY_RESOLVED
+    assert repeated.job.manual_reviewed_by == "ops.alex"
+    assert job_id not in {job.job_id for job in unresolved}
+    assert job_id in {job.job_id for job in reviewed}
+
+
+def test_resolve_manual_review_refuses_non_review_without_override(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    clean_job_id = uuid.uuid4()
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO weekly_pdf_jobs (
+                    job_id,
+                    chat_id,
+                    idempotency_key,
+                    status,
+                    refund_status,
+                    stale_after,
+                    delivery_status,
+                    requires_manual_review,
+                    created_at,
+                    updated_at,
+                    finished_at
+                )
+                VALUES (%s, 322, 'manual-resolve-weekly-clean', 'succeeded', 'not_required',
+                    %s, 'delivered', false, %s, %s, %s)
+                """,
+                (clean_job_id, now + timedelta(minutes=15), now, now, now),
+            )
+
+    refused = store.resolve_manual_review(
+        clean_job_id,
+        resolved_by="ops.alex",
+        resolution="operator_override",
+        note="Ticket MR-322.",
+        now=now + timedelta(minutes=5),
+    )
+    overridden = store.resolve_manual_review(
+        clean_job_id,
+        resolved_by="ops.alex",
+        resolution="operator_override",
+        note="Ticket MR-322 records audit-only closure.",
+        now=now + timedelta(minutes=6),
+        allow_non_manual_review=True,
+    )
+
+    assert refused.status == ManualReviewResolutionResultStatus.NOT_MANUAL_REVIEW
+    assert refused.job.manual_reviewed_at is None
+    assert overridden.status == ManualReviewResolutionResultStatus.RESOLVED
+    assert overridden.job.manual_reviewed_at == now + timedelta(minutes=6)
+    assert overridden.job.requires_manual_review is False
+    assert overridden.job.delivery_status == "delivered"
+    assert overridden.job.refund_status == "not_required"
+
+
 def test_cleanup_stale_running_job_refunds_once(store: PostgresWeeklyPdfJobStore) -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     chat_id = 107
@@ -1375,7 +1507,9 @@ class FakeJobCursor:
             requires_manual_review=True,
             manual_review_reason=manual_review_reason,
             manual_reviewed_at=None,
+            manual_reviewed_by=None,
             manual_review_resolution=None,
+            manual_review_note=None,
             finished_at=finished_at,
             updated_at=updated_at,
         )
@@ -1407,7 +1541,9 @@ def _job_row(job: WeeklyPdfJob, **overrides):
         "requires_manual_review": job.requires_manual_review,
         "manual_review_reason": job.manual_review_reason,
         "manual_reviewed_at": job.manual_reviewed_at,
+        "manual_reviewed_by": job.manual_reviewed_by,
         "manual_review_resolution": job.manual_review_resolution,
+        "manual_review_note": job.manual_review_note,
         "request_payload_json": None if job.request_snapshot is None else job.request_snapshot.request_payload,
         "profile_json": None if job.request_snapshot is None else job.request_snapshot.profile,
         "recent_recipe_ids_json": [] if job.request_snapshot is None else list(job.request_snapshot.recent_recipe_ids),

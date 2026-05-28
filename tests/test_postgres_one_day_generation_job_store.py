@@ -20,6 +20,7 @@ from diet_bot.one_day_generation_jobs import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    ManualReviewResolutionResultStatus,
     MarkSendStartedResultStatus,
     MarkRetryableFailureResultStatus,
     MarkValueMessageDeliveredResultStatus,
@@ -58,6 +59,10 @@ def test_migration_defines_required_schema_without_connecting_to_postgres() -> N
     assert "delivered_at TIMESTAMPTZ" in statements
     assert "finalization_error TEXT" in statements
     assert "requires_manual_review BOOLEAN NOT NULL DEFAULT false" in statements
+    assert "manual_reviewed_at TIMESTAMPTZ" in statements
+    assert "manual_reviewed_by TEXT" in statements
+    assert "manual_review_resolution TEXT" in statements
+    assert "manual_review_note TEXT" in statements
     assert "request_payload_json JSONB" in statements
     assert "request_kind TEXT" in statements
     assert "profile_json JSONB" in statements
@@ -80,10 +85,15 @@ def test_store_contract_without_connecting_to_postgres() -> None:
     start_signature = signature(PostgresOneDayGenerationJobStore.start_job_and_consume)
     cleanup_signature = signature(PostgresOneDayGenerationJobStore.cleanup_stale)
     delivered_signature = signature(PostgresOneDayGenerationJobStore.mark_value_message_delivered)
+    resolve_signature = signature(PostgresOneDayGenerationJobStore.resolve_manual_review)
 
     assert "test_access" in start_signature.parameters
     assert "chat_id" in cleanup_signature.parameters
     assert "value_message_key" in delivered_signature.parameters
+    assert "resolved_by" in resolve_signature.parameters
+    assert "resolution" in resolve_signature.parameters
+    assert "note" in resolve_signature.parameters
+    assert "allow_non_manual_review" in resolve_signature.parameters
     assert hasattr(PostgresOneDayGenerationJobStore, "admit_job")
     assert hasattr(PostgresOneDayGenerationJobStore, "admit_queued_job")
     assert hasattr(PostgresOneDayGenerationJobStore, "claim_next_queued_job")
@@ -94,6 +104,8 @@ def test_store_contract_without_connecting_to_postgres() -> None:
     assert hasattr(PostgresOneDayGenerationJobStore, "set_expected_value_messages")
     assert hasattr(PostgresOneDayGenerationJobStore, "finish_failure_and_refund_once")
     assert hasattr(PostgresOneDayGenerationJobStore, "get_unresolved_manual_review_jobs")
+    assert hasattr(PostgresOneDayGenerationJobStore, "get_manual_review_jobs")
+    assert hasattr(PostgresOneDayGenerationJobStore, "resolve_manual_review")
     assert "expected_value_messages" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns[
         "one_day_generation_jobs"
     ]
@@ -104,6 +116,12 @@ def test_store_contract_without_connecting_to_postgres() -> None:
         "one_day_generation_jobs"
     ]
     assert "one_day_generation_job_value_messages" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns
+    assert "manual_reviewed_at" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns["one_day_generation_jobs"]
+    assert "manual_reviewed_by" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns["one_day_generation_jobs"]
+    assert "manual_review_resolution" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns[
+        "one_day_generation_jobs"
+    ]
+    assert "manual_review_note" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns["one_day_generation_jobs"]
     assert "request_payload_json" in ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION.table_columns[
         "one_day_generation_jobs"
     ]
@@ -1127,6 +1145,110 @@ def test_unresolved_manual_review_query_returns_only_review_required_jobs(
     assert [job.job_id for job in limited] == [unknown.job_id]
 
 
+def test_resolve_manual_review_marks_audit_fields_without_changing_refund_or_delivery(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    _save_subscription(store, 126, now=now, one_day_remaining=1)
+    job = _running_job_with_expected_count(
+        store,
+        126,
+        "one-day-review-resolve",
+        now,
+        expected=2,
+        stale_after=now - timedelta(seconds=1),
+    )
+    store.mark_value_message_delivered(
+        job.job_id,
+        value_message_key="meal-breakfast",
+        now=now + timedelta(seconds=1),
+    )
+    store.cleanup_stale(chat_id=126, now=now + timedelta(seconds=2))
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE one_day_generation_jobs
+                SET refund_status = 'pending'
+                WHERE job_id = %s
+                """,
+                (job.job_id,),
+            )
+
+    result = store.resolve_manual_review(
+        job.job_id,
+        resolved_by="ops.mira",
+        resolution="no_refund_confirmed",
+        note="Ticket MR-126 checked partial delivery; no refund from this tool.",
+        now=now + timedelta(minutes=5),
+    )
+    repeated = store.resolve_manual_review(
+        job.job_id,
+        resolved_by="ops.second",
+        resolution="no_refund_confirmed",
+        note="Repeated ticket should not overwrite audit metadata.",
+        now=now + timedelta(minutes=6),
+    )
+    unresolved = store.get_unresolved_manual_review_jobs(limit=10)
+    reviewed = store.get_manual_review_jobs(limit=10, include_reviewed=True)
+
+    assert result.status == ManualReviewResolutionResultStatus.RESOLVED
+    assert result.job.manual_reviewed_at == now + timedelta(minutes=5)
+    assert result.job.manual_reviewed_by == "ops.mira"
+    assert result.job.manual_review_resolution == "no_refund_confirmed"
+    assert result.job.manual_review_note == "Ticket MR-126 checked partial delivery; no refund from this tool."
+    assert result.job.delivery_status == "unknown"
+    assert result.job.refund_status == "pending"
+    assert repeated.status == ManualReviewResolutionResultStatus.ALREADY_RESOLVED
+    assert repeated.job.manual_reviewed_by == "ops.mira"
+    assert job.job_id not in {review.job_id for review in unresolved}
+    assert job.job_id in {review.job_id for review in reviewed}
+
+
+def test_resolve_manual_review_refuses_non_review_without_override(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    _save_subscription(store, 127, now=now, one_day_remaining=1)
+    delivered = _running_job_with_expected_count(
+        store,
+        127,
+        "one-day-review-resolve-clean",
+        now,
+        expected=1,
+    )
+    store.mark_value_message_delivered(
+        delivered.job_id,
+        value_message_key="meal-breakfast",
+        now=now + timedelta(seconds=1),
+    )
+    store.finish_success(delivered.job_id, now=now + timedelta(seconds=2))
+
+    refused = store.resolve_manual_review(
+        delivered.job_id,
+        resolved_by="ops.mira",
+        resolution="operator_override",
+        note="Ticket MR-127.",
+        now=now + timedelta(minutes=5),
+    )
+    overridden = store.resolve_manual_review(
+        delivered.job_id,
+        resolved_by="ops.mira",
+        resolution="operator_override",
+        note="Ticket MR-127 records audit-only closure.",
+        now=now + timedelta(minutes=6),
+        allow_non_manual_review=True,
+    )
+
+    assert refused.status == ManualReviewResolutionResultStatus.NOT_MANUAL_REVIEW
+    assert refused.job.manual_reviewed_at is None
+    assert overridden.status == ManualReviewResolutionResultStatus.RESOLVED
+    assert overridden.job.manual_reviewed_at == now + timedelta(minutes=6)
+    assert overridden.job.requires_manual_review is False
+    assert overridden.job.delivery_status == "delivered"
+    assert overridden.job.refund_status == "not_required"
+
+
 def _running_job_with_expected_count(
     store: PostgresOneDayGenerationJobStore,
     chat_id: int,
@@ -1252,6 +1374,10 @@ def _one_day_job_row(job: OneDayGenerationJob, **overrides):
         "failure_reason": job.failure_reason,
         "finalization_error": job.finalization_error,
         "requires_manual_review": job.requires_manual_review,
+        "manual_reviewed_at": job.manual_reviewed_at,
+        "manual_reviewed_by": job.manual_reviewed_by,
+        "manual_review_resolution": job.manual_review_resolution,
+        "manual_review_note": job.manual_review_note,
     }
     row.update(overrides)
     return row

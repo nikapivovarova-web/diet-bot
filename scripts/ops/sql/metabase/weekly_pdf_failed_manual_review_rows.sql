@@ -9,7 +9,9 @@ SELECT
     requires_manual_review,
     manual_review_reason,
     manual_reviewed_at,
+    manual_reviewed_by,
     manual_review_resolution,
+    manual_review_note,
     failure_reason,
     finalization_error,
     created_at,
@@ -19,7 +21,7 @@ SELECT
     stale_after,
     finished_at
 FROM weekly_pdf_jobs
-WHERE status = 'failed'
+WHERE (status = 'failed' AND (requires_manual_review IS NOT TRUE OR manual_reviewed_at IS NULL))
    OR (requires_manual_review IS TRUE AND manual_reviewed_at IS NULL)
-   OR delivery_status = 'unknown'
+   OR (delivery_status = 'unknown' AND manual_reviewed_at IS NULL)
 ORDER BY COALESCE(finished_at, updated_at, created_at) DESC;
