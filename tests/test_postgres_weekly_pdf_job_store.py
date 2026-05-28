@@ -574,36 +574,36 @@ def test_claim_retry_and_expired_lease_reclaim(store: PostgresWeeklyPdfJobStore)
         next_attempt_at=now + timedelta(minutes=10),
         now=now + timedelta(minutes=1),
     )
-    too_early = store.claim_next_queued_job(
+    claimed_second = store.claim_next_queued_job(
         worker_id="worker-b",
         lease_until=now + timedelta(minutes=5),
         now=now + timedelta(minutes=2),
     )
+    nothing_retryable_yet = store.claim_next_queued_job(
+        worker_id="worker-c",
+        lease_until=now + timedelta(minutes=8),
+        now=now + timedelta(minutes=3),
+    )
+    reclaimed_expired = store.claim_next_queued_job(
+        worker_id="worker-c",
+        lease_until=now + timedelta(minutes=15),
+        now=now + timedelta(minutes=6),
+    )
+    extended_expired = store.extend_lease(
+        reclaimed_expired.job.job_id,
+        worker_id="worker-c",
+        lease_until=now + timedelta(minutes=20),
+        now=now + timedelta(minutes=7),
+    )
     reclaimed_retry = store.claim_next_queued_job(
-        worker_id="worker-b",
+        worker_id="worker-d",
         lease_until=now + timedelta(minutes=15),
         now=now + timedelta(minutes=10),
     )
-    extended = store.extend_lease(
-        reclaimed_retry.job.job_id,
-        worker_id="worker-b",
-        lease_until=now + timedelta(minutes=20),
-        now=now + timedelta(minutes=11),
-    )
-    claimed_second = store.claim_next_queued_job(
-        worker_id="worker-c",
-        lease_until=now + timedelta(minutes=15),
-        now=now + timedelta(minutes=12),
-    )
     blocked = store.claim_next_queued_job(
-        worker_id="worker-d",
+        worker_id="worker-e",
         lease_until=now + timedelta(minutes=30),
         now=now + timedelta(minutes=13),
-    )
-    reclaimed_expired = store.claim_next_queued_job(
-        worker_id="worker-d",
-        lease_until=now + timedelta(minutes=30),
-        now=now + timedelta(minutes=21),
     )
 
     assert claimed_first.status == ClaimQueuedJobResultStatus.CLAIMED
@@ -612,18 +612,18 @@ def test_claim_retry_and_expired_lease_reclaim(store: PostgresWeeklyPdfJobStore)
     assert retryable.job.status == JOB_STATUS_QUEUED
     assert retryable.job.attempt_count == 1
     assert retryable.job.next_attempt_at == now + timedelta(minutes=10)
-    assert too_early.status == ClaimQueuedJobResultStatus.CLAIMED
-    assert too_early.job.job_id == second.job_id
+    assert claimed_second.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert claimed_second.job.job_id == second.job_id
+    assert nothing_retryable_yet.status == ClaimQueuedJobResultStatus.EMPTY
+    assert reclaimed_expired.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert reclaimed_expired.job.job_id == second.job_id
+    assert reclaimed_expired.job.worker_id == "worker-c"
+    assert extended_expired.status == ExtendLeaseResultStatus.EXTENDED
+    assert extended_expired.job.leased_until == now + timedelta(minutes=20)
     assert reclaimed_retry.status == ClaimQueuedJobResultStatus.CLAIMED
     assert reclaimed_retry.job.job_id == first.job_id
-    assert reclaimed_retry.job.worker_id == "worker-b"
-    assert extended.status == ExtendLeaseResultStatus.EXTENDED
-    assert extended.job.leased_until == now + timedelta(minutes=20)
-    assert claimed_second.status == ClaimQueuedJobResultStatus.EMPTY
+    assert reclaimed_retry.job.worker_id == "worker-d"
     assert blocked.status == ClaimQueuedJobResultStatus.EMPTY
-    assert reclaimed_expired.status == ClaimQueuedJobResultStatus.CLAIMED
-    assert reclaimed_expired.job.job_id == first.job_id
-    assert reclaimed_expired.job.worker_id == "worker-d"
 
 
 def test_queued_job_does_not_consume_entitlement(store: PostgresWeeklyPdfJobStore) -> None:
