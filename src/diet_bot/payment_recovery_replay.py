@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
@@ -16,6 +16,8 @@ from .payment_recovery_spool import (
     ALLOWED_SERIALIZED_FIELDS,
     PaymentRecoveryRecord,
     PaymentRecoveryRecordError,
+    PaymentRecoverySpoolSummary,
+    summarize_payment_recovery_spool,
 )
 from .payments import (
     ORDER_STATUS_GRANTED,
@@ -541,11 +543,35 @@ def render_apply_human(report: PaymentReplayApplyReport) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_spool_status_human(summary: PaymentRecoverySpoolSummary) -> str:
+    fields = [
+        f"status={summary.status}",
+        f"records={summary.record_count}",
+        f"malformed={summary.malformed_line_count}",
+        f"duplicates={summary.duplicate_record_count}",
+        f"bytes={summary.bytes}",
+    ]
+    if summary.oldest_age_seconds is not None:
+        fields.append(f"oldest_age_seconds={summary.oldest_age_seconds}")
+    if summary.newest_age_seconds is not None:
+        fields.append(f"newest_age_seconds={summary.newest_age_seconds}")
+    if summary.reasons:
+        fields.append("reasons=" + ",".join(summary.reasons))
+    return " ".join(fields) + "\n"
+
+
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspect or apply payment recovery spool records.",
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("--spool", required=True, type=Path)
+    status_parser.add_argument("--warn-after-hours", type=float)
+    status_parser.add_argument("--fail-after-hours", type=float)
+    status_parser.add_argument("--max-records", type=int)
+    status_parser.add_argument("--now")
+    status_parser.add_argument("--json", action="store_true", dest="json_output")
     for mode in ("list", "dry-run"):
         subparser = subparsers.add_parser(mode)
         subparser.add_argument("--spool", required=True, type=Path)
@@ -565,6 +591,19 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     source_env = dict(os.environ if env is None else env)
 
     try:
+        if args.mode == "status":
+            summary = summarize_payment_recovery_spool(
+                args.spool,
+                now=_parse_optional_now(args.now),
+                warn_after=_hours_to_timedelta(args.warn_after_hours),
+                fail_after=_hours_to_timedelta(args.fail_after_hours),
+                max_records=args.max_records,
+            )
+            if args.json_output:
+                print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                print(render_spool_status_human(summary), end="")
+            return 1 if summary.status == "fail" else 0
         if args.mode == "list":
             report = list_spool(args.spool)
             _validate_expected_fingerprint(report, args.expected_spool_fingerprint)
@@ -906,6 +945,29 @@ def _exit_code(report: PaymentReplayReport | PaymentReplayApplyReport) -> int:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _hours_to_timedelta(value: float | None) -> timedelta | None:
+    if value is None:
+        return None
+    if value < 0:
+        raise PaymentReplayUsageError("hour thresholds must be non-negative")
+    return timedelta(hours=value)
+
+
+def _parse_optional_now(value: str | None) -> datetime | None:
+    if value is None or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise PaymentReplayUsageError("--now must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 if __name__ == "__main__":

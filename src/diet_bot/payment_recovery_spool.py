@@ -7,7 +7,7 @@ import re
 import stat
 import tempfile
 from dataclasses import InitVar, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -184,6 +184,48 @@ class PaymentRecoveryReadResult:
     duplicates_skipped: int = 0
 
 
+@dataclass(frozen=True)
+class PaymentRecoverySpoolSummary:
+    path: Path
+    exists: bool
+    bytes: int
+    record_count: int
+    malformed_line_count: int
+    duplicate_record_count: int
+    oldest_created_at: str | None
+    newest_created_at: str | None
+    oldest_age_seconds: int | None
+    newest_age_seconds: int | None
+    status: str
+    reasons: tuple[str, ...]
+    warn_after_seconds: int | None = None
+    fail_after_seconds: int | None = None
+    max_records: int | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "path": str(self.path),
+            "exists": self.exists,
+            "bytes": self.bytes,
+            "record_count": self.record_count,
+            "malformed_line_count": self.malformed_line_count,
+            "duplicate_record_count": self.duplicate_record_count,
+            "oldest_created_at": self.oldest_created_at,
+            "newest_created_at": self.newest_created_at,
+            "oldest_age_seconds": self.oldest_age_seconds,
+            "newest_age_seconds": self.newest_age_seconds,
+            "status": self.status,
+            "reasons": list(self.reasons),
+        }
+        if self.warn_after_seconds is not None:
+            payload["warn_after_seconds"] = self.warn_after_seconds
+        if self.fail_after_seconds is not None:
+            payload["fail_after_seconds"] = self.fail_after_seconds
+        if self.max_records is not None:
+            payload["max_records"] = self.max_records
+        return payload
+
+
 def append_payment_recovery_record(path: str | Path, record: PaymentRecoveryRecord) -> None:
     if not isinstance(record, PaymentRecoveryRecord):
         raise TypeError("record must be a PaymentRecoveryRecord")
@@ -235,6 +277,87 @@ def read_payment_recovery_records(path: str | Path, *, dedupe: bool = True) -> P
         records=tuple(records),
         malformed_lines=tuple(malformed_lines),
         duplicates_skipped=duplicates_skipped,
+    )
+
+
+def summarize_payment_recovery_spool(
+    path: str | Path,
+    *,
+    now: datetime | None = None,
+    warn_after: timedelta | None = None,
+    fail_after: timedelta | None = None,
+    max_records: int | None = None,
+) -> PaymentRecoverySpoolSummary:
+    spool_path = Path(path)
+    current_time = _normalize_summary_now(now)
+    if not spool_path.exists():
+        return PaymentRecoverySpoolSummary(
+            path=spool_path,
+            exists=False,
+            bytes=0,
+            record_count=0,
+            malformed_line_count=0,
+            duplicate_record_count=0,
+            oldest_created_at=None,
+            newest_created_at=None,
+            oldest_age_seconds=None,
+            newest_age_seconds=None,
+            status="ok",
+            reasons=("spool_missing",),
+            warn_after_seconds=_timedelta_seconds(warn_after),
+            fail_after_seconds=_timedelta_seconds(fail_after),
+            max_records=max_records,
+        )
+
+    all_records = read_payment_recovery_records(spool_path, dedupe=False)
+    deduped_records = read_payment_recovery_records(spool_path, dedupe=True)
+    created_times = tuple(_summary_timestamp(record.created_at) for record in all_records.records)
+    oldest = min(created_times) if created_times else None
+    newest = max(created_times) if created_times else None
+    oldest_age = _age_seconds(current_time, oldest)
+    newest_age = _age_seconds(current_time, newest)
+    record_count = len(all_records.records)
+    duplicate_count = max(0, record_count - len(deduped_records.records))
+    malformed_count = len(all_records.malformed_lines)
+
+    reasons: list[str] = []
+    status = "ok"
+    if malformed_count:
+        status = "fail"
+        reasons.append("malformed_spool_records")
+    if max_records is not None and record_count > max_records:
+        status = "fail"
+        reasons.append("record_count_exceeds_max")
+    fail_after_seconds = _timedelta_seconds(fail_after)
+    warn_after_seconds = _timedelta_seconds(warn_after)
+    if oldest_age is not None and fail_after_seconds is not None and oldest_age > fail_after_seconds:
+        status = "fail"
+        reasons.append("oldest_record_exceeds_fail_threshold")
+    elif oldest_age is not None and warn_after_seconds is not None and oldest_age > warn_after_seconds:
+        if status != "fail":
+            status = "warn"
+        reasons.append("oldest_record_exceeds_warn_threshold")
+    if record_count and not reasons:
+        reasons.append("spool_non_empty")
+    if not record_count and not reasons:
+        reasons.append("spool_empty")
+
+    return PaymentRecoverySpoolSummary(
+        path=spool_path,
+        exists=True,
+        bytes=spool_path.stat().st_size,
+        record_count=record_count,
+        malformed_line_count=malformed_count,
+        duplicate_record_count=duplicate_count,
+        oldest_created_at=oldest.isoformat(timespec="seconds") if oldest is not None else None,
+        newest_created_at=newest.isoformat(timespec="seconds") if newest is not None else None,
+        oldest_age_seconds=oldest_age,
+        newest_age_seconds=newest_age,
+        status=status,
+        reasons=tuple(reasons),
+        warn_after_seconds=warn_after_seconds,
+        fail_after_seconds=fail_after_seconds,
+        max_records=max_records,
     )
 
 
@@ -508,6 +631,35 @@ def _normalize_timestamp(value: object, field_name: str) -> str:
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
     return timestamp.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def _normalize_summary_now(value: datetime | None) -> datetime:
+    timestamp = datetime.now(UTC) if value is None else value
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC)
+
+
+def _summary_timestamp(value: str) -> datetime:
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    timestamp = datetime.fromisoformat(raw)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC)
+
+
+def _age_seconds(now: datetime, timestamp: datetime | None) -> int | None:
+    if timestamp is None:
+        return None
+    return max(0, int((now - timestamp).total_seconds()))
+
+
+def _timedelta_seconds(value: timedelta | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(value.total_seconds()))
 
 
 def _restrict_file_permissions(path: Path) -> None:
