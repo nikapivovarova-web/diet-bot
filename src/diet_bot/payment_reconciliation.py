@@ -14,6 +14,7 @@ from .payments import ORDER_STATUS_GRANTED, PaymentPayloadError, decode_payment_
 
 
 CATEGORY_MATCHED_PAID_GRANTED = "matched_paid_granted"
+CATEGORY_CHARGE_ID_MISMATCH = "charge_id_mismatch"
 CATEGORY_CHARGED_BUT_NOT_GRANTED = "charged_but_not_granted"
 CATEGORY_GRANTED_BUT_NO_PROVIDER_CHARGE = "granted_but_no_provider_charge"
 CATEGORY_DUPLICATE_PROVIDER_CHARGE_ORDER = "duplicate_provider_charge_order"
@@ -21,6 +22,7 @@ CATEGORY_RECOVERY_SPOOL_CANDIDATE = "recovery_spool_candidate"
 
 RECONCILIATION_CATEGORIES = (
     CATEGORY_MATCHED_PAID_GRANTED,
+    CATEGORY_CHARGE_ID_MISMATCH,
     CATEGORY_CHARGED_BUT_NOT_GRANTED,
     CATEGORY_GRANTED_BUT_NO_PROVIDER_CHARGE,
     CATEGORY_DUPLICATE_PROVIDER_CHARGE_ORDER,
@@ -39,6 +41,14 @@ class PaymentReconciliationItem:
     amount: int | None = None
     currency: str | None = None
     order_status: str | None = None
+    ledger_telegram_payment_charge_id: str | None = None
+    ledger_provider_payment_charge_id: str | None = None
+    ledger_amount: int | None = None
+    ledger_currency: str | None = None
+    ledger_order_status: str | None = None
+    amount_matches: bool | None = None
+    currency_matches: bool | None = None
+    charge_id_mismatch_fields: tuple[str, ...] = ()
     provider_charge_count: int | None = None
     recovery_record_id: str | None = None
 
@@ -59,12 +69,27 @@ class PaymentReconciliationItem:
             "amount": self.amount,
             "currency": self.currency,
             "order_status": self.order_status,
+            "ledger_telegram_payment_charge_id": redact_optional_identifier(
+                "telegram_payment_charge",
+                self.ledger_telegram_payment_charge_id,
+            ),
+            "ledger_provider_payment_charge_id": redact_optional_identifier(
+                "provider_payment_charge",
+                self.ledger_provider_payment_charge_id,
+            ),
+            "ledger_amount": self.ledger_amount,
+            "ledger_currency": self.ledger_currency,
+            "ledger_order_status": self.ledger_order_status,
+            "amount_matches": self.amount_matches,
+            "currency_matches": self.currency_matches,
             "provider_charge_count": self.provider_charge_count,
             "recovery_record_id": self.recovery_record_id,
         }
         for key, value in optional_fields.items():
             if value is not None:
                 payload[key] = value
+        if self.charge_id_mismatch_fields:
+            payload["charge_id_mismatch_fields"] = list(self.charge_id_mismatch_fields)
         return payload
 
 
@@ -130,6 +155,9 @@ def reconcile_payment_exports(
         exact_granted = [ledger for ledger in matches if _is_exact_granted_match(charge, ledger)]
         if exact_granted:
             items.append(_item(CATEGORY_MATCHED_PAID_GRANTED, charge, reason="provider_charge_matches_grant"))
+        elif charge_id_mismatch := _first_charge_id_mismatch(charge, matches):
+            ledger, mismatch_fields = charge_id_mismatch
+            items.append(_charge_id_mismatch_item(charge, ledger, mismatch_fields))
         else:
             reason = "provider_charge_missing_ledger" if not matches else _not_granted_reason(matches)
             items.append(_item(CATEGORY_CHARGED_BUT_NOT_GRANTED, charge, reason=reason))
@@ -180,15 +208,26 @@ def render_reconciliation_jsonl(report: PaymentReconciliationReport) -> str:
 
 
 def render_reconciliation_table(report: PaymentReconciliationReport) -> str:
-    lines = ["category provider order_id amount currency order_status reason"]
+    fields = (
+        "category",
+        "provider",
+        "order_id",
+        "telegram_payment_charge_id",
+        "provider_payment_charge_id",
+        "ledger_telegram_payment_charge_id",
+        "ledger_provider_payment_charge_id",
+        "amount",
+        "ledger_amount",
+        "currency",
+        "ledger_currency",
+        "order_status",
+        "ledger_order_status",
+        "reason",
+    )
+    lines = [" ".join(fields)]
     for item in report.items:
         payload = item.to_dict()
-        lines.append(
-            " ".join(
-                str(payload.get(key, "-"))
-                for key in ("category", "provider", "order_id", "amount", "currency", "order_status", "reason")
-            )
-        )
+        lines.append(" ".join(str(payload.get(key, "-")) for key in fields))
     return "\n".join(lines) + "\n"
 
 
@@ -297,7 +336,46 @@ def _is_exact_granted_match(left: _PaymentExportRow, right: _PaymentExportRow) -
         and left.provider == right.provider
         and _same_optional_int(left.amount, right.amount)
         and _same_optional_text(left.currency, right.currency)
+        and _charge_ids_compatible(left, right)
     )
+
+
+def _first_charge_id_mismatch(
+    row: _PaymentExportRow,
+    matches: Sequence[_PaymentExportRow],
+) -> tuple[_PaymentExportRow, tuple[str, ...]] | None:
+    for match in matches:
+        mismatch_fields = _charge_id_mismatch_fields(row, match)
+        if mismatch_fields:
+            return match, mismatch_fields
+    return None
+
+
+def _charge_id_mismatch_fields(left: _PaymentExportRow, right: _PaymentExportRow) -> tuple[str, ...]:
+    fields: list[str] = []
+    if (
+        left.telegram_payment_charge_id
+        and right.telegram_payment_charge_id
+        and left.telegram_payment_charge_id != right.telegram_payment_charge_id
+    ):
+        fields.append("telegram_payment_charge_id")
+    if (
+        left.provider_payment_charge_id
+        and right.provider_payment_charge_id
+        and left.provider_payment_charge_id != right.provider_payment_charge_id
+    ):
+        fields.append("provider_payment_charge_id")
+    return tuple(fields)
+
+
+def _charge_ids_compatible(left: _PaymentExportRow, right: _PaymentExportRow) -> bool:
+    return not _charge_id_mismatch_fields(left, right)
+
+
+def _charge_id_mismatch_reason(fields: Sequence[str]) -> str:
+    if len(fields) == 1:
+        return f"{fields[0]}_mismatch"
+    return "multiple_charge_id_mismatches"
 
 
 def _not_granted_reason(matches: Sequence[_PaymentExportRow]) -> str:
@@ -329,6 +407,32 @@ def _item(
         order_status=row.status,
         provider_charge_count=provider_charge_count,
         recovery_record_id=recovery_record_id,
+    )
+
+
+def _charge_id_mismatch_item(
+    provider_row: _PaymentExportRow,
+    ledger_row: _PaymentExportRow,
+    mismatch_fields: Sequence[str],
+) -> PaymentReconciliationItem:
+    return PaymentReconciliationItem(
+        category=CATEGORY_CHARGE_ID_MISMATCH,
+        provider=provider_row.provider,
+        reason=_charge_id_mismatch_reason(mismatch_fields),
+        order_id=provider_row.order_id,
+        telegram_payment_charge_id=provider_row.telegram_payment_charge_id,
+        provider_payment_charge_id=provider_row.provider_payment_charge_id,
+        amount=provider_row.amount,
+        currency=provider_row.currency,
+        order_status=provider_row.status,
+        ledger_telegram_payment_charge_id=ledger_row.telegram_payment_charge_id,
+        ledger_provider_payment_charge_id=ledger_row.provider_payment_charge_id,
+        ledger_amount=ledger_row.amount,
+        ledger_currency=ledger_row.currency,
+        ledger_order_status=ledger_row.status,
+        amount_matches=_same_optional_int(provider_row.amount, ledger_row.amount),
+        currency_matches=_same_optional_text(provider_row.currency, ledger_row.currency),
+        charge_id_mismatch_fields=tuple(mismatch_fields),
     )
 
 
