@@ -207,6 +207,119 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605280001",
+        description="Add durable weekly PDF worker queue fields",
+        statements=(
+            """
+            ALTER TABLE weekly_pdf_jobs
+                ADD COLUMN IF NOT EXISTS request_payload_json JSONB,
+                ADD COLUMN IF NOT EXISTS profile_json JSONB,
+                ADD COLUMN IF NOT EXISTS recent_recipe_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                ADD COLUMN IF NOT EXISTS generation_seed TEXT,
+                ADD COLUMN IF NOT EXISTS worker_id TEXT,
+                ADD COLUMN IF NOT EXISTS leased_until TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS last_error TEXT
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_request_payload_object'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_request_payload_object
+                        CHECK (
+                            request_payload_json IS NULL
+                            OR jsonb_typeof(request_payload_json) = 'object'
+                        );
+                END IF;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_profile_object'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_profile_object
+                        CHECK (profile_json IS NULL OR jsonb_typeof(profile_json) = 'object');
+                END IF;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_recent_recipe_ids_array'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_recent_recipe_ids_array
+                        CHECK (jsonb_typeof(recent_recipe_ids_json) = 'array');
+                END IF;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_worker_id_non_empty'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_worker_id_non_empty
+                        CHECK (worker_id IS NULL OR worker_id <> '');
+                END IF;
+            END $$;
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'chk_weekly_pdf_jobs_attempt_count_non_negative'
+                      AND conrelid = 'weekly_pdf_jobs'::regclass
+                ) THEN
+                    ALTER TABLE weekly_pdf_jobs
+                        ADD CONSTRAINT chk_weekly_pdf_jobs_attempt_count_non_negative
+                        CHECK (attempt_count >= 0);
+                END IF;
+            END $$;
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_weekly_pdf_jobs_queue_claim
+                ON weekly_pdf_jobs (
+                    COALESCE(next_attempt_at, created_at),
+                    created_at,
+                    job_id
+                )
+                WHERE status = 'queued'
+                  AND profile_json IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_weekly_pdf_jobs_lease_reclaim
+                ON weekly_pdf_jobs(leased_until, created_at, job_id)
+                WHERE status = 'running'
+                  AND leased_until IS NOT NULL
+                  AND profile_json IS NOT NULL
+            """,
+        ),
+    ),
 )
 
 

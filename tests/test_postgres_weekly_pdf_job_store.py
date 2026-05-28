@@ -18,19 +18,24 @@ from diet_bot.postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore, WE
 from diet_bot.subscriptions import Entitlement, apply_subscription_payment, grant_test_access
 from diet_bot.weekly_pdf_jobs import (
     AdmitJobResultStatus,
+    ClaimQueuedJobResultStatus,
+    ExtendLeaseResultStatus,
     FinishJobResultStatus,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_FAILED,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    MarkRetryableFailureResultStatus,
     MarkDeliveredResultStatus,
     MarkSendStartedResultStatus,
+    QueuedJobAdmissionResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
     StartJobResultStatus,
     WeeklyPdfJob,
+    WeeklyPdfRequestSnapshot,
 )
 
 
@@ -51,6 +56,15 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     assert "manual_review_reason TEXT" in statements
     assert "manual_reviewed_at TIMESTAMPTZ" in statements
     assert "manual_review_resolution TEXT" in statements
+    assert "request_payload_json JSONB" in statements
+    assert "profile_json JSONB" in statements
+    assert "recent_recipe_ids_json JSONB" in statements
+    assert "generation_seed TEXT" in statements
+    assert "worker_id TEXT" in statements
+    assert "leased_until TIMESTAMPTZ" in statements
+    assert "attempt_count INTEGER NOT NULL DEFAULT 0" in statements
+    assert "next_attempt_at TIMESTAMPTZ" in statements
+    assert "last_error TEXT" in statements
     assert "delivery_status = 'delivered'" in statements
     assert "delivery_status = 'unknown'" in statements
     assert "delivery_status = 'send_started'" in statements
@@ -60,6 +74,8 @@ def test_migration_defines_required_indexes_without_connecting_to_postgres() -> 
     assert "WHERE status IN ('queued', 'running')" in statements
     assert "idx_weekly_pdf_jobs_idempotency_key_unique" in statements
     assert "idx_weekly_pdf_jobs_stale" in statements
+    assert "idx_weekly_pdf_jobs_queue_claim" in statements
+    assert "idx_weekly_pdf_jobs_lease_reclaim" in statements
 
 
 def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
@@ -70,6 +86,10 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert "test_access" in start_signature.parameters
     assert "chat_id" in cleanup_signature.parameters
     assert "include_reviewed" in manual_review_signature.parameters
+    assert hasattr(PostgresWeeklyPdfJobStore, "admit_queued_job")
+    assert hasattr(PostgresWeeklyPdfJobStore, "claim_next_queued_job")
+    assert hasattr(PostgresWeeklyPdfJobStore, "extend_lease")
+    assert hasattr(PostgresWeeklyPdfJobStore, "mark_retryable_failure")
     assert hasattr(PostgresWeeklyPdfJobStore, "cancel_queued")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_send_started")
     assert hasattr(PostgresWeeklyPdfJobStore, "mark_delivered")
@@ -83,6 +103,17 @@ def test_store_pr12b_runtime_contract_without_connecting_to_postgres() -> None:
     assert "manual_review_reason" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "manual_reviewed_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
     assert "manual_review_resolution" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "request_payload_json" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "profile_json" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "recent_recipe_ids_json" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "generation_seed" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "worker_id" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "leased_until" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "attempt_count" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "next_attempt_at" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "last_error" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.table_columns["weekly_pdf_jobs"]
+    assert "idx_weekly_pdf_jobs_queue_claim" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.indexes
+    assert "idx_weekly_pdf_jobs_lease_reclaim" in WEEKLY_PDF_JOB_SCHEMA_EXPECTATION.indexes
 
 
 @pytest.fixture
@@ -148,7 +179,9 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
                   AND indexname IN (
                     'idx_weekly_pdf_jobs_active_chat_unique',
                     'idx_weekly_pdf_jobs_idempotency_key_unique',
-                    'idx_weekly_pdf_jobs_stale'
+                    'idx_weekly_pdf_jobs_stale',
+                    'idx_weekly_pdf_jobs_queue_claim',
+                    'idx_weekly_pdf_jobs_lease_reclaim'
                   )
                 """
             )
@@ -167,7 +200,16 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
                     'requires_manual_review',
                     'manual_review_reason',
                     'manual_reviewed_at',
-                    'manual_review_resolution'
+                    'manual_review_resolution',
+                    'request_payload_json',
+                    'profile_json',
+                    'recent_recipe_ids_json',
+                    'generation_seed',
+                    'worker_id',
+                    'leased_until',
+                    'attempt_count',
+                    'next_attempt_at',
+                    'last_error'
                   )
                 """
             )
@@ -178,6 +220,8 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "idx_weekly_pdf_jobs_active_chat_unique",
         "idx_weekly_pdf_jobs_idempotency_key_unique",
         "idx_weekly_pdf_jobs_stale",
+        "idx_weekly_pdf_jobs_queue_claim",
+        "idx_weekly_pdf_jobs_lease_reclaim",
     }
     assert new_columns == {
         "send_started_at",
@@ -188,6 +232,15 @@ def test_schema_init_is_idempotent(store: PostgresWeeklyPdfJobStore) -> None:
         "manual_review_reason",
         "manual_reviewed_at",
         "manual_review_resolution",
+        "request_payload_json",
+        "profile_json",
+        "recent_recipe_ids_json",
+        "generation_seed",
+        "worker_id",
+        "leased_until",
+        "attempt_count",
+        "next_attempt_at",
+        "last_error",
     }
 
 
@@ -391,6 +444,186 @@ def test_same_idempotency_key_returns_existing_job(store: PostgresWeeklyPdfJobSt
     assert second == first
     assert second.chat_id == 102
     assert second.metadata == {"request": "original"}
+
+
+def test_admit_queued_job_persists_snapshot_consumes_quota_and_dedupes(
+    store: PostgresWeeklyPdfJobStore,
+) -> None:
+    now = datetime(2026, 5, 28, tzinfo=UTC)
+    chat_id = 120
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=2)
+    snapshot = WeeklyPdfRequestSnapshot(
+        request_payload={"source": "telegram_weekly_pdf", "recent_recipe_keys": ["r:key"]},
+        profile={"age": 34, "goal": "balance"},
+        recent_recipe_ids=("r001", "r002"),
+        generation_seed="123456",
+    )
+
+    first = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="weekly-durable-admit",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=snapshot,
+        metadata={"source": "durable"},
+        now=now,
+    )
+    idempotent = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="weekly-durable-admit",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"different": True}),
+        now=now + timedelta(seconds=1),
+    )
+    active_duplicate = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="weekly-durable-duplicate",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"other": True}),
+        now=now + timedelta(seconds=2),
+    )
+
+    assert first.status == QueuedJobAdmissionResultStatus.ADMITTED
+    assert first.job is not None
+    assert first.job.status == JOB_STATUS_QUEUED
+    assert first.job.consumption_source == "monthly"
+    assert first.job.refund_status == REFUND_STATUS_PENDING
+    assert first.job.request_snapshot == snapshot
+    assert first.job.metadata == {"source": "durable"}
+    assert idempotent.status == QueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY
+    assert idempotent.job == first.job
+    assert active_duplicate.status == QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE
+    assert active_duplicate.job == first.job
+    assert _weekly_remaining(store, chat_id) == 1
+    assert _active_job_count(store, chat_id) == 1
+    assert store.get_job(first.job.job_id) == first.job
+
+
+def test_admit_queued_job_denied_without_job_or_quota_mutation(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 28, tzinfo=UTC)
+    chat_id = 121
+    _save_exhausted_entitlement(store, chat_id)
+
+    result = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="weekly-durable-denied",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"age": 40}),
+        now=now,
+    )
+
+    assert result.status == QueuedJobAdmissionResultStatus.DENIED
+    assert result.job is None
+    assert result.denial_reason == "weekly_pdf_entitlement_unavailable"
+    assert store.get_active_job_for_chat(chat_id) is None
+    assert _weekly_remaining(store, chat_id) == 0
+
+
+def test_start_job_does_not_double_consume_durable_admission(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 28, tzinfo=UTC)
+    chat_id = 124
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=2)
+    admitted = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="weekly-durable-start",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"age": 41}),
+        now=now,
+    ).job
+
+    started = store.start_job_and_consume(
+        admitted.job_id,
+        now=now + timedelta(seconds=1),
+        stale_after=now + timedelta(minutes=31),
+    )
+
+    assert started.status == StartJobResultStatus.STARTED
+    assert started.job.status == JOB_STATUS_RUNNING
+    assert started.job.consumption_source == "monthly"
+    assert started.job.refund_status == REFUND_STATUS_PENDING
+    assert _weekly_remaining(store, chat_id) == 1
+
+
+def test_claim_retry_and_expired_lease_reclaim(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 28, tzinfo=UTC)
+    _save_subscription(store, 122, now=now, weekly_pdf_remaining=1)
+    _save_subscription(store, 123, now=now, weekly_pdf_remaining=1)
+    first = store.admit_queued_job(
+        chat_id=122,
+        idempotency_key="weekly-claim-first",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"chat": 122}),
+        now=now,
+    ).job
+    second = store.admit_queued_job(
+        chat_id=123,
+        idempotency_key="weekly-claim-second",
+        stale_after=now + timedelta(minutes=30),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"chat": 123}),
+        now=now + timedelta(seconds=1),
+    ).job
+
+    claimed_first = store.claim_next_queued_job(
+        worker_id="worker-a",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(seconds=2),
+    )
+    retryable = store.mark_retryable_failure(
+        claimed_first.job.job_id,
+        worker_id="worker-a",
+        error="temporary_builder_error",
+        next_attempt_at=now + timedelta(minutes=10),
+        now=now + timedelta(minutes=1),
+    )
+    too_early = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=5),
+        now=now + timedelta(minutes=2),
+    )
+    reclaimed_retry = store.claim_next_queued_job(
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=15),
+        now=now + timedelta(minutes=10),
+    )
+    extended = store.extend_lease(
+        reclaimed_retry.job.job_id,
+        worker_id="worker-b",
+        lease_until=now + timedelta(minutes=20),
+        now=now + timedelta(minutes=11),
+    )
+    claimed_second = store.claim_next_queued_job(
+        worker_id="worker-c",
+        lease_until=now + timedelta(minutes=15),
+        now=now + timedelta(minutes=12),
+    )
+    blocked = store.claim_next_queued_job(
+        worker_id="worker-d",
+        lease_until=now + timedelta(minutes=30),
+        now=now + timedelta(minutes=13),
+    )
+    reclaimed_expired = store.claim_next_queued_job(
+        worker_id="worker-d",
+        lease_until=now + timedelta(minutes=30),
+        now=now + timedelta(minutes=21),
+    )
+
+    assert claimed_first.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert claimed_first.job.job_id == first.job_id
+    assert retryable.status == MarkRetryableFailureResultStatus.MARKED
+    assert retryable.job.status == JOB_STATUS_QUEUED
+    assert retryable.job.attempt_count == 1
+    assert retryable.job.next_attempt_at == now + timedelta(minutes=10)
+    assert too_early.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert too_early.job.job_id == second.job_id
+    assert reclaimed_retry.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert reclaimed_retry.job.job_id == first.job_id
+    assert reclaimed_retry.job.worker_id == "worker-b"
+    assert extended.status == ExtendLeaseResultStatus.EXTENDED
+    assert extended.job.leased_until == now + timedelta(minutes=20)
+    assert claimed_second.status == ClaimQueuedJobResultStatus.EMPTY
+    assert blocked.status == ClaimQueuedJobResultStatus.EMPTY
+    assert reclaimed_expired.status == ClaimQueuedJobResultStatus.CLAIMED
+    assert reclaimed_expired.job.job_id == first.job_id
+    assert reclaimed_expired.job.worker_id == "worker-d"
 
 
 def test_queued_job_does_not_consume_entitlement(store: PostgresWeeklyPdfJobStore) -> None:
@@ -929,6 +1162,29 @@ def test_cleanup_stale_queued_job_cancels_without_refund(store: PostgresWeeklyPd
     assert store.get_active_job_for_chat(chat_id) is None
 
 
+def test_cleanup_stale_preserves_durable_queued_job(store: PostgresWeeklyPdfJobStore) -> None:
+    now = datetime(2026, 5, 28, tzinfo=UTC)
+    chat_id = 126
+    _save_subscription(store, chat_id, now=now, weekly_pdf_remaining=1)
+    admitted = store.admit_queued_job(
+        chat_id=chat_id,
+        idempotency_key="durable-stale-queued-preserved",
+        stale_after=now - timedelta(seconds=1),
+        request_snapshot=WeeklyPdfRequestSnapshot(profile={"age": 36}),
+        now=now - timedelta(minutes=31),
+    ).job
+
+    cleaned = store.cleanup_stale(chat_id=chat_id, now=now)
+    active = store.get_active_job_for_chat(chat_id)
+
+    assert cleaned.jobs == []
+    assert active is not None
+    assert active.job_id == admitted.job_id
+    assert active.status == JOB_STATUS_QUEUED
+    assert active.request_snapshot == admitted.request_snapshot
+    assert _weekly_remaining(store, chat_id) == 0
+
+
 def test_test_access_job_does_not_mutate_quota_or_refund(store: PostgresWeeklyPdfJobStore) -> None:
     now = datetime(2026, 5, 23, tzinfo=UTC)
     chat_id = 109
@@ -1140,6 +1396,15 @@ def _job_row(job: WeeklyPdfJob, **overrides):
         "manual_review_reason": job.manual_review_reason,
         "manual_reviewed_at": job.manual_reviewed_at,
         "manual_review_resolution": job.manual_review_resolution,
+        "request_payload_json": None if job.request_snapshot is None else job.request_snapshot.request_payload,
+        "profile_json": None if job.request_snapshot is None else job.request_snapshot.profile,
+        "recent_recipe_ids_json": [] if job.request_snapshot is None else list(job.request_snapshot.recent_recipe_ids),
+        "generation_seed": None if job.request_snapshot is None else job.request_snapshot.generation_seed,
+        "worker_id": job.worker_id,
+        "leased_until": job.leased_until,
+        "attempt_count": job.attempt_count,
+        "next_attempt_at": job.next_attempt_at,
+        "last_error": job.last_error,
     }
     row.update(overrides)
     return row

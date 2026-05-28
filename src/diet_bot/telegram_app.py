@@ -160,15 +160,20 @@ from .subscriptions import (
 )
 from .validation import validate_plan
 from .weekly_pdf_job_runtime import (
+    WeeklyPdfDelivery,
     WeeklyPdfJobRuntime,
+    WeeklyPdfWorker,
+    WeeklyPdfWorkerSettings,
     validate_weekly_pdf_job_runtime_for_startup,
 )
 from .weekly_pdf_jobs import (
     AdmitJobResultStatus,
     FinishJobResultStatus,
     MarkSendStartedResultStatus,
+    QueuedJobAdmissionResultStatus as WeeklyPdfQueuedJobAdmissionResultStatus,
     StartJobResultStatus,
     WeeklyPdfJob,
+    WeeklyPdfRequestSnapshot,
 )
 
 
@@ -960,7 +965,8 @@ WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
-WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0444\u0430\u0439\u043b \u0443\u0436\u0435 \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e PDF \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+WEEK_PDF_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
 ONE_DAY_PLAN_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u0440\u0430\u0446\u0438\u043e\u043d. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
@@ -1714,14 +1720,20 @@ async def run_bot() -> None:
     validate_payment_runtime_for_startup(config)
     single_poller_guard = _acquire_postgres_single_poller_guard(config)
     one_day_worker_task: asyncio.Task | None = None
+    weekly_pdf_worker_task: asyncio.Task | None = None
     try:
         bot = Bot(config.bot_token)
         await _set_bot_commands(bot)
         dispatcher = create_dispatcher()
+        weekly_pdf_worker_task = _start_weekly_pdf_worker_if_configured(config, bot)
         one_day_worker_task = _start_one_day_generation_worker_if_configured(config, bot)
         try:
             await dispatcher.start_polling(bot)
         finally:
+            if weekly_pdf_worker_task is not None:
+                weekly_pdf_worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await weekly_pdf_worker_task
             if one_day_worker_task is not None:
                 one_day_worker_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1729,6 +1741,20 @@ async def run_bot() -> None:
     finally:
         if single_poller_guard is not None:
             single_poller_guard.close()
+
+
+def _start_weekly_pdf_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
+    if not getattr(config, "weekly_pdf_worker_enabled", False):
+        return None
+    runtime = _weekly_pdf_job_runtime()
+    if runtime is None:
+        logger.warning("Weekly PDF worker enabled but Postgres job runtime is unavailable")
+        return None
+    settings = WeeklyPdfWorkerSettings.from_config(config)
+    worker = WeeklyPdfWorker(runtime, _TelegramWeeklyPdfJobProcessor(bot), settings)
+    task = asyncio.create_task(worker.run_forever(), name="weekly-pdf-worker")
+    _observe_worker_task(task, "Weekly PDF worker")
+    return task
 
 
 def _start_one_day_generation_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
@@ -1741,11 +1767,11 @@ def _start_one_day_generation_worker_if_configured(config, bot: Bot) -> asyncio.
     settings = OneDayGenerationWorkerSettings.from_config(config)
     worker = OneDayGenerationWorker(runtime, _TelegramOneDayGenerationJobProcessor(bot), settings)
     task = asyncio.create_task(worker.run_forever(), name="one-day-generation-worker")
-    _observe_one_day_generation_worker_task(task)
+    _observe_worker_task(task, "One-day worker")
     return task
 
 
-def _observe_one_day_generation_worker_task(task: asyncio.Task) -> None:
+def _observe_worker_task(task: asyncio.Task, label: str) -> None:
     def log_unexpected_stop(done_task: asyncio.Task) -> None:
         if done_task.cancelled():
             return
@@ -1756,7 +1782,8 @@ def _observe_one_day_generation_worker_task(task: asyncio.Task) -> None:
         if exc is None:
             return
         logger.error(
-            "One-day worker task stopped unexpectedly; task_name=%s error_type=%s",
+            "%s task stopped unexpectedly; task_name=%s error_type=%s",
+            label,
             done_task.get_name(),
             type(exc).__name__,
         )
@@ -2403,6 +2430,32 @@ def _weekly_pdf_request_idempotency_key(message: Message, idempotency_key: str |
     return f"telegram_request:{message.chat.id}:{time.time_ns()}"
 
 
+def _weekly_pdf_request_snapshot(chat_id: int, profile: UserProfile) -> WeeklyPdfRequestSnapshot:
+    payload = {
+        "source": "telegram_weekly_pdf",
+        "recent_recipe_keys": list(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, ())),
+    }
+    return WeeklyPdfRequestSnapshot(
+        request_payload=payload,
+        profile=_profile_to_dict(profile),
+        recent_recipe_ids=tuple(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, ())),
+        generation_seed=str(_weekly_pdf_generation_seed_candidate(chat_id)),
+    )
+
+
+def _weekly_pdf_generation_seed_candidate(chat_id: int) -> int:
+    count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
+    seed_offset = PLAN_SEED_OFFSET_BY_CHAT_ID.setdefault(
+        chat_id,
+        random.SystemRandom().randrange(1, 1_000_000_000),
+    )
+    return seed_offset + count
+
+
+def _mark_weekly_pdf_generation_seed_admitted(chat_id: int) -> None:
+    PLAN_COUNT_BY_CHAT_ID[chat_id] = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0) + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
+
+
 async def _send_week_plan_with_access(
     message: Message,
     profile: UserProfile,
@@ -2491,10 +2544,19 @@ async def _send_week_plan_with_postgres_jobs(
         _weekly_pdf_diag("postgres_cleanup_stale_failed", chat_id=chat_id)
 
     try:
-        job_admission = runtime.admit(
+        await _load_chat_history_async(chat_id)
+    except ChatStateStorageError:
+        logger.exception("Failed to load chat history for queued weekly PDF job chat_id=%s", _mask_chat_id(chat_id))
+        await _send_chat_state_read_error(message)
+        return False
+
+    try:
+        job_admission = runtime.admit_queued(
             chat_id=chat_id,
             idempotency_key=idempotency_key,
+            request_snapshot=_weekly_pdf_request_snapshot(chat_id, profile),
             metadata={"source": "telegram_weekly_pdf"},
+            test_access=chat_id in TESTER_CHAT_IDS,
         )
     except Exception:
         logger.exception("Failed to admit weekly PDF Postgres job")
@@ -2503,124 +2565,25 @@ async def _send_week_plan_with_postgres_jobs(
         return False
 
     if job_admission.status in {
-        AdmitJobResultStatus.ACTIVE_DUPLICATE,
-        AdmitJobResultStatus.EXISTING_IDEMPOTENCY,
+        WeeklyPdfQueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+        WeeklyPdfQueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
     }:
         _weekly_pdf_diag("postgres_admit_duplicate", chat_id=chat_id, status=job_admission.status.value)
         await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
         return False
 
-    try:
-        weekly_pdf_available = await _weekly_pdf_attempt_available_async(chat_id)
-    except Exception:
-        _cancel_postgres_admitted_job(
-            runtime,
-            job_admission.job,
-            chat_id=chat_id,
-            reason="entitlement_preflight_error",
-        )
-        logger.exception("Failed to preflight weekly PDF entitlement after Postgres admission")
-        _weekly_pdf_diag("postgres_entitlement_preflight_error", chat_id=chat_id)
-        await _send_entitlement_storage_error(message)
-        return False
-
-    if not weekly_pdf_available:
-        _cancel_postgres_admitted_job(
-            runtime,
-            job_admission.job,
-            chat_id=chat_id,
-            reason="entitlement_preflight_denied",
-        )
+    if job_admission.status == WeeklyPdfQueuedJobAdmissionResultStatus.DENIED:
         _weekly_pdf_diag("postgres_access_denied_no_weekly_pdf_attempt", chat_id=chat_id)
         await _send_limit_paywall(message, "weekly_pdf")
         return False
 
-    queued_status_message: Message | None = None
-    postgres_start_attempted = False
-
-    async def run_weekly_pdf_job() -> bool:
-        nonlocal postgres_start_attempted
-        postgres_start_attempted = True
-        return await _send_week_plan_after_postgres_admission(
-            message,
-            profile,
-            runtime=runtime,
-            job=job_admission.job,
-            initial_status_message=queued_status_message,
-        )
-
-    try:
-        local_admission = WEEK_PDF_QUEUE_MANAGER.submit(chat_id, run_weekly_pdf_job)
-    except Exception:
-        _cancel_postgres_admitted_job(
-            runtime,
-            job_admission.job,
-            chat_id=chat_id,
-            reason="local_queue_submit_failed",
-        )
-        logger.exception("Failed to submit weekly PDF job to local queue")
-        await message.answer(WEEK_PDF_FAILURE_TEXT)
+    if job_admission.status != WeeklyPdfQueuedJobAdmissionResultStatus.ADMITTED or job_admission.job is None:
+        await _send_entitlement_storage_error(message)
         return False
 
-    if local_admission.duplicate:
-        _cancel_postgres_admitted_job(
-            runtime,
-            job_admission.job,
-            chat_id=chat_id,
-            reason="local_queue_duplicate_after_admit",
-        )
-        await message.answer(WEEK_PDF_ALREADY_RUNNING_TEXT)
-        return False
-
-    if local_admission.future is None:
-        _cancel_postgres_admitted_job(
-            runtime,
-            job_admission.job,
-            chat_id=chat_id,
-            reason="local_queue_submit_failed",
-        )
-        await message.answer(WEEK_PDF_FAILURE_TEXT)
-        return False
-
-    if not local_admission.starts_immediately:
-        try:
-            queued_status_message = await message.answer(
-                _week_pdf_queue_status_text(local_admission.ahead_count),
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        except asyncio.CancelledError:
-            WEEK_PDF_QUEUE_MANAGER.cancel(local_admission.future)
-            _cancel_postgres_admitted_job(
-                runtime,
-                job_admission.job,
-                chat_id=chat_id,
-                reason="local_queue_wait_cancelled",
-            )
-            raise
-        except Exception:
-            WEEK_PDF_QUEUE_MANAGER.cancel(local_admission.future)
-            _cancel_postgres_admitted_job(
-                runtime,
-                job_admission.job,
-                chat_id=chat_id,
-                reason="local_queue_status_failed",
-            )
-            raise
-        WEEK_PDF_QUEUE_MANAGER.mark_ready(local_admission.future)
-
-    try:
-        return await local_admission.future
-    except asyncio.CancelledError:
-        _weekly_pdf_diag("queue_wait_cancelled", chat_id=chat_id, **WEEK_PDF_QUEUE_MANAGER.snapshot())
-        WEEK_PDF_QUEUE_MANAGER.cancel(local_admission.future)
-        if not postgres_start_attempted:
-            _cancel_postgres_admitted_job(
-                runtime,
-                job_admission.job,
-                chat_id=chat_id,
-                reason="local_queue_wait_cancelled",
-            )
-        raise
+    _mark_weekly_pdf_generation_seed_admitted(chat_id)
+    await message.answer(WEEK_PDF_ACCEPTED_TEXT)
+    return True
 
 
 def _cancel_postgres_admitted_job(
@@ -3101,6 +3064,108 @@ def _recent_recipe_keys_from_snapshot(snapshot: OneDayGenerationRequestSnapshot)
     return tuple(str(key).strip() for key in raw_keys if str(key).strip())
 
 
+class _TelegramWeeklyPdfJobProcessor:
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+
+    async def prepare_delivery(self, job: WeeklyPdfJob) -> WeeklyPdfDelivery:
+        return await _prepare_weekly_pdf_delivery(job, self.bot)
+
+
+class _WeeklyPdfJobChat:
+    def __init__(self, chat_id: int) -> None:
+        self.id = chat_id
+        self.type = "private"
+
+
+class _WeeklyPdfJobMessage:
+    def __init__(self, *, bot: Bot, chat_id: int) -> None:
+        self.bot = bot
+        self.chat = _WeeklyPdfJobChat(chat_id)
+        self.message_id = None
+
+    async def answer(self, text: str, reply_markup=None):
+        return await self.bot.send_message(chat_id=self.chat.id, text=text, reply_markup=reply_markup)
+
+    async def answer_document(self, **kwargs):
+        return await self.bot.send_document(chat_id=self.chat.id, **kwargs)
+
+
+async def _prepare_weekly_pdf_delivery(job: WeeklyPdfJob, bot: Bot) -> WeeklyPdfDelivery:
+    snapshot = job.request_snapshot
+    if snapshot is None:
+        raise RuntimeError("weekly PDF job snapshot is missing")
+    profile = _profile_from_dict(snapshot.profile)
+    if profile is None:
+        raise RuntimeError("weekly PDF job profile snapshot is invalid")
+
+    message = _WeeklyPdfJobMessage(bot=bot, chat_id=job.chat_id)
+    recipe_history_entries: list[RecipeHistoryItem] = []
+
+    async def send(on_send_started, on_delivered) -> bool:
+        return await _send_week_plan(
+            message,
+            profile,
+            status_text=await _format_entitlement_status_async(job.chat_id),
+            recipe_history_entries=recipe_history_entries,
+            pdf_slot_acquired=True,
+            generation_seed=_weekly_generation_seed_from_snapshot(snapshot),
+            recent_avoidance=_weekly_recent_avoidance_from_snapshot(snapshot),
+            on_document_send_started=on_send_started,
+            on_document_delivered=on_delivered,
+        )
+
+    async def after_success() -> None:
+        await _remember_recipe_history_items_best_effort_async(
+            job.chat_id,
+            recipe_history_entries,
+            ration_kind="weekly_pdf",
+            context="weekly_pdf_worker_success",
+        )
+
+    return WeeklyPdfDelivery(send=send, after_success=after_success)
+
+
+def _weekly_generation_seed_from_snapshot(snapshot: WeeklyPdfRequestSnapshot) -> int:
+    if snapshot.generation_seed:
+        try:
+            return int(snapshot.generation_seed)
+        except ValueError:
+            pass
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "request_payload": snapshot.request_payload,
+                "profile": snapshot.profile,
+                "recent_recipe_ids": list(snapshot.recent_recipe_ids),
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return int(digest[:12], 16)
+
+
+def _weekly_recent_avoidance_from_snapshot(snapshot: WeeklyPdfRequestSnapshot) -> _RecentRecipeAvoidance:
+    recent_ids = _bounded_recent_strings(snapshot.recent_recipe_ids, RECENT_RECIPE_HISTORY_LIMIT)
+    recent_keys = _bounded_recent_strings(_weekly_recent_recipe_keys_from_snapshot(snapshot), RECENT_RECIPE_HISTORY_LIMIT)
+    reduced_ids = _bounded_recent_strings(recent_ids, RECENT_RECIPE_REDUCED_LIMIT)
+    reduced_keys = _bounded_recent_strings(recent_keys, RECENT_RECIPE_REDUCED_LIMIT)
+    return _RecentRecipeAvoidance(
+        full_recipe_ids=frozenset(recent_ids),
+        full_recipe_keys=frozenset(recent_keys),
+        reduced_recipe_ids=frozenset(reduced_ids),
+        reduced_recipe_keys=frozenset(reduced_keys),
+    )
+
+
+def _weekly_recent_recipe_keys_from_snapshot(snapshot: WeeklyPdfRequestSnapshot) -> tuple[str, ...]:
+    raw_keys = snapshot.request_payload.get("recent_recipe_keys", ())
+    if not isinstance(raw_keys, Sequence) or isinstance(raw_keys, (str, bytes)):
+        return ()
+    return tuple(str(key).strip() for key in raw_keys if str(key).strip())
+
+
 async def _send_week_plan(
     message: Message,
     profile: UserProfile,
@@ -3109,17 +3174,17 @@ async def _send_week_plan(
     recipe_history_entries: list[RecipeHistoryItem] | None = None,
     pdf_slot_acquired: bool = False,
     initial_status_message: Message | None = None,
+    generation_seed: int | None = None,
+    recent_avoidance: _RecentRecipeAvoidance | None = None,
     on_document_send_started: Callable[[], None] | None = None,
     on_document_delivered: Callable[[], None] | None = None,
 ) -> bool:
     chat_id = message.chat.id
-    count = PLAN_COUNT_BY_CHAT_ID.get(chat_id, 0)
-    seed_offset = PLAN_SEED_OFFSET_BY_CHAT_ID.setdefault(
-        chat_id,
-        random.SystemRandom().randrange(1, 1_000_000_000),
-    )
-    seed = seed_offset + count
-    PLAN_COUNT_BY_CHAT_ID[chat_id] = count + WEEK_PLAN_DAYS * WEEK_PLAN_CANDIDATE_COUNT
+    if generation_seed is None:
+        seed = _weekly_pdf_generation_seed_candidate(chat_id)
+        _mark_weekly_pdf_generation_seed_admitted(chat_id)
+    else:
+        seed = int(generation_seed)
     if initial_status_message is None:
         status_message = await message.answer(
             WEEK_PDF_STATUS_INITIAL_TEXT,
@@ -3130,13 +3195,14 @@ async def _send_week_plan(
         await _edit_week_pdf_status(status_message, WEEK_PDF_STATUS_INITIAL_TEXT)
     status_task = asyncio.create_task(_animate_week_pdf_status(message, status_message))
     try:
-        try:
-            recent_avoidance = await _load_recent_recipe_avoidance_async(chat_id)
-        except ChatStateStorageError:
-            logger.exception("Failed to load weekly PDF chat history for chat_id=%s", _mask_chat_id(chat_id))
-            await _stop_week_pdf_status(status_task)
-            await _edit_week_pdf_status(status_message, CHAT_STATE_READ_ERROR_TEXT)
-            return False
+        if recent_avoidance is None:
+            try:
+                recent_avoidance = await _load_recent_recipe_avoidance_async(chat_id)
+            except ChatStateStorageError:
+                logger.exception("Failed to load weekly PDF chat history for chat_id=%s", _mask_chat_id(chat_id))
+                await _stop_week_pdf_status(status_task)
+                await _edit_week_pdf_status(status_message, CHAT_STATE_READ_ERROR_TEXT)
+                return False
         _weekly_pdf_diag(
             "recent_avoidance_loaded",
             chat_id=chat_id,
