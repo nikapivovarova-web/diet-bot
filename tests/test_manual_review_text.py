@@ -27,6 +27,52 @@ def test_redacts_secret_assignments_and_preserves_surrounding_note() -> None:
     assert "top-secret" not in output
 
 
+def test_redacts_double_quoted_json_style_secret_assignments() -> None:
+    output = redact_manual_review_text(
+        '{"password":"cleartext","api_key":"key-456","token":"abc123","note":"ordinary quoted text"}'
+    )
+
+    assert '"password":"<redacted:secret>"' in output
+    assert '"api_key":"<redacted:secret>"' in output
+    assert '"token":"<redacted:secret>"' in output
+    assert '"note":"ordinary quoted text"' in output
+    assert "cleartext" not in output
+    assert "key-456" not in output
+    assert "abc123" not in output
+
+
+def test_redacts_single_quoted_dict_style_secret_assignments() -> None:
+    output = redact_manual_review_text(
+        "{'password':'cleartext','api_key':'key-456','token':'abc123','note':'ordinary quoted text'}"
+    )
+
+    assert "'password':'<redacted:secret>'" in output
+    assert "'api_key':'<redacted:secret>'" in output
+    assert "'token':'<redacted:secret>'" in output
+    assert "'note':'ordinary quoted text'" in output
+    assert "cleartext" not in output
+    assert "key-456" not in output
+    assert "abc123" not in output
+
+
+def test_redacts_quoted_database_url_and_dsn_assignments() -> None:
+    output = redact_manual_review_text(
+        '{"database_url":"postgresql://ops:secret@example.invalid/prod",'
+        '"dsn":"postgresql://ops:secret@example.invalid/report"}'
+    )
+
+    assert '"database_url":"<redacted:secret>"' in output
+    assert '"dsn":"<redacted:secret>"' in output
+    assert "postgresql://" not in output
+    assert "ops:secret" not in output
+
+
+def test_preserves_ordinary_quoted_note_text() -> None:
+    output = redact_manual_review_text('{"note":"password rotation discussed without values"}')
+
+    assert output == '{"note":"password rotation discussed without values"}'
+
+
 def test_redacts_long_numeric_ids_and_preserves_ordinary_note_text() -> None:
     output = redact_manual_review_text("Ticket MR-44 checked chat 987654321 and provider export.")
 

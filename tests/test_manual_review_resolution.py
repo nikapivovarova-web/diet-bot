@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -86,6 +87,43 @@ def test_weekly_resolve_dry_run_redacts_secret_note_from_output() -> None:
     assert store.job.manual_reviewed_at is None
 
 
+def test_weekly_resolve_dry_run_redacts_json_style_secret_note_from_output() -> None:
+    note = 'checked {"password":"cleartext","api_key":"key-456","token":"abc123"} in provider export'
+    store = FakeWeeklyStore(_weekly_job(job_id=WEEKLY_JOB_ID, chat_id=701))
+    stdout = StringIO()
+
+    exit_code = resolver.main(
+        [
+            "--job-type",
+            "weekly-pdf",
+            "--job-id",
+            str(WEEKLY_JOB_ID),
+            "--operator",
+            "ops.alex",
+            "--resolution",
+            "confirmed_delivered",
+            "--note",
+            note,
+            "--dry-run",
+        ],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=_factory({"weekly-pdf": store}),
+        stdout=stdout,
+        now=lambda: NOW,
+    )
+
+    output = stdout.getvalue()
+    payload = json.loads(output)
+    assert exit_code == 0
+    assert '"password":"<redacted:secret>"' in payload["requested_note"]
+    assert '"api_key":"<redacted:secret>"' in payload["requested_note"]
+    assert '"token":"<redacted:secret>"' in payload["requested_note"]
+    assert "cleartext" not in output
+    assert "key-456" not in output
+    assert "abc123" not in output
+    assert store.job.manual_reviewed_at is None
+
+
 def test_weekly_resolve_apply_marks_audit_fields_without_refund_changes() -> None:
     store = FakeWeeklyStore(
         _weekly_job(job_id=WEEKLY_JOB_ID, chat_id=701, refund_status="pending", delivery_status="unknown")
@@ -165,6 +203,40 @@ def test_weekly_resolve_apply_redacts_secret_note_from_output_but_stores_raw_not
     assert "secret=<redacted:secret>" in output
     assert "raw-provider-token-123" not in output
     assert "raw-secret-456" not in output
+    assert store.job.manual_review_note == note
+
+
+def test_weekly_resolve_apply_redacts_json_style_secret_note_from_output_but_stores_raw_note() -> None:
+    note = "Ticket MR-13 checked {'token':'abc123','api_key':'key-456'} in provider export."
+    store = FakeWeeklyStore(_weekly_job(job_id=WEEKLY_JOB_ID, chat_id=701))
+    stdout = StringIO()
+
+    exit_code = resolver.main(
+        [
+            "--job-type",
+            "weekly-pdf",
+            "--job-id",
+            str(WEEKLY_JOB_ID),
+            "--operator",
+            "ops.alex",
+            "--resolution",
+            "confirmed_delivered",
+            "--note",
+            note,
+            "--apply",
+        ],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=_factory({"weekly-pdf": store}),
+        stdout=stdout,
+        now=lambda: NOW,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "'token':'<redacted:secret>'" in output
+    assert "'api_key':'<redacted:secret>'" in output
+    assert "abc123" not in output
+    assert "key-456" not in output
     assert store.job.manual_review_note == note
 
 
