@@ -62,6 +62,93 @@ Payment recovery spool storage:
 - Recovery replay uses the PR45 payment recovery replay tooling documented
   below. Review and fingerprint the immutable spool before dry-run or apply.
 
+## Payment Scale Rehearsal
+
+Use this rehearsal before payment enablement work and after payment ledger or
+recovery changes. It uses only synthetic successful-payment events, fake
+provider identifiers, and a throwaway/local test database or in-memory tests.
+It must not set `TELEGRAM_PROVIDER_TOKEN`, enable real payments, start the bot
+runtime, call Telegram, call a payment provider, deploy, restart, or touch a
+production database.
+
+Run the focused local rehearsal tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest `
+  tests\test_payment_scale_rehearsal.py `
+  tests\test_payment_service.py `
+  tests\test_payment_recovery_spool.py `
+  tests\test_payment_recovery_replay.py `
+  tests\test_payment_recovery_spool_status.py `
+  tests\test_payment_reconciliation_report.py
+```
+
+The rehearsal must prove:
+
+- a synthetic successful payment grants the entitlement once;
+- duplicate successful-payment charge events do not double-grant;
+- a simulated ledger outage after Telegram charge notification writes the
+  recovery spool;
+- recovery dry-run identifies a replayable candidate;
+- recovery apply grants exactly once;
+- repeated recovery apply is idempotent and reports already recovered.
+
+Preserve the test command and commit SHA in the release evidence. Treat this as
+proof of local safety wiring only; real payment enablement still requires a
+separate explicit approval.
+
+## Payment Reconciliation Report
+
+Use the reconciliation report with local files only. It accepts a synthetic or
+exported fake-provider charge file plus a local payment ledger export file in
+JSON or CSV. It never calls Telegram, never calls a payment provider API, and
+does not require or read `TELEGRAM_PROVIDER_TOKEN`.
+
+Example with JSONL output:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\ops\payment_reconciliation_report.py `
+  --provider-export ".\ops-input\fake-provider-charges.json" `
+  --ledger-export ".\ops-input\payment-ledger-export.json" `
+  --recovery-spool ".\ops-input\payment-recovery-spool.jsonl" `
+  --format jsonl
+```
+
+The report categorizes local rows as:
+
+- `matched_paid_granted`;
+- `charged_but_not_granted`;
+- `granted_but_no_provider_charge`;
+- `duplicate_provider_charge_order`;
+- `recovery_spool_candidate`.
+
+Report output redacts order ids, chat/user ids, Telegram charge ids, provider
+charge ids, invoice payloads, and raw spool content. Keep the input exports in
+the operator evidence bundle, not in the repository.
+
+## Payment Recovery Spool Status
+
+Use spool status before payment enablement checks and during any incident where
+the recovery spool is non-empty. The status command reports aggregate count,
+bytes, malformed-line count, duplicate count, oldest/newest timestamps, and
+oldest/newest age. It does not print invoice payloads, raw charge ids,
+chat/user ids, tokens, or DSNs.
+
+Example warning after 2 hours and failing after 8 hours:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\ops\payment_recovery_replay.py status `
+  --spool ".\ops-input\payment-recovery-spool.jsonl" `
+  --warn-after-hours 2 `
+  --fail-after-hours 8 `
+  --max-records 100 `
+  --json
+```
+
+If the status is `warn`, inspect and schedule replay. If the status is `fail`,
+stop payment enablement or incident closure until the spool is reviewed,
+reconciled, and replayed or explicitly waived by the payment operator.
+
 ## Backup First
 
 Before any migration, freeze writes as much as the operating model allows and
