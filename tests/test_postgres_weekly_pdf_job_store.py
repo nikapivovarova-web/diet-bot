@@ -1337,7 +1337,19 @@ def _save_subscription(
         subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
     )
     entitlement.monthly_weekly_pdf_remaining = weekly_pdf_remaining
-    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).save_all({chat_id: entitlement})
+    PostgresEntitlementStore(
+        store.dsn,
+        connect_timeout=1,
+        connect_attempts=1,
+    ).save_chat_entitlement(chat_id, entitlement)
+
+
+def _save_exhausted_entitlement(store: PostgresWeeklyPdfJobStore, chat_id: int) -> None:
+    PostgresEntitlementStore(
+        store.dsn,
+        connect_timeout=1,
+        connect_attempts=1,
+    ).save_chat_entitlement(chat_id, Entitlement(monthly_weekly_pdf_remaining=0))
 
 
 def _weekly_remaining(store: PostgresWeeklyPdfJobStore, chat_id: int) -> int:
@@ -1509,7 +1521,9 @@ def _install_legacy_weekly_pdf_job_schema(psycopg: object, database_url: str) ->
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_MIGRATIONS_SQL)
-            for migration in MIGRATIONS[:-1]:
+            for migration in MIGRATIONS:
+                if migration.version >= "202605260001":
+                    continue
                 for statement in migration.statements:
                     statement = statement.strip()
                     if statement:
