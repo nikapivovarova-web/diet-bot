@@ -164,21 +164,30 @@ def test_healthcheck_payment_spool_check_is_config_only_by_default(
     monkeypatch.setattr(builtins, "__import__", guarded_import)
     monkeypatch.setattr(Path, "write_text", fail_write_text)
     monkeypatch.setattr(Path, "unlink", fail_unlink)
-    sys.modules.pop("diet_bot.healthcheck", None)
-    sys.modules.pop("diet_bot.payment_recovery_spool", None)
+    previous_healthcheck = sys.modules.pop("diet_bot.healthcheck", None)
+    previous_spool = sys.modules.pop("diet_bot.payment_recovery_spool", None)
+    try:
+        from diet_bot.healthcheck import main
 
-    from diet_bot.healthcheck import main
-
-    exit_code = main(
-        [],
-        env={
-            "DIET_BOT_TOKEN": "fake-token",
-            "DIET_BOT_PAYMENTS_ENABLED": "1",
-            "DIET_BOT_STORAGE_BACKEND": "postgres",
-            "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
-            "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(missing_parent_spool),
-        },
-    )
+        exit_code = main(
+            [],
+            env={
+                "DIET_BOT_TOKEN": "fake-token",
+                "DIET_BOT_PAYMENTS_ENABLED": "1",
+                "DIET_BOT_STORAGE_BACKEND": "postgres",
+                "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+                "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(missing_parent_spool),
+            },
+        )
+    finally:
+        if previous_healthcheck is not None:
+            sys.modules["diet_bot.healthcheck"] = previous_healthcheck
+        else:
+            sys.modules.pop("diet_bot.healthcheck", None)
+        if previous_spool is not None:
+            sys.modules["diet_bot.payment_recovery_spool"] = previous_spool
+        else:
+            sys.modules.pop("diet_bot.payment_recovery_spool", None)
 
     output = capsys.readouterr().out
     assert exit_code == 0
