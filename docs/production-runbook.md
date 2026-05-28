@@ -466,6 +466,78 @@ create an empty configured spool file if it does not already exist. The
 single-poller guard check briefly acquires the configured Postgres advisory lock
 and releases it before the command exits.
 
+## Runtime Ops Health Summary
+
+Run the runtime ops health summary after preflight for launch readiness and on an
+operator schedule during traffic. It is read-only: it connects to Postgres,
+summarizes the local payment recovery spool if configured, optionally compares
+local reconciliation files, and never starts the bot runtime, starts polling,
+calls Telegram, calls `getUpdates`, or contacts a payment provider.
+
+```powershell
+$env:DIET_BOT_DATABASE_URL = "<postgres-dsn-from-secret-manager>"
+$env:DIET_BOT_PAYMENT_RECOVERY_SPOOL = "<absolute-payment-recovery-spool-path>"
+.\.venv\Scripts\python.exe -m scripts.ops.ops_health_summary --format table --fail-on-alert
+```
+
+Default alert thresholds are intentionally conservative:
+
+- queue backlog: warning at 10 queued rows, fail at 50 queued rows per queue;
+- worker stalled: warning when stale active jobs are at least 30 minutes old,
+  fail at 2 hours;
+- manual-review backlog: warning at 1 unresolved row, fail at 10 unresolved
+  rows per queue;
+- recovery spool non-empty: warning at 1 record, fail at 10 records;
+- recovery spool age: warning at 1 hour, fail at 4 hours;
+- DB unavailable: fail immediately.
+
+Adjust thresholds with command flags only for an incident or load-test ticket,
+and record the override in the operator notes. Use `--format json` for alert
+ingestion. Use `--provider-export`, `--ledger-export`, and optionally
+`--reconciliation-recovery-spool` only with local fake/synthetic files; the
+command does not fetch provider data.
+
+Alert owner actions:
+
+- queue backlog: check worker logs, durable queue claims, concurrency settings,
+  and whether exactly one intended poller/worker set is active; pause launch
+  expansion until the queue drains or an approved recovery plan exists.
+- worker stalled: preserve logs, inspect lease/heartbeat updates, and recover
+  through approved retry/manual-review tooling only.
+- recovery spool non-empty: preserve the immutable spool, run spool status and
+  payment reconciliation, then dry-run recovery replay before any apply.
+- manual-review backlog: run the relevant manual-review report, assign an
+  operator owner, and decide customer action from existing evidence.
+- backup failure: stop cutover work, rerun the backup/restore drill with
+  sanitized output, and keep the failed artifact/log in the operator ticket.
+- DB unavailable: treat as a launch blocker; verify the secret-manager DSN,
+  database availability, network path, and recent maintenance.
+- Telegram send/rate-limit spike: if logs or metrics show send failures or
+  rate-limit responses, pause launch expansion, inspect send throttling and
+  delivery markers, and use manual-review reports for ambiguous deliveries.
+
+## Metabase Operations Dashboard
+
+Metabase is the dashboard layer, not a replacement for runtime alerts. Install
+or administer Metabase outside this repository, connect it only through an
+approved read-only Postgres user, and keep DSNs/secrets in the deployment secret
+manager rather than in dashboard SQL.
+
+Create Metabase questions from the SQL pack in `scripts/ops/sql/metabase` and
+keep the dashboard list aligned with `docs/ops/metabase-ops-queries.md`:
+
+- active entitlements count;
+- new paid grants/orders by day;
+- failed payment/recovery candidates;
+- one-day queue depth by status and failed/manual-review rows;
+- weekly PDF queue depth by status and failed/manual-review rows;
+- jobs older than threshold;
+- schema migration version summary.
+
+Backup/restore drill status is not represented in application tables. Attach or
+link the sanitized JSON output from backup and restore drill runs as external
+operator evidence.
+
 ## Weekly PDF Manual-Review Report
 
 Run this report when reviewing weekly PDF delivery health. It is read-only and
