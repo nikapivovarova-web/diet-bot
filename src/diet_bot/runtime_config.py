@@ -19,6 +19,12 @@ DEFAULT_ONE_DAY_WORKER_HEARTBEAT_SECONDS = 60
 DEFAULT_ONE_DAY_WORKER_RETRY_DELAY_SECONDS = 30
 DEFAULT_ONE_DAY_WORKER_MAX_ATTEMPTS = 3
 DEFAULT_ONE_DAY_WORKER_IDLE_SLEEP_SECONDS = 1.0
+DEFAULT_WEEKLY_PDF_WORKER_CONCURRENCY = 1
+DEFAULT_WEEKLY_PDF_WORKER_LEASE_SECONDS = 300
+DEFAULT_WEEKLY_PDF_WORKER_HEARTBEAT_SECONDS = 60
+DEFAULT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS = 30
+DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS = 3
+DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS = 1.0
 
 MISSING_BOT_TOKEN_ERROR = "Set DIET_BOT_TOKEN or TELEGRAM_BOT_TOKEN."
 PAYMENT_RECOVERY_SPOOL_ENV = "DIET_BOT_PAYMENT_RECOVERY_SPOOL"
@@ -58,6 +64,13 @@ class RuntimeConfig:
     one_day_worker_retry_delay_seconds: int = DEFAULT_ONE_DAY_WORKER_RETRY_DELAY_SECONDS
     one_day_worker_max_attempts: int = DEFAULT_ONE_DAY_WORKER_MAX_ATTEMPTS
     one_day_worker_idle_sleep_seconds: float = DEFAULT_ONE_DAY_WORKER_IDLE_SLEEP_SECONDS
+    weekly_pdf_worker_enabled: bool = False
+    weekly_pdf_worker_concurrency: int = DEFAULT_WEEKLY_PDF_WORKER_CONCURRENCY
+    weekly_pdf_worker_lease_seconds: int = DEFAULT_WEEKLY_PDF_WORKER_LEASE_SECONDS
+    weekly_pdf_worker_heartbeat_seconds: int = DEFAULT_WEEKLY_PDF_WORKER_HEARTBEAT_SECONDS
+    weekly_pdf_worker_retry_delay_seconds: int = DEFAULT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS
+    weekly_pdf_worker_max_attempts: int = DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS
+    weekly_pdf_worker_idle_sleep_seconds: float = DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS
     storage_backend: str = "json"
     config_errors: tuple[str, ...] = ()
 
@@ -92,6 +105,13 @@ class RuntimeConfig:
             "one_day_worker_retry_delay_seconds": self.one_day_worker_retry_delay_seconds,
             "one_day_worker_max_attempts": self.one_day_worker_max_attempts,
             "one_day_worker_idle_sleep_seconds": self.one_day_worker_idle_sleep_seconds,
+            "weekly_pdf_worker_enabled": self.weekly_pdf_worker_enabled,
+            "weekly_pdf_worker_concurrency": self.weekly_pdf_worker_concurrency,
+            "weekly_pdf_worker_lease_seconds": self.weekly_pdf_worker_lease_seconds,
+            "weekly_pdf_worker_heartbeat_seconds": self.weekly_pdf_worker_heartbeat_seconds,
+            "weekly_pdf_worker_retry_delay_seconds": self.weekly_pdf_worker_retry_delay_seconds,
+            "weekly_pdf_worker_max_attempts": self.weekly_pdf_worker_max_attempts,
+            "weekly_pdf_worker_idle_sleep_seconds": self.weekly_pdf_worker_idle_sleep_seconds,
             "storage_backend": self.storage_backend,
         }
 
@@ -103,6 +123,10 @@ class RuntimeConfig:
             issues.append("DIET_BOT_DATABASE_URL is required for postgres storage.")
         if self.one_day_worker_enabled and not self.database_url:
             issues.append("DIET_BOT_DATABASE_URL is required when the one-day worker is enabled.")
+        if self.weekly_pdf_worker_enabled and self.storage_backend != "postgres":
+            issues.append("DIET_BOT_WEEKLY_PDF_WORKER_ENABLED requires postgres storage backend.")
+        if self.weekly_pdf_worker_enabled and not self.database_url:
+            issues.append("DIET_BOT_DATABASE_URL is required when the weekly PDF worker is enabled.")
         if self.payments_enabled:
             if self.storage_backend != "postgres":
                 issues.append("Payments require Postgres storage backend.")
@@ -241,6 +265,50 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         + worker_attempts_errors
         + worker_idle_errors
     )
+    weekly_pdf_worker_concurrency, weekly_pdf_worker_concurrency_errors = _int_from_env(
+        source,
+        "DIET_BOT_WEEKLY_PDF_WORKER_CONCURRENCY",
+        DEFAULT_WEEKLY_PDF_WORKER_CONCURRENCY,
+        minimum=1,
+    )
+    weekly_pdf_worker_lease_seconds, weekly_pdf_worker_lease_errors = _int_from_env(
+        source,
+        "DIET_BOT_WEEKLY_PDF_WORKER_LEASE_SECONDS",
+        DEFAULT_WEEKLY_PDF_WORKER_LEASE_SECONDS,
+        minimum=1,
+    )
+    weekly_pdf_worker_heartbeat_seconds, weekly_pdf_worker_heartbeat_errors = _int_from_env(
+        source,
+        "DIET_BOT_WEEKLY_PDF_WORKER_HEARTBEAT_SECONDS",
+        DEFAULT_WEEKLY_PDF_WORKER_HEARTBEAT_SECONDS,
+        minimum=1,
+    )
+    weekly_pdf_worker_retry_delay_seconds, weekly_pdf_worker_retry_errors = _int_from_env(
+        source,
+        "DIET_BOT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS",
+        DEFAULT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS,
+        minimum=0,
+    )
+    weekly_pdf_worker_max_attempts, weekly_pdf_worker_attempts_errors = _int_from_env(
+        source,
+        "DIET_BOT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS",
+        DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS,
+        minimum=1,
+    )
+    weekly_pdf_worker_idle_sleep_seconds, weekly_pdf_worker_idle_errors = _float_from_env(
+        source,
+        "DIET_BOT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS",
+        DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS,
+        minimum=0.1,
+    )
+    weekly_pdf_worker_config_errors = (
+        weekly_pdf_worker_concurrency_errors
+        + weekly_pdf_worker_lease_errors
+        + weekly_pdf_worker_heartbeat_errors
+        + weekly_pdf_worker_retry_errors
+        + weekly_pdf_worker_attempts_errors
+        + weekly_pdf_worker_idle_errors
+    )
 
     return RuntimeConfig(
         bot_token=bot_token,
@@ -271,8 +339,15 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         one_day_worker_retry_delay_seconds=one_day_worker_retry_delay_seconds,
         one_day_worker_max_attempts=one_day_worker_max_attempts,
         one_day_worker_idle_sleep_seconds=one_day_worker_idle_sleep_seconds,
+        weekly_pdf_worker_enabled=_bool_from_env(source, "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED"),
+        weekly_pdf_worker_concurrency=weekly_pdf_worker_concurrency,
+        weekly_pdf_worker_lease_seconds=weekly_pdf_worker_lease_seconds,
+        weekly_pdf_worker_heartbeat_seconds=weekly_pdf_worker_heartbeat_seconds,
+        weekly_pdf_worker_retry_delay_seconds=weekly_pdf_worker_retry_delay_seconds,
+        weekly_pdf_worker_max_attempts=weekly_pdf_worker_max_attempts,
+        weekly_pdf_worker_idle_sleep_seconds=weekly_pdf_worker_idle_sleep_seconds,
         storage_backend=storage_backend,
-        config_errors=postgres_config_errors + worker_config_errors,
+        config_errors=postgres_config_errors + worker_config_errors + weekly_pdf_worker_config_errors,
     )
 
 

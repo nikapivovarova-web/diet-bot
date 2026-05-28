@@ -17,10 +17,14 @@ from .subscriptions import AttemptConsumption, Entitlement, consume_weekly_pdf_a
 from .weekly_pdf_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus,
+    ClaimQueuedJobResult,
+    ClaimQueuedJobResultStatus,
     CleanupStaleResult,
     DELIVERY_STATUS_DELIVERED,
     DELIVERY_STATUS_SEND_STARTED,
     DELIVERY_STATUS_UNKNOWN,
+    ExtendLeaseResult,
+    ExtendLeaseResultStatus,
     FinishJobResult,
     FinishJobResultStatus,
     JOB_STATUS_QUEUED,
@@ -28,8 +32,12 @@ from .weekly_pdf_jobs import (
     JOB_STATUS_SUCCEEDED,
     MarkDeliveredResult,
     MarkDeliveredResultStatus,
+    MarkRetryableFailureResult,
+    MarkRetryableFailureResultStatus,
     MarkSendStartedResult,
     MarkSendStartedResultStatus,
+    QueuedJobAdmissionResult,
+    QueuedJobAdmissionResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -37,6 +45,7 @@ from .weekly_pdf_jobs import (
     StartJobResultStatus,
     TERMINAL_JOB_STATUSES,
     WeeklyPdfJob,
+    WeeklyPdfRequestSnapshot,
     refund_status_for_consumption_source,
 )
 
@@ -64,6 +73,15 @@ WEEKLY_PDF_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "manual_review_reason",
             "manual_reviewed_at",
             "manual_review_resolution",
+            "request_payload_json",
+            "profile_json",
+            "recent_recipe_ids_json",
+            "generation_seed",
+            "worker_id",
+            "leased_until",
+            "attempt_count",
+            "next_attempt_at",
+            "last_error",
             "created_at",
             "updated_at",
             "started_at",
@@ -75,6 +93,8 @@ WEEKLY_PDF_JOB_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
         "idx_weekly_pdf_jobs_active_chat_unique",
         "idx_weekly_pdf_jobs_idempotency_key_unique",
         "idx_weekly_pdf_jobs_stale",
+        "idx_weekly_pdf_jobs_queue_claim",
+        "idx_weekly_pdf_jobs_lease_reclaim",
     ),
     remediation="Run weekly PDF job migrations before use.",
 )
@@ -166,6 +186,298 @@ class PostgresWeeklyPdfJobStore:
 
         raise RuntimeError("Weekly PDF job admission conflict could not be resolved.")
 
+    def admit_queued_job(
+        self,
+        *,
+        chat_id: int,
+        idempotency_key: str,
+        stale_after: datetime,
+        request_snapshot: WeeklyPdfRequestSnapshot,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        test_access: bool = False,
+        job_id: UUID | str | None = None,
+    ) -> QueuedJobAdmissionResult:
+        idempotency_key = _required_text(idempotency_key, "idempotency_key")
+        snapshot = _coerce_request_snapshot(request_snapshot)
+        current_time = _normalize_datetime(now)
+        candidate_job_id = _coerce_uuid(job_id) if job_id is not None else uuid4()
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_entitlement_map_cur(cur)
+
+                    existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
+                    if existing_idempotency is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
+                            existing_idempotency,
+                        )
+
+                    active_duplicate = self._get_active_job_for_chat_cur(cur, chat_id)
+                    if active_duplicate is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+                            active_duplicate,
+                        )
+
+                    entitlement: Entitlement | None = None
+                    consumption_source: str | None
+                    if test_access:
+                        consumption_source = "test_access"
+                    else:
+                        entitlement = _load_entitlement_cur(cur, chat_id)
+                        consumption = consume_weekly_pdf_attempt(entitlement, current_time)
+                        if not consumption.allowed:
+                            return QueuedJobAdmissionResult(
+                                QueuedJobAdmissionResultStatus.DENIED,
+                                None,
+                                "weekly_pdf_entitlement_unavailable",
+                            )
+                        consumption_source = consumption.source
+                        _upsert_entitlement_cur(cur, chat_id, entitlement)
+
+                    refund_status = refund_status_for_consumption_source(consumption_source)
+                    cur.execute(
+                        """
+                        INSERT INTO weekly_pdf_jobs (
+                            job_id,
+                            chat_id,
+                            idempotency_key,
+                            status,
+                            consumption_source,
+                            refund_status,
+                            stale_after,
+                            metadata_json,
+                            request_payload_json,
+                            profile_json,
+                            recent_recipe_ids_json,
+                            generation_seed,
+                            next_attempt_at,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            %s,
+                            %s,
+                            %s,
+                            'queued',
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            NULL,
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING *
+                        """,
+                        (
+                            candidate_job_id,
+                            int(chat_id),
+                            idempotency_key,
+                            consumption_source,
+                            refund_status,
+                            _normalize_datetime(stale_after),
+                            _jsonb(dict(metadata or {})),
+                            _jsonb(snapshot.request_payload),
+                            _jsonb(snapshot.profile),
+                            _jsonb(list(snapshot.recent_recipe_ids)),
+                            snapshot.generation_seed,
+                            current_time,
+                            current_time,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.ADMITTED,
+                            _job_from_row(row),
+                        )
+
+                    if entitlement is not None and consumption_source in {"monthly", "extra"}:
+                        refund_attempt(
+                            entitlement,
+                            AttemptConsumption(True, "weekly_pdf", consumption_source),
+                        )
+                        _upsert_entitlement_cur(cur, chat_id, entitlement)
+
+                    existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
+                    if existing_idempotency is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.EXISTING_IDEMPOTENCY,
+                            existing_idempotency,
+                        )
+
+                    active_duplicate = self._get_active_job_for_chat_cur(cur, chat_id)
+                    if active_duplicate is not None:
+                        return QueuedJobAdmissionResult(
+                            QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE,
+                            active_duplicate,
+                        )
+
+        raise RuntimeError("Durable weekly PDF job admission conflict could not be resolved.")
+
+    def get_job(self, job_id: UUID | str) -> WeeklyPdfJob | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                return self._get_job_cur(cur, job_id)
+
+    def claim_next_queued_job(
+        self,
+        *,
+        worker_id: str,
+        lease_until: datetime,
+        now: datetime | None = None,
+    ) -> ClaimQueuedJobResult:
+        worker_id = _required_text(worker_id, "worker_id")
+        current_time = _normalize_datetime(now)
+        lease_until = _normalize_datetime(lease_until)
+        if lease_until <= current_time:
+            raise ValueError("lease_until must be after now")
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        WITH candidate AS (
+                            SELECT job_id
+                            FROM weekly_pdf_jobs
+                            WHERE profile_json IS NOT NULL
+                              AND (
+                                (
+                                    status = 'queued'
+                                    AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
+                                    AND (leased_until IS NULL OR leased_until <= %s)
+                                )
+                                OR (
+                                    status = 'running'
+                                    AND leased_until IS NOT NULL
+                                    AND leased_until <= %s
+                                    AND send_started_at IS NULL
+                                    AND delivered_at IS NULL
+                                )
+                              )
+                            ORDER BY
+                                COALESCE(next_attempt_at, created_at),
+                                created_at,
+                                job_id
+                            LIMIT 1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE weekly_pdf_jobs
+                        SET status = 'running',
+                            worker_id = %s,
+                            leased_until = %s,
+                            next_attempt_at = NULL,
+                            started_at = COALESCE(started_at, %s),
+                            heartbeat_at = %s,
+                            stale_after = GREATEST(stale_after, %s),
+                            updated_at = %s
+                        WHERE job_id = (SELECT job_id FROM candidate)
+                        RETURNING *
+                        """,
+                        (
+                            current_time,
+                            current_time,
+                            current_time,
+                            worker_id,
+                            lease_until,
+                            current_time,
+                            current_time,
+                            lease_until,
+                            current_time,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return ClaimQueuedJobResult(ClaimQueuedJobResultStatus.EMPTY, None)
+                    return ClaimQueuedJobResult(ClaimQueuedJobResultStatus.CLAIMED, _job_from_row(row))
+
+    def extend_lease(
+        self,
+        job_id: UUID | str,
+        *,
+        worker_id: str,
+        lease_until: datetime,
+        now: datetime | None = None,
+    ) -> ExtendLeaseResult:
+        worker_id = _required_text(worker_id, "worker_id")
+        current_time = _normalize_datetime(now)
+        lease_until = _normalize_datetime(lease_until)
+        if lease_until <= current_time:
+            raise ValueError("lease_until must be after now")
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return ExtendLeaseResult(ExtendLeaseResultStatus.NOT_FOUND, None)
+                    if job.status != JOB_STATUS_RUNNING or job.leased_until is None:
+                        return ExtendLeaseResult(ExtendLeaseResultStatus.INVALID_STATE, job)
+                    if job.worker_id != worker_id:
+                        return ExtendLeaseResult(ExtendLeaseResultStatus.WORKER_MISMATCH, job)
+                    cur.execute(
+                        """
+                        UPDATE weekly_pdf_jobs
+                        SET leased_until = %s,
+                            heartbeat_at = %s,
+                            stale_after = GREATEST(stale_after, %s),
+                            updated_at = %s
+                        WHERE job_id = %s
+                        RETURNING *
+                        """,
+                        (lease_until, current_time, lease_until, current_time, job.job_id),
+                    )
+                    return ExtendLeaseResult(ExtendLeaseResultStatus.EXTENDED, _job_from_row(cur.fetchone()))
+
+    def mark_retryable_failure(
+        self,
+        job_id: UUID | str,
+        *,
+        worker_id: str,
+        error: str | None,
+        next_attempt_at: datetime,
+        now: datetime | None = None,
+    ) -> MarkRetryableFailureResult:
+        worker_id = _required_text(worker_id, "worker_id")
+        current_time = _normalize_datetime(now)
+        next_attempt_at = _normalize_datetime(next_attempt_at)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    job = self._get_job_cur(cur, job_id, for_update=True)
+                    if job is None:
+                        return MarkRetryableFailureResult(MarkRetryableFailureResultStatus.NOT_FOUND, None)
+                    if job.status != JOB_STATUS_RUNNING or job.send_started_at is not None or job.delivered_at is not None:
+                        return MarkRetryableFailureResult(MarkRetryableFailureResultStatus.INVALID_STATE, job)
+                    if job.worker_id != worker_id:
+                        return MarkRetryableFailureResult(MarkRetryableFailureResultStatus.WORKER_MISMATCH, job)
+                    cur.execute(
+                        """
+                        UPDATE weekly_pdf_jobs
+                        SET status = 'queued',
+                            worker_id = NULL,
+                            leased_until = NULL,
+                            next_attempt_at = %s,
+                            attempt_count = attempt_count + 1,
+                            last_error = COALESCE(%s, last_error),
+                            updated_at = %s
+                        WHERE job_id = %s
+                        RETURNING *
+                        """,
+                        (next_attempt_at, _optional_text(error), current_time, job.job_id),
+                    )
+                    return MarkRetryableFailureResult(
+                        MarkRetryableFailureResultStatus.MARKED,
+                        _job_from_row(cur.fetchone()),
+                    )
+
     def start_job_and_consume(
         self,
         job_id: UUID | str,
@@ -187,6 +499,28 @@ class PostgresWeeklyPdfJobStore:
                         return StartJobResult(StartJobResultStatus.TERMINAL, job)
                     if job.status != JOB_STATUS_QUEUED:
                         return StartJobResult(StartJobResultStatus.TERMINAL, job)
+
+                    if job.consumption_source is not None:
+                        cur.execute(
+                            """
+                            UPDATE weekly_pdf_jobs
+                            SET status = 'running',
+                                stale_after = %s,
+                                started_at = COALESCE(started_at, %s),
+                                heartbeat_at = %s,
+                                updated_at = %s
+                            WHERE job_id = %s
+                            RETURNING *
+                            """,
+                            (
+                                _normalize_datetime(stale_after) if stale_after is not None else job.stale_after,
+                                current_time,
+                                current_time,
+                                current_time,
+                                job.job_id,
+                            ),
+                        )
+                        return StartJobResult(StartJobResultStatus.STARTED, _job_from_row(cur.fetchone()))
 
                     if test_access:
                         consumption_source = "test_access"
@@ -445,6 +779,7 @@ class PostgresWeeklyPdfJobStore:
                         FROM weekly_pdf_jobs
                         WHERE chat_id = %s
                           AND status IN ('queued', 'running')
+                          AND (status <> 'queued' OR profile_json IS NULL)
                           AND stale_after <= %s
                         ORDER BY stale_after, created_at, job_id
                         LIMIT %s
@@ -885,6 +1220,12 @@ def _job_from_row(row: Any) -> WeeklyPdfJob:
         manual_review_reason=_optional_text(row["manual_review_reason"]),
         manual_reviewed_at=_datetime_or_none(row["manual_reviewed_at"]),
         manual_review_resolution=_optional_text(row["manual_review_resolution"]),
+        request_snapshot=_request_snapshot_from_row(row),
+        worker_id=_optional_text(row["worker_id"]),
+        leased_until=_datetime_or_none(row["leased_until"]),
+        attempt_count=int(row["attempt_count"] or 0),
+        next_attempt_at=_datetime_or_none(row["next_attempt_at"]),
+        last_error=_optional_text(row["last_error"]),
     )
 
 
@@ -892,6 +1233,27 @@ def _coerce_uuid(value: UUID | str) -> UUID:
     if isinstance(value, UUID):
         return value
     return UUID(str(value))
+
+
+def _coerce_request_snapshot(value: WeeklyPdfRequestSnapshot) -> WeeklyPdfRequestSnapshot:
+    if isinstance(value, WeeklyPdfRequestSnapshot):
+        return value
+    raise TypeError("request_snapshot must be WeeklyPdfRequestSnapshot")
+
+
+def _request_snapshot_from_row(row: Any) -> WeeklyPdfRequestSnapshot | None:
+    profile = row["profile_json"]
+    if profile is None:
+        return None
+    recent_recipe_ids = row["recent_recipe_ids_json"] or []
+    if isinstance(recent_recipe_ids, (str, bytes)):
+        recent_recipe_ids = []
+    return WeeklyPdfRequestSnapshot(
+        request_payload=dict(row["request_payload_json"] or {}),
+        profile=dict(profile or {}),
+        recent_recipe_ids=tuple(str(item) for item in recent_recipe_ids),
+        generation_seed=_optional_text(row["generation_seed"]),
+    )
 
 
 def _required_text(value: str, field_name: str) -> str:

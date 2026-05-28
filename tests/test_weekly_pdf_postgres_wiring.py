@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -11,7 +10,6 @@ import pytest
 import diet_bot.telegram_app as telegram_app
 from diet_bot.chat_state_storage import ChatStateStorageError
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
-from diet_bot.entitlement_storage import EntitlementStorageError
 from diet_bot.weekly_pdf_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus,
@@ -26,6 +24,8 @@ from diet_bot.weekly_pdf_jobs import (
     MarkDeliveredResultStatus,
     MarkSendStartedResult,
     MarkSendStartedResultStatus,
+    QueuedJobAdmissionResult,
+    QueuedJobAdmissionResultStatus,
     REFUND_STATUS_NOT_REQUIRED,
     REFUND_STATUS_PENDING,
     REFUND_STATUS_REFUNDED,
@@ -65,7 +65,7 @@ def test_weekly_pdf_diag_redacts_chat_and_job_identifiers(caplog) -> None:
 
 
 @pytest.mark.anyio
-async def test_postgres_active_duplicate_does_not_consume_or_enter_local_queue(monkeypatch) -> None:
+async def test_postgres_active_duplicate_returns_already_active_without_local_queue(monkeypatch) -> None:
     chat_id = 201_001
     message = FakeMessage(chat_id)
     runtime = FakeWeeklyPdfRuntime(admit_status=AdmitJobResultStatus.ACTIVE_DUPLICATE)
@@ -86,7 +86,7 @@ async def test_postgres_active_duplicate_does_not_consume_or_enter_local_queue(m
     assert message.texts == [(telegram_app.WEEK_PDF_ALREADY_RUNNING_TEXT, None)]
     assert runtime.events == [
         ("cleanup", chat_id),
-        ("admit", chat_id, "idem-active"),
+        ("admit_queued", chat_id, "idem-active", False),
     ]
 
 
@@ -116,7 +116,7 @@ def test_telegram_json_weekly_pdf_runtime_does_not_import_postgres_store(monkeyp
 
 
 @pytest.mark.anyio
-async def test_postgres_existing_idempotency_does_not_consume_or_enter_local_queue(monkeypatch) -> None:
+async def test_postgres_existing_idempotency_returns_already_active_without_local_queue(monkeypatch) -> None:
     chat_id = 201_002
     message = FakeMessage(chat_id)
     runtime = FakeWeeklyPdfRuntime(admit_status=AdmitJobResultStatus.EXISTING_IDEMPOTENCY)
@@ -137,48 +137,47 @@ async def test_postgres_existing_idempotency_does_not_consume_or_enter_local_que
     assert message.texts == [(telegram_app.WEEK_PDF_ALREADY_RUNNING_TEXT, None)]
     assert runtime.events == [
         ("cleanup", chat_id),
-        ("admit", chat_id, "idem-existing"),
+        ("admit_queued", chat_id, "idem-existing", False),
     ]
 
 
 @pytest.mark.anyio
-async def test_postgres_local_queue_submit_failure_cancels_admitted_job_without_start(monkeypatch) -> None:
+async def test_postgres_admission_returns_accepted_without_entering_local_queue_or_starting(monkeypatch) -> None:
     chat_id = 201_003
     message = FakeMessage(chat_id)
     runtime = FakeWeeklyPdfRuntime()
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
-    _allow_weekly_pdf_preflight(monkeypatch)
 
     def fail_submit(*_args, **_kwargs):
-        raise RuntimeError("queue submit failed")
+        raise AssertionError("Durable weekly PDF admission must not enter the local queue")
 
     monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_submit)
+    monkeypatch.setattr(telegram_app, "_send_week_plan_after_postgres_admission", _fail_async)
 
     sent = await telegram_app._send_week_plan_with_access(
         message,
         profile_with(),
-        idempotency_key="idem-queue-failed",
+        idempotency_key="idem-accepted",
     )
 
-    assert sent is False
+    assert sent is True
+    assert message.texts == [(telegram_app.WEEK_PDF_ACCEPTED_TEXT, None)]
     assert ("start", runtime.job.job_id, False) not in runtime.events
     assert runtime.events == [
         ("cleanup", chat_id),
-        ("admit", chat_id, "idem-queue-failed"),
-        ("cancel", runtime.job.job_id, "local_queue_submit_failed"),
+        ("admit_queued", chat_id, "idem-accepted", False),
     ]
 
 
 @pytest.mark.anyio
-async def test_postgres_no_quota_after_admit_cancels_job_without_local_queue_submit(monkeypatch) -> None:
+async def test_postgres_no_quota_denied_by_durable_admission_without_local_queue_submit(monkeypatch) -> None:
     chat_id = 201_009
     events: list[tuple] = []
-    runtime = FakeWeeklyPdfRuntime(events=events)
+    runtime = FakeWeeklyPdfRuntime(
+        events=events,
+        queued_admit_status=QueuedJobAdmissionResultStatus.DENIED,
+    )
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
-
-    def deny_weekly_pdf_preflight(preflight_chat_id: int) -> bool:
-        events.append(("preflight", preflight_chat_id))
-        return False
 
     async def send_paywall(message: FakeMessage, ration_kind: str) -> None:
         events.append(("paywall", message.chat.id, ration_kind))
@@ -186,7 +185,6 @@ async def test_postgres_no_quota_after_admit_cancels_job_without_local_queue_sub
     def fail_submit(*_args, **_kwargs):
         raise AssertionError("No-quota Postgres admission must not enter the local queue")
 
-    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", deny_weekly_pdf_preflight)
     monkeypatch.setattr(telegram_app, "_send_limit_paywall", send_paywall)
     monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_submit)
 
@@ -199,29 +197,22 @@ async def test_postgres_no_quota_after_admit_cancels_job_without_local_queue_sub
     assert sent is False
     assert events == [
         ("cleanup", chat_id),
-        ("admit", chat_id, "idem-no-quota"),
-        ("preflight", chat_id),
-        ("cancel", runtime.job.job_id, "entitlement_preflight_denied"),
+        ("admit_queued", chat_id, "idem-no-quota", False),
         ("paywall", chat_id, "weekly_pdf"),
     ]
 
 
 @pytest.mark.anyio
-async def test_postgres_preflight_error_after_admit_cancels_job_without_local_queue_submit(monkeypatch) -> None:
+async def test_postgres_admission_error_returns_storage_error_without_local_queue(monkeypatch) -> None:
     chat_id = 201_010
     message = FakeMessage(chat_id)
     events: list[tuple] = []
-    runtime = FakeWeeklyPdfRuntime(events=events)
+    runtime = FakeWeeklyPdfRuntime(events=events, fail_admit_queued=True)
     monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
 
-    def fail_weekly_pdf_preflight(preflight_chat_id: int) -> bool:
-        events.append(("preflight", preflight_chat_id))
-        raise EntitlementStorageError("preflight failed")
-
     def fail_submit(*_args, **_kwargs):
-        raise AssertionError("Postgres admission with preflight error must not enter the local queue")
+        raise AssertionError("Postgres admission error must not enter the local queue")
 
-    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", fail_weekly_pdf_preflight)
     monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "submit", fail_submit)
 
     sent = await telegram_app._send_week_plan_with_access(
@@ -234,72 +225,7 @@ async def test_postgres_preflight_error_after_admit_cancels_job_without_local_qu
     assert message.texts == [(telegram_app.ENTITLEMENT_STORAGE_ERROR_TEXT, None)]
     assert events == [
         ("cleanup", chat_id),
-        ("admit", chat_id, "idem-preflight-error"),
-        ("preflight", chat_id),
-        ("cancel", runtime.job.job_id, "entitlement_preflight_error"),
-    ]
-
-
-@pytest.mark.anyio
-async def test_postgres_cancel_after_local_ready_cancels_admitted_job_without_start(monkeypatch) -> None:
-    chat_id = 201_007
-    blocker_chat_id = 201_008
-    telegram_app._configure_weekly_pdf_concurrency(1)
-    blocker_started = asyncio.Event()
-    blocker_release = asyncio.Event()
-    local_ready = asyncio.Event()
-
-    async def blocker_runner() -> bool:
-        blocker_started.set()
-        await blocker_release.wait()
-        return True
-
-    blocker_admission = telegram_app.WEEK_PDF_QUEUE_MANAGER.submit(blocker_chat_id, blocker_runner)
-    assert blocker_admission.future is not None
-    await asyncio.wait_for(blocker_started.wait(), timeout=1)
-
-    original_mark_ready = telegram_app.WEEK_PDF_QUEUE_MANAGER.mark_ready
-
-    def mark_ready_and_signal(future):
-        original_mark_ready(future)
-        local_ready.set()
-
-    monkeypatch.setattr(telegram_app.WEEK_PDF_QUEUE_MANAGER, "mark_ready", mark_ready_and_signal)
-
-    runtime = FakeWeeklyPdfRuntime()
-    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
-    _allow_weekly_pdf_preflight(monkeypatch)
-
-    def fail_json_consume_or_refund(*_args, **_kwargs):
-        raise AssertionError("Cancelled Postgres admission must not mutate JSON entitlements")
-
-    monkeypatch.setattr(telegram_app, "_consume_generation_attempt", fail_json_consume_or_refund)
-    monkeypatch.setattr(telegram_app, "_refund_generation_attempt", fail_json_consume_or_refund)
-
-    task = asyncio.create_task(
-        telegram_app._send_week_plan_with_access(
-            FakeMessage(chat_id),
-            profile_with(),
-            idempotency_key="idem-cancel-after-ready",
-        )
-    )
-
-    await asyncio.wait_for(local_ready.wait(), timeout=1)
-    await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    blocker_release.set()
-    await asyncio.wait_for(blocker_admission.future, timeout=1)
-
-    assert ("start", runtime.job.job_id, False) not in runtime.events
-    assert ("failure", runtime.job.job_id, "weekly_pdf_not_sent") not in runtime.events
-    assert runtime.events.count(("cancel", runtime.job.job_id, "local_queue_wait_cancelled")) == 1
-    assert runtime.events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-cancel-after-ready"),
-        ("cancel", runtime.job.job_id, "local_queue_wait_cancelled"),
+        ("admit_queued", chat_id, "idem-preflight-error", False),
     ]
 
 
@@ -325,17 +251,10 @@ async def test_postgres_start_and_finish_success_wrap_successful_document_send(m
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-success",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is True
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-success"),
-        ("preflight", chat_id),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("send_started", runtime.job.job_id),
@@ -366,16 +285,10 @@ async def test_postgres_history_save_failure_after_pdf_delivery_is_best_effort(m
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-history-save-failure",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is True
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-history-save-failure"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("send_started", runtime.job.job_id),
@@ -421,16 +334,10 @@ async def test_postgres_delivered_marker_failure_after_upload_finishes_non_refun
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-marker-failure",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is True
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-marker-failure"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("send_started", runtime.job.job_id),
@@ -484,16 +391,10 @@ async def test_postgres_send_start_marker_failure_preserves_pre_upload_refund(mo
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-send-start-failure",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is False
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-send-start-failure"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("send_started", runtime.job.job_id),
@@ -524,16 +425,10 @@ async def test_postgres_upload_failure_after_send_start_is_non_refundable(monkey
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-upload-failure-after-send-start",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is False
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-upload-failure-after-send-start"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("send_started", runtime.job.job_id),
@@ -571,15 +466,9 @@ async def test_postgres_marker_failure_then_status_edit_error_does_not_refund_or
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
     with pytest.raises(RuntimeError, match="status edit failed"):
-        await telegram_app._send_week_plan_with_access(
-            FakeMessage(chat_id),
-            profile_with(),
-            idempotency_key="idem-marker-failure-status-edit",
-        )
+        await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-marker-failure-status-edit"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("delivered", runtime.job.job_id),
@@ -616,16 +505,10 @@ async def test_postgres_marker_failure_stale_cleanup_before_normal_success_does_
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-marker-failure-stale",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is True
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-marker-failure-stale"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("delivered", runtime.job.job_id),
@@ -659,16 +542,10 @@ async def test_postgres_generation_failure_uses_store_refund_path_not_json_refun
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-failure",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is False
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-failure"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("failure", runtime.job.job_id, "weekly_pdf_not_sent"),
@@ -694,15 +571,9 @@ async def test_postgres_post_delivery_failure_marks_delivered_before_failure(mon
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
     with pytest.raises(RuntimeError, match="status edit failed"):
-        await telegram_app._send_week_plan_with_access(
-            FakeMessage(chat_id),
-            profile_with(),
-            idempotency_key="idem-post-delivery-failure",
-        )
+        await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-post-delivery-failure"),
         ("start", runtime.job.job_id, False),
         ("send",),
         ("delivered", runtime.job.job_id),
@@ -733,16 +604,10 @@ async def test_postgres_tester_chat_id_starts_lifecycle_as_test_access_without_j
 
     monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
 
-    sent = await telegram_app._send_week_plan_with_access(
-        FakeMessage(chat_id),
-        profile_with(),
-        idempotency_key="idem-test-access",
-    )
+    sent = await _run_admitted_weekly_pdf(runtime, chat_id)
 
     assert sent is True
     assert events == [
-        ("cleanup", chat_id),
-        ("admit", chat_id, "idem-test-access"),
         ("start", runtime.job.job_id, True),
         ("send",),
         ("delivered", runtime.job.job_id),
@@ -876,11 +741,15 @@ class FakeWeeklyPdfRuntime:
         *,
         events: list[tuple] | None = None,
         admit_status: AdmitJobResultStatus = AdmitJobResultStatus.ADMITTED,
+        queued_admit_status: QueuedJobAdmissionResultStatus | None = None,
+        fail_admit_queued: bool = False,
         start_status: StartJobResultStatus = StartJobResultStatus.STARTED,
         start_source: str | None = "monthly",
     ) -> None:
         self.events = events if events is not None else []
         self.admit_status = admit_status
+        self.queued_admit_status = queued_admit_status
+        self.fail_admit_queued = fail_admit_queued
         self.start_status = start_status
         self.start_source = start_source
         self.job = _job(status=JOB_STATUS_QUEUED, chat_id=0)
@@ -939,6 +808,34 @@ class FakeWeeklyPdfRuntime:
         self.job = _job(status=status, chat_id=chat_id)
         self.events.append(("admit", chat_id, idempotency_key))
         return AdmitJobResult(self.admit_status, self.job)
+
+    def admit_queued(
+        self,
+        *,
+        chat_id: int,
+        idempotency_key: str,
+        request_snapshot,
+        metadata=None,
+        test_access: bool = False,
+    ):
+        del request_snapshot, metadata
+        self.events.append(("admit_queued", chat_id, idempotency_key, test_access))
+        if self.fail_admit_queued:
+            raise RuntimeError("admission failed")
+        queued_status = self.queued_admit_status
+        if queued_status is None:
+            queued_status = QueuedJobAdmissionResultStatus(self.admit_status.value)
+        if queued_status == QueuedJobAdmissionResultStatus.DENIED:
+            return QueuedJobAdmissionResult(
+                QueuedJobAdmissionResultStatus.DENIED,
+                None,
+                "weekly_pdf_entitlement_unavailable",
+            )
+        status = JOB_STATUS_RUNNING if queued_status == QueuedJobAdmissionResultStatus.ACTIVE_DUPLICATE else JOB_STATUS_QUEUED
+        refund_status = REFUND_STATUS_NOT_REQUIRED if test_access else REFUND_STATUS_PENDING
+        source = "test_access" if test_access else "monthly"
+        self.job = _job(status=status, chat_id=chat_id, source=source, refund_status=refund_status)
+        return QueuedJobAdmissionResult(queued_status, self.job)
 
     def start_job_and_consume(self, job_id, *, test_access: bool = False):
         self.events.append(("start", job_id, test_access))
@@ -1063,6 +960,20 @@ class FakeMessage:
 
 async def _fake_edit_text(*_args, **_kwargs) -> None:
     return None
+
+
+async def _run_admitted_weekly_pdf(runtime: FakeWeeklyPdfRuntime, chat_id: int) -> bool:
+    runtime.job = _job(status=JOB_STATUS_QUEUED, chat_id=chat_id)
+    return await telegram_app._send_week_plan_after_postgres_admission(
+        FakeMessage(chat_id),
+        profile_with(),
+        runtime=runtime,
+        job=runtime.job,
+    )
+
+
+async def _fail_async(*_args, **_kwargs):
+    raise AssertionError("unexpected async call")
 
 
 def profile_with(**kwargs) -> UserProfile:

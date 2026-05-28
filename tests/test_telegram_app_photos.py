@@ -498,6 +498,85 @@ async def test_run_bot_starts_configured_one_day_worker_without_real_polling(mon
 
 
 @pytest.mark.anyio
+async def test_run_bot_starts_configured_weekly_pdf_worker_without_real_polling(monkeypatch) -> None:
+    fake_bot = object()
+    fake_runtime = object()
+    events: list[object] = []
+
+    class FakeDispatcher:
+        async def start_polling(self, bot) -> None:
+            events.append(("poll", bot))
+            await asyncio.sleep(0)
+
+    class FakeWorker:
+        def __init__(self, runtime, processor, settings) -> None:
+            events.append(
+                (
+                    "worker_init",
+                    runtime,
+                    type(processor).__name__,
+                    settings.concurrency,
+                    settings.lease_seconds,
+                    settings.heartbeat_interval_seconds,
+                    settings.retry_delay_seconds,
+                    settings.max_attempts,
+                    settings.idle_sleep_seconds,
+                ),
+            )
+
+        async def run_forever(self) -> None:
+            events.append("worker_run")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("worker_cancelled")
+
+    class FakeGuard:
+        def close(self) -> None:
+            events.append("guard_close")
+
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "postgres")
+    monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://user:secret@example/db")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_ENABLED", "1")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_CONCURRENCY", "2")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_LEASE_SECONDS", "90")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_HEARTBEAT_SECONDS", "10")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS", "7")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("DIET_BOT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS", "0.2")
+    monkeypatch.setattr(telegram_app, "Bot", lambda _token: fake_bot)
+    monkeypatch.setattr(telegram_app, "_set_bot_commands", lambda _bot: asyncio.sleep(0))
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_weekly_pdf_job_runtime_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_one_day_generation_job_store_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_payment_runtime_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "_acquire_postgres_single_poller_guard", lambda _config: FakeGuard())
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: fake_runtime)
+    monkeypatch.setattr(telegram_app, "WeeklyPdfWorker", FakeWorker)
+
+    await telegram_app.run_bot()
+
+    assert (
+        "worker_init",
+        fake_runtime,
+        "_TelegramWeeklyPdfJobProcessor",
+        2,
+        90,
+        10,
+        7,
+        5,
+        0.2,
+    ) in events
+    assert "worker_run" in events
+    assert "worker_cancelled" in events
+    assert ("poll", fake_bot) in events
+    assert "guard_close" in events
+
+
+@pytest.mark.anyio
 async def test_one_day_worker_task_exception_is_observed_without_secret_leak(monkeypatch, caplog) -> None:
     fake_runtime = object()
 

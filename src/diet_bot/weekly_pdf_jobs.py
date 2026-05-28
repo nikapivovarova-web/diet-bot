@@ -35,6 +35,31 @@ REFUNDABLE_CONSUMPTION_SOURCES = frozenset({"monthly", "extra"})
 
 
 @dataclass(frozen=True)
+class WeeklyPdfRequestSnapshot:
+    request_payload: dict[str, Any] = field(default_factory=dict)
+    profile: dict[str, Any] = field(default_factory=dict)
+    recent_recipe_ids: Sequence[str] = field(default_factory=tuple)
+    generation_seed: str | None = None
+
+    def __post_init__(self) -> None:
+        generation_seed = None
+        if self.generation_seed is not None:
+            generation_seed = str(self.generation_seed).strip() or None
+        object.__setattr__(self, "request_payload", dict(self.request_payload or {}))
+        object.__setattr__(self, "profile", dict(self.profile or {}))
+        object.__setattr__(
+            self,
+            "recent_recipe_ids",
+            tuple(
+                recipe_id
+                for recipe_id in (str(item).strip() for item in self.recent_recipe_ids or ())
+                if recipe_id
+            ),
+        )
+        object.__setattr__(self, "generation_seed", generation_seed)
+
+
+@dataclass(frozen=True)
 class WeeklyPdfJob:
     job_id: UUID
     chat_id: int
@@ -58,6 +83,12 @@ class WeeklyPdfJob:
     manual_review_reason: str | None = None
     manual_reviewed_at: datetime | None = None
     manual_review_resolution: str | None = None
+    request_snapshot: WeeklyPdfRequestSnapshot | None = None
+    worker_id: str | None = None
+    leased_until: datetime | None = None
+    attempt_count: int = 0
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata))
@@ -77,6 +108,57 @@ class AdmitJobResultStatus(str, Enum):
 class AdmitJobResult:
     status: AdmitJobResultStatus
     job: WeeklyPdfJob
+
+
+class QueuedJobAdmissionResultStatus(str, Enum):
+    ADMITTED = "admitted"
+    EXISTING_IDEMPOTENCY = "existing_idempotency"
+    ACTIVE_DUPLICATE = "active_duplicate"
+    DENIED = "denied"
+
+
+@dataclass(frozen=True)
+class QueuedJobAdmissionResult:
+    status: QueuedJobAdmissionResultStatus
+    job: WeeklyPdfJob | None = None
+    denial_reason: str | None = None
+
+
+class ClaimQueuedJobResultStatus(str, Enum):
+    CLAIMED = "claimed"
+    EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class ClaimQueuedJobResult:
+    status: ClaimQueuedJobResultStatus
+    job: WeeklyPdfJob | None = None
+
+
+class ExtendLeaseResultStatus(str, Enum):
+    EXTENDED = "extended"
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
+    WORKER_MISMATCH = "worker_mismatch"
+
+
+@dataclass(frozen=True)
+class ExtendLeaseResult:
+    status: ExtendLeaseResultStatus
+    job: WeeklyPdfJob | None = None
+
+
+class MarkRetryableFailureResultStatus(str, Enum):
+    MARKED = "marked"
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
+    WORKER_MISMATCH = "worker_mismatch"
+
+
+@dataclass(frozen=True)
+class MarkRetryableFailureResult:
+    status: MarkRetryableFailureResultStatus
+    job: WeeklyPdfJob | None = None
 
 
 class StartJobResultStatus(str, Enum):
