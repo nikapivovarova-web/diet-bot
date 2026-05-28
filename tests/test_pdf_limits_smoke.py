@@ -154,6 +154,51 @@ async def test_weekly_pdf_render_failure_does_not_consume_limit_or_send_text_fal
 
 
 @pytest.mark.anyio
+async def test_weekly_pdf_missing_rendered_file_refunds_before_upload(monkeypatch, tmp_path) -> None:
+    chat_id = 101_019
+    message = FakeMessage(chat_id)
+    _save_active_subscription(chat_id, weekly_pdf_remaining=1)
+    plans = tuple(sample_meal_plan() for _ in range(7))
+    missing_pdf_path = tmp_path / "missing.pdf"
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
+    monkeypatch.setattr(telegram_app, "build_week_plan_pdf", lambda *_args: missing_pdf_path)
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
+    assert not sent
+    assert entitlement.monthly_weekly_pdf_remaining == 1
+    assert message.documents == []
+
+
+@pytest.mark.anyio
+async def test_weekly_pdf_empty_payload_refunds_before_upload(monkeypatch) -> None:
+    chat_id = 101_020
+    message = FakeMessage(chat_id)
+    _save_active_subscription(chat_id, weekly_pdf_remaining=1)
+    plans = tuple(sample_meal_plan() for _ in range(7))
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_week_plans_with_recent_fallback",
+        lambda *_args: _week_plan_build_result(plans),
+    )
+    monkeypatch.setattr(telegram_app, "_build_week_pdf_payload", lambda *_args: (b"", "week.pdf"))
+
+    sent = await telegram_app._send_week_plan_with_access(message, profile_with())
+
+    entitlement = telegram_app.load_entitlements(telegram_app.SUBSCRIPTIONS_STATE_FILE)[chat_id]
+    assert not sent
+    assert entitlement.monthly_weekly_pdf_remaining == 1
+    assert message.documents == []
+
+
+@pytest.mark.anyio
 async def test_weekly_pdf_size_guard_does_not_consume_limit_or_send_text_fallback(monkeypatch) -> None:
     chat_id = 101_003
     message = FakeMessage(chat_id)

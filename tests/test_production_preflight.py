@@ -51,6 +51,7 @@ def _patch_successful_runtime_checks(monkeypatch: pytest.MonkeyPatch, preflight)
         return wrapped
 
     monkeypatch.setattr(preflight, "_validate_postgres_connectivity", record("postgres_connectivity"))
+    monkeypatch.setattr(preflight, "validate_local_telegram_media_assets", record("local_media_assets"))
     monkeypatch.setattr(preflight, "validate_chat_state_store_for_startup", record("chat_state_schema"))
     monkeypatch.setattr(preflight, "create_entitlement_store", lambda _config: FakeStore())
     monkeypatch.setattr(preflight, "validate_entitlement_store_for_startup", record("entitlement_schema"))
@@ -82,11 +83,13 @@ def test_production_preflight_success_reports_pass_and_uses_existing_validators(
     assert "production preflight" in output
     assert "result: PASS" in output
     assert "PASS runtime config" in output
+    assert "PASS local Telegram media assets" in output
     assert "PASS Postgres connectivity" in output
     assert "PASS entitlement schema" in output
     assert "PASS payment ledger schema" in output
     assert "PASS single-poller guard acquire/release" in output
     assert calls == [
+        "local_media_assets",
         "postgres_connectivity",
         "chat_state_schema",
         "entitlement_schema",
@@ -117,11 +120,13 @@ def test_controlled_qa_preflight_success_reports_pass_and_uses_existing_safe_val
     assert "result: PASS" in output
     assert "PASS controlled QA runtime config" in output
     assert "tester_chat_ids_count=2" in output
+    assert "PASS local Telegram media assets" in output
     assert "PASS Postgres connectivity" in output
     assert "PASS entitlement schema" in output
     assert "PASS payment ledger schema" in output
     assert "PASS single-poller guard acquire/release" in output
     assert calls == [
+        "local_media_assets",
         "postgres_connectivity",
         "chat_state_schema",
         "entitlement_schema",
@@ -135,6 +140,30 @@ def test_controlled_qa_preflight_success_reports_pass_and_uses_existing_safe_val
     assert "postgresql://qa_user:" not in output
     assert "111" not in output
     assert "222" not in output
+
+
+def test_production_preflight_reports_local_media_asset_failure_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    _patch_successful_runtime_checks(monkeypatch, preflight)
+
+    def fail_media_assets() -> None:
+        raise RuntimeError("welcome photo 'missing.png' does not exist")
+
+    monkeypatch.setattr(preflight, "validate_local_telegram_media_assets", fail_media_assets)
+
+    exit_code = preflight.main([], env=_valid_env(tmp_path))
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "FAIL local Telegram media assets" in output
+    assert "missing.png" in output
+    assert "bot-super-secret" not in output
+    assert "db-super-secret" not in output
 
 
 def test_controlled_qa_preflight_rejects_production_environment_before_db_checks(

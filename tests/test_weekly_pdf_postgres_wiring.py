@@ -10,6 +10,7 @@ import pytest
 import diet_bot.telegram_app as telegram_app
 from diet_bot.chat_state_storage import ChatStateStorageError
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
+from diet_bot.telegram_media_validation import TelegramMediaValidationError
 from diet_bot.weekly_pdf_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus,
@@ -632,6 +633,68 @@ async def test_send_week_pdf_document_marks_delivery_after_answer_document_succe
     )
 
     assert events == ["send_started", "answer_document", "delivered"]
+
+
+@pytest.mark.anyio
+async def test_send_week_pdf_document_rejects_empty_pdf_before_send_start() -> None:
+    events: list[str] = []
+
+    class DocumentMessage(FakeMessage):
+        async def answer_document(self, **_kwargs) -> None:
+            events.append("answer_document")
+
+    with pytest.raises(TelegramMediaValidationError, match="empty"):
+        await telegram_app._send_week_pdf_document(
+            DocumentMessage(201_022),
+            b"",
+            "week.pdf",
+            on_document_send_started=lambda: events.append("send_started"),
+            on_document_delivered=lambda: events.append("delivered"),
+        )
+
+    assert events == []
+
+
+@pytest.mark.anyio
+async def test_send_week_pdf_document_rejects_oversized_pdf_before_send_start(monkeypatch) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(telegram_app, "TELEGRAM_DOCUMENT_MAX_BYTES", 8, raising=False)
+
+    class DocumentMessage(FakeMessage):
+        async def answer_document(self, **_kwargs) -> None:
+            events.append("answer_document")
+
+    with pytest.raises(TelegramMediaValidationError, match="exceeds"):
+        await telegram_app._send_week_pdf_document(
+            DocumentMessage(201_023),
+            b"%PDF-1.4\nlarge",
+            "week.pdf",
+            on_document_send_started=lambda: events.append("send_started"),
+            on_document_delivered=lambda: events.append("delivered"),
+        )
+
+    assert events == []
+
+
+@pytest.mark.anyio
+async def test_send_week_pdf_document_rejects_long_caption_before_send_start() -> None:
+    events: list[str] = []
+
+    class DocumentMessage(FakeMessage):
+        async def answer_document(self, **_kwargs) -> None:
+            events.append("answer_document")
+
+    with pytest.raises(TelegramMediaValidationError, match="caption"):
+        await telegram_app._send_week_pdf_document(
+            DocumentMessage(201_024),
+            b"%PDF-1.4\n%test",
+            "week.pdf",
+            status_text="x" * 2_000,
+            on_document_send_started=lambda: events.append("send_started"),
+            on_document_delivered=lambda: events.append("delivered"),
+        )
+
+    assert events == []
 
 
 @pytest.mark.anyio

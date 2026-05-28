@@ -47,6 +47,10 @@ from diet_bot.payment_recovery_spool import (
     append_payment_recovery_record as write_payment_recovery_record,
     read_payment_recovery_records,
 )
+from diet_bot.telegram_media_validation import (
+    TELEGRAM_MESSAGE_MAX_CHARS,
+    TelegramMediaValidationError,
+)
 from diet_bot.one_day_generation_jobs import (
     AdmitJobResult,
     AdmitJobResultStatus as OneDayAdmitJobResultStatus,
@@ -248,6 +252,18 @@ def test_photo_input_keeps_remote_url() -> None:
     )
 
     assert _photo_input(meal) == "https://example.com/photo.jpg"
+
+
+def test_photo_input_rejects_invalid_local_file_before_telegram(tmp_path: Path) -> None:
+    meal = Meal(
+        name="Test meal",
+        portions=(),
+        recipe="Test recipe",
+        image_url=str(tmp_path),
+    )
+
+    with pytest.raises(TelegramMediaValidationError, match="regular file"):
+        _photo_input(meal)
 
 
 def test_start_keyboard_has_welcome_buttons() -> None:
@@ -4888,6 +4904,34 @@ async def test_long_meal_card_sends_photo_without_duplicate_title() -> None:
     assert len(message.texts) == 1
     sent_text = message.texts[0][0]
     assert sent_text.count("🌙 Ужин: Боул с бататом, фасолью и рисом") == 1
+
+
+@pytest.mark.anyio
+async def test_invalid_local_meal_photo_falls_back_to_text_before_telegram(tmp_path: Path) -> None:
+    meal = Meal(
+        name="Local Photo Meal",
+        portions=(),
+        recipe="Serve as text because the local photo path is invalid.",
+        image_url=str(tmp_path),
+    )
+    message = FakeMessage()
+
+    await _send_meal_card(message, meal)
+
+    assert message.photos == []
+    assert len(message.texts) == 1
+    assert "Local Photo Meal" in message.texts[0][0]
+
+
+@pytest.mark.anyio
+async def test_send_text_chunks_never_sends_over_telegram_message_limit() -> None:
+    message = FakeMessage()
+    text = "x" * (TELEGRAM_MESSAGE_MAX_CHARS + 100)
+
+    await telegram_app._send_text_chunks(message, text)
+
+    assert len(message.texts) == 2
+    assert all(0 < len(chunk) <= TELEGRAM_MESSAGE_MAX_CHARS for chunk, _ in message.texts)
 
 
 @pytest.mark.anyio

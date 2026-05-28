@@ -17,6 +17,7 @@ from .runtime_config import (
     validate_startup,
     validate_strict_production,
 )
+from .telegram_media_validation import validate_local_telegram_media_assets
 from .weekly_pdf_job_runtime import validate_weekly_pdf_job_runtime_for_startup
 
 
@@ -116,6 +117,7 @@ def run_preflight(
 
     checks: list[PreflightCheck] = [
         PreflightCheck("runtime config", PASS),
+        _check("local Telegram media assets", validate_local_telegram_media_assets, redaction_values),
         _check("Postgres connectivity", lambda: _validate_postgres_connectivity(config), redaction_values),
         _check("chat state schema", lambda: validate_chat_state_store_for_startup(config), redaction_values),
         _check(
@@ -194,6 +196,7 @@ def run_controlled_qa_preflight(
                 f"tester_chat_ids_count={len(config.tester_chat_ids)}",
             ),
         ),
+        _check("local Telegram media assets", validate_local_telegram_media_assets, redaction_values),
         _check("Postgres connectivity", lambda: _validate_postgres_connectivity(config), redaction_values),
         _check("chat state schema", lambda: validate_chat_state_store_for_startup(config), redaction_values),
         _check(

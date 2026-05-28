@@ -11,4 +11,5 @@ __all__ = [
     "questionnaire",
     "presentation",
     "pdf_renderer",
+    "telegram_media_validation",
 ]
