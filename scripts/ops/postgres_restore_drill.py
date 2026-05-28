@@ -21,20 +21,34 @@ except ModuleNotFoundError:
 DEFAULT_ADMIN_URL_ENV = "DIET_BOT_RESTORE_ADMIN_DATABASE_URL"
 DEFAULT_COMPARE_SOURCE_URL_ENV = "DIET_BOT_BACKUP_DATABASE_URL"
 RESTORE_DATABASE_PREFIX = "diet_bot_restore_drill_"
-REQUIRED_TABLES = (
-    "schema_migrations",
+SCHEMA_TABLES = ("schema_migrations",)
+ENTITLEMENT_TABLES = (
     "entitlements",
     "entitlement_processed_charge_ids",
     "entitlement_json_import_runs",
-    "weekly_pdf_jobs",
+)
+WEEKLY_PDF_JOB_TABLES = ("weekly_pdf_jobs",)
+CHAT_STATE_TABLES = (
     "chat_profiles",
     "chat_recipe_history",
     "chat_state_json_import_runs",
+)
+ONE_DAY_GENERATION_JOB_TABLES = (
+    "one_day_generation_jobs",
+    "one_day_generation_job_value_messages",
 )
 PAYMENT_LEDGER_TABLES = (
     "payment_orders",
     "payment_charges",
     "payment_events",
+)
+REQUIRED_TABLES = (
+    *SCHEMA_TABLES,
+    *ENTITLEMENT_TABLES,
+    *WEEKLY_PDF_JOB_TABLES,
+    *CHAT_STATE_TABLES,
+    *ONE_DAY_GENERATION_JOB_TABLES,
+    *PAYMENT_LEDGER_TABLES,
 )
 _DATABASE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _UNSAFE_DATABASE_NAMES = {
@@ -67,8 +81,18 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     parser.add_argument("--backup-file", required=True, type=Path)
     parser.add_argument("--admin-url-env", default=DEFAULT_ADMIN_URL_ENV)
     parser.add_argument("--compare-source-url-env")
+    parser.add_argument(
+        "--allow-row-count-mismatch",
+        action="store_true",
+        help=(
+            "Allow source-to-restore required table row-count differences after comparison. "
+            "Use only with a documented operator waiver."
+        ),
+    )
     parser.add_argument("--keep-restore-db", action="store_true")
     args = parser.parse_args(argv)
+    if args.allow_row_count_mismatch and not args.compare_source_url_env:
+        parser.error("--allow-row-count-mismatch requires --compare-source-url-env")
 
     source_env = dict(os.environ if env is None else env)
     backup_file = args.backup_file
@@ -112,7 +136,11 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
         )
         verification = _verify_restored_database(restore_url)
         if compare_source_url is not None:
-            comparison = _compare_source_and_restore_counts(compare_source_url, restore_url)
+            comparison = _compare_source_and_restore_counts(
+                compare_source_url,
+                restore_url,
+                allow_mismatch=args.allow_row_count_mismatch,
+            )
             comparison = {
                 "source_url_env": args.compare_source_url_env,
                 "frozen_writes_required": True,
@@ -210,7 +238,7 @@ def _run_tool(command: list[str], *, env: dict[str, str], tool_name: str) -> Non
 def _verify_restored_database(database_url: str) -> dict[str, Any]:
     with _connect(database_url) as conn:
         with conn.cursor() as cur:
-            present_tables = _fetch_present_tables(cur, (*REQUIRED_TABLES, *PAYMENT_LEDGER_TABLES))
+            present_tables = _fetch_present_tables(cur, REQUIRED_TABLES)
             required_counts = _table_counts(cur, REQUIRED_TABLES, present_tables=present_tables)
             missing_required = [
                 table_name
@@ -222,14 +250,23 @@ def _verify_restored_database(database_url: str) -> dict[str, Any]:
                     "restored database is missing required tables: "
                     + ", ".join(sorted(missing_required)),
                 )
-            payment_counts = _table_counts(cur, PAYMENT_LEDGER_TABLES, present_tables=present_tables)
     return {
         "required_tables": required_counts,
-        "payment_ledger_tables": payment_counts,
+        "schema_tables": _select_table_counts(required_counts, SCHEMA_TABLES),
+        "entitlement_tables": _select_table_counts(required_counts, ENTITLEMENT_TABLES),
+        "weekly_pdf_job_tables": _select_table_counts(required_counts, WEEKLY_PDF_JOB_TABLES),
+        "chat_state_tables": _select_table_counts(required_counts, CHAT_STATE_TABLES),
+        "one_day_generation_job_tables": _select_table_counts(required_counts, ONE_DAY_GENERATION_JOB_TABLES),
+        "payment_ledger_tables": _select_table_counts(required_counts, PAYMENT_LEDGER_TABLES),
     }
 
 
-def _compare_source_and_restore_counts(source_url: str, restore_url: str) -> dict[str, Any]:
+def _compare_source_and_restore_counts(
+    source_url: str,
+    restore_url: str,
+    *,
+    allow_mismatch: bool = False,
+) -> dict[str, Any]:
     source_counts = _fetch_counts_for_tables(source_url, REQUIRED_TABLES)
     restore_counts = _fetch_counts_for_tables(restore_url, REQUIRED_TABLES)
     tables = {
@@ -240,9 +277,16 @@ def _compare_source_and_restore_counts(source_url: str, restore_url: str) -> dic
         }
         for table_name in REQUIRED_TABLES
     }
+    mismatched_tables = sorted(table_name for table_name, report in tables.items() if not report["matches"])
+    if mismatched_tables and not allow_mismatch:
+        raise SystemExit(
+            "restore drill row-count mismatch for required tables: "
+            + ", ".join(mismatched_tables),
+        )
     return {
         "tables": tables,
-        "all_counts_match": all(report["matches"] for report in tables.values()),
+        "all_counts_match": not mismatched_tables,
+        "row_count_mismatch_allowed": bool(allow_mismatch),
     }
 
 
@@ -290,8 +334,15 @@ def _table_counts(
     return reports
 
 
+def _select_table_counts(
+    reports: dict[str, dict[str, int | bool | None]],
+    table_names: tuple[str, ...],
+) -> dict[str, dict[str, int | bool | None]]:
+    return {table_name: reports[table_name] for table_name in table_names}
+
+
 def _quote_identifier(identifier: str) -> str:
-    if identifier not in (*REQUIRED_TABLES, *PAYMENT_LEDGER_TABLES):
+    if identifier not in REQUIRED_TABLES:
         raise ValueError(f"unexpected table identifier: {identifier!r}")
     return '"' + identifier.replace('"', '""') + '"'
 

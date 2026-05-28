@@ -40,6 +40,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install PostgreSQL client tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - name: Install dependency lock tooling
         run: python -m pip install -r requirements/lock-tools.txt
       - name: Verify dependency locks
@@ -56,7 +58,7 @@ jobs:
           python -m pip install --no-deps -e .
           python -m pip check
       - name: Run PostgreSQL integration tests
-        run: python -m pytest -q -p no:cacheprovider -m postgres_integration tests/test_postgres_runtime_preflight.py tests/test_postgres_entitlement_store.py tests/test_postgres_payment_store.py tests/test_postgres_weekly_pdf_job_store.py tests/test_postgres_chat_state_store.py tests/test_postgres_one_day_generation_job_store.py
+        run: python -m pytest -q -p no:cacheprovider -m postgres_integration tests/test_postgres_runtime_preflight.py tests/test_postgres_entitlement_store.py tests/test_postgres_payment_store.py tests/test_postgres_weekly_pdf_job_store.py tests/test_postgres_chat_state_store.py tests/test_postgres_one_day_generation_job_store.py tests/test_postgres_restore_drill_ops.py
       - name: Run entitlement JSON migration tests
         run: python -m pytest -q -p no:cacheprovider tests/test_entitlement_json_migration.py
       - name: Run storage runtime safety tests
