@@ -87,10 +87,15 @@ Before building or packaging, verify the dependency locks from a clean checkout:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements\lock-tools.txt
-.\.venv\Scripts\python.exe -m piptools compile requirements\lock-tools.in --resolver=backtracking --strip-extras --no-header --no-emit-index-url --allow-unsafe --output-file=requirements\lock-tools.txt
-.\.venv\Scripts\python.exe -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --no-header --no-emit-index-url --output-file=requirements\prod.txt
-.\.venv\Scripts\python.exe -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --extra=dev --no-header --no-emit-index-url --output-file=requirements\dev.txt
-git diff --exit-code -- requirements\lock-tools.txt requirements\prod.txt requirements\dev.txt
+$lockToolsOut = Join-Path $env:TEMP "foodbalance-lock-tools.txt"
+$prodOut = Join-Path $env:TEMP "foodbalance-prod.txt"
+$devOut = Join-Path $env:TEMP "foodbalance-dev.txt"
+.\.venv\Scripts\python.exe -m piptools compile requirements\lock-tools.in --resolver=backtracking --strip-extras --no-header --no-emit-index-url --allow-unsafe --output-file="$lockToolsOut"
+.\.venv\Scripts\python.exe -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --no-header --no-emit-index-url --output-file="$prodOut"
+.\.venv\Scripts\python.exe -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --extra=dev --no-header --no-emit-index-url --output-file="$devOut"
+.\.venv\Scripts\python.exe .\scripts\check_dependency_locks.py .\requirements\lock-tools.txt "$lockToolsOut" --allow-extra colorama
+.\.venv\Scripts\python.exe .\scripts\check_dependency_locks.py .\requirements\prod.txt "$prodOut" --allow-extra colorama --allow-extra tzdata
+.\.venv\Scripts\python.exe .\scripts\check_dependency_locks.py .\requirements\dev.txt "$devOut" --allow-extra colorama --allow-extra tzdata
 ```
 
 Build and verify a production-style install without starting the bot:

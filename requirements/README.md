@@ -52,4 +52,6 @@ Then run:
 .\.venv\Scripts\python.exe -m compileall -q src scripts tests
 ```
 
-CI regenerates the locks and fails if `git diff` sees drift.
+CI regenerates the locks into temporary files and compares package pins with
+`scripts/check_dependency_locks.py`. The check permits the committed Windows
+platform pins (`colorama`, `tzdata`) when the workflow runs on Linux.

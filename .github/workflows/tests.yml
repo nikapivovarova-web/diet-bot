@@ -24,10 +24,12 @@ jobs:
         run: python -m pip install -r requirements/lock-tools.txt
       - name: Verify dependency locks
         run: |
-          python -m piptools compile requirements/lock-tools.in --resolver=backtracking --strip-extras --no-header --no-emit-index-url --allow-unsafe --output-file=requirements/lock-tools.txt
-          python -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --no-header --no-emit-index-url --output-file=requirements/prod.txt
-          python -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --extra=dev --no-header --no-emit-index-url --output-file=requirements/dev.txt
-          git diff --exit-code -- requirements/lock-tools.txt requirements/prod.txt requirements/dev.txt
+          python -m piptools compile requirements/lock-tools.in --resolver=backtracking --strip-extras --no-header --no-emit-index-url --allow-unsafe --output-file="$RUNNER_TEMP/lock-tools.txt"
+          python -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --no-header --no-emit-index-url --output-file="$RUNNER_TEMP/prod.txt"
+          python -m piptools compile pyproject.toml --resolver=backtracking --strip-extras --extra=dev --no-header --no-emit-index-url --output-file="$RUNNER_TEMP/dev.txt"
+          python scripts/check_dependency_locks.py requirements/lock-tools.txt "$RUNNER_TEMP/lock-tools.txt" --allow-extra colorama
+          python scripts/check_dependency_locks.py requirements/prod.txt "$RUNNER_TEMP/prod.txt" --allow-extra colorama --allow-extra tzdata
+          python scripts/check_dependency_locks.py requirements/dev.txt "$RUNNER_TEMP/dev.txt" --allow-extra colorama --allow-extra tzdata
       - name: Install package and dev dependencies from lock
         run: |
           python -m pip install -r requirements/dev.txt
