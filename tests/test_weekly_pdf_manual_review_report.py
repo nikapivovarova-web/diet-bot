@@ -110,7 +110,9 @@ def test_include_reviewed_uses_read_only_review_query() -> None:
         updated_at=now - timedelta(hours=1),
         delivery_status="unknown",
         manual_reviewed_at=now,
+        manual_reviewed_by="ops.alex",
         manual_review_resolution="operator_confirmed_delivery",
+        manual_review_note="Ticket MR-302 confirmed delivery in provider export.",
     )
     store = FakeStore(unresolved_jobs=[unresolved], all_review_jobs=[unresolved, reviewed])
     stdout = StringIO()
@@ -127,7 +129,71 @@ def test_include_reviewed_uses_read_only_review_query() -> None:
     assert store.calls == [("manual_review", 2, True)]
     assert str(unresolved.job_id) in output
     assert str(reviewed.job_id) in output
+    assert "ops.alex" in output
     assert "operator_confirmed_delivery" in output
+    assert "Ticket MR-302" in output
+
+
+def test_include_reviewed_redacts_secret_note() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000000303"),
+        chat_id=303,
+        created_at=now,
+        updated_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.alex",
+        manual_review_resolution="operator_confirmed_delivery",
+        manual_review_note="Ticket MR-303 checked postgresql://ops:super-secret@example.invalid/prod.",
+    )
+    store = FakeStore(unresolved_jobs=[], all_review_jobs=[reviewed])
+    stdout = StringIO()
+
+    exit_code = report.main(
+        ["--include-reviewed", "--limit", "1"],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "Ticket MR-303 checked" in output
+    assert "postgresql://" in output
+    assert "example.invalid/prod" in output
+    assert "ops:super-secret" not in output
+
+
+def test_include_reviewed_redacts_json_style_secret_note() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000000304"),
+        chat_id=304,
+        created_at=now,
+        updated_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.alex",
+        manual_review_resolution="operator_confirmed_delivery",
+        manual_review_note="Ticket MR-304 checked {'token':'abc123','database_url':'postgresql://ops:secret@example.invalid/prod'}.",
+    )
+    store = FakeStore(unresolved_jobs=[], all_review_jobs=[reviewed])
+    stdout = StringIO()
+
+    exit_code = report.main(
+        ["--include-reviewed", "--limit", "1"],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "'token':'<redacted:secret>'" in output
+    assert "'database_url':'<redacted:secret>'" in output
+    assert "abc123" not in output
+    assert "postgresql://ops:secret" not in output
 
 
 def test_missing_database_url_exits_safely_without_store_access() -> None:
@@ -233,7 +299,9 @@ def _job(
     requires_manual_review: bool = True,
     manual_review_reason: str | None = "send_started_without_delivery_confirmation",
     manual_reviewed_at: datetime | None = None,
+    manual_reviewed_by: str | None = None,
     manual_review_resolution: str | None = None,
+    manual_review_note: str | None = None,
 ) -> WeeklyPdfJob:
     return WeeklyPdfJob(
         job_id=job_id,
@@ -251,5 +319,7 @@ def _job(
         requires_manual_review=requires_manual_review,
         manual_review_reason=manual_review_reason,
         manual_reviewed_at=manual_reviewed_at,
+        manual_reviewed_by=manual_reviewed_by,
         manual_review_resolution=manual_review_resolution,
+        manual_review_note=manual_review_note,
     )

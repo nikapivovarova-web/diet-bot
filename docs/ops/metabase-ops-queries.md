@@ -8,9 +8,9 @@ This pack is a read-only dashboard layer for FoodBalance operations. Copy the SQ
 - `new_paid_grants_by_day.sql`: daily paid/granted order volume by product, provider, currency, and status.
 - `failed_payment_recovery_candidates.sql`: paid-not-granted, old pending, failed, and orphan successful-payment candidates.
 - `one_day_queue_depth_by_status.sql`: one-day durable queue depth and stale counts by status.
-- `one_day_failed_manual_review_rows.sql`: one-day failed/manual-review rows with hashed chat identifiers.
+- `one_day_failed_manual_review_rows.sql`: one-day failed/unresolved manual-review rows with hashed chat identifiers and manual-resolution audit fields.
 - `weekly_pdf_queue_depth_by_status.sql`: weekly PDF durable queue depth and stale counts by status.
-- `weekly_pdf_failed_manual_review_rows.sql`: weekly PDF failed/unresolved manual-review rows with hashed chat identifiers.
+- `weekly_pdf_failed_manual_review_rows.sql`: weekly PDF failed/unresolved manual-review rows with hashed chat identifiers and manual-resolution audit fields.
 - `jobs_older_than_threshold.sql`: active one-day and weekly jobs older than the dashboard threshold.
 - `schema_migration_version_summary.sql`: applied schema migration versions by component.
 
@@ -29,4 +29,9 @@ Backup/restore drill status is not stored in the application database. Keep it a
 
 ## Safety Notes
 
-The row-level query files hash `chat_id` as `chat_id_hash` and avoid `SELECT *`. Restrict dashboard access to operators who already have production-read approval, and use the runtime ops health summary for threshold exit codes and incident gating.
+The row-level query files hash `chat_id` as `chat_id_hash` and avoid `SELECT *`.
+Resolved manual-review rows are filtered out of unresolved backlog cards by
+`manual_reviewed_at IS NULL`; use the report tools with `--include-reviewed` for
+audit comparison. Restrict dashboard access to operators who already have
+production-read approval, and use the runtime ops health summary for threshold
+exit codes and incident gating.

@@ -112,18 +112,113 @@ def test_report_json_redacts_sensitive_fields() -> None:
     assert "postgresql://" not in rendered
 
 
-def test_include_reviewed_is_not_supported_without_review_fields() -> None:
-    stderr = StringIO()
+def test_include_reviewed_uses_read_only_review_query() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    unresolved = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000001121"),
+        chat_id=121,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+        delivery_status="unknown",
+    )
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000001122"),
+        chat_id=999999122,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.mira",
+        manual_review_resolution="no_refund_confirmed",
+        manual_review_note="Ticket MR-1122 verified partial delivery.",
+    )
+    store = FakeStore(unresolved_jobs=[unresolved], all_review_jobs=[unresolved, reviewed])
+    stdout = StringIO()
 
     exit_code = report.main(
-        ["--include-reviewed"],
+        ["--include-reviewed", "--limit", "2"],
         env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
-        store_factory=FailingStoreFactory(),
-        stderr=stderr,
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
     )
 
-    assert exit_code == 2
-    assert "unrecognized arguments: --include-reviewed" in stderr.getvalue()
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert store.calls == [("manual_review", 2, True)]
+    assert str(unresolved.job_id) in output
+    assert str(reviewed.job_id) in output
+    assert "ops.mira" in output
+    assert "no_refund_confirmed" in output
+    assert "Ticket MR-1122" in output
+    assert "999999122" not in output
+
+
+def test_include_reviewed_redacts_secret_note_in_json() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000001123"),
+        chat_id=123,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.mira",
+        manual_review_resolution="no_refund_confirmed",
+        manual_review_note="Ticket MR-1123 checked api_key=raw-api-key-123.",
+    )
+    store = FakeStore(unresolved_jobs=[], all_review_jobs=[reviewed])
+    stdout = StringIO()
+
+    exit_code = report.main(
+        ["--include-reviewed", "--json", "--limit", "1"],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
+    )
+
+    rendered = stdout.getvalue()
+    payload = json.loads(rendered)
+    assert exit_code == 0
+    assert payload["jobs"][0]["manual_review_note"].startswith("Ticket MR-1123 checked")
+    assert "api_key=<redacted:secret>" in rendered
+    assert "raw-api-key-123" not in rendered
+
+
+def test_include_reviewed_redacts_json_style_secret_note_in_report_output() -> None:
+    now = datetime(2026, 5, 26, 9, 15, tzinfo=UTC)
+    reviewed = _job(
+        job_id=UUID("00000000-0000-0000-0000-000000001124"),
+        chat_id=124,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+        delivery_status="unknown",
+        manual_reviewed_at=now,
+        manual_reviewed_by="ops.mira",
+        manual_review_resolution="no_refund_confirmed",
+        manual_review_note='Ticket MR-1124 checked {"password":"cleartext","dsn":"postgresql://ops:secret@example.invalid/prod"}.',
+    )
+    store = FakeStore(unresolved_jobs=[], all_review_jobs=[reviewed])
+    stdout = StringIO()
+
+    exit_code = report.main(
+        ["--include-reviewed", "--json", "--limit", "1"],
+        env={"DIET_BOT_DATABASE_URL": "postgresql://user:secret@example.invalid/prod"},
+        store_factory=lambda _dsn: store,
+        stdout=stdout,
+    )
+
+    rendered = stdout.getvalue()
+    payload = json.loads(rendered)
+    note = payload["jobs"][0]["manual_review_note"]
+    assert exit_code == 0
+    assert '"password":"<redacted:secret>"' in note
+    assert '"dsn":"<redacted:secret>"' in note
+    assert "cleartext" not in rendered
+    assert "postgresql://ops:secret" not in rendered
 
 
 def test_database_url_env_can_be_overridden() -> None:
@@ -235,14 +330,26 @@ class FakeStore:
         *,
         unresolved_jobs: list[OneDayGenerationJob],
         all_jobs: list[OneDayGenerationJob] | None = None,
+        all_review_jobs: list[OneDayGenerationJob] | None = None,
     ) -> None:
         self.unresolved_jobs = list(unresolved_jobs)
-        self.all_jobs = list(all_jobs or unresolved_jobs)
+        self.all_review_jobs = list(all_review_jobs or all_jobs or unresolved_jobs)
         self.calls: list[tuple] = []
 
     def get_unresolved_manual_review_jobs(self, *, limit: int) -> list[OneDayGenerationJob]:
         self.calls.append(("unresolved", limit))
-        return [job for job in self.unresolved_jobs if job.requires_manual_review][:limit]
+        return [
+            job
+            for job in self.unresolved_jobs
+            if job.requires_manual_review and job.manual_reviewed_at is None
+        ][:limit]
+
+    def get_manual_review_jobs(self, *, limit: int, include_reviewed: bool) -> list[OneDayGenerationJob]:
+        self.calls.append(("manual_review", limit, include_reviewed))
+        jobs = self.all_review_jobs if include_reviewed else self.unresolved_jobs
+        if not include_reviewed:
+            jobs = [job for job in jobs if job.manual_reviewed_at is None]
+        return [job for job in jobs if job.requires_manual_review][:limit]
 
     def admit_job(self, *args, **kwargs):
         raise AssertionError("report must not mutate jobs")
@@ -286,6 +393,10 @@ def _job(
     failure_reason: str | None = None,
     finalization_error: str | None = None,
     requires_manual_review: bool = True,
+    manual_reviewed_at: datetime | None = None,
+    manual_reviewed_by: str | None = None,
+    manual_review_resolution: str | None = None,
+    manual_review_note: str | None = None,
     metadata: dict[str, object] | None = None,
 ) -> OneDayGenerationJob:
     return OneDayGenerationJob(
@@ -306,4 +417,8 @@ def _job(
         failure_reason=failure_reason,
         finalization_error=finalization_error,
         requires_manual_review=requires_manual_review,
+        manual_reviewed_at=manual_reviewed_at,
+        manual_reviewed_by=manual_reviewed_by,
+        manual_review_resolution=manual_review_resolution,
+        manual_review_note=manual_review_note,
     )
