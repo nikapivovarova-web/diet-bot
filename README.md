@@ -40,9 +40,20 @@ The bot also shows reply-keyboard buttons for starting a plan, choosing sex, goa
 
 ## Run Tests
 
+Install developer dependencies from the committed lock first:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements\dev.txt
+.\.venv\Scripts\python.exe -m pip install --no-deps -e .
+```
+
 ```bash
 .\.venv\Scripts\python.exe -m pytest
 ```
+
+Dependency lock maintenance is documented in
+[`requirements/README.md`](requirements/README.md).
 
 ## Run Demo
 
