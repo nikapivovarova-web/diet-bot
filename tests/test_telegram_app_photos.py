@@ -69,6 +69,11 @@ from diet_bot.one_day_generation_jobs import (
     StartJobResult,
     StartJobResultStatus as OneDayStartJobResultStatus,
 )
+from diet_bot.weekly_pdf_jobs import (
+    QueuedJobAdmissionResult as WeeklyQueuedJobAdmissionResult,
+    QueuedJobAdmissionResultStatus as WeeklyQueuedJobAdmissionResultStatus,
+    WeeklyPdfJob,
+)
 from diet_bot.telegram_app import (
     BOT_COMMANDS,
     BUY_EXTRA_ONE_DAY_RU_CARD_TEXT,
@@ -84,6 +89,7 @@ from diet_bot.telegram_app import (
     CALLBACK_PAY_RU_EXTRA_ONE_DAY,
     CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF,
     CALLBACK_PAY_TELEGRAM_STARS,
+    CALLBACK_PRIVACY_POLICY,
     CALLBACK_PROMO_CODE,
     CALLBACK_REPEAT,
     CALLBACK_START,
@@ -176,6 +182,24 @@ def _button_text_urls(markup) -> list[tuple[str, str | None]]:
     return [(button.text, button.url) for row in markup.inline_keyboard for button in row]
 
 
+def _button_text_callbacks(markup) -> list[tuple[str, str | None]]:
+    assert markup is not None
+    return [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
+
+
+def _button_text_actions(markup) -> list[tuple[str, str | None]]:
+    assert markup is not None
+    return [
+        (button.text, button.callback_data if button.callback_data is not None else button.url)
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+
+
+def _privacy_policy_action() -> tuple[str, str | None]:
+    return (PRIVACY_POLICY_TEXT, telegram_app.PRIVACY_POLICY_URL or CALLBACK_PRIVACY_POLICY)
+
+
 def _first_callback_data_from_last_message(message) -> str:
     _text, markup = message.texts[-1]
     assert markup is not None
@@ -207,16 +231,18 @@ class FakePromoEntitlementService:
     def __init__(self, *, fail_grants: int = 0) -> None:
         self.fail_grants = fail_grants
         self.grants: list[tuple[int, str]] = []
+        self.grant_kwargs: list[dict[str, object]] = []
         self.entitlements: dict[int, telegram_app.Entitlement] = {}
 
-    def apply_subscription_payment(self, chat_id: int, charge_id: str):
+    def apply_subscription_payment(self, chat_id: int, charge_id: str, **kwargs):
         if self.fail_grants:
             self.fail_grants -= 1
             raise telegram_app.EntitlementStorageError("grant failed")
         entitlement = self.entitlements.get(chat_id, telegram_app.Entitlement())
-        result = telegram_app.apply_subscription_payment(entitlement, charge_id)
+        result = telegram_app.apply_subscription_payment(entitlement, charge_id, **kwargs)
         self.entitlements[chat_id] = entitlement
         self.grants.append((chat_id, charge_id))
+        self.grant_kwargs.append(dict(kwargs))
         return result
 
     def get_entitlement(self, chat_id: int) -> telegram_app.Entitlement:
@@ -268,14 +294,14 @@ def test_photo_input_rejects_invalid_local_file_before_telegram(tmp_path: Path) 
 
 def test_start_keyboard_has_welcome_buttons() -> None:
     keyboard = _start_keyboard()
-    buttons = [row[0] for row in keyboard.inline_keyboard]
 
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(keyboard) == [
         (TRY_FREE_TEXT, CALLBACK_START),
         (SUBSCRIBE_MONTH_TEXT, CALLBACK_SUBSCRIBE),
         (FEATURES_TEXT, CALLBACK_FEATURES),
         (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
     assert "FoodBalance" in WELCOME_TEXT
     assert WELCOME_PHOTO_PATH.exists()
@@ -290,7 +316,7 @@ def test_start_keyboard_includes_privacy_url_when_configured(monkeypatch) -> Non
 
 
 @pytest.mark.anyio
-async def test_questionnaire_start_exposes_privacy_before_sensitive_question(monkeypatch) -> None:
+async def test_questionnaire_start_does_not_repeat_privacy_on_normal_questions(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", PRIVACY_URL, raising=False)
     message = FakeMessage()
 
@@ -298,7 +324,7 @@ async def test_questionnaire_start_exposes_privacy_before_sensitive_question(mon
 
     sent_text, markup = message.texts[-1]
     assert sent_text == start_session().current_question.prompt
-    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(markup)
+    assert markup is None
 
 
 @pytest.mark.anyio
@@ -998,7 +1024,7 @@ async def test_private_start_still_sends_welcome(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_private_callback_start_flow_unchanged(monkeypatch) -> None:
+async def test_private_callback_start_shows_privacy_consent_before_questionnaire(monkeypatch) -> None:
     chat_id = 80_302
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     message = FakeMessage(chat_id, chat_type="private")
@@ -1008,12 +1034,17 @@ async def test_private_callback_start_flow_unchanged(monkeypatch) -> None:
         await telegram_app.handle_callback(callback)
 
         assert callback.answers == [None]
-        assert chat_id in SESSION_BY_CHAT_ID
-        assert chat_id in TRIAL_CHAT_IDS
-        assert message.texts[-1][0] == start_session().current_question.prompt
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in TRIAL_CHAT_IDS
+        assert message.texts[-1][0] == telegram_app.PRIVACY_CONSENT_TEXT
+        assert (
+            telegram_app.PRIVACY_CONSENT_ACCEPT_TEXT,
+            telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL,
+        ) in _button_text_callbacks(message.texts[-1][1])
     finally:
         SESSION_BY_CHAT_ID.pop(chat_id, None)
         TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
 
 
 def test_subscriber_cabinet_keyboard_shows_limits_without_upsells(monkeypatch, tmp_path) -> None:
@@ -1031,11 +1062,13 @@ def test_subscriber_cabinet_keyboard_shows_limits_without_upsells(monkeypatch, t
     buttons = [row[0] for row in keyboard.inline_keyboard]
     button_texts = [button.text for button in buttons]
 
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(keyboard) == [
         (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 3 из 5 + 1 доп.", CALLBACK_ONE_DAY_PLAN),
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 2 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
     assert TRY_FREE_TEXT not in button_texts
     assert SUBSCRIBE_MONTH_TEXT not in button_texts
@@ -1057,11 +1090,13 @@ async def test_start_sends_subscriber_cabinet_instead_of_free_trial(monkeypatch,
     assert sent_text.startswith(SUBSCRIBER_CABINET_TEXT)
     assert "Рационы на 1 день: 4 из 5" in sent_text
     assert "Анкета: пока нет сохраненного отчета" in sent_text
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(markup) == [
         (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 4 из 5", CALLBACK_ONE_DAY_PLAN),
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 3 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
 
 
@@ -1092,11 +1127,13 @@ def test_subscription_payment_result_opens_subscriber_cabinet(monkeypatch, tmp_p
     keyboard = _payment_result_keyboard(chat_id, telegram_app.PaymentApplication(True, "subscription"))
     buttons = [row[0] for row in keyboard.inline_keyboard]
 
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(keyboard) == [
         (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 5 из 5", CALLBACK_ONE_DAY_PLAN),
         (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 4 из 4", CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
 
 
@@ -1104,18 +1141,21 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     keyboard = _subscription_payment_keyboard()
     buttons = [row[0] for row in keyboard.inline_keyboard]
 
-    assert SUBSCRIPTION_STARS_AMOUNT == 400
-    assert "599 ₽" in SUBSCRIPTION_PAYMENT_TEXT
-    assert "400 Stars" in SUBSCRIPTION_PAYMENT_TEXT
+    assert SUBSCRIPTION_STARS_AMOUNT == 450
+    assert "799 ₽" in SUBSCRIPTION_PAYMENT_TEXT
+    assert "450 Stars" in SUBSCRIPTION_PAYMENT_TEXT
     assert "4 недельных PDF-рациона" in SUBSCRIPTION_PAYMENT_TEXT
     assert "5 рационов на 1 день" in SUBSCRIPTION_PAYMENT_TEXT
     assert "Разовые покупки" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "50 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "250 ₽" not in SUBSCRIPTION_PAYMENT_TEXT
     assert "не является медицинской консультацией" in SUBSCRIPTION_PAYMENT_TEXT
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(keyboard) == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
 
 
@@ -1192,13 +1232,19 @@ def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
         BUY_EXTRA_WEEKLY_PDF_TEXT,
         CALLBACK_BUY_EXTRA_WEEKLY_PDF,
     )
-    assert [(row[0].text, row[0].callback_data) for row in day_keyboard.inline_keyboard[2:]] == [
+    assert _button_text_actions(day_keyboard)[2:] == [
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
-    assert [(row[0].text, row[0].callback_data) for row in week_keyboard.inline_keyboard[2:]] == [
+    assert _button_text_actions(week_keyboard)[2:] == [
         (BUY_EXTRA_ONE_DAY_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_ONE_DAY),
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
 
 
@@ -1224,11 +1270,14 @@ async def test_active_subscription_limit_paywall_offers_only_extra_purchases(mon
         (button.text, button.callback_data)
         for button in buttons
     ]
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(markup) == [
         (BUY_EXTRA_ONE_DAY_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_ONE_DAY),
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
 
 
@@ -1247,9 +1296,12 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
 
     assert "Чтобы продолжить, оформите месячный доступ." in sent_text
     assert "купить разовую попытку" not in sent_text
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(markup) == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
+        (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
 
 
@@ -1306,7 +1358,7 @@ def test_pre_checkout_accepts_valid_order_payload_without_chat_validation(monkey
     query = SimpleNamespace(
         invoice_payload=encode_payment_order_payload(order.order_id, order.nonce),
         currency="XTR",
-        total_amount=400,
+        total_amount=450,
         from_user=SimpleNamespace(id=101),
     )
 
@@ -1414,13 +1466,13 @@ async def test_payment_callback_uses_callback_user_as_buyer_and_message_chat_for
     accepted_query = SimpleNamespace(
         invoice_payload=invoice["payload"],
         currency="XTR",
-        total_amount=400,
+        total_amount=450,
         from_user=SimpleNamespace(id=101),
     )
     wrong_user_query = SimpleNamespace(
         invoice_payload=invoice["payload"],
         currency="XTR",
-        total_amount=400,
+        total_amount=450,
         from_user=SimpleNamespace(id=999),
     )
 
@@ -1478,7 +1530,7 @@ async def test_send_extra_day_invoice_link_creates_one_time_stars_invoice(monkey
     invoice = message.bot.invoice_links[0]
     assert invoice["currency"] == "XTR"
     assert invoice["payload"].startswith("diet:order:v1:")
-    assert invoice["prices"][0].amount == 35
+    assert invoice["prices"][0].amount == 29
     assert invoice["subscription_period"] is None
 
 
@@ -1587,21 +1639,21 @@ async def test_ru_card_callback_creates_yookassa_invoice_with_receipt(monkeypatc
     assert invoice["currency"] == "RUB"
     assert invoice["provider_token"] == "provider-token"
     assert invoice["payload"].startswith("diet:order:v1:")
-    assert invoice["prices"][0].amount == 59_900
+    assert invoice["prices"][0].amount == 79_900
     assert invoice["need_email"] is True
     assert invoice["send_email_to_provider"] is True
     assert item == {
-        "description": "FoodBalance: подписка на месяц",
+            "description": "FoodBalance: доступ на 30 дней",
         "quantity": "1.00",
         "amount": {
-            "value": "599.00",
+            "value": "799.00",
             "currency": "RUB",
         },
         "vat_code": 1,
         "payment_mode": "full_payment",
         "payment_subject": "service",
     }
-    assert message.texts[-1][0] == "FoodBalance: подписка на месяц\n\nСтоимость: 599 ₽."
+    assert message.texts[-1][0] == "FoodBalance: доступ на 30 дней\n\nСтоимость: 799 ₽."
     assert message.texts[-1][1].inline_keyboard[0][0].url == "https://t.me/invoice/test"
 
 
@@ -1653,7 +1705,7 @@ def test_successful_payment_order_payload_grants_once_and_validates_chat(monkeyp
     payment = SimpleNamespace(
         invoice_payload=encode_payment_order_payload(order.order_id, order.nonce),
         currency="XTR",
-        total_amount=400,
+        total_amount=450,
         telegram_payment_charge_id="tg-charge-1",
         provider_payment_charge_id=None,
     )
@@ -1676,7 +1728,7 @@ def test_static_legacy_successful_payment_records_unknown_without_grant(monkeypa
     payment = SimpleNamespace(
         invoice_payload=PAYLOAD_SUBSCRIPTION_MONTH,
         currency="XTR",
-        total_amount=400,
+        total_amount=450,
         telegram_payment_charge_id="tg-charge-static",
         provider_payment_charge_id=None,
     )
@@ -1718,7 +1770,7 @@ async def test_successful_payment_ledger_failure_spools_recovery_record_before_n
     payment = SimpleNamespace(
         invoice_payload=invoice_payload,
         currency="RUB",
-        total_amount=59_900,
+        total_amount=79_900,
         telegram_payment_charge_id="tg-charge-1",
         provider_payment_charge_id="provider-charge-1",
         subscription_expiration_date=1_781_234_567,
@@ -1740,7 +1792,7 @@ async def test_successful_payment_ledger_failure_spools_recovery_record_before_n
     assert record.telegram_payment_charge_id == "tg-charge-1"
     assert record.provider_payment_charge_id == "provider-charge-1"
     assert record.currency == "RUB"
-    assert record.total_amount == 59_900
+    assert record.total_amount == 79_900
     assert record.subscription_expiration_date == 1_781_234_567
     assert set(record.to_dict()).issubset(ALLOWED_SERIALIZED_FIELDS)
     assert "private@example.test" not in json.dumps(record.to_dict(), sort_keys=True)
@@ -1788,7 +1840,7 @@ async def test_successful_payment_successful_grant_does_not_spool(monkeypatch) -
     payment = SimpleNamespace(
         invoice_payload=encode_payment_order_payload("order_12345678", "nonce_12345678"),
         currency="XTR",
-        total_amount=35,
+        total_amount=29,
         telegram_payment_charge_id="tg-charge-ok",
         provider_payment_charge_id=None,
     )
@@ -1819,7 +1871,7 @@ async def test_successful_payment_spool_append_failure_logs_critical_and_sends_s
     payment = SimpleNamespace(
         invoice_payload=encode_payment_order_payload("order_12345678", "nonce_12345678"),
         currency="XTR",
-        total_amount=400,
+        total_amount=450,
         telegram_payment_charge_id="tg-charge-critical",
         provider_payment_charge_id=None,
     )
@@ -1849,20 +1901,23 @@ def test_trial_subscription_keyboard_has_cta_button() -> None:
     button = keyboard.inline_keyboard[0][0]
 
     assert (button.text, button.callback_data) == (SUBSCRIBE_CTA_TEXT, CALLBACK_SUBSCRIBE)
-    assert "пробный рацион на 1 день" in TRIAL_SUBSCRIPTION_TEXT
-    assert "4 недельных рациона" in TRIAL_SUBSCRIPTION_TEXT
-    assert "5 дополнительных дневных рационов" in TRIAL_SUBSCRIPTION_TEXT
+    assert TRIAL_SUBSCRIPTION_TEXT.startswith("Понравился рацион?")
+    assert "каждый день завтрак, обед, ужин и перекусы" in TRIAL_SUBSCRIPTION_TEXT
+    assert "КБЖУ по каждому блюду" in TRIAL_SUBSCRIPTION_TEXT
+    assert "полная таблица витаминов и минералов за день" in TRIAL_SUBSCRIPTION_TEXT
+    assert "Месячный доступ — это 4 недельных рациона плюс 5 дополнительных дней" in TRIAL_SUBSCRIPTION_TEXT
 
 
 def test_plan_choice_keyboard_has_day_and_week_pdf_buttons() -> None:
     keyboard = _plan_choice_keyboard()
-    buttons = [row[0] for row in keyboard.inline_keyboard]
 
-    assert [(button.text, button.callback_data) for button in buttons] == [
+    assert _button_text_actions(keyboard) == [
         (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
         (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
         (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+        (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        _privacy_policy_action(),
     ]
     assert WEEK_PLAN_PDF_PLACEHOLDER_TEXT == "Функция рациона на неделю в PDF пока в разработке."
 
@@ -2227,12 +2282,12 @@ class FailingSuccessfulPaymentService:
 def _fake_amount(provider: str, product: str) -> int:
     if provider == PROVIDER_TELEGRAM_STARS:
         return {
-            PRODUCT_SUBSCRIPTION_MONTH: 400,
-            PRODUCT_EXTRA_ONE_DAY: 35,
-            PRODUCT_EXTRA_WEEKLY_PDF: 170,
+            PRODUCT_SUBSCRIPTION_MONTH: 450,
+            PRODUCT_EXTRA_ONE_DAY: 29,
+            PRODUCT_EXTRA_WEEKLY_PDF: 141,
         }[product]
     return {
-        PRODUCT_SUBSCRIPTION_MONTH: 59_900,
+        PRODUCT_SUBSCRIPTION_MONTH: 79_900,
         PRODUCT_EXTRA_ONE_DAY: 5_000,
         PRODUCT_EXTRA_WEEKLY_PDF: 25_000,
     }[product]
@@ -2441,6 +2496,48 @@ class FakeOneDayGenerationRuntime:
 
 def _install_one_day_runtime(monkeypatch, runtime: FakeOneDayGenerationRuntime | None) -> None:
     monkeypatch.setattr(telegram_app, "_ONE_DAY_GENERATION_JOB_RUNTIME", runtime, raising=False)
+
+
+class FakeWeeklyPdfQueuedRuntime:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+        self.job: WeeklyPdfJob | None = None
+
+    def cleanup_stale(self, *, chat_id: int) -> None:
+        self.calls.append(("cleanup_stale", chat_id))
+
+    def admit_queued(
+        self,
+        *,
+        chat_id: int,
+        idempotency_key: str,
+        request_snapshot,
+        metadata=None,
+        test_access: bool = False,
+    ) -> WeeklyQueuedJobAdmissionResult:
+        self.calls.append(
+            (
+                "admit_queued",
+                {
+                    "chat_id": chat_id,
+                    "idempotency_key": idempotency_key,
+                    "request_snapshot": request_snapshot,
+                    "metadata": metadata,
+                    "test_access": test_access,
+                },
+            )
+        )
+        self.job = WeeklyPdfJob(
+            job_id=uuid4(),
+            chat_id=chat_id,
+            idempotency_key=idempotency_key,
+            status="queued",
+            refund_status="pending",
+            consumption_source="monthly",
+            stale_after=datetime(2026, 5, 26, tzinfo=UTC),
+            request_snapshot=request_snapshot,
+        )
+        return WeeklyQueuedJobAdmissionResult(WeeklyQueuedJobAdmissionResultStatus.ADMITTED, self.job)
 
 
 def _trial_cta_messages(message: FakeMessage) -> list[str]:
@@ -2862,11 +2959,7 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
     assert bot.commands == BOT_COMMANDS
     assert "grant_test_access" not in [command.command for command in bot.commands]
     assert "330366" not in [command.command for command in bot.commands]
-    assert [(command.command, command.description) for command in bot.commands] == [
-        ("start", "Открыть стартовое меню"),
-        ("plan", "Заполнить анкету для рациона"),
-        ("cancel", "Сбросить активную анкету"),
-    ]
+    assert [command.command for command in bot.commands] == ["start", "plan", "promo", "privacy", "cancel"]
     assert "myid" not in [command.command for command in bot.commands]
 
 
@@ -2981,11 +3074,13 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
 
         assert not telegram_app._has_active_paid_access(target_chat_id)
         assert sent_text.startswith("Анкета уже сохранена.")
-        assert [(button.text, button.callback_data) for button in buttons] == [
+        assert _button_text_actions(markup) == [
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
+            _privacy_policy_action(),
         ]
         assert not weekly_consumption.allowed
         assert one_day_consumption.source == "free_trial"
@@ -3098,6 +3193,46 @@ async def test_week_plan_history_read_failure_stops_status_and_returns_false(mon
 
 
 @pytest.mark.anyio
+async def test_postgres_weekly_pdf_admission_does_not_send_duplicate_generation_message(monkeypatch) -> None:
+    chat_id = 92_004
+    runtime = FakeWeeklyPdfQueuedRuntime()
+    message = FakeMessage(chat_id, message_id=92004)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_job_runtime", lambda: runtime)
+
+    async def fake_load_history(loaded_chat_id: int) -> None:
+        RECENT_RECIPE_IDS_BY_CHAT_ID[loaded_chat_id] = ["persisted-week-r1"]
+        RECENT_RECIPE_KEYS_BY_CHAT_ID[loaded_chat_id] = ["breakfast:persisted-week-r1"]
+
+    async def fail_send_week_plan(*_args, **_kwargs) -> bool:
+        raise AssertionError("Durable weekly PDF admission must not generate or send a second notice in the handler")
+
+    monkeypatch.setattr(telegram_app, "_load_chat_history_async", fake_load_history)
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fail_send_week_plan)
+
+    try:
+        sent = await telegram_app._send_week_plan_with_access(
+            message,
+            profile_with(age=40),
+            idempotency_key="weekly-pdf-key",
+        )
+
+        assert sent is True
+        assert message.texts == []
+        admit_call = next(payload for name, payload in runtime.calls if name == "admit_queued")
+        snapshot = admit_call["request_snapshot"]
+        assert admit_call["idempotency_key"] == "weekly-pdf-key"
+        assert admit_call["metadata"] == {"source": "telegram_weekly_pdf"}
+        assert snapshot.profile["age"] == 40
+        assert snapshot.recent_recipe_ids == ("persisted-week-r1",)
+        assert snapshot.request_payload["recent_recipe_keys"] == ["breakfast:persisted-week-r1"]
+    finally:
+        PLAN_COUNT_BY_CHAT_ID.pop(chat_id, None)
+        PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
+        RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+
+
+@pytest.mark.anyio
 async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monkeypatch, tmp_path) -> None:
     chat_id = 91_001
     monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
@@ -3126,11 +3261,13 @@ async def test_questionnaire_completion_sends_calculation_and_plan_buttons(monke
         sent_text, markup = message.texts[-1]
         assert "Ваш расчет" in sent_text
         assert "Считаю рацион" not in "\n".join(text for text, _ in message.texts)
-        assert [(row[0].text, row[0].callback_data) for row in markup.inline_keyboard] == [
+        assert _button_text_actions(markup) == [
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
+            _privacy_policy_action(),
         ]
     finally:
         SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -3517,11 +3654,13 @@ async def test_saved_questionnaire_profile_survives_memory_reset(monkeypatch, tm
         assert restored_profile.restrictions[-1].value == "грибы"
         assert chat_id not in SESSION_BY_CHAT_ID
         assert "Ваш расчет" in sent_text
-        assert [(button.text, button.callback_data) for button in buttons] == [
+        assert _button_text_actions(markup) == [
             (ONE_DAY_PLAN_TEXT, CALLBACK_ONE_DAY_PLAN),
             (WEEK_PLAN_PDF_TEXT, CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
+            _privacy_policy_action(),
         ]
     finally:
         SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -3542,6 +3681,7 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
     before = telegram_app.load_entitlements(subscriptions_path)[chat_id].to_dict()
     message = FakeMessage(chat_id, text=CHANGE_PROFILE_TEXT)
     try:
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.add(chat_id)
         await handle_answer(message)
 
         for answer in [
@@ -3567,11 +3707,13 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
         assert before == after
         assert chat_id not in SESSION_BY_CHAT_ID
         assert "Ваш расчет" in sent_text
-        assert [(button.text, button.callback_data) for button in buttons] == [
+        assert _button_text_actions(markup) == [
             (f"{SUBSCRIBER_ONE_DAY_PLAN_TEXT} - осталось 2 из 5", CALLBACK_ONE_DAY_PLAN),
             (f"{SUBSCRIBER_WEEK_PLAN_PDF_TEXT} - осталось 1 из 4", CALLBACK_WEEK_PLAN_PDF),
             (CHANGE_PROFILE_TEXT, CALLBACK_NEW),
+            (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
             (SUPPORT_TEXT, CALLBACK_SUPPORT),
+            _privacy_policy_action(),
         ]
     finally:
         SESSION_BY_CHAT_ID.pop(chat_id, None)
@@ -3580,6 +3722,7 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
 
 
 @pytest.mark.anyio

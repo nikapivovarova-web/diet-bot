@@ -32,7 +32,7 @@ def make_record(**overrides: object) -> PaymentRecoveryRecord:
         "telegram_payment_charge_id": "tg-charge-1",
         "provider_payment_charge_id": "provider-charge-1",
         "currency": " rub ",
-        "total_amount": 59_900,
+        "total_amount": 79_900,
         "subscription_expiration_date": 1_781_234_567,
         "created_at": CREATED_AT,
     }
@@ -55,7 +55,7 @@ def test_valid_record_serializes_minimal_allowed_fields() -> None:
         "telegram_payment_charge_id": "tg-charge-1",
         "provider_payment_charge_id": "provider-charge-1",
         "currency": "RUB",
-        "total_amount": 59_900,
+        "total_amount": 79_900,
         "subscription_expiration_date": 1_781_234_567,
         "created_at": "2026-05-25T10:30:00+00:00",
     }

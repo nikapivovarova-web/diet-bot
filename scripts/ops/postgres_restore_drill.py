@@ -42,6 +42,11 @@ PAYMENT_LEDGER_TABLES = (
     "payment_charges",
     "payment_events",
 )
+PROMO_TABLES = (
+    "promo_codes",
+    "promo_code_redemptions",
+    "promo_import_runs",
+)
 REQUIRED_TABLES = (
     *SCHEMA_TABLES,
     *ENTITLEMENT_TABLES,
@@ -49,6 +54,7 @@ REQUIRED_TABLES = (
     *CHAT_STATE_TABLES,
     *ONE_DAY_GENERATION_JOB_TABLES,
     *PAYMENT_LEDGER_TABLES,
+    *PROMO_TABLES,
 )
 _DATABASE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _UNSAFE_DATABASE_NAMES = {
@@ -258,6 +264,7 @@ def _verify_restored_database(database_url: str) -> dict[str, Any]:
         "chat_state_tables": _select_table_counts(required_counts, CHAT_STATE_TABLES),
         "one_day_generation_job_tables": _select_table_counts(required_counts, ONE_DAY_GENERATION_JOB_TABLES),
         "payment_ledger_tables": _select_table_counts(required_counts, PAYMENT_LEDGER_TABLES),
+        "promo_tables": _select_table_counts(required_counts, PROMO_TABLES),
     }
 
 

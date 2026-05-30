@@ -72,6 +72,11 @@ ORIENTATION_SENTENCE = (
     "Это ориентировочный расчёт. В реальности состав продуктов может немного отличаться "
     "из-за бренда, способа приготовления и точности порций."
 )
+CALCULATION_INTRO_TEXT = "Готово. Вот что я рассчитал специально под тебя:"
+CALCULATION_FOLLOW_UP_TEXT = (
+    "Твой рацион на сегодня составлен так, чтобы покрыть эти показатели "
+    "вкусной и разнообразной едой. Смотри:"
+)
 BATCH_CONTAINER_COUNT_RE = re.compile(
     r"\b\d+\s+("
     r"маффин(?:ов|а|ы)?|"
@@ -97,6 +102,8 @@ def format_plan_response(plan: MealPlan, validation: ValidationResult) -> str:
 
 def format_calculation_summary(targets: NutritionTargets, safety: SafetyResult | None = None) -> str:
     calculation: list[str] = []
+    calculation.append(CALCULATION_INTRO_TEXT)
+    calculation.append("")
     calculation.append("🧮 Ваш расчет")
     calculation.append(f"📌 ИМТ (индекс массы тела): {targets.bmi} ({_bmi_ru(targets.bmi_category)})")
     if bmi_warning := _bmi_warning(targets.bmi):
@@ -116,6 +123,8 @@ def format_calculation_summary(targets: NutritionTargets, safety: SafetyResult |
         calculation.append("🛡️ Ограничения, которые я учел")
         calculation.extend(f"- {note}" for note in safety.caution_notes)
 
+    calculation.append("")
+    calculation.append(CALCULATION_FOLLOW_UP_TEXT)
     return "\n".join(calculation)
 
 
@@ -132,7 +141,7 @@ def format_daily_totals(plan: MealPlan) -> str:
 
 
 def format_week_shopping_list(plans: Sequence[MealPlan]) -> str:
-    shopping: list[str] = ["🛒 Общий список покупок на неделю"]
+    shopping: list[str] = ["🛒 Общий список продуктов на неделю"]
     meals = (meal for plan in plans for meal in plan.meals)
     groups = build_shopping_groups_for_meals(meals)
     if not groups:
@@ -182,7 +191,7 @@ def format_plan_messages(plan: MealPlan, validation: ValidationResult) -> tuple[
 
     totals = format_daily_totals(plan)
 
-    shopping: list[str] = ["🛒 Список покупок"]
+    shopping: list[str] = ["🛒 Список продуктов"]
     for item in build_shopping_list(plan):
         shopping.append(f"- {item.food_name}: {format_display_grams(item.grams)} г")
 
@@ -214,38 +223,142 @@ def format_meal_card(meal: Meal, include_photo_credit: bool = True) -> str:
     return "\n".join(lines)
 
 
+def format_meal_kbju_line(meal: Meal) -> str:
+    nutrients = meal.nutrients
+    return (
+        f"{_meal_kbju_label(meal)}: {nutrients.get('energy_kcal'):.0f} ккал, "
+        f"белки {nutrients.get('protein_g'):.0f} г, "
+        f"жиры {nutrients.get('fat_g'):.0f} г, "
+        f"углеводы {nutrients.get('carbohydrate_g'):.0f} г."
+    )
+
+
+def _meal_kbju_label(meal: Meal) -> str:
+    label = re.sub(r"^[^\w]+", "", meal.name).strip()
+    role, separator, _rest = label.partition(":")
+    if separator and role.strip():
+        return role.strip()
+    return label or meal.name
+
+
 def _meal_card_lines(meal: Meal) -> list[str]:
+    lines = [format_meal_kbju_line(meal)]
     if not meal.batch:
-        lines = ["Ингредиенты:"]
-        lines.extend(f"- {format_ingredient(portion)}" for portion in meal.portions)
+        lines.append("Ингредиенты:")
+        lines.extend(f"- {format_ingredient_for_display(portion)}" for portion in meal.portions)
         lines.append(f"👨‍🍳 Как приготовить: {meal.recipe}")
         return lines
 
     serving = _counted(meal.batch.serving_units, meal.batch.unit_forms)
     if meal.batch.is_carryover:
-        return [
-            f"- Порция сегодня: {serving}",
-            f"👨‍🍳 Как приготовить: Съешьте {serving} из приготовленной партии.",
-            "- В расчет дня входит только сегодняшняя порция.",
-        ]
+        lines.extend(
+            [
+                f"- Порция сегодня: {serving}",
+                f"👨‍🍳 Как приготовить: Съешьте {serving} из приготовленной партии.",
+                "- В расчет дня входит только сегодняшняя порция.",
+            ]
+        )
+        return lines
 
     total = _counted(meal.batch.total_units, meal.batch.unit_forms)
     prep_count = _counted(meal.batch.serving_count, ("перекус", "перекуса", "перекусов"))
     remaining_units = meal.batch.total_units - meal.batch.serving_units
     remaining_servings = meal.batch.serving_count - 1
-    lines = [
-        f"- Порция сегодня: {serving}",
-        f"- Приготовьте {total} на {prep_count}: сегодня съешьте только {serving}.",
-        (
-            f"- Остальные {_counted(remaining_units, meal.batch.unit_forms)} уберите на "
-            f"следующие {_counted(remaining_servings, ('перекус', 'перекуса', 'перекусов'))}."
-        ),
-        "Ингредиенты на партию:",
-    ]
-    lines.extend(f"- {format_ingredient(portion)}" for portion in meal.batch.batch_portions)
+    lines.extend(
+        [
+            f"- Порция сегодня: {serving}",
+            f"- Приготовьте {total} на {prep_count}: сегодня съешьте только {serving}.",
+            (
+                f"- Остальные {_counted(remaining_units, meal.batch.unit_forms)} уберите на "
+                f"следующие {_counted(remaining_servings, ('перекус', 'перекуса', 'перекусов'))}."
+            ),
+            "Ингредиенты на партию:",
+        ]
+    )
+    lines.extend(f"- {format_ingredient_for_display(portion)}" for portion in meal.batch.batch_portions)
     lines.append(f"👨‍🍳 Как приготовить: {format_batch_recipe_text(meal.recipe, meal.batch)}")
     lines.append("- В расчет дня входит только сегодняшняя порция.")
     return lines
+
+
+def format_ingredient_for_display(portion: FoodPortion) -> str:
+    text = format_ingredient(portion)
+    hint = _extra_household_hint(portion)
+    if hint is None:
+        return text
+    base = text.rsplit(" (", 1)[0] if text.endswith(")") and " (" in text else text
+    return f"{base} ({hint})"
+
+
+def _extra_household_hint(portion: FoodPortion) -> str | None:
+    food_id = portion.food.id
+    name = portion.food.name.lower()
+    grams = portion.grams
+    if grams <= 0:
+        return None
+    if food_id == "garlic":
+        return _garlic_hint(grams)
+    if food_id == "dates":
+        return _date_hint(grams)
+    if food_id in {"lemon_juice", "lime_juice", "soy_sauce", "vinegar", "mayonnaise"}:
+        return _spoon_hint(grams)
+    if food_id == "hummus":
+        return _spoon_hint(grams)
+    if portion.food.category == "sauce":
+        return _spoon_hint(grams)
+    if "харисс" in name:
+        return _spoon_hint(grams)
+    return None
+
+
+def _garlic_hint(grams: float) -> str | None:
+    if grams < 1:
+        return None
+    cloves = grams / 5
+    if cloves <= 0.35:
+        return "примерно 1/4 зубчика"
+    if cloves <= 0.75:
+        return "примерно 1/2 зубчика"
+    if cloves <= 1.35:
+        return "примерно 1 зубчик"
+    count = round(cloves)
+    return f"примерно {_counted(count, ('зубчик', 'зубчика', 'зубчиков'))}"
+
+
+def _date_hint(grams: float) -> str | None:
+    if grams < 5:
+        return None
+    pieces = grams / 18
+    if pieces <= 0.75:
+        return "примерно 1 финик"
+    if pieces <= 1.6:
+        return "примерно 1-2 финика"
+    if pieces <= 2.8:
+        return "примерно 2-3 финика"
+    count = round(pieces)
+    return f"примерно {_counted(count, ('финик', 'финика', 'фиников'))}"
+
+
+def _spoon_hint(grams: float) -> str | None:
+    if grams < 1:
+        return "несколько капель"
+    if grams < 15:
+        teaspoons = grams / 5
+        if teaspoons <= 0.35:
+            return "примерно 1/4 чайной ложки"
+        if teaspoons <= 0.75:
+            return "примерно 1/2 чайной ложки"
+        if teaspoons <= 1.35:
+            return "примерно 1 чайная ложка"
+        count = round(teaspoons)
+        return f"примерно {_counted(count, ('чайная ложка', 'чайные ложки', 'чайных ложек'))}"
+    tablespoons = grams / 15
+    if tablespoons <= 1.35:
+        return "примерно 1 столовая ложка"
+    if tablespoons <= 1.75:
+        return "примерно 1,5 столовой ложки"
+    count = round(tablespoons)
+    return f"примерно {_counted(count, ('столовая ложка', 'столовые ложки', 'столовых ложек'))}"
 
 
 def format_batch_recipe_text(recipe: str, batch: BatchPrep) -> str:
@@ -321,9 +434,9 @@ def _coverage_dot(value: float, target: float) -> str:
     if target <= 0:
         return "🔴"
     percent = value / target * 100
-    if percent >= 100:
+    if percent >= 95:
         return "🟢"
-    if percent >= 50:
+    if percent >= 45:
         return "🟡"
     return "🔴"
 

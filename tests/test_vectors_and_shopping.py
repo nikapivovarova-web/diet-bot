@@ -149,7 +149,7 @@ def test_week_shopping_list_aggregates_all_day_plans() -> None:
 
     text = format_week_shopping_list((first_day, second_day))
 
-    assert "Общий список покупок на неделю" in text
+    assert "Общий список продуктов на неделю" in text
     assert "Крупы, хлеб и гарниры" in text
     assert "Мясо, рыба, яйца и белок" in text
     assert "рис: 250 г" in text

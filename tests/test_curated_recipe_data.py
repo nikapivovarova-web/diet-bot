@@ -1,4 +1,5 @@
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -8,12 +9,15 @@ from diet_bot.curated_data import _cis_friendly_ingredient, _looks_incomplete_in
 from diet_bot.domain import ActivityLevel, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, NutrientVector
 from diet_bot.recipe_catalog import built_in_recipes
+from scripts.dev.recipe_content_audit import run_audit
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 LEGACY_CURATED_RECIPE_COUNT = 400
+PRODUCT_RECOVERY_RECIPE_COUNT = 210
 DOCX_RECIPE_COUNT = 55
-TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + DOCX_RECIPE_COUNT
+TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + PRODUCT_RECOVERY_RECIPE_COUNT + DOCX_RECIPE_COUNT
+PRODUCT_RECOVERY_RECIPE_NOS = frozenset(range(401, 611))
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
 
@@ -129,6 +133,25 @@ def test_curated_recipe_source_json_has_no_truncated_instructions() -> None:
     assert truncated == []
 
 
+def test_product_recovery_batch_r401_r610_has_required_rows_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+
+    recovery_rows = [row for row in recipes if int(row["recipe_no"]) in PRODUCT_RECOVERY_RECIPE_NOS]
+    recovery_ids = {row["recipe_id"] for row in recovery_rows}
+    nutrition_ids = {row["recipe_id"] for row in nutrition}
+    ingredient_counts = Counter(row["recipe_id"] for row in ingredients if row["recipe_id"] in recovery_ids)
+
+    assert len(recovery_rows) == PRODUCT_RECOVERY_RECIPE_COUNT
+    assert {int(row["recipe_no"]) for row in recovery_rows} == PRODUCT_RECOVERY_RECIPE_NOS
+    assert all(row["recipe_id"] in nutrition_ids for row in recovery_rows)
+    assert all(ingredient_counts[row["recipe_id"]] >= 3 for row in recovery_rows)
+    assert all(row.get("instructions_ru", "").strip().endswith(".") for row in recovery_rows)
+    assert all(row.get("image_url") == f"recipe_photos/r{row['recipe_no']}.jpg" for row in recovery_rows)
+    assert all((DATA_DIR / row["image_url"]).exists() for row in recovery_rows)
+
+
 def test_docx_recipe_batch_r611_r665_has_required_rows_and_photos() -> None:
     recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
     nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
@@ -141,7 +164,6 @@ def test_docx_recipe_batch_r611_r665_has_required_rows_and_photos() -> None:
 
     assert len(docx_rows) == DOCX_RECIPE_COUNT
     assert {int(row["recipe_no"]) for row in docx_rows} == DOCX_RECIPE_NOS
-    assert {row["recipe_no"] for row in recipes if 401 <= int(row["recipe_no"]) <= 610} == set()
     assert all(str(row["recipe_key"]).startswith(DOCX_RECIPE_KEY_PREFIX) for row in docx_rows)
     assert all(row["recipe_id"] in nutrition_ids for row in docx_rows)
     assert all(ingredient_counts[row["recipe_id"]] >= 4 for row in docx_rows)
@@ -158,6 +180,27 @@ def test_docx_recipe_batch_r611_r665_foods_are_resolved() -> None:
             normalized_food_id
             for row in ingredients
             if 611 <= int(row.get("recipe_no") or 0) <= 665
+            if (normalized_food_id := _cis_friendly_ingredient(row)[0]) not in foods
+        }
+    )
+
+    assert missing_foods == []
+
+
+def test_recipe_content_audit_has_no_round2_blockers() -> None:
+    result = run_audit(DATA_DIR)
+
+    assert [issue.markdown_line() for issue in result.blockers] == []
+
+
+def test_product_recovery_batch_r401_r610_foods_are_resolved() -> None:
+    foods = {food.id for food in curated_foods()}
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    missing_foods = sorted(
+        {
+            normalized_food_id
+            for row in ingredients
+            if 401 <= int(row.get("recipe_no") or 0) <= 610
             if (normalized_food_id := _cis_friendly_ingredient(row)[0]) not in foods
         }
     )
@@ -195,7 +238,259 @@ def test_curated_recipe_ingredient_mapping_avoids_known_false_matches() -> None:
     assert by_no_and_raw[(247, "арахисовое масло — 11 мл")]["food_id"] == "peanut_oil"
     assert by_no_and_raw[(247, "азиатское чили-масло — 0,5 мл")]["food_id"] == "chili_oil"
     assert by_no_and_raw[(287, "спелые томаты — 130 г")]["food_id"] == "tomato"
-    assert by_no_and_raw[(306, "поджаренный грецкий орех или пекан — 5 г")]["food_id"] == "pecans"
+    assert by_no_and_raw[(306, "поджаренный грецкий орех или пекан — 5 г (примерно 1 ст. л.)")]["food_id"] == "pecans"
+
+
+def test_curated_recipe_data_fixes_manual_smoke_ingredient_anomalies() -> None:
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    by_recipe_line = {
+        (row["recipe_id"], row["line_index"]): row
+        for row in ingredients
+    }
+    recipe_text = {
+        row["recipe_id"]: row["instructions_ru"]
+        for row in recipes
+    }
+    recipe_titles = {
+        row["recipe_id"]: row["title_ru"]
+        for row in recipes
+    }
+    food_names = {
+        row["food_id"]: row["name_ru"]
+        for row in foods
+    }
+
+    assert by_recipe_line[("r062_veganskie_myusli_maffiny_s_yablokom_i_pekanom", 8)]["grams"] == 3.75
+    assert by_recipe_line[("r062_veganskie_myusli_maffiny_s_yablokom_i_pekanom", 1)]["grams"] == 12.5
+    assert by_recipe_line[("r064_zapechennaya_bananovaya_ovsyanka_s_arahisovoy_pastoy", 10)]["grams"] == 12.0
+    assert by_recipe_line[("r139_belaya_ryba_pikkata_s_limonno_kapersovym_maslyanym_sou", 1)]["grams"] == 14.6
+    assert by_recipe_line[("r139_belaya_ryba_pikkata_s_limonno_kapersovym_maslyanym_sou", 8)]["grams"] == 18.8
+    assert by_recipe_line[("r184_tayskiy_zharenyy_ris_s_ananasom_i_keshyu", 2)]["grams"] == 8.5
+    assert by_recipe_line[("r543_tushenaya_govyadina_s_kartofelem", 3)]["grams"] == 40.0
+    assert by_recipe_line[("r543_tushenaya_govyadina_s_kartofelem", 4)]["grams"] == 50.0
+    assert by_recipe_line[("r543_tushenaya_govyadina_s_kartofelem", 8)]["grams"] == 0.2
+    assert by_recipe_line[("r600_sendvich_s_tuntsom", 1)]["grams"] == 60.0
+    assert by_recipe_line[("r601_tost_s_arahisovoy_pastoy_i_yablokom", 1)]["grams"] == 60.0
+    assert by_recipe_line[("r273_zelenyy_humus_s_bazilikom_petrushkoy_i_ovoschnymi_palo", 12)]["grams"] == 80.0
+    assert "овощными палочками" in recipe_text["r273_zelenyy_humus_s_bazilikom_petrushkoy_i_ovoschnymi_palo"]
+    assert "Готовим:" not in recipe_text["r441_omlet_iz_nutovoy_muki_s_brokkoli_i_struchkovoy_fasolyu"]
+    assert by_recipe_line[("r197_batat_s_nutom_masala_i_zelenym_chatni", 3)]["food_id"] == "salt"
+    assert "примерно 1/2 ч. л." in by_recipe_line[("r034_pankeyki_na_protivne_s_chetyrmya_toppingami", 10)]["raw_text"]
+    assert "Жевательный батончик" in recipe_titles["r270_zhevatelnye_batonchiki_s_shokoladnoy_kroshkoy_i_risovy"]
+    assert "23 x 33" not in recipe_text["r270_zhevatelnye_batonchiki_s_shokoladnoy_kroshkoy_i_risovy"]
+    assert "18 батончиков" not in recipe_text["r270_zhevatelnye_batonchiki_s_shokoladnoy_kroshkoy_i_risovy"]
+    assert "american_cheese" not in food_names
+    assert "harissa" not in food_names
+
+
+def test_round2_recipe_content_regressions_are_absent() -> None:
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    ingredients_by_recipe: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in ingredients:
+        ingredients_by_recipe[str(row["recipe_id"])].append(row)
+
+    standalone_gotovim = [
+        row["recipe_id"]
+        for row in recipes
+        if re.search(r"(?:^|[.!?]\s*)Готовим:\s*(?:$|[.!?])", row["instructions_ru"])
+    ]
+    assert standalone_gotovim == []
+
+    zero_baking_powder = [
+        (row["recipe_id"], row["line_index"], row["raw_text"])
+        for row in ingredients
+        if row["food_id"] == "baking_powder"
+        if float(row["grams"]) == 0
+        if "разрыхлитель" in str(row["raw_text"]).lower()
+    ]
+    assert zero_baking_powder == []
+
+    searchable_blob = "\n".join(
+        json.dumps(row, ensure_ascii=False).lower()
+        for dataset in (foods, recipes, ingredients)
+        for row in dataset
+    )
+    forbidden_terms = ("хариса", "харисса", "harissa", "american_cheese", "американский сыр")
+    assert [term for term in forbidden_terms if term in searchable_blob] == []
+
+    mayo_without_ingredient = []
+    optional_markers = ("по желанию", "опционально", "при желании", "можно заменить")
+    for recipe in recipes:
+        instructions = str(recipe["instructions_ru"]).lower()
+        if "майонез" not in instructions:
+            continue
+        food_ids = {str(row["food_id"]) for row in ingredients_by_recipe[str(recipe["recipe_id"])]}
+        if "mayonnaise" in food_ids or any(marker in instructions for marker in optional_markers):
+            continue
+        mayo_without_ingredient.append(recipe["recipe_id"])
+    assert mayo_without_ingredient == []
+
+    hummus_without_support = []
+    blend_markers = ("измельч", "взбей", "блендер", "комбайн", "пюре", "паста")
+    hummus_base_ids = {"hummus", "chickpeas", "black_beans", "beans", "white_beans"}
+    hummus_flavor_ids = {"tahini", "garlic", "lemon_juice", "olive_oil", "greek_yogurt"}
+    for recipe in recipes:
+        if "хумус" not in str(recipe["title_ru"]).lower():
+            continue
+        rows = ingredients_by_recipe[str(recipe["recipe_id"])]
+        food_ids = {str(row["food_id"]) for row in rows}
+        instructions = str(recipe["instructions_ru"]).lower()
+        has_ready_hummus = "hummus" in food_ids
+        makes_hummus = bool(food_ids & hummus_base_ids) and bool(food_ids & hummus_flavor_ids) and any(
+            marker in instructions for marker in blend_markers
+        )
+        if not (has_ready_hummus or makes_hummus):
+            hummus_without_support.append((recipe["recipe_id"], recipe["title_ru"]))
+    assert hummus_without_support == []
+
+
+def test_round2_confident_approximate_measure_targets_are_not_gram_only() -> None:
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    confident_food_ids = {
+        "almond_butter",
+        "almonds",
+        "brazil_nuts",
+        "cashews",
+        "dates",
+        "dried_dates",
+        "garlic",
+        "hot_sauce",
+        "hummus",
+        "mayonnaise",
+        "mixed_nuts",
+        "nuts_mix",
+        "peanut_butter",
+        "peanuts",
+        "pecans",
+        "pesto",
+        "pine_nuts",
+        "pistachios",
+        "pumpkin_seeds",
+        "salsa",
+        "sesame_seeds",
+        "soy_sauce",
+        "sriracha_extra",
+        "sunflower_seeds",
+        "tahini",
+        "teriyaki_sauce",
+        "tomato_paste",
+        "walnuts",
+    }
+    small_cheese_food_ids = {
+        "cheddar",
+        "cream_cheese",
+        "feta",
+        "goat_cheese",
+        "gouda",
+        "monterey_jack",
+        "mozzarella",
+        "parmesan",
+        "ricotta",
+        "swiss_cheese",
+    }
+
+    missing = [
+        (row["recipe_no"], row["line_index"], row["food_id"], row["quantity_text"], row["raw_text"])
+        for row in ingredients
+        if (
+            row["food_id"] in confident_food_ids
+            or (row["food_id"] in small_cheese_food_ids and float(row["grams"]) <= 30)
+            or _is_confident_salt_or_pepper_measure(row)
+        )
+        if _looks_like_gram_only_measure(row)
+    ]
+
+    assert missing == []
+
+
+def test_round2_garlic_and_date_examples_have_household_measures_when_present() -> None:
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+
+    garlic_5g_rows = [
+        row
+        for row in ingredients
+        if row["food_id"] == "garlic" and 4.5 <= float(row["grams"]) <= 5.5
+    ]
+    date_example_rows = [
+        row
+        for row in ingredients
+        if row["food_id"] in {"dates", "dried_dates"} and 14 <= float(row["grams"]) <= 45
+    ]
+
+    assert garlic_5g_rows
+    assert all("зуб" in _measure_blob(row).lower() for row in garlic_5g_rows)
+    assert all("финик" in _measure_blob(row).lower() for row in date_example_rows)
+
+
+def test_round2_sauce_and_paste_measures_do_not_use_dry_grain_wording() -> None:
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    sauce_or_paste_food_ids = {
+        "almond_butter",
+        "chili_sauce",
+        "hot_sauce",
+        "hummus",
+        "mayonnaise",
+        "peanut_butter",
+        "pesto",
+        "salsa",
+        "sriracha",
+        "sriracha_extra",
+        "tahini",
+        "teriyaki_sauce",
+        "tomato_paste",
+    }
+
+    offenders = [
+        (row["recipe_no"], row["line_index"], row["food_id"], row["raw_text"])
+        for row in ingredients
+        if row["food_id"] in sauce_or_paste_food_ids or any(word in str(row["raw_text"]).lower() for word in ("соус", "паста"))
+        if "сухая крупа" in _measure_blob(row).lower()
+    ]
+
+    assert offenders == []
+
+
+def _looks_like_gram_only_measure(row: dict[str, object]) -> bool:
+    text = _measure_blob(row).lower()
+    if not re.search(r"(?:^|[\s/])\d+(?:[,.]\d+)?\s*г(?:\s|$)", text):
+        return False
+    household_markers = (
+        "шт",
+        "зуб",
+        "доль",
+        "ломт",
+        "ст.",
+        "ч.",
+        "мл",
+        "стак",
+        "чашк",
+        "банк",
+        "горст",
+        "щеп",
+        "примерно",
+        "около",
+        "≈",
+        "~",
+        "1/2",
+        "1/3",
+        "1/4",
+    )
+    return not any(marker in text for marker in household_markers)
+
+
+def _is_confident_salt_or_pepper_measure(row: dict[str, object]) -> bool:
+    if row["food_id"] not in {"salt", "black_pepper", "white_pepper"}:
+        return False
+    grams = float(row["grams"])
+    return 0.25 <= grams <= 1.0
+
+
+def _measure_blob(row: dict[str, object]) -> str:
+    return f"{row.get('quantity_text', '')} {row.get('raw_text', '')}"
 
 
 def test_bare_animal_main_gets_deficit_based_garnish() -> None:

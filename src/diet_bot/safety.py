@@ -259,7 +259,6 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
             "sour_cream",
             "creme_fraiche",
             "goat_cheese",
-            "american_cheese",
             "processed_cheese",
             "swiss_cheese",
             "gouda",
@@ -322,7 +321,6 @@ FOOD_EXCLUSION_CATEGORIES: tuple[FoodExclusionCategory, ...] = (
         ingredient_ids=(
             "cream_cheese",
             "goat_cheese",
-            "american_cheese",
             "processed_cheese",
             "swiss_cheese",
             "gouda",

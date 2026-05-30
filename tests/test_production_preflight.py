@@ -16,6 +16,8 @@ def _valid_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "DIET_BOT_ENV": "production",
         "DIET_BOT_STORAGE_BACKEND": "postgres",
         "DIET_BOT_DATABASE_URL": "postgresql://user:db-super-secret@example.test/diet_bot_prod",
+        "DIET_BOT_ONE_DAY_WORKER_ENABLED": "1",
+        "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED": "1",
         "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
         "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
         "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(tmp_path / "payment-recovery.jsonl"),
@@ -61,6 +63,7 @@ def _patch_successful_runtime_checks(monkeypatch: pytest.MonkeyPatch, preflight)
         "validate_one_day_generation_job_store_for_startup",
         record("one_day_schema"),
     )
+    monkeypatch.setattr(preflight, "_validate_promo_schema", record("promo_schema"))
     monkeypatch.setattr(preflight, "_validate_payment_ledger_schema", record("payment_ledger_schema"))
     monkeypatch.setattr(preflight, "validate_payment_recovery_spool_ready", record("payment_spool"))
     monkeypatch.setattr(preflight, "_validate_single_poller_guard", record("single_poller_guard"))
@@ -86,6 +89,7 @@ def test_production_preflight_success_reports_pass_and_uses_existing_validators(
     assert "PASS local Telegram media assets" in output
     assert "PASS Postgres connectivity" in output
     assert "PASS entitlement schema" in output
+    assert "PASS promo schema" in output
     assert "PASS payment ledger schema" in output
     assert "PASS single-poller guard acquire/release" in output
     assert calls == [
@@ -95,6 +99,7 @@ def test_production_preflight_success_reports_pass_and_uses_existing_validators(
         "entitlement_schema",
         "weekly_pdf_schema",
         "one_day_schema",
+        "promo_schema",
         "payment_ledger_schema",
         "payment_spool",
         "single_poller_guard",
@@ -123,6 +128,7 @@ def test_controlled_qa_preflight_success_reports_pass_and_uses_existing_safe_val
     assert "PASS local Telegram media assets" in output
     assert "PASS Postgres connectivity" in output
     assert "PASS entitlement schema" in output
+    assert "PASS promo schema" in output
     assert "PASS payment ledger schema" in output
     assert "PASS single-poller guard acquire/release" in output
     assert calls == [
@@ -132,6 +138,7 @@ def test_controlled_qa_preflight_success_reports_pass_and_uses_existing_safe_val
         "entitlement_schema",
         "weekly_pdf_schema",
         "one_day_schema",
+        "promo_schema",
         "payment_ledger_schema",
         "single_poller_guard",
     ]
@@ -404,6 +411,36 @@ def test_production_preflight_reports_missing_schema_without_printing_dsn(
     assert "postgresql://user:" not in output
 
 
+def test_production_preflight_reports_missing_promo_schema_without_printing_dsn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    _patch_successful_runtime_checks(monkeypatch, preflight)
+
+    def fail_promo_schema(_config) -> None:
+        raise RuntimeError(
+            "Postgres promo schema is invalid: missing tables: "
+            "promo_codes, promo_code_redemptions, promo_import_runs. "
+            "dsn=postgresql://user:db-super-secret@example.test/diet_bot_prod",
+        )
+
+    monkeypatch.setattr(preflight, "_validate_promo_schema", fail_promo_schema)
+
+    exit_code = preflight.main([], env=_valid_env(tmp_path))
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "FAIL promo schema" in output
+    assert "promo_codes" in output
+    assert "promo_code_redemptions" in output
+    assert "promo_import_runs" in output
+    assert "db-super-secret" not in output
+    assert "postgresql://user:" not in output
+
+
 def test_production_preflight_checks_configured_spool_even_when_payments_disabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -548,8 +585,32 @@ def test_runbook_documents_production_preflight_cli() -> None:
     assert "never starts polling" in runbook
     assert "never calls Telegram API" in runbook
     assert "payment ledger schema/migration expectations" in runbook
+    assert "promo schema/migration expectations" in runbook
     assert "single-poller advisory guard can be acquired and released" in runbook
     assert "must not contain full" in runbook
+
+
+def test_restore_drill_required_tables_include_promo_tables() -> None:
+    from scripts.ops import postgres_restore_drill
+
+    assert {
+        "promo_codes",
+        "promo_code_redemptions",
+        "promo_import_runs",
+    } <= set(postgres_restore_drill.REQUIRED_TABLES)
+
+
+def test_runbook_documents_promo_store_migration_import_and_restore() -> None:
+    runbook = Path("docs/production-runbook.md").read_text(encoding="utf-8")
+
+    assert "PostgresPromoStore(\"<postgres-dsn>\").initialize()" in runbook
+    assert "promo_codes.json" in runbook
+    assert "JSON promo state is an import seed or local fallback only" in runbook
+    assert "promo_codes" in runbook
+    assert "promo_code_redemptions" in runbook
+    assert "promo_import_runs" in runbook
+    assert "FOOD20" in runbook
+    assert "campaign approval" in runbook
 
 
 def test_runbook_documents_controlled_qa_guardrails() -> None:

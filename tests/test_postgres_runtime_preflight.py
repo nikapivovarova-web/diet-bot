@@ -132,6 +132,8 @@ def _runtime_config(database_url: str, tmp_path: Path, *, payments_enabled: bool
         "DIET_BOT_ENV": "production",
         "DIET_BOT_STORAGE_BACKEND": "postgres",
         "DIET_BOT_DATABASE_URL": database_url,
+        "DIET_BOT_ONE_DAY_WORKER_ENABLED": "1",
+        "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED": "1",
         "DIET_BOT_SUPPORT_CHAT_ID": "123456",
         "DIET_BOT_PRIVACY_POLICY_URL": "https://example.test/privacy",
         "DIET_BOT_PAYMENT_RECOVERY_SPOOL": str(tmp_path / "payment_recovery.jsonl"),

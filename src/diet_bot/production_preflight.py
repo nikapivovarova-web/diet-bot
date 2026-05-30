@@ -135,6 +135,7 @@ def run_preflight(
             lambda: validate_one_day_generation_job_store_for_startup(config),
             redaction_values,
         ),
+        _check("promo schema", lambda: _validate_promo_schema(config), redaction_values),
         _check("payment ledger schema", lambda: _validate_payment_ledger_schema(config), redaction_values),
     ]
 
@@ -214,6 +215,7 @@ def run_controlled_qa_preflight(
             lambda: validate_one_day_generation_job_store_for_startup(config),
             redaction_values,
         ),
+        _check("promo schema", lambda: _validate_promo_schema(config), redaction_values),
         _check("payment ledger schema", lambda: _validate_payment_ledger_schema(config), redaction_values),
         _check(
             "single-poller guard acquire/release",
@@ -326,6 +328,17 @@ def _validate_payment_ledger_schema(config: RuntimeConfig) -> None:
     from .postgres_payment_store import PostgresPaymentStore
 
     PostgresPaymentStore(config.database_url).validate_schema()
+
+
+def _validate_promo_schema(config: RuntimeConfig) -> None:
+    if config.storage_backend != "postgres":
+        raise RuntimeError("Promo schema preflight requires Postgres storage.")
+    if not config.database_url:
+        raise RuntimeError("DIET_BOT_DATABASE_URL is required for promo schema preflight.")
+
+    from .postgres_promo_store import PostgresPromoStore
+
+    PostgresPromoStore(config.database_url).validate_schema()
 
 
 def _validate_single_poller_guard(config: RuntimeConfig) -> None:

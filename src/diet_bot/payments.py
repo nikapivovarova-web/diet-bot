@@ -157,12 +157,12 @@ class PaymentHandlingResult:
 
 PRODUCT_PRICES: dict[str, dict[str, PaymentProductPrice]] = {
     PROVIDER_TELEGRAM_STARS: {
-        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=400, currency="XTR"),
-        PRODUCT_EXTRA_ONE_DAY: PaymentProductPrice(amount=35, currency="XTR"),
-        PRODUCT_EXTRA_WEEKLY_PDF: PaymentProductPrice(amount=170, currency="XTR"),
+        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=450, currency="XTR"),
+        PRODUCT_EXTRA_ONE_DAY: PaymentProductPrice(amount=29, currency="XTR"),
+        PRODUCT_EXTRA_WEEKLY_PDF: PaymentProductPrice(amount=141, currency="XTR"),
     },
     PROVIDER_YOOKASSA: {
-        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=59_900, currency="RUB"),
+        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=79_900, currency="RUB"),
         PRODUCT_EXTRA_ONE_DAY: PaymentProductPrice(amount=5_000, currency="RUB"),
         PRODUCT_EXTRA_WEEKLY_PDF: PaymentProductPrice(amount=25_000, currency="RUB"),
     },

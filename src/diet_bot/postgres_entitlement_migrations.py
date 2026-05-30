@@ -86,6 +86,32 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605290001",
+        description="Add managed subscription metadata to entitlements",
+        statements=(
+            """
+            ALTER TABLE entitlements
+                ADD COLUMN IF NOT EXISTS subscription_source TEXT NOT NULL DEFAULT 'none'
+            """,
+            """
+            ALTER TABLE entitlements
+                ADD COLUMN IF NOT EXISTS auto_renew_status TEXT NOT NULL DEFAULT 'not_applicable'
+            """,
+            """
+            ALTER TABLE entitlements
+                ADD COLUMN IF NOT EXISTS stars_subscription_charge_id TEXT
+            """,
+            """
+            ALTER TABLE entitlements
+                ADD COLUMN IF NOT EXISTS last_subscription_payment_charge_id TEXT
+            """,
+            """
+            ALTER TABLE entitlements
+                ADD COLUMN IF NOT EXISTS current_period_payment_order_id TEXT
+            """,
+        ),
+    ),
 )
 
 

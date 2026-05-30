@@ -162,7 +162,10 @@ async def test_postgres_admission_returns_accepted_without_entering_local_queue_
     )
 
     assert sent is True
-    assert message.texts == [(telegram_app.WEEK_PDF_ACCEPTED_TEXT, None)]
+    old_duplicate_accepted_text = "Готовлю недельный PDF. Я пришлю его сюда, как только он будет готов."
+    assert message.texts == []
+    assert telegram_app.WEEK_PDF_ACCEPTED_TEXT == telegram_app.WEEK_PDF_STATUS_INITIAL_TEXT
+    assert all(text != old_duplicate_accepted_text for text, _reply_markup in message.texts)
     assert ("start", runtime.job.job_id, False) not in runtime.events
     assert runtime.events == [
         ("cleanup", chat_id),

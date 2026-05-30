@@ -222,6 +222,42 @@ def test_hard_profile_blender_simple_recipes_enter_ranked_pool() -> None:
     assert recipes_by_id["r658_svekolnyy_humus_s_ovoschami"] in ranked_snacks
 
 
+def test_rank_recipes_filters_avoided_recipe_keys_by_requested_slot() -> None:
+    profile = _profile()
+    food_by_id = _filtered_food_by_id(profile)
+    target = calculate_targets(profile).targets
+    snack_slot = next(slot for slot in _meal_energy_slots(profile.meal_count) if slot.slot == "snack")
+    recipe = next(
+        recipe
+        for recipe in built_in_recipes()
+        if recipe.id == "r601_tost_s_arahisovoy_pastoy_i_yablokom"
+    )
+    kwargs = {
+        "recipes": [recipe],
+        "slot": "snack",
+        "used_recipe_ids": set(),
+        "used_food_ids": Counter(),
+        "used_formats": Counter(),
+        "food_by_id": food_by_id,
+        "current_total": NutrientVector(),
+        "target": target,
+        "slot_energy_target": target.get("energy_kcal") * snack_slot.target_ratio,
+        "slot_min_energy": target.get("energy_kcal") * snack_slot.min_ratio,
+        "slot_max_energy": target.get("energy_kcal") * snack_slot.max_ratio,
+        "variety_seed": 8,
+        "index": 2,
+    }
+
+    assert recipe not in _rank_recipes(
+        **kwargs,
+        avoided_recipe_keys={"snack:curated:r601_tost_s_arahisovoy_pastoy_i_yablokom"},
+    )
+    assert recipe in _rank_recipes(
+        **kwargs,
+        avoided_recipe_keys={"breakfast:curated:r601_tost_s_arahisovoy_pastoy_i_yablokom"},
+    )
+
+
 def _milk_recipe() -> RecipeTemplate:
     return RecipeTemplate(
         id="milk_based_breakfast",

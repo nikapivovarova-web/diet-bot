@@ -509,6 +509,9 @@ def test_backup_restore_drill_preserves_seeded_critical_tables(
         "payment_orders",
         "payment_charges",
         "payment_events",
+        "promo_codes",
+        "promo_code_redemptions",
+        "promo_import_runs",
     ):
         assert required_counts[table_name]["source_count"] == 1
         assert required_counts[table_name]["restored_count"] == 1
@@ -661,6 +664,7 @@ def _initialize_restore_drill_source(database_url: str) -> None:
     from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
     from diet_bot.postgres_one_day_generation_job_store import PostgresOneDayGenerationJobStore
     from diet_bot.postgres_payment_store import PostgresPaymentStore
+    from diet_bot.postgres_promo_store import PostgresPromoStore
     from diet_bot.postgres_weekly_pdf_job_store import PostgresWeeklyPdfJobStore
 
     PostgresEntitlementStore(database_url, connect_timeout=1, connect_attempts=1).initialize()
@@ -668,6 +672,7 @@ def _initialize_restore_drill_source(database_url: str) -> None:
     PostgresChatStateStore(database_url, connect_timeout=1, connect_attempts=1).initialize()
     PostgresWeeklyPdfJobStore(database_url, connect_timeout=1, connect_attempts=1).initialize()
     PostgresOneDayGenerationJobStore(database_url, connect_timeout=1, connect_attempts=1).initialize()
+    PostgresPromoStore(database_url, connect_timeout=1, connect_attempts=1).initialize()
 
 
 def _seed_restore_drill_source(psycopg: object, database_url: str) -> None:
@@ -834,6 +839,76 @@ def _seed_restore_drill_source(psycopg: object, database_url: str) -> None:
                     'telegram_stars:tg-charge-restore-drill',
                     'tg-charge-restore-drill',
                     '{"source":"restore_drill"}'::jsonb
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO promo_codes (
+                    code,
+                    kind,
+                    max_uses,
+                    per_user_limit,
+                    created_by,
+                    campaign_key,
+                    metadata_json
+                )
+                VALUES (
+                    'RESTORE-DRILL-PROMO',
+                    'monthly_access',
+                    1,
+                    1,
+                    3001,
+                    'restore-drill',
+                    '{"source":"restore_drill"}'::jsonb
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO promo_code_redemptions (
+                    code,
+                    chat_id,
+                    user_id,
+                    status,
+                    idempotency_key,
+                    redeemed_at,
+                    entitlement_charge_id,
+                    campaign_key,
+                    source,
+                    metadata_json
+                )
+                VALUES (
+                    'RESTORE-DRILL-PROMO',
+                    1001,
+                    2001,
+                    'redeemed',
+                    'promo-restore-drill',
+                    now(),
+                    'promo:restore-drill',
+                    'restore-drill',
+                    'restore_drill',
+                    '{"source":"restore_drill"}'::jsonb
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO promo_import_runs (
+                    migration_id,
+                    source_fingerprint,
+                    source_metadata_json,
+                    result_json,
+                    status,
+                    finished_at
+                )
+                VALUES (
+                    'restore-drill-promo-import',
+                    'sha256:restore-drill',
+                    '{"source":"restore_drill"}'::jsonb,
+                    '{"created":1,"redeemed":1}'::jsonb,
+                    'applied',
+                    now()
                 )
                 """
             )

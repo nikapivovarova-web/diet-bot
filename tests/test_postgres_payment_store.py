@@ -24,6 +24,7 @@ from diet_bot.payments import (
     PaymentCharge,
     PaymentEvent,
     PaymentOrder,
+    expected_payment_price,
 )
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_payment_store import PostgresPaymentStore
@@ -145,7 +146,7 @@ def test_find_charge_by_external_id_is_read_only_and_returns_context(monkeypatch
         provider=PROVIDER_YOOKASSA,
         telegram_payment_charge_id="tg-charge-lookup",
         provider_payment_charge_id="provider-charge-lookup",
-        amount=59_900,
+        amount=79_900,
         currency="RUB",
     )
     cur = StaticSelectCursor(existing_row)
@@ -160,7 +161,7 @@ def test_find_charge_by_external_id_is_read_only_and_returns_context(monkeypatch
 
     assert charge is not None
     assert charge.order_id == "order_charge_lookup"
-    assert charge.amount == 59_900
+    assert charge.amount == 79_900
     normalized = [" ".join(query.split()).upper() for query in cur.queries]
     assert all(query.startswith("SELECT") for query in normalized)
     assert not any("FOR UPDATE" in query for query in normalized)
@@ -353,8 +354,8 @@ def test_charge_and_event_recording_are_idempotent(store: PostgresPaymentStore) 
             provider=PROVIDER_TELEGRAM_STARS,
             telegram_payment_charge_id="tg-charge-1",
             provider_payment_charge_id=None,
-            amount=400,
-            currency="XTR",
+            amount=order.amount,
+            currency=order.currency,
             raw_payload={"ok": True},
         )
     )
@@ -364,8 +365,8 @@ def test_charge_and_event_recording_are_idempotent(store: PostgresPaymentStore) 
             provider=PROVIDER_TELEGRAM_STARS,
             telegram_payment_charge_id="tg-charge-1",
             provider_payment_charge_id=None,
-            amount=400,
-            currency="XTR",
+            amount=order.amount,
+            currency=order.currency,
             raw_payload={"ok": True},
         )
     )
@@ -391,8 +392,8 @@ def test_duplicate_provider_charge_is_not_inserted_twice(store: PostgresPaymentS
             provider=PROVIDER_YOOKASSA,
             telegram_payment_charge_id="tg-charge-yoo-1",
             provider_payment_charge_id="provider-charge-1",
-            amount=59_900,
-            currency="RUB",
+            amount=first_order.amount,
+            currency=first_order.currency,
         )
     )
     duplicate = store.record_charge(
@@ -401,8 +402,8 @@ def test_duplicate_provider_charge_is_not_inserted_twice(store: PostgresPaymentS
             provider=PROVIDER_YOOKASSA,
             telegram_payment_charge_id="tg-charge-yoo-2",
             provider_payment_charge_id="provider-charge-1",
-            amount=25_000,
-            currency="RUB",
+            amount=second_order.amount,
+            currency=second_order.currency,
         )
     )
 
@@ -429,8 +430,8 @@ def test_successful_payment_transaction_rolls_back_if_entitlement_grant_fails(
             provider=PROVIDER_TELEGRAM_STARS,
             telegram_payment_charge_id="tg-charge-rollback",
             provider_payment_charge_id=None,
-            amount=400,
-            currency="XTR",
+            amount=order.amount,
+            currency=order.currency,
             grant_entitlement=fail_grant,
         )
 
@@ -453,8 +454,8 @@ def test_successful_payment_transaction_grants_entitlement_tables(
         provider=PROVIDER_TELEGRAM_STARS,
         telegram_payment_charge_id="tg-charge-grant",
         provider_payment_charge_id=None,
-        amount=400,
-        currency="XTR",
+        amount=order.amount,
+        currency=order.currency,
         now=now,
         subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
     )
@@ -702,8 +703,8 @@ def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
         provider=PROVIDER_TELEGRAM_STARS,
         telegram_payment_charge_id="tg-charge-first",
         provider_payment_charge_id=None,
-        amount=400,
-        currency="XTR",
+        amount=order.amount,
+        currency=order.currency,
         grant_entitlement=lambda _cur, _order, charge: grants.append(str(charge.telegram_payment_charge_id)),
     )
     second = store.record_successful_payment_and_grant_entitlement(
@@ -711,8 +712,8 @@ def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
         provider=PROVIDER_TELEGRAM_STARS,
         telegram_payment_charge_id="tg-charge-second",
         provider_payment_charge_id=None,
-        amount=400,
-        currency="XTR",
+        amount=order.amount,
+        currency=order.currency,
         grant_entitlement=lambda _cur, _order, charge: grants.append(str(charge.telegram_payment_charge_id)),
     )
 
@@ -731,7 +732,7 @@ def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
     ("override", "reason"),
     [
         ({"provider": PROVIDER_YOOKASSA}, "provider_mismatch"),
-        ({"amount": 401}, "amount_mismatch"),
+        ({"amount": "mismatched"}, "amount_mismatch"),
         ({"currency": "RUB"}, "currency_mismatch"),
     ],
 )
@@ -747,10 +748,12 @@ def test_successful_payment_transaction_rejects_mismatched_payment_context(
         "provider": PROVIDER_TELEGRAM_STARS,
         "telegram_payment_charge_id": "tg-charge-bad-context",
         "provider_payment_charge_id": None,
-        "amount": 400,
-        "currency": "XTR",
+        "amount": order.amount,
+        "currency": order.currency,
         "grant_entitlement": lambda _cur, _order, charge: grants.append(str(charge.telegram_payment_charge_id)),
     }
+    if override.get("amount") == "mismatched":
+        override = {**override, "amount": order.amount + 1}
     request.update(override)
 
     result = store.record_successful_payment_and_grant_entitlement(**request)
@@ -769,20 +772,15 @@ def test_successful_payment_transaction_rejects_mismatched_payment_context(
 
 
 def _order(order_id: str, product: str, *, provider: str = PROVIDER_TELEGRAM_STARS) -> PaymentOrder:
-    if provider == PROVIDER_TELEGRAM_STARS:
-        amount = 400 if product == PRODUCT_SUBSCRIPTION_MONTH else 170
-        currency = "XTR"
-    else:
-        amount = 59_900 if product == PRODUCT_SUBSCRIPTION_MONTH else 25_000
-        currency = "RUB"
+    price = expected_payment_price(provider, product)
     return PaymentOrder(
         order_id=order_id,
         user_id=101,
         chat_id=202,
         product=product,
         provider=provider,
-        amount=amount,
-        currency=currency,
+        amount=price.amount,
+        currency=price.currency,
         nonce=f"nonce_{order_id}",
     )
 
@@ -974,6 +972,11 @@ class MissingEntitlementCursor:
                 "free_trial_used": False,
                 "subscription_period_start": None,
                 "subscription_period_end": None,
+                "subscription_source": "none",
+                "auto_renew_status": "not_applicable",
+                "stars_subscription_charge_id": None,
+                "last_subscription_payment_charge_id": None,
+                "current_period_payment_order_id": None,
                 "test_access_until": None,
                 "test_access_enabled": False,
                 "monthly_one_day_remaining": 0,
