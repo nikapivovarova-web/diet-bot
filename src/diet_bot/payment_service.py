@@ -18,6 +18,7 @@ from .payments import (
     PaymentHandlingResult,
     PaymentOrder,
     PaymentPayloadError,
+    PaymentReversalResult,
     PaymentValidationResult,
     RecordedPaymentCharge,
     decode_payment_order_payload,
@@ -45,6 +46,20 @@ class PaymentRepository(Protocol):
         ...
 
     def mark_order_failed(self, order_id: str, reason: str | None = None) -> PaymentOrder:
+        ...
+
+    def record_payment_reversal(
+        self,
+        *,
+        provider: str,
+        telegram_payment_charge_id: str | None,
+        provider_payment_charge_id: str | None,
+        reversal_status: str,
+        amount: int | None = None,
+        currency: str | None = None,
+        raw_payload: dict[str, object] | None = None,
+        now: datetime | None = None,
+    ) -> PaymentReversalResult:
         ...
 
 
@@ -82,6 +97,7 @@ class PaymentService:
         currency: str | None = None,
     ) -> PaymentOrder:
         expected = expected_payment_price(provider, product)
+        now = self._now_factory()
         order = PaymentOrder(
             order_id=self._order_id_factory(),
             user_id=int(user_id),
@@ -91,12 +107,43 @@ class PaymentService:
             amount=expected.amount if amount is None else int(amount),
             currency=expected.currency if currency is None else str(currency),
             nonce=self._nonce_factory(),
-            created_at=self._now_factory(),
+            created_at=now,
         )
+        create_or_reuse_pending = getattr(self._repository, "create_or_reuse_pending_order", None)
+        if callable(create_or_reuse_pending):
+            return create_or_reuse_pending(order, pending_ttl=self._order_ttl, now=now)
         return self._repository.create_order(order)
 
     def mark_order_failed(self, order_id: str, reason: str | None = None) -> PaymentOrder:
         return self._repository.mark_order_failed(order_id, reason)
+
+    def handle_payment_reversal(
+        self,
+        *,
+        provider: str,
+        telegram_payment_charge_id: str | None,
+        provider_payment_charge_id: str | None = None,
+        reversal_status: str,
+        amount: int | None = None,
+        currency: str | None = None,
+        raw_payload: dict[str, object] | None = None,
+        now: datetime | None = None,
+    ) -> PaymentReversalResult:
+        recorder = getattr(self._repository, "record_payment_reversal", None)
+        if not callable(recorder):
+            return PaymentReversalResult(False, reason="payment_reversal_not_supported")
+        kwargs: dict[str, object] = {
+            "provider": provider,
+            "telegram_payment_charge_id": telegram_payment_charge_id,
+            "provider_payment_charge_id": provider_payment_charge_id,
+            "reversal_status": reversal_status,
+            "amount": amount,
+            "currency": currency,
+            "raw_payload": raw_payload,
+        }
+        if now is not None:
+            kwargs["now"] = now
+        return recorder(**kwargs)
 
     def validate_order_payment(
         self,

@@ -253,6 +253,131 @@ assert "psycopg" not in sys.modules
 
 
 @pytest.mark.anyio
+async def test_payment_callback_double_click_reuses_pending_order_without_second_invoice(monkeypatch) -> None:
+    from dataclasses import replace
+    from itertools import count
+    from threading import Lock
+
+    import diet_bot.telegram_app as telegram_app
+    from diet_bot.payment_service import PaymentService
+    from diet_bot.payments import (
+        ORDER_STATUS_PENDING,
+        PRODUCT_SUBSCRIPTION_MONTH,
+        PROVIDER_TELEGRAM_STARS,
+        PaymentOrder,
+    )
+
+    class PendingRepo:
+        def __init__(self) -> None:
+            self.orders: dict[str, PaymentOrder] = {}
+            self.lock = Lock()
+
+        def create_order(self, order: PaymentOrder) -> PaymentOrder:
+            with self.lock:
+                self.orders[order.order_id] = order
+                return order
+
+        def create_or_reuse_pending_order(self, order: PaymentOrder, **_kwargs) -> PaymentOrder:
+            with self.lock:
+                for existing in self.orders.values():
+                    if (
+                        int(existing.chat_id) == int(order.chat_id)
+                        and existing.product == order.product
+                        and existing.provider == order.provider
+                        and int(existing.amount) == int(order.amount)
+                        and existing.currency == order.currency
+                        and existing.status == ORDER_STATUS_PENDING
+                    ):
+                        return replace(existing, reused_pending=True)
+                self.orders[order.order_id] = order
+                return order
+
+        def get_order(self, order_id: str) -> PaymentOrder | None:
+            return self.orders.get(order_id)
+
+        def record_event(self, _event):
+            raise NotImplementedError
+
+        def record_charge(self, _charge):
+            raise NotImplementedError
+
+        def mark_order_paid(self, order_id: str) -> PaymentOrder:
+            return self.orders[order_id]
+
+        def mark_order_granted(self, order_id: str) -> PaymentOrder:
+            return self.orders[order_id]
+
+        def mark_order_failed(self, order_id: str, reason: str | None = None) -> PaymentOrder:
+            failed = replace(self.orders[order_id], status="failed", failure_reason=reason)
+            self.orders[order_id] = failed
+            return failed
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.invoice_links: list[dict[str, object]] = []
+
+        async def create_invoice_link(self, **kwargs) -> str:
+            self.invoice_links.append(dict(kwargs))
+            return "https://t.me/invoice/test"
+
+    class FakeMessage:
+        def __init__(self) -> None:
+            self.chat = types.SimpleNamespace(id=202, type="private")
+            self.from_user = types.SimpleNamespace(id=777)
+            self.bot = FakeBot()
+            self.texts: list[str] = []
+
+        async def answer(self, text: str, **_kwargs) -> None:
+            self.texts.append(text)
+
+    class FakeCallback:
+        def __init__(self, message: FakeMessage) -> None:
+            self.data = telegram_app.CALLBACK_PAY_TELEGRAM_STARS
+            self.message = message
+            self.from_user = types.SimpleNamespace(id=101)
+            self.answers: list[str | None] = []
+
+        async def answer(self, text: str | None = None, **_kwargs) -> None:
+            self.answers.append(text)
+
+    repo = PendingRepo()
+    sequence = count(1)
+    service = PaymentService(
+        repo,
+        order_id_factory=lambda: f"order_{next(sequence):08d}",
+        nonce_factory=lambda: f"nonce_{next(sequence):08d}",
+    )
+
+    async def no_active_subscription(_message) -> bool:
+        return False
+
+    monkeypatch.setattr(telegram_app, "PAYMENTS_ENABLED", True, raising=False)
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service, raising=False)
+    monkeypatch.setattr(telegram_app, "_send_active_subscription_notice_if_needed", no_active_subscription)
+    message = FakeMessage()
+
+    await telegram_app.handle_callback(FakeCallback(message))
+    await telegram_app.handle_callback(FakeCallback(message))
+
+    expected_notice = (
+        "\u0421\u0447\u0435\u0442 \u0443\u0436\u0435 \u0441\u043e\u0437\u0434\u0430\u043d. "
+        "\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 "
+        "\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0443\u044e "
+        "\u0441\u0441\u044b\u043b\u043a\u0443 \u0434\u043b\u044f "
+        "\u043e\u043f\u043b\u0430\u0442\u044b \u0438\u043b\u0438 "
+        "\u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 "
+        "\u043f\u043e\u0437\u0436\u0435."
+    )
+    assert len(repo.orders) == 1
+    assert len(message.bot.invoice_links) == 1
+    assert message.texts[-1] == expected_notice
+    saved_order = next(iter(repo.orders.values()))
+    assert saved_order.product == PRODUCT_SUBSCRIPTION_MONTH
+    assert saved_order.provider == PROVIDER_TELEGRAM_STARS
+
+
+@pytest.mark.anyio
 async def test_one_day_generation_delivery_offloads_plan_build_to_thread(monkeypatch) -> None:
     import diet_bot.telegram_app as telegram_app
     from diet_bot.domain import (

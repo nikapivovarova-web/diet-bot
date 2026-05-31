@@ -1160,6 +1160,15 @@ PAYMENT_ACTIVATION_DELAYED_TEXT = (
     "\u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 "
     "\u0432\u043a\u043b\u044e\u0447\u0438\u0442 \u0434\u043e\u0441\u0442\u0443\u043f."
 )
+PAYMENT_PENDING_INVOICE_ALREADY_OPEN_TEXT = (
+    "\u0421\u0447\u0435\u0442 \u0443\u0436\u0435 \u0441\u043e\u0437\u0434\u0430\u043d. "
+    "\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 "
+    "\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0443\u044e "
+    "\u0441\u0441\u044b\u043b\u043a\u0443 \u0434\u043b\u044f "
+    "\u043e\u043f\u043b\u0430\u0442\u044b \u0438\u043b\u0438 "
+    "\u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 "
+    "\u043f\u043e\u0437\u0436\u0435."
+)
 PAYMENT_RECOVERY_SPOOL_ENV = "DIET_BOT_PAYMENT_RECOVERY_SPOOL"
 PAYMENT_PAYLOAD_AMOUNTS = {
     PAYLOAD_SUBSCRIPTION_MONTH: SUBSCRIPTION_STARS_AMOUNT,
@@ -5161,6 +5170,9 @@ async def _send_stars_invoice_link(message: Message, payload: str, *, payer_user
         logger.exception("Failed to create payment ledger order for Stars invoice")
         await _send_payment_ledger_unavailable_notice(message)
         return
+    if getattr(order, "reused_pending", False):
+        await message.answer(PAYMENT_PENDING_INVOICE_ALREADY_OPEN_TEXT)
+        return
 
     try:
         invoice_link = await message.bot.create_invoice_link(
@@ -5216,6 +5228,9 @@ async def _send_yookassa_invoice_link(message: Message, payload: str, *, payer_u
     except Exception:
         logger.exception("Failed to create payment ledger order for YooKassa invoice")
         await _send_payment_ledger_unavailable_notice(message)
+        return
+    if getattr(order, "reused_pending", False):
+        await message.answer(PAYMENT_PENDING_INVOICE_ALREADY_OPEN_TEXT)
         return
 
     try:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .payments import (
+    CHARGE_STATUS_CANCELED,
+    CHARGE_STATUS_REFUNDED,
     CHARGE_STATUS_SUCCEEDED,
     ORDER_STATUS_FAILED,
     ORDER_STATUS_GRANTED,
@@ -18,6 +21,7 @@ from .payments import (
     PaymentCharge,
     PaymentEvent,
     PaymentOrder,
+    PaymentReversalResult,
     RecordedPaymentCharge,
 )
 from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
@@ -32,6 +36,7 @@ from .subscriptions import (
     Entitlement,
     apply_extra_one_day_payment,
     apply_extra_weekly_pdf_payment,
+    apply_payment_reversal,
     apply_subscription_payment,
 )
 
@@ -133,35 +138,29 @@ class PostgresPaymentStore:
     def create_order(self, order: PaymentOrder) -> PaymentOrder:
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO payment_orders (
-                        order_id,
-                        user_id,
-                        chat_id,
-                        product,
-                        provider,
-                        amount,
-                        currency,
-                        nonce,
-                        status
+                return self._create_order_cur(cur, order)
+
+    def create_or_reuse_pending_order(
+        self,
+        order: PaymentOrder,
+        *,
+        pending_ttl: timedelta | None = timedelta(minutes=30),
+        now: datetime | None = None,
+    ) -> PaymentOrder:
+        current_time = now or datetime.now(UTC)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_pending_order_key_cur(cur, order)
+                    reusable = self._find_reusable_pending_order_cur(
+                        cur,
+                        order,
+                        pending_ttl=pending_ttl,
+                        now=current_time,
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING *
-                    """,
-                    (
-                        order.order_id,
-                        order.user_id,
-                        order.chat_id,
-                        order.product,
-                        order.provider,
-                        order.amount,
-                        order.currency,
-                        order.nonce,
-                        order.status,
-                    ),
-                )
-                return _order_from_row(cur.fetchone())
+                    if reusable is not None:
+                        return reusable
+                    return self._create_order_cur(cur, order)
 
     def get_order(self, order_id: str) -> PaymentOrder | None:
         with self._connect() as conn:
@@ -186,6 +185,22 @@ class PostgresPaymentStore:
                     provider_payment_charge_id=provider_payment_charge_id,
                     for_update=False,
                 )
+
+    def find_charge_by_order_id(self, order_id: str) -> PaymentCharge | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM payment_charges
+                    WHERE order_id = %s
+                    ORDER BY charge_id DESC
+                    LIMIT 1
+                    """,
+                    (order_id,),
+                )
+                row = cur.fetchone()
+        return _charge_from_row(row) if row is not None else None
 
     def record_event(self, event: PaymentEvent) -> PaymentEvent:
         with self._connect() as conn:
@@ -287,6 +302,166 @@ class PostgresPaymentStore:
                     self._mark_order_cur(cur, order.order_id, ORDER_STATUS_GRANTED)
                     return recorded
 
+    def record_payment_reversal(
+        self,
+        *,
+        provider: str,
+        telegram_payment_charge_id: str | None,
+        provider_payment_charge_id: str | None,
+        reversal_status: str,
+        amount: int | None = None,
+        currency: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> PaymentReversalResult:
+        normalized_status = _payment_reversal_status(reversal_status)
+        ledger_status = _ledger_charge_status_for_reversal(normalized_status)
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    charge = self._find_charge_by_external_id_cur(
+                        cur,
+                        provider=provider,
+                        telegram_payment_charge_id=telegram_payment_charge_id,
+                        provider_payment_charge_id=provider_payment_charge_id,
+                        for_update=True,
+                    )
+                    if charge is None:
+                        return PaymentReversalResult(False, reason="charge_not_found")
+                    order = (
+                        self._get_order_cur(cur, charge.order_id, for_update=True)
+                        if charge.order_id is not None
+                        else None
+                    )
+                    if charge.status == ledger_status:
+                        return PaymentReversalResult(
+                            False,
+                            order.product if order is not None else None,
+                            duplicate=True,
+                            reason="duplicate_reversal",
+                            order_id=order.order_id if order is not None else charge.order_id,
+                            charge_status=charge.status,
+                        )
+
+                    payload = dict(raw_payload or {})
+                    payload.setdefault("reversal_status", normalized_status)
+                    payload.setdefault("ledger_charge_status", ledger_status)
+                    if amount is not None:
+                        payload.setdefault("reversal_amount", int(amount))
+                    if currency is not None:
+                        payload.setdefault("reversal_currency", str(currency))
+                    updated_charge = self._update_charge_reversal_cur(cur, charge, ledger_status, payload)
+
+                    manual_review_required = False
+                    reason = _payment_reversal_context_mismatch_reason(
+                        charge,
+                        amount=amount,
+                        currency=currency,
+                    )
+                    if reason is not None:
+                        manual_review_required = True
+                    elif order is None:
+                        manual_review_required = True
+                        reason = "order_not_found"
+                    else:
+                        reversal = _apply_payment_reversal_entitlement_cur(
+                            cur,
+                            order,
+                            updated_charge,
+                            reversal_status=normalized_status,
+                            now=now,
+                        )
+                        manual_review_required = reversal.manual_review_required
+                        reason = reversal.reason
+
+                    if order is not None:
+                        self._mark_order_cur(
+                            cur,
+                            order.order_id,
+                            ORDER_STATUS_FAILED,
+                            reason=_payment_reversal_order_failure_reason(
+                                normalized_status,
+                                manual_review_required=manual_review_required,
+                            ),
+                        )
+                    return PaymentReversalResult(
+                        True,
+                        order.product if order is not None else None,
+                        manual_review_required=manual_review_required,
+                        reason=reason,
+                        order_id=order.order_id if order is not None else charge.order_id,
+                        charge_status=updated_charge.status,
+                    )
+
+    def _create_order_cur(self, cur: Any, order: PaymentOrder) -> PaymentOrder:
+        cur.execute(
+            """
+            INSERT INTO payment_orders (
+                order_id,
+                user_id,
+                chat_id,
+                product,
+                provider,
+                amount,
+                currency,
+                nonce,
+                status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (
+                order.order_id,
+                order.user_id,
+                order.chat_id,
+                order.product,
+                order.provider,
+                order.amount,
+                order.currency,
+                order.nonce,
+                order.status,
+            ),
+        )
+        return _order_from_row(cur.fetchone())
+
+    def _find_reusable_pending_order_cur(
+        self,
+        cur: Any,
+        order: PaymentOrder,
+        *,
+        pending_ttl: timedelta | None,
+        now: datetime,
+    ) -> PaymentOrder | None:
+        cur.execute(
+            """
+            SELECT *
+            FROM payment_orders
+            WHERE chat_id = %s
+              AND product = %s
+              AND provider = %s
+              AND amount = %s
+              AND currency = %s
+              AND status = %s
+            ORDER BY created_at, order_id
+            FOR UPDATE
+            """,
+            (
+                order.chat_id,
+                order.product,
+                order.provider,
+                order.amount,
+                order.currency,
+                ORDER_STATUS_PENDING,
+            ),
+        )
+        for row in cur.fetchall():
+            existing = _order_from_row(row)
+            if _pending_order_expired(existing, pending_ttl=pending_ttl, now=now):
+                self._mark_order_cur(cur, existing.order_id, ORDER_STATUS_FAILED, reason="order_expired")
+                continue
+            return replace(existing, reused_pending=True)
+        return None
+
     def _record_event_cur(self, cur: Any, event: PaymentEvent) -> PaymentEvent:
         cur.execute(
             """
@@ -358,6 +533,28 @@ class PostgresPaymentStore:
         if existing is None:
             raise RuntimeError("Payment charge insert conflicted but no existing row was found.")
         return RecordedPaymentCharge(existing, inserted=False)
+
+    def _update_charge_reversal_cur(
+        self,
+        cur: Any,
+        charge: PaymentCharge,
+        status: str,
+        payload: dict[str, Any],
+    ) -> PaymentCharge:
+        cur.execute(
+            """
+            UPDATE payment_charges
+            SET status = %s,
+                raw_payload_json = raw_payload_json || %s
+            WHERE charge_id = %s
+            RETURNING *
+            """,
+            (status, _jsonb(payload), charge.charge_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(f"Payment charge not found: {charge.charge_id}")
+        return _charge_from_row(row)
 
     def _find_existing_event_cur(self, cur: Any, event: PaymentEvent) -> PaymentEvent | None:
         clauses = ["event_id = %s"]
@@ -500,8 +697,76 @@ def _grant_entitlement_cur(
     _upsert_entitlement_cur(cur, order.chat_id, entitlement)
 
 
+def _apply_payment_reversal_entitlement_cur(
+    cur: Any,
+    order: PaymentOrder,
+    charge: PaymentCharge,
+    *,
+    reversal_status: str,
+    now: datetime | None,
+):
+    _lock_entitlement_map_cur(cur)
+    entitlement = _load_entitlement_cur(cur, order.chat_id)
+    result = apply_payment_reversal(
+        entitlement,
+        order.product,
+        _entitlement_charge_key(order, charge),
+        order_id=order.order_id,
+        reversal_status=reversal_status,
+        now=now,
+    )
+    _upsert_entitlement_cur(cur, order.chat_id, entitlement)
+    return result
+
+
 def _lock_entitlement_map_cur(cur: Any) -> None:
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
+
+
+def _payment_reversal_status(value: str) -> str:
+    normalized = str(value or "refunded").strip().lower()
+    if normalized == "cancelled":
+        normalized = "canceled"
+    if normalized == "refund":
+        normalized = "refunded"
+    if normalized in {"refunded", "canceled", "reversed", "chargeback"}:
+        return normalized
+    return "reversed"
+
+
+def _ledger_charge_status_for_reversal(status: str) -> str:
+    if status == "canceled":
+        return CHARGE_STATUS_CANCELED
+    return CHARGE_STATUS_REFUNDED
+
+
+def _payment_reversal_order_failure_reason(
+    status: str,
+    *,
+    manual_review_required: bool,
+) -> str:
+    base = {
+        "refunded": "payment_refunded",
+        "canceled": "payment_canceled",
+        "reversed": "payment_reversed",
+        "chargeback": "payment_chargeback",
+    }.get(status, "payment_reversed")
+    if manual_review_required:
+        return f"{base}_manual_review"
+    return base
+
+
+def _payment_reversal_context_mismatch_reason(
+    charge: PaymentCharge,
+    *,
+    amount: int | None,
+    currency: str | None,
+) -> str | None:
+    if amount is not None and int(amount) != int(charge.amount):
+        return "partial_refund_manual_review"
+    if currency is not None and str(currency) != charge.currency:
+        return "currency_mismatch"
+    return None
 
 
 def _payment_context_mismatch_reason(
@@ -521,6 +786,49 @@ def _payment_context_mismatch_reason(
     if order.currency != currency:
         return "currency_mismatch"
     return None
+
+
+def _lock_pending_order_key_cur(cur: Any, order: PaymentOrder) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_pending_order_lock_id(order),))
+
+
+def _pending_order_lock_id(order: PaymentOrder) -> int:
+    key = ":".join(
+        (
+            "payment_pending_order_v1",
+            str(int(order.chat_id)),
+            str(order.product),
+            str(order.provider),
+            str(int(order.amount)),
+            str(order.currency),
+        )
+    )
+    value = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big", signed=False)
+    if value >= 2**63:
+        value -= 2**64
+    return value
+
+
+def _pending_order_expired(
+    order: PaymentOrder,
+    *,
+    pending_ttl: timedelta | None,
+    now: datetime,
+) -> bool:
+    if pending_ttl is None:
+        return False
+    created_at = order.created_at or order.updated_at
+    if created_at is None:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    else:
+        created_at = created_at.astimezone(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    else:
+        now = now.astimezone(UTC)
+    return created_at + pending_ttl < now
 
 
 def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:

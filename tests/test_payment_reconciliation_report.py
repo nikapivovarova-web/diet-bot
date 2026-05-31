@@ -126,6 +126,75 @@ def test_reconciliation_still_classifies_true_provider_ledger_matches() -> None:
     assert [item.category for item in report.items] == ["matched_paid_granted"]
 
 
+def test_reconciliation_flags_refunded_provider_charge_with_granted_ledger() -> None:
+    provider_rows = [
+        _provider_row(
+            "order_refund01",
+            "tg-refund-raw",
+            "provider-refund-raw",
+            status="refunded",
+        )
+    ]
+    ledger_rows = [
+        _ledger_row(
+            "order_refund01",
+            "tg-refund-raw",
+            "provider-refund-raw",
+            order_status="granted",
+        )
+    ]
+
+    report = reconcile_payment_exports(provider_rows, ledger_rows)
+
+    assert report.counts["matched_paid_granted"] == 0
+    assert [item.category for item in report.items] == ["provider_refunded_but_granted"]
+    assert report.items[0].reason == "provider_status_refunded"
+    assert report.has_findings
+
+
+def test_reconciliation_flags_canceled_or_reversed_provider_charge_with_granted_ledger() -> None:
+    provider_rows = [
+        _provider_row(
+            "order_cancel01",
+            "tg-cancel-raw",
+            "provider-cancel-raw",
+            status="canceled",
+        ),
+        _provider_row(
+            "order_reverse01",
+            "tg-reverse-raw",
+            "provider-reverse-raw",
+            status="reversed",
+        ),
+    ]
+    ledger_rows = [
+        _ledger_row(
+            "order_cancel01",
+            "tg-cancel-raw",
+            "provider-cancel-raw",
+            order_status="granted",
+        ),
+        _ledger_row(
+            "order_reverse01",
+            "tg-reverse-raw",
+            "provider-reverse-raw",
+            order_status="granted",
+        ),
+    ]
+
+    report = reconcile_payment_exports(provider_rows, ledger_rows)
+
+    assert report.counts["matched_paid_granted"] == 0
+    assert [item.category for item in report.items] == [
+        "provider_canceled_but_granted",
+        "provider_reversed_but_granted",
+    ]
+    assert [item.reason for item in report.items] == [
+        "provider_status_canceled",
+        "provider_status_reversed",
+    ]
+
+
 def test_reconciliation_still_classifies_provider_without_ledger() -> None:
     report = reconcile_payment_exports([_provider_row("order_missing", "tg-missing-raw", "provider-missing-raw")], [])
 
@@ -189,6 +258,34 @@ def test_reconciliation_cli_accepts_csv_json_spool_and_outputs_redacted_jsonl(
     assert "tg-paid-raw" not in output
     assert "provider-paid-raw" not in output
     assert "order_paid01" not in output
+
+
+def test_reconciliation_cli_says_report_is_read_only_and_points_to_apply_command(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    provider_json, ledger_json = _write_reconciliation_inputs(tmp_path)
+
+    exit_code = payment_reconciliation_report.main(
+        [
+            "--provider-export",
+            str(provider_json),
+            "--ledger-export",
+            str(ledger_json),
+            "--format",
+            "jsonl",
+        ],
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "reconciliation is read-only" in captured.err
+    assert "scripts.ops.apply_payment_reversal" in captured.err
+    assert "--dry-run" in captured.err
+    assert "--apply" in captured.err
+    assert "tg-paid-raw" not in captured.err
+    assert "provider-paid-raw" not in captured.err
+    assert "order_paid01" not in captured.err
 
 
 def test_reconciliation_cli_fails_when_explicit_recovery_spool_is_missing(
@@ -282,7 +379,13 @@ def test_reconciliation_cli_allow_malformed_spool_continues_and_reports_count(
     assert str(spool) not in captured.err
 
 
-def _provider_row(order_id: str, telegram_charge_id: str, provider_charge_id: str) -> dict[str, object]:
+def _provider_row(
+    order_id: str,
+    telegram_charge_id: str,
+    provider_charge_id: str,
+    *,
+    status: str = "succeeded",
+) -> dict[str, object]:
     return {
         "provider": "fake_provider",
         "order_id": order_id,
@@ -290,7 +393,7 @@ def _provider_row(order_id: str, telegram_charge_id: str, provider_charge_id: st
         "provider_payment_charge_id": provider_charge_id,
         "amount": 1000,
         "currency": "RUB",
-        "status": "succeeded",
+        "status": status,
     }
 
 
