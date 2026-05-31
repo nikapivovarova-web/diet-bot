@@ -398,6 +398,51 @@ async def test_worker_processes_durable_weekly_queue_with_bounded_concurrency() 
 
 
 @pytest.mark.anyio
+async def test_worker_times_out_hung_weekly_pdf_prepare_and_continues_next_job() -> None:
+    store = _InMemoryWeeklyPdfJobStore(default_quota=1)
+    runtime = WeeklyPdfJobRuntime(store)
+    hung = runtime.admit_queued(
+        chat_id=1,
+        idempotency_key="weekly-hung-prepare",
+        request_snapshot=_weekly_snapshot(1),
+    ).job
+    next_job = runtime.admit_queued(
+        chat_id=2,
+        idempotency_key="weekly-next-job",
+        request_snapshot=_weekly_snapshot(2),
+    ).job
+
+    class HungFirstPrepareProcessor(_RecordingWeeklyPdfProcessor):
+        async def prepare_delivery(self, job: WeeklyPdfJob) -> WeeklyPdfDelivery:
+            if job.chat_id == 1:
+                await asyncio.Event().wait()
+            return await super().prepare_delivery(job)
+
+    worker = WeeklyPdfWorker(
+        runtime,
+        HungFirstPrepareProcessor(),
+        WeeklyPdfWorkerSettings(
+            worker_id="weekly-worker-a",
+            concurrency=1,
+            heartbeat_interval_seconds=3600,
+            max_attempts=1,
+            job_timeout_seconds=0.02,
+        ),
+    )
+
+    processed = await asyncio.wait_for(worker.run_until_empty(max_batches=3), timeout=1)
+
+    failed = store.jobs_by_id[hung.job_id]
+    succeeded = store.jobs_by_id[next_job.job_id]
+    assert processed == 2
+    assert failed.status == JOB_STATUS_FAILED
+    assert failed.refund_status == REFUND_STATUS_REFUNDED
+    assert failed.send_started_at is None
+    assert succeeded.status == JOB_STATUS_SUCCEEDED
+    assert ("extend_lease", hung.job_id) not in store.calls
+
+
+@pytest.mark.anyio
 async def test_worker_retries_pre_send_failure_then_refunds_once_after_max_attempts() -> None:
     store = _InMemoryWeeklyPdfJobStore(default_quota=1)
     runtime = WeeklyPdfJobRuntime(store)

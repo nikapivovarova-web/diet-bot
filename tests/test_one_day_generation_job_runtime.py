@@ -381,6 +381,49 @@ async def test_worker_claims_leased_jobs_and_finalizes_value_delivery_with_bound
 
 
 @pytest.mark.anyio
+async def test_worker_times_out_hung_one_day_send_and_continues_next_job() -> None:
+    store = _InMemoryOneDayGenerationJobStore(default_quota=1)
+    runtime = OneDayGenerationJobRuntime(store)
+    hung = runtime.admit_queued(chat_id=1, idempotency_key="hung-send", request_snapshot=_snapshot(1)).job
+    next_job = runtime.admit_queued(chat_id=2, idempotency_key="next-job", request_snapshot=_snapshot(2)).job
+
+    class HungFirstSendProcessor(_RecordingProcessor):
+        async def prepare_delivery(self, job: OneDayGenerationJob) -> OneDayGenerationDelivery:
+            if job.chat_id == 1:
+                async def send_hangs() -> None:
+                    await asyncio.Event().wait()
+
+                return OneDayGenerationDelivery(
+                    value_messages=(OneDayGenerationValueMessage("meal:00:hung", send_hangs),),
+                )
+            return await super().prepare_delivery(job)
+
+    worker = OneDayGenerationWorker(
+        runtime,
+        HungFirstSendProcessor(),
+        OneDayGenerationWorkerSettings(
+            worker_id="worker-a",
+            concurrency=1,
+            heartbeat_interval_seconds=3600,
+            max_attempts=1,
+            job_timeout_seconds=0.02,
+        ),
+    )
+
+    processed = await asyncio.wait_for(worker.run_until_empty(max_batches=3), timeout=1)
+
+    failed = store.jobs_by_id[hung.job_id]
+    succeeded = store.jobs_by_id[next_job.job_id]
+    assert processed == 2
+    assert failed.status == JOB_STATUS_FAILED
+    assert failed.refund_status == REFUND_STATUS_NOT_REQUIRED
+    assert failed.delivery_status == "unknown"
+    assert failed.requires_manual_review is True
+    assert succeeded.status == JOB_STATUS_SUCCEEDED
+    assert ("extend_lease", hung.job_id) not in store.calls
+
+
+@pytest.mark.anyio
 async def test_worker_generates_from_persisted_snapshot() -> None:
     store = _InMemoryOneDayGenerationJobStore(default_quota=1)
     runtime = OneDayGenerationJobRuntime(store)

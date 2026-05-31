@@ -648,6 +648,64 @@ async def test_one_day_worker_task_exception_is_observed_without_secret_leak(mon
 
 
 @pytest.mark.anyio
+async def test_run_bot_fails_closed_when_one_day_worker_dies_during_polling(monkeypatch, caplog) -> None:
+    fake_bot = object()
+    fake_runtime = object()
+    poll_started = asyncio.Event()
+    events: list[object] = []
+
+    class FakeDispatcher:
+        async def start_polling(self, bot) -> None:
+            events.append(("poll", bot))
+            poll_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("poll_cancelled")
+
+    class CrashingWorker:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def run_forever(self) -> None:
+            events.append("worker_run")
+            await poll_started.wait()
+            raise RuntimeError("bot-token-secret should not be logged")
+
+    class FakeGuard:
+        def close(self) -> None:
+            events.append("guard_close")
+
+    monkeypatch.setenv("DIET_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "postgres")
+    monkeypatch.setenv("DIET_BOT_DATABASE_URL", "postgresql://user:secret@example/db")
+    monkeypatch.setenv("DIET_BOT_ONE_DAY_WORKER_ENABLED", "1")
+    monkeypatch.setattr(telegram_app, "Bot", lambda _token: fake_bot)
+    monkeypatch.setattr(telegram_app, "_set_bot_commands", lambda _bot: asyncio.sleep(0))
+    monkeypatch.setattr(telegram_app, "create_dispatcher", lambda: FakeDispatcher())
+    monkeypatch.setattr(telegram_app, "validate_chat_state_store_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "_validate_entitlement_storage", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_weekly_pdf_job_runtime_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_one_day_generation_job_store_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "validate_payment_runtime_for_startup", lambda _config: None)
+    monkeypatch.setattr(telegram_app, "_acquire_postgres_single_poller_guard", lambda _config: FakeGuard())
+    monkeypatch.setattr(telegram_app, "_one_day_generation_job_runtime", lambda: fake_runtime)
+    monkeypatch.setattr(telegram_app, "OneDayGenerationWorker", CrashingWorker)
+    caplog.set_level(logging.ERROR, logger="diet_bot.telegram_app")
+
+    with pytest.raises(RuntimeError, match="One-day worker stopped unexpectedly"):
+        await asyncio.wait_for(telegram_app.run_bot(), timeout=1)
+
+    assert ("poll", fake_bot) in events
+    assert "worker_run" in events
+    assert "poll_cancelled" in events
+    assert "guard_close" in events
+    assert "One-day worker task stopped unexpectedly" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "bot-token-secret" not in caplog.text
+
+
+@pytest.mark.anyio
 async def test_promo_code_button_asks_for_code(monkeypatch, tmp_path) -> None:
     chat_id = 80_201
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
@@ -1021,6 +1079,36 @@ async def test_private_start_still_sends_welcome(monkeypatch, tmp_path) -> None:
     assert callbacks[0] == CALLBACK_START
     assert CALLBACK_FEATURES in callbacks
     assert chat_id not in SESSION_BY_CHAT_ID
+
+
+@pytest.mark.anyio
+async def test_repeated_start_clears_active_trial_questionnaire_state(monkeypatch, tmp_path) -> None:
+    chat_id = 80_304
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
+    message = FakeMessage(chat_id, chat_type="private")
+    try:
+        await telegram_app._start_questionnaire(message, is_trial=True)
+        assert chat_id in SESSION_BY_CHAT_ID
+        assert chat_id in TRIAL_CHAT_IDS
+        assert telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(chat_id)
+
+        start_message = FakeMessage(chat_id, text="/start", chat_type="private")
+        await telegram_app.start(start_message)
+
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in TRIAL_CHAT_IDS
+        assert chat_id not in telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID
+
+        stale_answer = FakeMessage(chat_id, text="32", chat_type="private")
+        await handle_answer(stale_answer)
+
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert stale_answer.texts[-1][0] == "Нажмите кнопку, чтобы составить рацион 👇"
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.pop(chat_id, None)
 
 
 @pytest.mark.anyio
@@ -3964,6 +4052,62 @@ async def test_one_day_json_backend_preserves_legacy_consume_refund_behavior(mon
     entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
     assert sent is True
     assert send_calls == 1
+    assert entitlement.monthly_one_day_remaining == 0
+
+
+@pytest.mark.anyio
+async def test_one_day_json_backend_offloads_legacy_plan_build_to_thread(monkeypatch, tmp_path) -> None:
+    chat_id = 91_057
+    subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    _install_one_day_runtime(monkeypatch, None)
+    _save_active_subscription(subscriptions_path, chat_id, one_day_remaining=1, weekly_pdf_remaining=1)
+    profile = profile_with(age=44)
+    plan = _one_day_plan_for_runtime_tests()
+    offload_depth = 0
+    to_thread_calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        nonlocal offload_depth
+
+        to_thread_calls.append((func, args, dict(kwargs)))
+        offload_depth += 1
+        try:
+            return func(*args, **kwargs)
+        finally:
+            offload_depth -= 1
+
+    def fake_build_one_day_plan(profile_arg, **kwargs):
+        assert offload_depth > 0, "legacy JSON one-day generation must offload the planner"
+        assert profile_arg is profile
+        assert kwargs["recipe_source"] == "curated_only"
+        return plan
+
+    async def fake_load_chat_history(_chat_id: int) -> None:
+        return None
+
+    async def fake_send_meal_card(_message, _meal) -> None:
+        return None
+
+    async def fake_send_text_chunks(_message, _text, _reply_markup=None) -> None:
+        return None
+
+    async def fake_format_entitlement_status(_chat_id: int) -> str:
+        return "status"
+
+    monkeypatch.setattr(telegram_app.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", fake_build_one_day_plan)
+    monkeypatch.setattr(telegram_app, "_load_chat_history_async", fake_load_chat_history)
+    monkeypatch.setattr(telegram_app, "_send_meal_card", fake_send_meal_card)
+    monkeypatch.setattr(telegram_app, "_send_text_chunks", fake_send_text_chunks)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status_async", fake_format_entitlement_status)
+
+    sent = await telegram_app._send_one_day_plan_with_access(FakeMessage(chat_id), profile)
+
+    entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert sent is True
+    assert [call[0] for call in to_thread_calls] == [fake_build_one_day_plan]
     assert entitlement.monthly_one_day_remaining == 0
 
 

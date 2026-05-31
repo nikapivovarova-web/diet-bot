@@ -1376,6 +1376,8 @@ async def start(message: Message) -> None:
         return
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    _clear_questionnaire_session(message.chat.id)
+    TRIAL_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
         return
     await _send_welcome_photo(message)
@@ -2047,26 +2049,81 @@ async def run_bot() -> None:
     single_poller_guard = _acquire_postgres_single_poller_guard(config)
     one_day_worker_task: asyncio.Task | None = None
     weekly_pdf_worker_task: asyncio.Task | None = None
+    sales_followup_worker_task: asyncio.Task | None = None
     try:
         bot = Bot(config.bot_token)
         await _set_bot_commands(bot)
         dispatcher = create_dispatcher()
         weekly_pdf_worker_task = _start_weekly_pdf_worker_if_configured(config, bot)
         one_day_worker_task = _start_one_day_generation_worker_if_configured(config, bot)
+        sales_followup_worker_task = _start_sales_followup_worker_if_configured(config, bot)
+        worker_tasks = [
+            task
+            for task in (weekly_pdf_worker_task, one_day_worker_task, sales_followup_worker_task)
+            if task is not None
+        ]
+        polling_task = asyncio.create_task(dispatcher.start_polling(bot), name="telegram-polling")
         try:
-            await dispatcher.start_polling(bot)
+            await _run_polling_with_worker_supervision(polling_task, worker_tasks)
         finally:
-            if weekly_pdf_worker_task is not None:
-                weekly_pdf_worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await weekly_pdf_worker_task
-            if one_day_worker_task is not None:
-                one_day_worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await one_day_worker_task
+            await _cancel_background_task(polling_task)
+            for worker_task in worker_tasks:
+                await _cancel_background_task(worker_task)
     finally:
         if single_poller_guard is not None:
             single_poller_guard.close()
+
+
+async def _run_polling_with_worker_supervision(
+    polling_task: asyncio.Task,
+    worker_tasks: Sequence[asyncio.Task],
+) -> None:
+    if not worker_tasks:
+        await polling_task
+        return
+
+    pending: set[asyncio.Task] = {polling_task, *worker_tasks}
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task is not polling_task:
+                await _cancel_background_task(polling_task)
+                _raise_worker_task_stopped(task)
+        if polling_task in done:
+            await polling_task
+            return
+
+
+def _raise_worker_task_stopped(task: asyncio.Task) -> None:
+    label = _worker_task_label(task)
+    if not task.cancelled():
+        with suppress(Exception):
+            task.exception()
+    raise RuntimeError(f"{label} stopped unexpectedly")
+
+
+def _worker_task_label(task: asyncio.Task) -> str:
+    task_name = task.get_name()
+    if task_name == "one-day-generation-worker":
+        return "One-day worker"
+    if task_name == "weekly-pdf-worker":
+        return "Weekly PDF worker"
+    if task_name == "sales-followup-worker":
+        return "Sales follow-up worker"
+    return "Worker"
+
+
+async def _cancel_background_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
 
 
 def _start_weekly_pdf_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
@@ -3396,7 +3453,8 @@ async def _send_plan(
         return False
     recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
     recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
-    plan_result = build_one_day_plan(
+    plan_result = await asyncio.to_thread(
+        build_one_day_plan,
         profile,
         variety_seed=seed,
         avoided_recipe_ids=recent_recipe_ids,
