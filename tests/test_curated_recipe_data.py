@@ -16,10 +16,18 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 LEGACY_CURATED_RECIPE_COUNT = 400
 PRODUCT_RECOVERY_RECIPE_COUNT = 210
 DOCX_RECIPE_COUNT = 55
-TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + PRODUCT_RECOVERY_RECIPE_COUNT + DOCX_RECIPE_COUNT
+SELECTED53_RECIPE_COUNT = 45
+TOTAL_CURATED_RECIPE_COUNT = (
+    LEGACY_CURATED_RECIPE_COUNT
+    + PRODUCT_RECOVERY_RECIPE_COUNT
+    + DOCX_RECIPE_COUNT
+    + SELECTED53_RECIPE_COUNT
+)
 PRODUCT_RECOVERY_RECIPE_NOS = frozenset(range(401, 611))
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
+SELECTED53_RECIPE_KEY_PREFIX = "selected53_"
+SELECTED53_RECIPE_NOS = frozenset(range(666, 711))
 
 
 def test_curated_recipe_data_has_full_calculation_coverage() -> None:
@@ -185,6 +193,135 @@ def test_docx_recipe_batch_r611_r665_foods_are_resolved() -> None:
     )
 
     assert missing_foods == []
+
+
+def test_selected53_recipe_batch_r666_r710_has_required_rows_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+
+    selected_rows = [row for row in recipes if int(row["recipe_no"]) in SELECTED53_RECIPE_NOS]
+    selected_ids = {row["recipe_id"] for row in selected_rows}
+    nutrition_ids = {row["recipe_id"] for row in nutrition}
+    ingredient_counts = Counter(row["recipe_id"] for row in ingredients if row["recipe_id"] in selected_ids)
+
+    assert len(selected_rows) == SELECTED53_RECIPE_COUNT
+    assert {int(row["recipe_no"]) for row in selected_rows} == SELECTED53_RECIPE_NOS
+    assert all(str(row["recipe_key"]).startswith(SELECTED53_RECIPE_KEY_PREFIX) for row in selected_rows)
+    assert all(row.get("source_staging_pack") == "selected-53" for row in selected_rows)
+    assert all(row["recipe_id"] in nutrition_ids for row in selected_rows)
+    assert all(ingredient_counts[row["recipe_id"]] >= 2 for row in selected_rows)
+    assert all(row.get("instructions_ru", "").strip().endswith(".") for row in selected_rows)
+    assert all(row.get("image_url") == f"recipe_photos/r{row['recipe_no']}.jpg" for row in selected_rows)
+    assert all((DATA_DIR / row["image_url"]).exists() for row in selected_rows)
+
+
+def test_selected53_recipe_batch_r666_r710_foods_are_resolved() -> None:
+    foods = {food.id for food in curated_foods()}
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    missing_foods = sorted(
+        {
+            normalized_food_id
+            for row in ingredients
+            if 666 <= int(row.get("recipe_no") or 0) <= 710
+            if (normalized_food_id := _cis_friendly_ingredient(row)[0]) not in foods
+        }
+    )
+
+    assert missing_foods == []
+
+
+def test_selected53_post_import_blocker_mappings_are_fixed() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+
+    by_recipe_line = {
+        (int(row["recipe_no"]), int(row["line_index"])): row
+        for row in ingredients
+        if int(row.get("recipe_no") or 0) in SELECTED53_RECIPE_NOS
+    }
+
+    expected_rows = {
+        (684, 1): ("green_beans", 150.0),
+        (685, 1): ("rice_paper", 45.0),
+        (688, 1): ("pasta_generic", 50.0),
+        (691, 2): ("chicken_hearts", 150.0),
+        (692, 1): ("beef_liver", 80.0),
+        (705, 2): ("almond_milk", 50.0),
+    }
+    for key, (food_id, grams) in expected_rows.items():
+        row = by_recipe_line[key]
+        assert row["food_id"] == food_id
+        assert float(row["grams"]) == grams
+
+    sour_cream = {row["food_id"]: row for row in foods}["sour_cream"]
+    assert sour_cream["fdc_id"] == "171256"
+    assert "potato chips" not in sour_cream["source_description"].lower()
+    assert sour_cream["nutrients_per_100g"]["energy_kcal"] == 135.0
+
+    recipe_id_by_no = {int(row["recipe_no"]): row["recipe_id"] for row in recipes}
+    nutrition_by_id = {row["recipe_id"]: row for row in nutrition}
+    expected_energy = {
+        684: 144.29,
+        685: 324.47,
+        688: 633.45,
+        691: 454.61,
+        692: 356.95,
+        705: 336.65,
+        707: 653.56,
+    }
+    for recipe_no, energy_kcal in expected_energy.items():
+        row = nutrition_by_id[recipe_id_by_no[recipe_no]]
+        assert row["calculation_status"] == "ok"
+        assert row["energy_kcal"] == energy_kcal
+
+
+def test_sour_cream_recipe_nutrition_matches_current_food_profile() -> None:
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+
+    foods_by_id = {row["food_id"]: row for row in foods}
+    ingredients_by_recipe: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in ingredients:
+        ingredients_by_recipe[row["recipe_id"]].append(row)
+
+    sour_cream_recipe_ids = sorted(
+        {
+            row["recipe_id"]
+            for row in ingredients
+            if row.get("food_id") == "sour_cream"
+        }
+    )
+    assert len(sour_cream_recipe_ids) == 26
+
+    nutrition_by_id = {row["recipe_id"]: row for row in nutrition}
+    nutrient_fields = [
+        key
+        for key, value in nutrition[0].items()
+        if key not in {"ingredient_count", "unmatched_ingredient_count"}
+        and isinstance(value, (int, float))
+    ]
+
+    mismatches = []
+    for recipe_id in sour_cream_recipe_ids:
+        expected = dict.fromkeys(nutrient_fields, 0.0)
+        for ingredient in ingredients_by_recipe[recipe_id]:
+            food = foods_by_id[ingredient["food_id"]]
+            grams = float(ingredient["grams"])
+            for field in nutrient_fields:
+                expected[field] += float(food["nutrients_per_100g"].get(field, 0.0)) * grams / 100
+
+        saved = nutrition_by_id[recipe_id]
+        for field in nutrient_fields:
+            saved_value = round(float(saved[field]), 2)
+            expected_value = round(float(expected[field]), 2)
+            if saved_value != expected_value:
+                mismatches.append((recipe_id, field, saved_value, expected_value))
+
+    assert mismatches == []
 
 
 def test_recipe_content_audit_has_no_round2_blockers() -> None:
