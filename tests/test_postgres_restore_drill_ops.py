@@ -503,6 +503,7 @@ def test_backup_restore_drill_preserves_seeded_critical_tables(
         "entitlement_processed_charge_ids",
         "chat_profiles",
         "chat_recipe_history",
+        "chat_privacy_consents",
         "weekly_pdf_jobs",
         "one_day_generation_jobs",
         "one_day_generation_job_value_messages",
@@ -706,6 +707,15 @@ def _seed_restore_drill_source(psycopg: object, database_url: str) -> None:
                 """
                 INSERT INTO chat_recipe_history (chat_id, recipe_ids, recipe_keys)
                 VALUES (1001, '[101]'::jsonb, '["r101"]'::jsonb)
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO chat_privacy_consents (chat_id, consent_json)
+                VALUES (
+                    1001,
+                    '{"accepted":true,"accepted_at":"2026-05-31T12:00:00+00:00","text_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","schema_version":1}'::jsonb
+                )
                 """
             )
             cur.execute(

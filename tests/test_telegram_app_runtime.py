@@ -201,6 +201,27 @@ def _install_postgres_promo_store_double(
     monkeypatch.setitem(sys.modules, "diet_bot.postgres_promo_store", fake_module)
 
 
+class _AdminPromoMessageDouble:
+    def __init__(self, chat_id: int, *, chat_type: str = "private") -> None:
+        self.chat = types.SimpleNamespace(id=chat_id, type=chat_type)
+        self.from_user = types.SimpleNamespace(id=chat_id)
+        self.texts: list[str] = []
+
+    async def answer(self, text: str, **_kwargs) -> None:
+        self.texts.append(text)
+
+
+class _AdminPromoCallbackDouble:
+    def __init__(self, data: str, message: _AdminPromoMessageDouble, *, user_id: int) -> None:
+        self.data = data
+        self.message = message
+        self.from_user = types.SimpleNamespace(id=user_id)
+        self.answers: list[str | None] = []
+
+    async def answer(self, text: str | None = None, **_kwargs) -> None:
+        self.answers.append(text)
+
+
 def test_telegram_app_import_does_not_import_postgres_or_psycopg_on_json_path() -> None:
     code = """
 import builtins
@@ -721,6 +742,104 @@ def test_postgres_admin_discount_create_list_and_disable_use_store_not_json(
     assert store.disable_calls == [
         ("FB-DISC-POST-2026", {"disabled_by": admin_user_id}),
     ]
+
+
+@pytest.mark.anyio
+async def test_admin_discount_list_callback_answers_storage_error_when_promo_store_unavailable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    class FailingListStore(_PostgresPromoStoreDouble):
+        def list_active_promo_codes(self, **kwargs):
+            self.list_calls.append(dict(kwargs))
+            raise telegram_app.EntitlementStorageError("promo store unavailable")
+
+    config = _postgres_runtime_config(tmp_path)
+    store = FailingListStore()
+    message = _AdminPromoMessageDouble(chat_id=701)
+    callback = _AdminPromoCallbackDouble(
+        telegram_app.CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+        message,
+        user_id=701,
+    )
+
+    monkeypatch.setattr(telegram_app, "Message", _AdminPromoMessageDouble)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {701})
+    monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    _install_postgres_promo_store_double(monkeypatch, store)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [None]
+    assert message.texts == [telegram_app.ADMIN_PROMO_STORAGE_ERROR_TEXT]
+    assert store.list_calls == [{}]
+
+
+@pytest.mark.anyio
+async def test_admin_discount_list_callback_renders_postgres_discount_promos(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    config = _postgres_runtime_config(tmp_path)
+    store = _PostgresPromoStoreDouble()
+    discount = telegram_app.PromoCodeDefinition(
+        code="FB-DISC-LIST-2026",
+        kind=telegram_app.PromoCodeKind.DISCOUNT,
+        max_redemptions=5,
+        per_user_limit=1,
+        discount_percent=25,
+    )
+    monthly_access = telegram_app.PromoCodeDefinition(code="FB-MONT-HLY1-2026")
+    store.promos[discount.code] = _stored_promo_code(discount)
+    store.promos[monthly_access.code] = _stored_promo_code(monthly_access)
+    message = _AdminPromoMessageDouble(chat_id=702)
+    callback = _AdminPromoCallbackDouble(
+        telegram_app.CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+        message,
+        user_id=702,
+    )
+
+    monkeypatch.setattr(telegram_app, "Message", _AdminPromoMessageDouble)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {702})
+    monkeypatch.setattr(telegram_app, "load_runtime_config", lambda: config)
+    _install_postgres_promo_store_double(monkeypatch, store)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [None]
+    assert len(message.texts) == 1
+    assert "FB-DISC-LIST-2026" in message.texts[0]
+    assert "25%" in message.texts[0]
+    assert "FB-MONT-HLY1-2026" not in message.texts[0]
+    assert store.list_calls == [{}]
+
+
+@pytest.mark.anyio
+async def test_admin_discount_list_callback_keeps_non_admins_out(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    def fail_runtime_config():
+        raise AssertionError("admin discount list must not read promo storage for non-admins")
+
+    message = _AdminPromoMessageDouble(chat_id=703)
+    callback = _AdminPromoCallbackDouble(
+        telegram_app.CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+        message,
+        user_id=999,
+    )
+
+    monkeypatch.setattr(telegram_app, "Message", _AdminPromoMessageDouble)
+    monkeypatch.setattr(telegram_app, "ADMIN_USER_IDS", {703})
+    monkeypatch.setattr(telegram_app, "load_runtime_config", fail_runtime_config)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == ["Command is available only to admins."]
+    assert message.texts == []
 
 
 def test_json_admin_discount_flow_remains_fallback(monkeypatch, tmp_path) -> None:

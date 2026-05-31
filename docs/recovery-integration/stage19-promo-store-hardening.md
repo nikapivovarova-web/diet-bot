@@ -28,11 +28,11 @@ Tables:
   - `chat_id`, `user_id`, redemption lifecycle timestamps and status;
   - nullable payment/order/grant/campaign metadata fields;
   - `idempotency_key`, `entitlement_charge_id`, source, metadata JSON;
-  - unique idempotency key, unique nullable payment order and entitlement charge indexes, and a unique active `(code, chat_id)` index for duplicate-chat protection.
+  - unique idempotency key, unique nullable payment order and entitlement charge indexes, and a non-unique `(code, chat_id, status, created_at)` lookup index. Duplicate-chat protection is enforced transactionally from `per_user_limit`, not by a hard one-row uniqueness constraint.
 - `promo_import_runs`
   - import audit table for JSON-state migration/import runs.
 
-Schema validation is defined in `PROMO_SCHEMA_EXPECTATION` in `src/diet_bot/postgres_promo_store.py`, covering tables, columns, indexes, constraints, and migration version `202605300001`.
+Schema validation is defined in `PROMO_SCHEMA_EXPECTATION` in `src/diet_bot/postgres_promo_store.py`, covering tables, columns, indexes, constraints, and promo migration versions `202605300001` and `202605310002`.
 
 ## Store API Added
 
@@ -56,7 +56,7 @@ Store methods:
 - `get_redemption_status()`
 - `import_json_state()`
 
-Redemption/reservation locks the promo row with `FOR UPDATE`, checks kind/active/expiry/max-use state inside the transaction, returns an idempotent existing redemption for the same chat/code, and prevents additional chats from exceeding `max_uses`.
+Redemption/reservation locks the promo row with `FOR UPDATE`, checks kind/active/expiry/max-use state inside the transaction, returns an idempotent existing redemption for the same idempotency key, enforces `per_user_limit` per `(code, chat_id)` across active `reserved`/`redeemed` rows, and prevents total active redemptions from exceeding `max_uses`.
 
 JSON import preserves existing JSON model fields through `PromoCodeRecord`, including active/disabled state, expiry, discount fields, monthly duration, and `used_by_chat_id`/`used_at` as `promo_code_redemptions.status='redeemed'` with `source='json_import'`.
 
@@ -91,7 +91,7 @@ The existing `/330366` admin promo panel now branches on runtime storage backend
 
 ## Preflight, Runbook, And Restore Drill
 
-Production preflight now includes a `promo schema` check after the durable job schema checks and before payment ledger validation. The check lazy-loads `PostgresPromoStore` and runs `validate_schema()`, so production Postgres preflight fails closed if `promo_codes`, `promo_code_redemptions`, `promo_import_runs`, promo migration version `202605300001`, or critical promo indexes/constraints are missing. Controlled QA preflight runs the same promo schema validator against its isolated Postgres database.
+Production preflight now includes a `promo schema` check after the durable job schema checks and before payment ledger validation. The check lazy-loads `PostgresPromoStore` and runs `validate_schema()`, so production Postgres preflight fails closed if `promo_codes`, `promo_code_redemptions`, `promo_import_runs`, promo migration versions `202605300001` and `202605310002`, or critical promo indexes/constraints are missing. Controlled QA preflight runs the same promo schema validator against its isolated Postgres database.
 
 The explicit restore-drill required table list now includes:
 

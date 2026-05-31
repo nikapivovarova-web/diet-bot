@@ -31,6 +31,7 @@ WEEKLY_PDF_JOB_TABLES = ("weekly_pdf_jobs",)
 CHAT_STATE_TABLES = (
     "chat_profiles",
     "chat_recipe_history",
+    "chat_privacy_consents",
     "chat_state_json_import_runs",
 )
 ONE_DAY_GENERATION_JOB_TABLES = (

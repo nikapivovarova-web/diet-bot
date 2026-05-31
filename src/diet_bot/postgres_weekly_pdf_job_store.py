@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from .postgres_connection import DirectPostgresConnectionProvider, PostgresConnectionProvider
-from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
+from .postgres_entitlement_store import lock_chat_entitlement_cur
 from .postgres_schema_validation import (
     SCHEMA_MIGRATIONS_COLUMNS,
     PostgresSchemaExpectation,
@@ -209,7 +209,7 @@ class PostgresWeeklyPdfJobStore:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    _lock_entitlement_map_cur(cur)
+                    lock_chat_entitlement_cur(cur, chat_id)
 
                     existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
                     if existing_idempotency is not None:
@@ -529,7 +529,7 @@ class PostgresWeeklyPdfJobStore:
                     if test_access:
                         consumption_source = "test_access"
                     else:
-                        _lock_entitlement_map_cur(cur)
+                        lock_chat_entitlement_cur(cur, job.chat_id)
                         entitlement = _load_entitlement_cur(cur, job.chat_id)
                         consumption = consume_weekly_pdf_attempt(entitlement, current_time)
                         _upsert_entitlement_cur(cur, job.chat_id, entitlement)
@@ -1124,7 +1124,7 @@ class PostgresWeeklyPdfJobStore:
 
         refund_status = job.refund_status
         if job.refund_status == REFUND_STATUS_PENDING and job.consumption_source in {"monthly", "extra"}:
-            _lock_entitlement_map_cur(cur)
+            lock_chat_entitlement_cur(cur, job.chat_id)
             entitlement = _load_entitlement_cur(cur, job.chat_id)
             refund_attempt(
                 entitlement,
@@ -1155,10 +1155,6 @@ class PostgresWeeklyPdfJobStore:
 
     def close(self) -> None:
         self._connection_provider.close()
-
-
-def _lock_entitlement_map_cur(cur: Any) -> None:
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
 
 
 def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:

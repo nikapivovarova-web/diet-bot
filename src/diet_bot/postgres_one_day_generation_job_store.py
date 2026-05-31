@@ -45,7 +45,7 @@ from .one_day_generation_jobs import (
     refund_status_for_consumption_source,
 )
 from .postgres_connection import DirectPostgresConnectionProvider, PostgresConnectionProvider
-from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
+from .postgres_entitlement_store import lock_chat_entitlement_cur
 from .postgres_one_day_generation_job_migrations import (
     MIGRATIONS,
     run_one_day_generation_job_schema_migrations,
@@ -224,7 +224,7 @@ class PostgresOneDayGenerationJobStore:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    _lock_entitlement_map_cur(cur)
+                    lock_chat_entitlement_cur(cur, chat_id)
 
                     existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
                     if existing_idempotency is not None:
@@ -558,7 +558,7 @@ class PostgresOneDayGenerationJobStore:
                     if test_access:
                         consumption_source = "test_access"
                     else:
-                        _lock_entitlement_map_cur(cur)
+                        lock_chat_entitlement_cur(cur, job.chat_id)
                         entitlement = _load_entitlement_cur(cur, job.chat_id)
                         consumption = consume_one_day_attempt(entitlement, current_time)
                         _upsert_entitlement_cur(cur, job.chat_id, entitlement)
@@ -1296,7 +1296,7 @@ class PostgresOneDayGenerationJobStore:
 
         refund_status = job.refund_status
         if job.refund_status == REFUND_STATUS_PENDING and job.consumption_source in {"monthly", "extra", "free_trial"}:
-            _lock_entitlement_map_cur(cur)
+            lock_chat_entitlement_cur(cur, job.chat_id)
             entitlement = _load_entitlement_cur(cur, job.chat_id)
             refund_attempt(
                 entitlement,
@@ -1327,10 +1327,6 @@ class PostgresOneDayGenerationJobStore:
 
     def close(self) -> None:
         self._connection_provider.close()
-
-
-def _lock_entitlement_map_cur(cur: Any) -> None:
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
 
 
 def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:

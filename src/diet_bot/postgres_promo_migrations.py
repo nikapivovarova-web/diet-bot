@@ -201,6 +201,19 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605310002",
+        description="Allow promo per-user limits above one",
+        statements=(
+            """
+            DROP INDEX IF EXISTS idx_promo_code_redemptions_code_chat_active_unique
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_promo_code_redemptions_code_chat_status
+                ON promo_code_redemptions(code, chat_id, status, created_at)
+            """,
+        ),
+    ),
 )
 
 

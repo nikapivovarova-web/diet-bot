@@ -222,6 +222,7 @@ logger = logging.getLogger(__name__)
 ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить доступ. Попробуйте позже."
 CHAT_PROFILE_STORAGE_ERROR_TEXT = "Не удалось сохранить анкету. Попробуйте позже."
 CHAT_STATE_READ_ERROR_TEXT = "Не удалось загрузить данные чата. Попробуйте позже."
+PRIVACY_CONSENT_STORAGE_ERROR_TEXT = "Не удалось сохранить согласие. Попробуйте позже."
 
 
 def _entitlement_service() -> EntitlementService:
@@ -336,6 +337,14 @@ async def _load_chat_history_async(chat_id: int) -> None:
 
 async def _save_chat_profile_async(chat_id: int, profile: UserProfile) -> None:
     await _run_chat_state_db_call(_save_chat_profile, chat_id, profile)
+
+
+async def _has_privacy_consent_async(chat_id: int) -> bool:
+    return await _run_chat_state_db_call(_has_privacy_consent, chat_id)  # type: ignore[return-value]
+
+
+async def _save_privacy_consent_async(chat_id: int) -> None:
+    await _run_chat_state_db_call(_save_privacy_consent, chat_id)
 
 
 async def _load_recent_recipe_avoidance_async(chat_id: int) -> _RecentRecipeAvoidance:
@@ -1060,6 +1069,7 @@ PRIVACY_CONSENT_TEXT = (
     "Мы используем данные анкеты только для расчета рациона, проверки доступа и поддержки."
 )
 PRIVACY_CONSENT_ACCEPT_TEXT = "✅ Принять и продолжить"
+PRIVACY_CONSENT_SCHEMA_VERSION = 1
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
 CALLBACK_NEW = "diet:new"
@@ -1533,7 +1543,11 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
     if data in {CALLBACK_PRIVACY_CONSENT, CALLBACK_PRIVACY_CONSENT_TRIAL}:
         await callback.answer()
-        PRIVACY_CONSENT_CHAT_IDS.add(message.chat.id)
+        try:
+            await _save_privacy_consent_async(message.chat.id)
+        except ChatStateStorageError:
+            await message.answer(PRIVACY_CONSENT_STORAGE_ERROR_TEXT)
+            return
         await _start_questionnaire(message, is_trial=data == CALLBACK_PRIVACY_CONSENT_TRIAL)
         return
 
@@ -2249,7 +2263,12 @@ async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> N
 
 async def _start_questionnaire_with_privacy_consent(message: Message, *, is_trial: bool = False) -> None:
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
-    if message.chat.id in PRIVACY_CONSENT_CHAT_IDS:
+    try:
+        has_consent = await _has_privacy_consent_async(message.chat.id)
+    except ChatStateStorageError:
+        await _send_chat_state_read_error(message)
+        return
+    if has_consent:
         await _start_questionnaire(message, is_trial=is_trial)
         return
     await message.answer(
@@ -4809,6 +4828,45 @@ def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
         raise ChatStateStorageError("Could not save chat profile") from exc
 
 
+def _has_privacy_consent(chat_id: int) -> bool:
+    if chat_id in PRIVACY_CONSENT_CHAT_IDS:
+        return True
+    chat_state = _load_chat_state(chat_id)
+    if not _is_privacy_consent_record(chat_state.get("privacy_consent")):
+        return False
+    PRIVACY_CONSENT_CHAT_IDS.add(chat_id)
+    return True
+
+
+def _save_privacy_consent(chat_id: int) -> None:
+    try:
+        _chat_state_store().save_chat_state(chat_id, {"privacy_consent": _privacy_consent_record()})
+    except ChatStateStorageError:
+        raise
+    except Exception as exc:
+        raise ChatStateStorageError("Could not save privacy consent") from exc
+    PRIVACY_CONSENT_CHAT_IDS.add(chat_id)
+
+
+def _privacy_consent_record(now: datetime | None = None) -> dict[str, object]:
+    record: dict[str, object] = {
+        "accepted": True,
+        "accepted_at": (now or datetime.now(UTC)).replace(microsecond=0).isoformat(),
+        "text_sha256": hashlib.sha256(PRIVACY_CONSENT_TEXT.encode("utf-8")).hexdigest(),
+        "schema_version": PRIVACY_CONSENT_SCHEMA_VERSION,
+    }
+    if PRIVACY_POLICY_URL:
+        record["policy_url"] = PRIVACY_POLICY_URL
+    return record
+
+
+def _is_privacy_consent_record(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    accepted_at = value.get("accepted_at")
+    return value.get("accepted") is True and isinstance(accepted_at, str) and bool(accepted_at.strip())
+
+
 def _load_chat_state(chat_id: int) -> dict[str, object]:
     try:
         store = _chat_state_store()
@@ -6014,8 +6072,8 @@ def _list_postgres_admin_discount_promos(config) -> list[PromoCodeDefinition]:
             if _promo_store_promo_is_kind(promo, PromoCodeKind.DISCOUNT)
         ]
     except EntitlementStorageError:
-        logger.exception("Failed to disable admin discount promo due to promo storage error")
-        return None, ADMIN_PROMO_STORAGE_ERROR_TEXT
+        logger.exception("Failed to list admin discount promos due to promo storage error")
+        raise
     except Exception as exc:
         raise EntitlementStorageError("Postgres promo store is unavailable.") from exc
     return sorted(promos, key=lambda item: item.code)

@@ -70,6 +70,8 @@ class JsonChatStateStore:
                 current["recipe_keys"] = chat_state["recipe_keys"]
             if "profile" in chat_state:
                 current["profile"] = chat_state["profile"]
+            if "privacy_consent" in chat_state:
+                current["privacy_consent"] = chat_state["privacy_consent"]
             state[str(chat_id)] = _normalize_chat_state(current, source=self.path)
             self._replace_with_state(state)
 
@@ -188,7 +190,34 @@ def _normalize_chat_state(raw: Mapping[str, object], *, source: Path) -> ChatSta
     profile = raw.get("profile")
     if isinstance(profile, Mapping):
         chat_state["profile"] = dict(profile)
+    privacy_consent = _privacy_consent_record(raw.get("privacy_consent"))
+    if privacy_consent is not None:
+        chat_state["privacy_consent"] = privacy_consent
     return chat_state
+
+
+def _privacy_consent_record(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("accepted") is not True:
+        return None
+    accepted_at = value.get("accepted_at")
+    if not isinstance(accepted_at, str) or not accepted_at.strip():
+        return None
+    consent: dict[str, object] = {
+        "accepted": True,
+        "accepted_at": accepted_at,
+    }
+    text_sha256 = value.get("text_sha256")
+    if isinstance(text_sha256, str) and text_sha256:
+        consent["text_sha256"] = text_sha256
+    policy_url = value.get("policy_url")
+    if isinstance(policy_url, str) and policy_url:
+        consent["policy_url"] = policy_url
+    schema_version = value.get("schema_version")
+    if isinstance(schema_version, int):
+        consent["schema_version"] = schema_version
+    return consent
 
 
 def _string_list(value: object) -> list[str]:

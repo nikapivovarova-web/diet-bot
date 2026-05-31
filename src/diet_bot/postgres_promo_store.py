@@ -109,7 +109,7 @@ PROMO_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
         "idx_promo_code_redemptions_idempotency_key_unique",
         "idx_promo_code_redemptions_payment_order_unique",
         "idx_promo_code_redemptions_entitlement_charge_unique",
-        "idx_promo_code_redemptions_code_chat_active_unique",
+        "idx_promo_code_redemptions_code_chat_status",
         "idx_promo_code_redemptions_code_status",
         "idx_promo_code_redemptions_chat_status",
     ),
@@ -531,8 +531,15 @@ class PostgresPromoStore:
                     if kind is not None and _kind_value(promo.kind) != _kind_value(kind):
                         return PromoRedemptionResult("not_access_code", code, chat_id)
 
-                    existing = self._get_active_redemption_cur(cur, code, chat_id, for_update=True)
-                    if existing is not None:
+                    existing_by_key = self._get_redemption_by_idempotency_key_cur(cur, idempotency_key)
+                    if existing_by_key is not None:
+                        if existing_by_key.code == code and existing_by_key.chat_id == chat_id:
+                            return PromoRedemptionResult("already_redeemed", code, chat_id, existing_by_key)
+                        return PromoRedemptionResult("idempotency_key_conflict", code, chat_id)
+
+                    chat_uses = self._active_redemption_count_for_chat_cur(cur, code, chat_id)
+                    if chat_uses >= promo.per_user_limit:
+                        existing = self._get_active_redemption_cur(cur, code, chat_id, for_update=True)
                         return PromoRedemptionResult("already_redeemed", code, chat_id, existing)
 
                     current_uses = self._active_redemption_count_cur(cur, code)
@@ -672,6 +679,19 @@ class PostgresPromoStore:
               AND status = ANY(%s)
             """,
             (code, list(ACTIVE_REDEMPTION_STATUSES)),
+        )
+        return int(cur.fetchone()["count"])
+
+    def _active_redemption_count_for_chat_cur(self, cur: Any, code: str, chat_id: int) -> int:
+        cur.execute(
+            """
+            SELECT count(*) AS count
+            FROM promo_code_redemptions
+            WHERE code = %s
+              AND chat_id = %s
+              AND status = ANY(%s)
+            """,
+            (code, int(chat_id), list(ACTIVE_REDEMPTION_STATUSES)),
         )
         return int(cur.fetchone()["count"])
 

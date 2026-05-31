@@ -37,6 +37,32 @@ class FakeCallback:
         self.answers.append(text)
 
 
+class InMemoryChatStateStore:
+    def __init__(self, state: dict[str, dict[str, object]] | None = None) -> None:
+        self.state = state or {}
+        self.save_calls: list[tuple[int, dict[str, object]]] = []
+
+    def load_chat_state(self, chat_id: int) -> dict[str, object]:
+        return dict(self.state.get(str(chat_id), {}))
+
+    def save_chat_state(self, chat_id: int, chat_state: dict[str, object]) -> None:
+        current = dict(self.state.get(str(chat_id), {}))
+        current.update(dict(chat_state))
+        self.state[str(chat_id)] = current
+        self.save_calls.append((int(chat_id), dict(chat_state)))
+
+    def load_all(self) -> dict[str, dict[str, object]]:
+        return {chat_id: dict(state) for chat_id, state in self.state.items()}
+
+    def save_all(self, state: dict[str, dict[str, object]]) -> None:
+        self.state = {chat_id: dict(chat_state) for chat_id, chat_state in state.items()}
+
+
+class FailingConsentSaveStore(InMemoryChatStateStore):
+    def save_chat_state(self, chat_id: int, chat_state: dict[str, object]) -> None:
+        raise telegram_app.ChatStateStorageError("consent save failed")
+
+
 def _keyboard_buttons(reply_markup: object | None) -> list[tuple[str, str | None]]:
     if reply_markup is None:
         return []
@@ -58,6 +84,7 @@ def test_free_trial_callback_shows_privacy_consent_before_first_question(monkeyp
     chat_id = 51_004
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None)
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: InMemoryChatStateStore())
     message = FakeMessage(chat_id)
     callback = FakeCallback(telegram_app.CALLBACK_START, message)
 
@@ -84,6 +111,8 @@ def test_privacy_consent_acceptance_continues_to_first_question(monkeypatch: pyt
     chat_id = 51_005
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None)
+    store = InMemoryChatStateStore()
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
     message = FakeMessage(chat_id)
     callback = FakeCallback(telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL, message)
 
@@ -94,6 +123,8 @@ def test_privacy_consent_acceptance_continues_to_first_question(monkeypatch: pyt
         buttons = _keyboard_buttons(reply_markup)
         assert text == telegram_app.start_session().current_question.prompt
         assert chat_id in telegram_app.PRIVACY_CONSENT_CHAT_IDS
+        assert store.save_calls
+        assert "privacy_consent" in store.save_calls[-1][1]
         assert chat_id in telegram_app.SESSION_BY_CHAT_ID
         assert chat_id in telegram_app.TRIAL_CHAT_IDS
         assert all(button_text != telegram_app.PRIVACY_POLICY_TEXT for button_text, _ in buttons)
@@ -101,6 +132,59 @@ def test_privacy_consent_acceptance_continues_to_first_question(monkeypatch: pyt
         telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
         telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
         getattr(telegram_app, "PRIVACY_CONSENT_CHAT_IDS", set()).discard(chat_id)
+
+
+def test_privacy_consent_acceptance_is_loaded_from_chat_state_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = 51_007
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None)
+    store = InMemoryChatStateStore()
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: store)
+    accept_message = FakeMessage(chat_id)
+    accept_callback = FakeCallback(telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL, accept_message)
+
+    try:
+        asyncio.run(telegram_app.handle_callback(accept_callback))
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
+
+        restart_message = FakeMessage(chat_id)
+        asyncio.run(telegram_app._start_questionnaire_with_privacy_consent(restart_message))
+
+        text, reply_markup = restart_message.answers[-1]
+        assert text == telegram_app.start_session().current_question.prompt
+        assert text != telegram_app.PRIVACY_CONSENT_TEXT
+        assert chat_id in telegram_app.PRIVACY_CONSENT_CHAT_IDS
+        assert not _keyboard_buttons(reply_markup)
+    finally:
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
+
+
+def test_privacy_consent_save_failure_does_not_start_questionnaire(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat_id = 51_008
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "_chat_state_store", lambda: FailingConsentSaveStore())
+    message = FakeMessage(chat_id)
+    callback = FakeCallback(telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL, message)
+
+    try:
+        asyncio.run(telegram_app.handle_callback(callback))
+
+        text, reply_markup = message.answers[-1]
+        assert text == telegram_app.PRIVACY_CONSENT_STORAGE_ERROR_TEXT
+        assert reply_markup is None
+        assert chat_id not in telegram_app.PRIVACY_CONSENT_CHAT_IDS
+        assert chat_id not in telegram_app.SESSION_BY_CHAT_ID
+        assert chat_id not in telegram_app.TRIAL_CHAT_IDS
+    finally:
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
 
 
 def test_questionnaire_question_markup_does_not_include_privacy_policy(

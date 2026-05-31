@@ -36,8 +36,16 @@ def test_valid_state_roundtrips_profile_and_history(tmp_path: Path) -> None:
         "weight_kg": 64,
         "goal": "maintain",
     }
+    privacy_consent = {
+        "accepted": True,
+        "accepted_at": "2026-05-31T12:00:00+00:00",
+        "text_sha256": "f" * 64,
+        "policy_url": "https://foodbalance.example/privacy",
+        "schema_version": 1,
+    }
 
     store.save_chat_state(101, {"profile": profile})
+    store.save_chat_state(101, {"privacy_consent": privacy_consent})
     store.save_chat_state(
         101,
         {"recipe_ids": ["r001", "r002"], "recipe_keys": ["breakfast:r001", "main:r002"]},
@@ -46,6 +54,7 @@ def test_valid_state_roundtrips_profile_and_history(tmp_path: Path) -> None:
     assert store.load_all() == {
         "101": {
             "profile": profile,
+            "privacy_consent": privacy_consent,
             "recipe_ids": ["r001", "r002"],
             "recipe_keys": ["breakfast:r001", "main:r002"],
         },

@@ -25,7 +25,7 @@ def test_promo_migration_declares_required_tables_indexes_and_constraints() -> N
     assert "CREATE TABLE IF NOT EXISTS promo_codes" in statements
     assert "CREATE TABLE IF NOT EXISTS promo_code_redemptions" in statements
     assert "CREATE TABLE IF NOT EXISTS promo_import_runs" in statements
-    assert "idx_promo_code_redemptions_code_chat_active_unique" in statements
+    assert "idx_promo_code_redemptions_code_chat_status" in statements
     assert "chk_promo_codes_discount_shape" in statements
     assert "chk_promo_code_redemptions_status" in statements
 
@@ -37,8 +37,16 @@ def test_promo_migration_declares_required_tables_indexes_and_constraints() -> N
     )
     assert "promo_code_redemptions" in PROMO_SCHEMA_EXPECTATION.table_columns
     assert "promo_import_runs" in PROMO_SCHEMA_EXPECTATION.table_columns
-    assert "idx_promo_code_redemptions_code_chat_active_unique" in PROMO_SCHEMA_EXPECTATION.indexes
+    assert "idx_promo_code_redemptions_code_chat_status" in PROMO_SCHEMA_EXPECTATION.indexes
     assert "chk_promo_codes_discount_shape" in PROMO_SCHEMA_EXPECTATION.constraints
+
+
+def test_promo_migration_removes_unique_chat_code_index_for_per_user_limits() -> None:
+    statements = "\n".join(statement for migration in MIGRATIONS for statement in migration.statements)
+
+    assert "DROP INDEX IF EXISTS idx_promo_code_redemptions_code_chat_active_unique" in statements
+    assert "idx_promo_code_redemptions_code_chat_status" in statements
+    assert "idx_promo_code_redemptions_code_chat_status" in PROMO_SCHEMA_EXPECTATION.indexes
 
 
 def test_store_api_surface_is_ready_for_future_wiring() -> None:
@@ -141,7 +149,7 @@ def test_schema_init_is_idempotent(store: PostgresPromoStore) -> None:
                 WHERE schemaname = current_schema()
                   AND indexname IN (
                     'idx_promo_codes_active_kind',
-                    'idx_promo_code_redemptions_code_chat_active_unique',
+                    'idx_promo_code_redemptions_code_chat_status',
                     'idx_promo_code_redemptions_idempotency_key_unique'
                   )
                 """
@@ -158,7 +166,7 @@ def test_schema_init_is_idempotent(store: PostgresPromoStore) -> None:
     }
     assert indexes == {
         "idx_promo_codes_active_kind",
-        "idx_promo_code_redemptions_code_chat_active_unique",
+        "idx_promo_code_redemptions_code_chat_status",
         "idx_promo_code_redemptions_idempotency_key_unique",
     }
 
@@ -262,6 +270,61 @@ def test_multi_use_code_respects_max_uses(store: PostgresPromoStore) -> None:
                 """
             )
             assert int(cur.fetchone()["count"]) == 2
+
+
+def test_per_user_limit_allows_same_chat_until_limit_then_blocks(store: PostgresPromoStore) -> None:
+    store.create_or_update_promo_code(
+        PromoCodeDefinition(
+            code="FB-PERU-LIMT-2026",
+            kind=PromoCodeKind.DISCOUNT,
+            max_redemptions=3,
+            per_user_limit=2,
+            discount_percent=20,
+        ),
+    )
+
+    first = store.reserve_promo_code(
+        "FB-PERU-LIMT-2026",
+        chat_id=451,
+        idempotency_key="per-user-451-first",
+        kind=PromoCodeKind.DISCOUNT,
+    )
+    second = store.reserve_promo_code(
+        "FB-PERU-LIMT-2026",
+        chat_id=451,
+        idempotency_key="per-user-451-second",
+        kind=PromoCodeKind.DISCOUNT,
+    )
+    third_same_chat = store.reserve_promo_code(
+        "FB-PERU-LIMT-2026",
+        chat_id=451,
+        idempotency_key="per-user-451-third",
+        kind=PromoCodeKind.DISCOUNT,
+    )
+    other_chat = store.reserve_promo_code(
+        "FB-PERU-LIMT-2026",
+        chat_id=452,
+        idempotency_key="per-user-452-first",
+        kind=PromoCodeKind.DISCOUNT,
+    )
+
+    assert first.status == "reserved"
+    assert second.status == "reserved"
+    assert third_same_chat.status == "already_redeemed"
+    assert other_chat.status == "reserved"
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT chat_id, count(*) AS count
+                FROM promo_code_redemptions
+                WHERE code = 'FB-PERU-LIMT-2026'
+                GROUP BY chat_id
+                ORDER BY chat_id
+                """
+            )
+            counts = {int(row["chat_id"]): int(row["count"]) for row in cur.fetchall()}
+    assert counts == {451: 2, 452: 1}
 
 
 def test_expired_and_disabled_codes_cannot_redeem(store: PostgresPromoStore) -> None:

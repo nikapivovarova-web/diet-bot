@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -17,6 +18,7 @@ from .subscriptions import Entitlement
 
 ENTITLEMENT_MAP_LOCK_ID = 4_382_026_052_200_001
 ENTITLEMENT_IMPORT_LOCK_ID = 4_382_026_052_200_002
+ENTITLEMENT_CHAT_LOCK_PERSON = b"fb-ent-chat-v1"
 
 ENTITLEMENT_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
     component="entitlement",
@@ -114,10 +116,12 @@ class PostgresEntitlementStore:
                 return self._load_chat_entitlement_cur(cur, int(chat_id))
 
     def save_chat_entitlement(self, chat_id: int, entitlement: Entitlement) -> None:
+        chat_id = int(chat_id)
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    self._upsert_entitlement_cur(cur, int(chat_id), entitlement)
+                    self._lock_chat_entitlement_cur(cur, chat_id)
+                    self._upsert_entitlement_cur(cur, chat_id, entitlement)
 
     def save_all(self, entitlements: Mapping[int, Entitlement]) -> None:
         with self._connect() as conn:
@@ -132,6 +136,7 @@ class PostgresEntitlementStore:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
+                    self._lock_chat_entitlement_cur(cur, chat_id)
                     cur.execute(
                         "INSERT INTO entitlements (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
                         (chat_id,),
@@ -408,6 +413,9 @@ class PostgresEntitlementStore:
     def _lock_import_cur(self, cur: Any) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_IMPORT_LOCK_ID,))
 
+    def _lock_chat_entitlement_cur(self, cur: Any, chat_id: int) -> None:
+        lock_chat_entitlement_cur(cur, chat_id)
+
     def _require_empty_json_import_target_cur(self, cur: Any) -> None:
         counts = self._json_import_target_counts_cur(cur)
         if not any(counts.values()):
@@ -480,6 +488,19 @@ def _unique_charge_ids(charge_ids: list[str]) -> list[str]:
         unique.append(text)
         seen.add(text)
     return unique
+
+
+def entitlement_chat_lock_id(chat_id: int) -> int:
+    digest = hashlib.blake2b(
+        f"entitlement-chat:{int(chat_id)}".encode("ascii"),
+        digest_size=8,
+        person=ENTITLEMENT_CHAT_LOCK_PERSON,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def lock_chat_entitlement_cur(cur: Any, chat_id: int) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (entitlement_chat_lock_id(chat_id),))
 
 
 def _optional_text(value: Any) -> str | None:
