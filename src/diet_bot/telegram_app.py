@@ -111,6 +111,24 @@ from .runtime_config import (
     validate_startup,
     weekly_selection_diagnostics_enabled,
 )
+from .sales_followup import (
+    DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+    SALES_FOLLOWUP_OPT_OUT_CALLBACK_DATA,
+    build_sales_followup_trigger_idempotency_key,
+    render_sales_followup_payload,
+    schedule_sales_followup_after_free_trial_delivery,
+)
+from .sales_followup_runtime import (
+    SalesFollowupEligibility,
+    SalesFollowupPermanentSendError,
+    SalesFollowupSendRequest,
+    SalesFollowupSendResult,
+    SalesFollowupTransientSendError,
+    SalesFollowupUnknownSendOutcome,
+    SalesFollowupWorker,
+    SalesFollowupWorkerSettings,
+    SalesFollowupJobRuntime,
+)
 from .safety import evaluate_safety
 from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
 from .entitlement_service import EntitlementService
@@ -166,7 +184,7 @@ from .subscriptions import (
     save_entitlements,
     set_test_access_enabled,
 )
-from .telegram_send import TelegramSendError, safe_telegram_send
+from .telegram_send import TelegramSendError, TelegramSendFailureClass, safe_telegram_send
 from .telegram_media_validation import (
     TELEGRAM_CAPTION_MAX_CHARS,
     TELEGRAM_DOCUMENT_MAX_BYTES,
@@ -273,6 +291,46 @@ def _one_day_generation_job_runtime() -> OneDayGenerationJobRuntime | None:
     return _ONE_DAY_GENERATION_JOB_RUNTIME  # type: ignore[return-value]
 
 
+_SALES_FOLLOWUP_STORE_NOT_LOADED = object()
+_SALES_FOLLOWUP_STORE: object | None = _SALES_FOLLOWUP_STORE_NOT_LOADED
+
+
+def _sales_followup_runtime_enabled() -> bool:
+    return bool(getattr(load_runtime_config(), "sales_followup_enabled", False))
+
+
+def _sales_followup_store():
+    global _SALES_FOLLOWUP_STORE
+    config = load_runtime_config()
+    if not getattr(config, "sales_followup_enabled", False):
+        return None
+    if getattr(config, "storage_backend", "json") != "postgres" or not getattr(config, "database_url", None):
+        return None
+    if _SALES_FOLLOWUP_STORE is _SALES_FOLLOWUP_STORE_NOT_LOADED:
+        from .postgres_connection import get_shared_postgres_connection_provider
+        from .postgres_sales_followup_store import PostgresSalesFollowupStore
+
+        _SALES_FOLLOWUP_STORE = PostgresSalesFollowupStore(
+            str(config.database_url),
+            connect_timeout=int(getattr(config, "postgres_connect_timeout", 5)),
+            connection_provider=get_shared_postgres_connection_provider(config),
+        )
+    return _SALES_FOLLOWUP_STORE
+
+
+_SALES_FOLLOWUP_JOB_RUNTIME_NOT_LOADED = object()
+_SALES_FOLLOWUP_JOB_RUNTIME: SalesFollowupJobRuntime | None | object = _SALES_FOLLOWUP_JOB_RUNTIME_NOT_LOADED
+
+
+def _sales_followup_job_runtime() -> SalesFollowupJobRuntime | None:
+    global _SALES_FOLLOWUP_JOB_RUNTIME
+    if _SALES_FOLLOWUP_JOB_RUNTIME is _SALES_FOLLOWUP_JOB_RUNTIME_NOT_LOADED:
+        _SALES_FOLLOWUP_JOB_RUNTIME = SalesFollowupJobRuntime.from_config(load_runtime_config())
+    if _SALES_FOLLOWUP_JOB_RUNTIME is None:
+        return None
+    return _SALES_FOLLOWUP_JOB_RUNTIME  # type: ignore[return-value]
+
+
 def _validate_entitlement_storage(config) -> None:
     store = create_entitlement_store(config)
     validate_entitlement_store_for_startup(config, store)
@@ -321,6 +379,61 @@ async def _run_chat_state_db_call(func: Callable[..., object], /, *args: object,
     except DbExecutorBusy as exc:
         logger.warning("DB executor is busy during chat state operation: %s", getattr(func, "__name__", func))
         raise ChatStateStorageError("DB executor is busy.") from exc
+
+
+async def _run_sales_followup_db_call(func: Callable[..., object], /, *args: object, **kwargs: object) -> object:
+    if not _should_dispatch_storage_db_calls():
+        return func(*args, **kwargs)
+    try:
+        return await run_db_call(func, *args, **kwargs)
+    except DbExecutorBusy as exc:
+        logger.warning("DB executor is busy during sales follow-up operation: %s", getattr(func, "__name__", func))
+        raise RuntimeError("Sales follow-up DB executor is busy.") from exc
+
+
+def _cancel_sales_followup_after_access_grant(chat_id: int, *, reason: str) -> None:
+    store = _sales_followup_store()
+    if store is None:
+        return
+    cancel_jobs = getattr(store, "cancel_active_jobs_for_chat_campaign", None)
+    if not callable(cancel_jobs):
+        return
+    try:
+        cancel_jobs(
+            chat_id=int(chat_id),
+            campaign_key=DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+            reason=reason,
+            chain_status="cancelled",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to cancel sales follow-up jobs after access grant chat_id=%s reason=%s",
+            _mask_chat_id(chat_id),
+            reason,
+        )
+
+
+async def _cancel_sales_followup_after_access_grant_async(chat_id: int, *, reason: str) -> None:
+    store = _sales_followup_store()
+    if store is None:
+        return
+    cancel_jobs = getattr(store, "cancel_active_jobs_for_chat_campaign", None)
+    if not callable(cancel_jobs):
+        return
+    try:
+        await _run_sales_followup_db_call(
+            cancel_jobs,
+            chat_id=int(chat_id),
+            campaign_key=DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+            reason=reason,
+            chain_status="cancelled",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to cancel sales follow-up jobs after access grant chat_id=%s reason=%s",
+            _mask_chat_id(chat_id),
+            reason,
+        )
 
 
 def _should_dispatch_storage_db_calls() -> bool:
@@ -1086,6 +1199,8 @@ CALLBACK_PRIVACY_POLICY = "diet:privacy_policy"
 CALLBACK_PRIVACY_CONSENT = "diet:privacy_consent"
 CALLBACK_PRIVACY_CONSENT_TRIAL = "diet:privacy_consent:trial"
 CALLBACK_SUPPORT = "diet:support"
+CALLBACK_SALES_FOLLOWUP_OPT_OUT = SALES_FOLLOWUP_OPT_OUT_CALLBACK_DATA
+SALES_FOLLOWUP_OPT_OUT_CONFIRMATION_TEXT = "Хорошо, больше не буду напоминать."
 CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE = "diet:admin:create_monthly_access_code"
 CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO = "diet:admin:create_discount_promo"
 CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS = "diet:admin:list_discount_promos"
@@ -1486,6 +1601,10 @@ async def handle_callback(callback: CallbackQuery) -> None:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     if data not in ADMIN_PROMO_CALLBACKS:
         ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+
+    if data == CALLBACK_SALES_FOLLOWUP_OPT_OUT:
+        await _handle_sales_followup_opt_out_callback(callback, message)
+        return
 
     if data == CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE:
         if not _is_admin_callback(callback):
@@ -1978,6 +2097,25 @@ def _start_one_day_generation_worker_if_configured(config, bot: Bot) -> asyncio.
     return task
 
 
+def _start_sales_followup_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
+    if not getattr(config, "sales_followup_worker_enabled", False):
+        return None
+    runtime = _sales_followup_job_runtime()
+    if runtime is None:
+        logger.warning("Sales follow-up worker enabled but Postgres job runtime is unavailable")
+        return None
+    settings = SalesFollowupWorkerSettings.from_config(config)
+    worker = SalesFollowupWorker(
+        runtime,
+        _TelegramSalesFollowupSender(bot),
+        eligibility_checker=_sales_followup_production_eligibility,
+        settings=settings,
+    )
+    task = asyncio.create_task(worker.run_forever(), name="sales-followup-worker")
+    _observe_worker_task(task, "Sales follow-up worker")
+    return task
+
+
 def _observe_worker_task(task: asyncio.Task, label: str) -> None:
     def log_unexpected_stop(done_task: asyncio.Task) -> None:
         if done_task.cancelled():
@@ -2026,6 +2164,42 @@ def _is_private_chat_message(message: Message) -> bool:
     return str(getattr(chat_type, "value", chat_type)).lower() == "private"
 
 
+def _message_chat_type(message: Message) -> str | None:
+    chat_type = getattr(getattr(message, "chat", None), "type", None)
+    if chat_type is None:
+        return None
+    return str(getattr(chat_type, "value", chat_type)).lower()
+
+
+def _chat_type_is_private(chat_type: object) -> bool:
+    if chat_type is None:
+        return False
+    return str(getattr(chat_type, "value", chat_type)).lower() == "private"
+
+
+def _sales_followup_production_eligibility(job: object) -> SalesFollowupEligibility:
+    chat_type = _sales_followup_job_chat_type(job)
+    if chat_type is not None and not _chat_type_is_private(chat_type):
+        return SalesFollowupEligibility.blocked("non_private_chat")
+
+    chat_id = int(getattr(job, "chat_id"))
+    if _has_active_paid_access(chat_id):
+        return SalesFollowupEligibility.blocked("active_paid_access")
+    if _weekly_pdf_attempt_available(chat_id):
+        return SalesFollowupEligibility.blocked("weekly_pdf_access")
+    return SalesFollowupEligibility.allowed()
+
+
+def _sales_followup_job_chat_type(job: object) -> object | None:
+    chat_type = getattr(job, "chat_type", None)
+    if chat_type is not None:
+        return chat_type
+    payload = getattr(job, "payload", None)
+    if isinstance(payload, Mapping):
+        return payload.get("chat_type")
+    return None
+
+
 async def _reject_non_private_message(message: Message) -> bool:
     if _is_private_chat_message(message):
         return False
@@ -2041,6 +2215,50 @@ async def _reject_non_private_callback(callback: CallbackQuery, message: Message
         return True
     await callback.answer(PRIVATE_CHAT_CALLBACK_TEXT)
     return True
+
+
+async def _handle_sales_followup_opt_out_callback(callback: CallbackQuery, message: Message) -> None:
+    store = _sales_followup_store()
+    if store is not None:
+        try:
+            await _run_sales_followup_db_call(
+                store.set_opt_out,
+                message.chat.id,
+                opt_out_source="telegram_callback",
+            )
+            cancel_jobs = getattr(store, "cancel_active_jobs_for_chat_campaign", None)
+            if callable(cancel_jobs):
+                await _run_sales_followup_db_call(
+                    cancel_jobs,
+                    chat_id=message.chat.id,
+                    campaign_key=DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+                    reason="opted_out",
+                    chain_status="opted_out",
+                )
+        except Exception:
+            logger.exception(
+                "Failed to persist sales follow-up opt-out for chat_id=%s",
+                _mask_chat_id(message.chat.id),
+            )
+            await callback.answer("Не удалось сохранить настройку. Попробуйте позже.")
+            return
+
+    await callback.answer()
+    await _confirm_sales_followup_opt_out(message)
+
+
+async def _confirm_sales_followup_opt_out(message: Message) -> None:
+    edit_text = getattr(message, "edit_text", None)
+    if callable(edit_text):
+        try:
+            await edit_text(SALES_FOLLOWUP_OPT_OUT_CONFIRMATION_TEXT, reply_markup=None)
+            return
+        except Exception:
+            logger.exception(
+                "Failed to edit sales follow-up opt-out confirmation for chat_id=%s",
+                _mask_chat_id(message.chat.id),
+            )
+    await message.answer(SALES_FOLLOWUP_OPT_OUT_CONFIRMATION_TEXT)
 
 
 async def _start_support_request(message: Message) -> None:
@@ -2319,18 +2537,18 @@ async def _send_trial_plan(
     *,
     idempotency_key: str | None = None,
 ) -> None:
+    trial_idempotency_key = idempotency_key or _trial_plan_idempotency_key(
+        message.chat.id,
+        QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
+        profile,
+    )
     runtime = _one_day_generation_job_runtime()
     if runtime is not None:
         await _send_trial_plan_with_postgres_job(
             message,
             profile,
             runtime=runtime,
-            idempotency_key=idempotency_key
-            or _trial_plan_idempotency_key(
-                message.chat.id,
-                QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
-                profile,
-            ),
+            idempotency_key=trial_idempotency_key,
         )
         return
 
@@ -2357,6 +2575,13 @@ async def _send_trial_plan(
 
     if sent:
         await _send_trial_subscription_cta(message)
+        await _schedule_sales_followup_after_trial_success(
+            chat_id=message.chat.id,
+            chat_type=_message_chat_type(message),
+            source=consumption.source,
+            include_trial_subscription_cta=True,
+            trigger_id=trial_idempotency_key,
+        )
 
 
 def _trial_plan_idempotency_key(chat_id: int, session_token: str | None, profile: UserProfile) -> str:
@@ -2393,6 +2618,62 @@ async def _send_trial_subscription_cta(message: Message) -> None:
     )
 
 
+async def _schedule_sales_followup_after_trial_success(
+    *,
+    chat_id: int,
+    chat_type: object,
+    source: str | None,
+    include_trial_subscription_cta: bool,
+    trigger_id: object,
+    trigger_job_id: object | None = None,
+) -> None:
+    feature_enabled = _sales_followup_runtime_enabled()
+    store = _sales_followup_store() if feature_enabled else None
+    has_active_paid_access = False
+    has_weekly_pdf_access = False
+    if feature_enabled and store is not None:
+        try:
+            has_active_paid_access = await _has_active_paid_access_async(chat_id)
+            has_weekly_pdf_access = await _weekly_pdf_attempt_available_async(chat_id)
+        except Exception:
+            logger.exception(
+                "Sales follow-up eligibility check failed for chat_id=%s; skipping schedule",
+                _mask_chat_id(chat_id),
+            )
+            return
+
+    try:
+        result = schedule_sales_followup_after_free_trial_delivery(
+            store=store,
+            chat_id=chat_id,
+            chat_is_private=_chat_type_is_private(chat_type),
+            feature_enabled=feature_enabled,
+            delivery_succeeded=True,
+            source=source,
+            include_trial_subscription_cta=include_trial_subscription_cta,
+            has_active_paid_access=has_active_paid_access,
+            has_weekly_pdf_access=has_weekly_pdf_access,
+            trigger_idempotency_key=build_sales_followup_trigger_idempotency_key(
+                chat_id=chat_id,
+                trigger_id=trigger_id,
+            ),
+            triggered_at=datetime.now(UTC),
+            trigger_job_id=trigger_job_id,
+        )
+    except Exception:
+        logger.exception(
+            "Sales follow-up schedule admission failed for chat_id=%s",
+            _mask_chat_id(chat_id),
+        )
+        return
+
+    logger.info(
+        "Sales follow-up schedule admission result for chat_id=%s status=%s",
+        _mask_chat_id(chat_id),
+        result.status.value,
+    )
+
+
 async def _send_trial_plan_with_postgres_job(
     message: Message,
     profile: UserProfile,
@@ -2424,6 +2705,7 @@ async def _send_trial_plan_with_postgres_job(
                 request_kind="telegram_trial",
                 request_payload={
                     "source": "telegram_trial",
+                    "chat_type": _message_chat_type(message),
                     "include_calculation_report": True,
                     "include_default_after_plan_keyboard": False,
                     "include_entitlement_status": False,
@@ -3181,6 +3463,50 @@ class _TelegramOneDayGenerationJobProcessor:
         return await _prepare_one_day_generation_delivery(job, self.bot)
 
 
+class _TelegramSalesFollowupSender:
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+
+    async def send(self, request: SalesFollowupSendRequest) -> SalesFollowupSendResult:
+        payload = dict(request.payload or {})
+        payload.setdefault("message_text", request.message_text)
+        if request.button_label is not None:
+            payload.setdefault("button_label", request.button_label)
+        if request.target_callback_data is not None:
+            payload.setdefault("target_callback_data", request.target_callback_data)
+        rendered = render_sales_followup_payload(payload)
+        if not rendered.sendable:
+            raise SalesFollowupPermanentSendError(rendered.failure_reason or "sales_followup_not_sendable")
+
+        try:
+            sent = await safe_telegram_send(
+                lambda: self.bot.send_message(
+                    chat_id=request.chat_id,
+                    text=rendered.message_text,
+                    reply_markup=_sales_followup_inline_keyboard(rendered.keyboard),
+                ),
+                operation_name="sales_followup_worker_send_message",
+            )
+        except TelegramSendError as exc:
+            if exc.result.classification == TelegramSendFailureClass.RETRYABLE:
+                raise SalesFollowupTransientSendError(str(exc)) from exc
+            if exc.result.classification == TelegramSendFailureClass.PERMANENT:
+                raise SalesFollowupPermanentSendError(str(exc)) from exc
+            raise SalesFollowupUnknownSendOutcome(str(exc)) from exc
+        return SalesFollowupSendResult(telegram_message_id=getattr(sent, "message_id", None))
+
+
+def _sales_followup_inline_keyboard(
+    rows: tuple[tuple[tuple[str, str], ...], ...],
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=text, callback_data=callback_data) for text, callback_data in row]
+            for row in rows
+        ],
+    )
+
+
 class _OneDayJobChat:
     def __init__(self, chat_id: int) -> None:
         self.id = chat_id
@@ -3277,6 +3603,14 @@ async def _prepare_one_day_generation_delivery(job: OneDayGenerationJob, bot: Bo
         )
         if request_payload.get("include_trial_subscription_cta"):
             await _send_trial_subscription_cta(message)
+            await _schedule_sales_followup_after_trial_success(
+                chat_id=job.chat_id,
+                chat_type=request_payload.get("chat_type"),
+                source=job.consumption_source,
+                include_trial_subscription_cta=True,
+                trigger_id=job.job_id,
+                trigger_job_id=job.job_id,
+            )
 
     return OneDayGenerationDelivery(
         value_messages=tuple(value_messages),
@@ -3377,6 +3711,7 @@ async def _prepare_weekly_pdf_delivery(job: WeeklyPdfJob, bot: Bot) -> WeeklyPdf
             ration_kind="weekly_pdf",
             context="weekly_pdf_worker_success",
         )
+        await _cancel_sales_followup_after_access_grant_async(job.chat_id, reason="weekly_pdf_delivered")
 
     return WeeklyPdfDelivery(send=send, after_success=after_success)
 
@@ -5579,7 +5914,19 @@ def _apply_successful_payment(
         raise
     except Exception as exc:
         raise PaymentLedgerUnavailable("payment_ledger_unavailable", "Payment ledger is unavailable.") from exc
-    return _payment_application_from_handling_result(result)
+    application = _payment_application_from_handling_result(result)
+    _cancel_sales_followup_after_payment_grant(chat_id, application)
+    return application
+
+
+def _cancel_sales_followup_after_payment_grant(chat_id: int, result: PaymentApplication) -> None:
+    if not result.processed:
+        return
+    if result.grant == "subscription":
+        _cancel_sales_followup_after_access_grant(chat_id, reason="subscription_granted")
+        return
+    if result.grant == "extra_weekly_pdf":
+        _cancel_sales_followup_after_access_grant(chat_id, reason="weekly_pdf_access_granted")
 
 
 def _payment_success_text(result: PaymentApplication) -> str:
@@ -5602,7 +5949,7 @@ def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeAct
         return activation
 
     try:
-        _entitlement_service().apply_subscription_payment(
+        grant_result = _entitlement_service().apply_subscription_payment(
             chat_id,
             promo_code_grant_charge_id(activation.code),
             subscription_source="promo",
@@ -5615,6 +5962,8 @@ def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeAct
         except Exception:
             logger.exception("Failed to roll back promo activation after entitlement grant failure")
         raise
+    if getattr(grant_result, "processed", True):
+        _cancel_sales_followup_after_access_grant(chat_id, reason="monthly_access_promo_granted")
     return activation
 
 
@@ -5645,7 +5994,7 @@ def _activate_postgres_promo_code_for_chat(config, chat_id: int, promo_code: str
 
     redemption_id = _promo_redemption_id_from_store_result(reserve_result)
     try:
-        _entitlement_service().apply_subscription_payment(
+        grant_result = _entitlement_service().apply_subscription_payment(
             chat_id,
             charge_id,
             subscription_source="promo",
@@ -5658,6 +6007,9 @@ def _activate_postgres_promo_code_for_chat(config, chat_id: int, promo_code: str
         except Exception:
             logger.exception("Failed to release Postgres promo reservation after entitlement grant failure")
         raise
+
+    if getattr(grant_result, "processed", True):
+        _cancel_sales_followup_after_access_grant(chat_id, reason="monthly_access_promo_granted")
 
     try:
         store.finalize_promo_redemption(redemption_id, entitlement_charge_id=charge_id)
@@ -6319,6 +6671,8 @@ def _record_successful_generation_history(
             ration_kind=consumption.ration_kind,
             context="after_successful_generation_delivery",
         )
+        if consumption.ration_kind == "weekly_pdf":
+            _cancel_sales_followup_after_access_grant(chat_id, reason="weekly_pdf_delivered")
 
 def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
     del chat_id, consumption

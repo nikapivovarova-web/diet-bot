@@ -73,6 +73,8 @@ class RuntimeConfig:
     weekly_pdf_worker_retry_delay_seconds: int = DEFAULT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS
     weekly_pdf_worker_max_attempts: int = DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS
     weekly_pdf_worker_idle_sleep_seconds: float = DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS
+    sales_followup_enabled: bool = False
+    sales_followup_worker_enabled: bool = False
     storage_backend: str = "json"
     config_errors: tuple[str, ...] = ()
 
@@ -116,6 +118,8 @@ class RuntimeConfig:
             "weekly_pdf_worker_retry_delay_seconds": self.weekly_pdf_worker_retry_delay_seconds,
             "weekly_pdf_worker_max_attempts": self.weekly_pdf_worker_max_attempts,
             "weekly_pdf_worker_idle_sleep_seconds": self.weekly_pdf_worker_idle_sleep_seconds,
+            "sales_followup_enabled": self.sales_followup_enabled,
+            "sales_followup_worker_enabled": self.sales_followup_worker_enabled,
             "storage_backend": self.storage_backend,
         }
 
@@ -131,6 +135,16 @@ class RuntimeConfig:
             issues.append("DIET_BOT_WEEKLY_PDF_WORKER_ENABLED requires postgres storage backend.")
         if self.weekly_pdf_worker_enabled and not self.database_url:
             issues.append("DIET_BOT_DATABASE_URL is required when the weekly PDF worker is enabled.")
+        if self.sales_followup_enabled and self.storage_backend != "postgres":
+            issues.append("DIET_BOT_SALES_FOLLOWUP_ENABLED requires postgres storage backend.")
+        if self.sales_followup_enabled and not self.database_url:
+            issues.append("DIET_BOT_DATABASE_URL is required when sales follow-up is enabled.")
+        if self.sales_followup_worker_enabled and not self.sales_followup_enabled:
+            issues.append("DIET_BOT_SALES_FOLLOWUP_WORKER_ENABLED requires DIET_BOT_SALES_FOLLOWUP_ENABLED=1.")
+        if self.sales_followup_worker_enabled and self.storage_backend != "postgres":
+            issues.append("DIET_BOT_SALES_FOLLOWUP_WORKER_ENABLED requires postgres storage backend.")
+        if self.sales_followup_worker_enabled and not self.database_url:
+            issues.append("DIET_BOT_DATABASE_URL is required when the sales follow-up worker is enabled.")
         if self.payments_enabled:
             if self.storage_backend != "postgres":
                 issues.append("Payments require Postgres storage backend.")
@@ -367,6 +381,8 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         weekly_pdf_worker_retry_delay_seconds=weekly_pdf_worker_retry_delay_seconds,
         weekly_pdf_worker_max_attempts=weekly_pdf_worker_max_attempts,
         weekly_pdf_worker_idle_sleep_seconds=weekly_pdf_worker_idle_sleep_seconds,
+        sales_followup_enabled=_bool_from_env(source, "DIET_BOT_SALES_FOLLOWUP_ENABLED"),
+        sales_followup_worker_enabled=_bool_from_env(source, "DIET_BOT_SALES_FOLLOWUP_WORKER_ENABLED"),
         storage_backend=storage_backend,
         config_errors=postgres_config_errors + worker_config_errors + weekly_pdf_worker_config_errors,
     )

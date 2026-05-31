@@ -222,6 +222,84 @@ class _AdminPromoCallbackDouble:
         self.answers.append(text)
 
 
+class _SalesFollowupBotDouble:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    async def send_message(self, **kwargs):
+        self.messages.append(dict(kwargs))
+        return types.SimpleNamespace(message_id=808)
+
+
+class _SalesFollowupMessageDouble:
+    def __init__(self, *, chat_id: int = 4242, chat_type: str = "private") -> None:
+        self.chat = types.SimpleNamespace(id=chat_id, type=chat_type)
+        self.from_user = types.SimpleNamespace(id=chat_id)
+        self.texts: list[tuple[str, object | None]] = []
+        self.edits: list[str] = []
+
+    async def answer(self, text: str, reply_markup=None, **_kwargs) -> None:
+        self.texts.append((text, reply_markup))
+
+    async def edit_text(self, text: str, **_kwargs) -> None:
+        self.edits.append(text)
+
+
+class _SalesFollowupCallbackDouble:
+    def __init__(self, data: str, message: _SalesFollowupMessageDouble) -> None:
+        self.data = data
+        self.message = message
+        self.from_user = types.SimpleNamespace(id=message.chat.id)
+        self.answers: list[tuple[str | None, dict[str, object]]] = []
+
+    async def answer(self, text: str | None = None, **kwargs) -> None:
+        self.answers.append((text, dict(kwargs)))
+
+
+class _SalesFollowupStoreDouble:
+    def __init__(self) -> None:
+        self.opt_out_calls: list[dict[str, object]] = []
+        self.cancel_calls: list[dict[str, object]] = []
+
+    def set_opt_out(self, chat_id: int, **kwargs):
+        self.opt_out_calls.append({"chat_id": int(chat_id), **dict(kwargs)})
+        return types.SimpleNamespace(chat_id=int(chat_id), opted_out_at=datetime(2026, 5, 31, tzinfo=UTC))
+
+    def cancel_active_jobs_for_chat_campaign(self, **kwargs) -> int:
+        self.cancel_calls.append(dict(kwargs))
+        return 3
+
+
+class _PaymentServiceDouble:
+    def __init__(self, result) -> None:
+        self.result = result
+        self.successful_payment_calls: list[dict[str, object]] = []
+
+    def handle_successful_payment(self, **kwargs):
+        self.successful_payment_calls.append(dict(kwargs))
+        return self.result
+
+
+class _PaymentOrderServiceDouble:
+    def __init__(self, order) -> None:
+        self.order = order
+        self.create_order_calls: list[dict[str, object]] = []
+
+    def create_order(self, **kwargs):
+        self.create_order_calls.append(dict(kwargs))
+        return self.order
+
+
+def _successful_payment_double(*, payload: str = "diet:order:v1:order_12345678:nonce_12345678:deadbeefdeadbeef"):
+    return types.SimpleNamespace(
+        invoice_payload=payload,
+        currency="XTR",
+        total_amount=450,
+        telegram_payment_charge_id="tg-charge-success",
+        provider_payment_charge_id=None,
+    )
+
+
 def test_telegram_app_import_does_not_import_postgres_or_psycopg_on_json_path() -> None:
     code = """
 import builtins
@@ -271,6 +349,387 @@ assert "psycopg" not in sys.modules
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.anyio
+async def test_sales_followup_sender_renders_exact_text_and_two_row_keyboard() -> None:
+    import diet_bot.telegram_app as telegram_app
+    from diet_bot.sales_followup import build_sales_followup_job_drafts
+    from diet_bot.sales_followup_runtime import SalesFollowupSendRequest
+
+    draft = build_sales_followup_job_drafts(
+        chat_id=4242,
+        campaign_key="free_trial_v1",
+        triggered_at=datetime(2026, 5, 31, tzinfo=UTC),
+    )[0]
+    bot = _SalesFollowupBotDouble()
+    sender = telegram_app._TelegramSalesFollowupSender(bot)
+
+    result = await sender.send(
+        SalesFollowupSendRequest(
+            job_id=uuid4(),
+            chat_id=4242,
+            step_key=draft.step_key,
+            step_index=draft.step_index,
+            message_text=draft.payload["message_text"],
+            button_label=draft.payload["button_label"],
+            target_callback_data=draft.payload["target_callback_data"],
+            payload=draft.payload,
+        )
+    )
+
+    assert result.telegram_message_id == 808
+    assert len(bot.messages) == 1
+    message = bot.messages[0]
+    assert message["chat_id"] == 4242
+    assert message["text"] == draft.payload["message_text"]
+    keyboard = message["reply_markup"].inline_keyboard
+    assert [(button.text, button.callback_data) for button in keyboard[0]] == [
+        (draft.payload["button_label"], draft.payload["target_callback_data"])
+    ]
+    assert [(button.text, button.callback_data) for button in keyboard[1]] == [
+        ("Не напоминать", telegram_app.CALLBACK_SALES_FOLLOWUP_OPT_OUT)
+    ]
+
+
+@pytest.mark.anyio
+async def test_sales_followup_opt_out_callback_writes_preference_cancels_jobs_and_confirms(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    store = _SalesFollowupStoreDouble()
+    message = _SalesFollowupMessageDouble(chat_id=5151)
+    callback = _SalesFollowupCallbackDouble(telegram_app.CALLBACK_SALES_FOLLOWUP_OPT_OUT, message)
+    monkeypatch.setattr(telegram_app, "Message", _SalesFollowupMessageDouble)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+
+    await telegram_app.handle_callback(callback)
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [(None, {}), (None, {})]
+    assert store.opt_out_calls == [
+        {"chat_id": 5151, "opt_out_source": "telegram_callback"},
+        {"chat_id": 5151, "opt_out_source": "telegram_callback"},
+    ]
+    assert store.cancel_calls == [
+        {
+            "chat_id": 5151,
+            "campaign_key": "free_trial_v1",
+            "reason": "opted_out",
+            "chain_status": "opted_out",
+        },
+        {
+            "chat_id": 5151,
+            "campaign_key": "free_trial_v1",
+            "reason": "opted_out",
+            "chain_status": "opted_out",
+        },
+    ]
+    assert message.edits == [
+        "Хорошо, больше не буду напоминать.",
+        "Хорошо, больше не буду напоминать.",
+    ]
+    assert message.texts == []
+
+
+@pytest.mark.anyio
+async def test_sales_followup_opt_out_callback_handles_missing_store_gracefully(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    message = _SalesFollowupMessageDouble(chat_id=6161)
+    callback = _SalesFollowupCallbackDouble(telegram_app.CALLBACK_SALES_FOLLOWUP_OPT_OUT, message)
+    monkeypatch.setattr(telegram_app, "Message", _SalesFollowupMessageDouble)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: None)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [(None, {})]
+    assert message.edits == ["Хорошо, больше не буду напоминать."]
+
+
+@pytest.mark.anyio
+async def test_sales_followup_opt_out_does_not_affect_other_callbacks(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    store = _SalesFollowupStoreDouble()
+    support_calls: list[int] = []
+
+    async def fake_start_support_request(message) -> None:
+        support_calls.append(message.chat.id)
+
+    message = _SalesFollowupMessageDouble(chat_id=7171)
+    callback = _SalesFollowupCallbackDouble(telegram_app.CALLBACK_SUPPORT, message)
+    monkeypatch.setattr(telegram_app, "Message", _SalesFollowupMessageDouble)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+    monkeypatch.setattr(telegram_app, "_start_support_request", fake_start_support_request)
+
+    await telegram_app.handle_callback(callback)
+
+    assert callback.answers == [(None, {})]
+    assert support_calls == [7171]
+    assert store.opt_out_calls == []
+    assert store.cancel_calls == []
+
+
+def test_sales_followup_callback_mapping_reuses_existing_weekly_pdf_and_subscription_callbacks() -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    assert telegram_app.CALLBACK_WEEK_PLAN_PDF == "diet:week_pdf"
+    assert telegram_app.CALLBACK_SUBSCRIBE == "diet:subscribe_month"
+    assert telegram_app.CALLBACK_SALES_FOLLOWUP_OPT_OUT == "diet:sales_followup_opt_out"
+    assert telegram_app.CALLBACK_SALES_FOLLOWUP_OPT_OUT not in {
+        telegram_app.CALLBACK_WEEK_PLAN_PDF,
+        telegram_app.CALLBACK_SUBSCRIBE,
+    }
+
+
+@pytest.mark.parametrize(
+    ("product", "expected_grant", "expected_reason"),
+    [
+        ("subscription_month", "subscription", "subscription_granted"),
+        ("extra_weekly_pdf", "extra_weekly_pdf", "weekly_pdf_access_granted"),
+    ],
+)
+def test_successful_payment_access_grants_cancel_sales_followup(
+    monkeypatch,
+    product: str,
+    expected_grant: str,
+    expected_reason: str,
+) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    store = _SalesFollowupStoreDouble()
+    service = _PaymentServiceDouble(telegram_app.PaymentHandlingResult(True, product))
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+
+    result = telegram_app._apply_successful_payment(
+        5151,
+        _successful_payment_double(),
+        user_id=9191,
+    )
+
+    assert result.processed
+    assert result.grant == expected_grant
+    assert store.cancel_calls == [
+        {
+            "chat_id": 5151,
+            "campaign_key": "free_trial_v1",
+            "reason": expected_reason,
+            "chain_status": "cancelled",
+        }
+    ]
+
+
+def test_failed_successful_payment_handling_does_not_cancel_sales_followup(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    store = _SalesFollowupStoreDouble()
+    service = _PaymentServiceDouble(telegram_app.PaymentHandlingResult(False, reason="order_not_payable"))
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+
+    result = telegram_app._apply_successful_payment(
+        5252,
+        _successful_payment_double(),
+        user_id=9292,
+    )
+
+    assert not result.processed
+    assert store.cancel_calls == []
+
+
+def test_payment_order_creation_does_not_cancel_sales_followup(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    store = _SalesFollowupStoreDouble()
+    order = telegram_app.PaymentOrder(
+        order_id="order_12345678",
+        user_id=101,
+        chat_id=202,
+        product=telegram_app.PRODUCT_SUBSCRIPTION_MONTH,
+        provider=telegram_app.PROVIDER_TELEGRAM_STARS,
+        amount=450,
+        currency="XTR",
+        nonce="nonce_12345678",
+    )
+    service = _PaymentOrderServiceDouble(order)
+    message = _SalesFollowupMessageDouble(chat_id=202)
+    monkeypatch.setattr(telegram_app, "_payment_service", lambda: service)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+
+    _, created_order, payload = telegram_app._create_payment_order_payload(
+        message,
+        telegram_app.PROVIDER_TELEGRAM_STARS,
+        telegram_app.PRODUCT_SUBSCRIPTION_MONTH,
+        payer_user_id=101,
+    )
+
+    assert created_order is order
+    assert payload.startswith("diet:order:v1:")
+    assert store.cancel_calls == []
+
+
+def test_monthly_access_promo_grant_cancels_sales_followup(monkeypatch, tmp_path) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    chat_id = 5353
+    promo_path = tmp_path / "promo_codes.json"
+    telegram_app.save_promo_codes(
+        promo_path,
+        {"FB-ABCD-EFGH-2345": telegram_app.PromoCodeRecord.monthly_access()},
+    )
+    store = _SalesFollowupStoreDouble()
+    service = _PromoEntitlementServiceDouble()
+    monkeypatch.setattr(telegram_app, "PROMO_CODES_STATE_FILE", promo_path)
+    monkeypatch.setattr(telegram_app, "_entitlement_service", lambda: service)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+
+    activation = telegram_app._activate_promo_code_for_chat(chat_id, "fb abcd efgh 2345")
+
+    assert activation.activated
+    assert service.grants == [(chat_id, "promo:FB-ABCD-EFGH-2345")]
+    assert store.cancel_calls == [
+        {
+            "chat_id": chat_id,
+            "campaign_key": "free_trial_v1",
+            "reason": "monthly_access_promo_granted",
+            "chain_status": "cancelled",
+        }
+    ]
+
+
+def test_successful_weekly_pdf_delivery_cancels_sales_followup(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    store = _SalesFollowupStoreDouble()
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store)
+    monkeypatch.setattr(
+        telegram_app,
+        "_remember_recipe_history_items_best_effort",
+        lambda *_args, **_kwargs: None,
+    )
+
+    telegram_app._record_successful_generation_history(
+        5454,
+        telegram_app.AttemptConsumption(True, "weekly_pdf", "monthly"),
+        (),
+    )
+
+    assert store.cancel_calls == [
+        {
+            "chat_id": 5454,
+            "campaign_key": "free_trial_v1",
+            "reason": "weekly_pdf_delivered",
+            "chain_status": "cancelled",
+        }
+    ]
+
+
+def test_sales_followup_production_eligibility_skips_when_subscription_active(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    monkeypatch.setattr(telegram_app, "_has_active_paid_access", lambda chat_id: chat_id == 5555)
+    monkeypatch.setattr(
+        telegram_app,
+        "_weekly_pdf_attempt_available",
+        lambda _chat_id: pytest.fail("weekly PDF access should not be checked after paid access blocks"),
+    )
+
+    result = telegram_app._sales_followup_production_eligibility(
+        types.SimpleNamespace(chat_id=5555, payload={"chat_type": "private"})
+    )
+
+    assert not result.eligible
+    assert result.reason == "active_paid_access"
+
+
+def test_sales_followup_production_eligibility_skips_when_weekly_pdf_access_active(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    monkeypatch.setattr(telegram_app, "_has_active_paid_access", lambda _chat_id: False)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", lambda chat_id: chat_id == 5656)
+
+    result = telegram_app._sales_followup_production_eligibility(
+        types.SimpleNamespace(chat_id=5656, payload={"chat_type": "private"})
+    )
+
+    assert not result.eligible
+    assert result.reason == "weekly_pdf_access"
+
+
+def test_sales_followup_production_eligibility_allows_private_no_access_user(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    monkeypatch.setattr(telegram_app, "_has_active_paid_access", lambda _chat_id: False)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available", lambda _chat_id: False)
+
+    result = telegram_app._sales_followup_production_eligibility(
+        types.SimpleNamespace(chat_id=5757, payload={"chat_type": "private"})
+    )
+
+    assert result.eligible
+    assert result.reason is None
+
+
+def test_sales_followup_production_eligibility_skips_non_private_payload(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_has_active_paid_access",
+        lambda _chat_id: pytest.fail("access must not be checked for known non-private chats"),
+    )
+    monkeypatch.setattr(
+        telegram_app,
+        "_weekly_pdf_attempt_available",
+        lambda _chat_id: pytest.fail("weekly PDF must not be checked for known non-private chats"),
+    )
+
+    result = telegram_app._sales_followup_production_eligibility(
+        types.SimpleNamespace(chat_id=5858, payload={"chat_type": "group"})
+    )
+
+    assert not result.eligible
+    assert result.reason == "non_private_chat"
+
+
+def test_sales_followup_worker_startup_uses_production_eligibility_checker(monkeypatch) -> None:
+    import diet_bot.telegram_app as telegram_app
+
+    captured: dict[str, object] = {}
+    runtime = object()
+
+    class WorkerDouble:
+        def __init__(self, runtime_arg, sender_arg, *, eligibility_checker=None, settings=None) -> None:
+            captured["runtime"] = runtime_arg
+            captured["sender"] = sender_arg
+            captured["eligibility_checker"] = eligibility_checker
+            captured["settings"] = settings
+
+        def run_forever(self):
+            captured["run_forever_called"] = True
+            return object()
+
+    class TaskDouble:
+        def __init__(self, coro, name: str | None = None) -> None:
+            captured["task_coro"] = coro
+            captured["task_name"] = name
+
+        def add_done_callback(self, _callback) -> None:
+            captured["done_callback_added"] = True
+
+    monkeypatch.setattr(telegram_app, "_sales_followup_job_runtime", lambda: runtime)
+    monkeypatch.setattr(telegram_app, "SalesFollowupWorker", WorkerDouble)
+    monkeypatch.setattr(telegram_app.asyncio, "create_task", lambda coro, name=None: TaskDouble(coro, name))
+
+    task = telegram_app._start_sales_followup_worker_if_configured(
+        types.SimpleNamespace(sales_followup_worker_enabled=True),
+        bot=object(),
+    )
+
+    assert task is not None
+    assert captured["runtime"] is runtime
+    assert captured["eligibility_checker"] is telegram_app._sales_followup_production_eligibility
 
 
 @pytest.mark.anyio

@@ -2498,6 +2498,46 @@ def _install_one_day_runtime(monkeypatch, runtime: FakeOneDayGenerationRuntime |
     monkeypatch.setattr(telegram_app, "_ONE_DAY_GENERATION_JOB_RUNTIME", runtime, raising=False)
 
 
+class FakeSalesFollowupStore:
+    def __init__(self, *, opted_out: bool = False) -> None:
+        self.opted_out = opted_out
+        self.create_calls: list[dict[str, object]] = []
+
+    def get_preference(self, chat_id: int):
+        if not self.opted_out:
+            return None
+        return SimpleNamespace(chat_id=chat_id, opted_out_at=datetime(2026, 5, 31, tzinfo=UTC))
+
+    def create_chain(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return SimpleNamespace(
+            status=SimpleNamespace(value="created"),
+            chain=SimpleNamespace(chain_id=uuid4()),
+            jobs=tuple(SimpleNamespace(step_index=index) for index in range(1, 9)),
+        )
+
+
+def _install_sales_followup_scheduler(
+    monkeypatch,
+    store: FakeSalesFollowupStore | None,
+    *,
+    enabled: bool = True,
+    has_active_paid_access: bool = False,
+    has_weekly_pdf_access: bool = False,
+) -> None:
+    monkeypatch.setattr(telegram_app, "_sales_followup_runtime_enabled", lambda: enabled, raising=False)
+    monkeypatch.setattr(telegram_app, "_sales_followup_store", lambda: store, raising=False)
+
+    async def fake_has_active_paid_access(_chat_id: int) -> bool:
+        return has_active_paid_access
+
+    async def fake_weekly_pdf_attempt_available(_chat_id: int) -> bool:
+        return has_weekly_pdf_access
+
+    monkeypatch.setattr(telegram_app, "_has_active_paid_access_async", fake_has_active_paid_access)
+    monkeypatch.setattr(telegram_app, "_weekly_pdf_attempt_available_async", fake_weekly_pdf_attempt_available)
+
+
 class FakeWeeklyPdfQueuedRuntime:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
@@ -4193,6 +4233,7 @@ async def test_postgres_trial_request_durable_admits_without_calculation_generat
         assert admit_call["test_access"] is False
         assert snapshot.request_kind == "telegram_trial"
         assert snapshot.profile["age"] == 41
+        assert snapshot.request_payload["chat_type"] == "private"
         assert snapshot.recent_recipe_ids == ("trial-r1",)
         assert snapshot.request_payload["recent_recipe_keys"] == ["trial:key:r1"]
         assert snapshot.request_payload["include_calculation_report"] is True
@@ -4505,6 +4546,8 @@ async def test_send_trial_plan_keeps_legacy_path_without_one_day_job_runtime(mon
     subscriptions_path = tmp_path / "subscriptions.json"
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
     _install_one_day_runtime(monkeypatch, None)
+    followup_store = FakeSalesFollowupStore()
+    _install_sales_followup_scheduler(monkeypatch, followup_store)
     message = FakeMessage(chat_id, message_id=229)
 
     async def fake_send_plan(*_args, **_kwargs) -> bool:
@@ -4521,6 +4564,8 @@ async def test_send_trial_plan_keeps_legacy_path_without_one_day_job_runtime(mon
     entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
     assert entitlement.free_trial_used is True
     assert message.texts[-1][0].startswith(TRIAL_SUBSCRIPTION_TEXT)
+    assert len(followup_store.create_calls) == 1
+    assert followup_store.create_calls[0]["chat_id"] == chat_id
 
 
 @pytest.mark.anyio
@@ -4532,6 +4577,8 @@ async def test_telegram_one_day_worker_processor_sends_trial_delivery_and_cta_af
     plan = _one_day_plan_for_runtime_tests()
     events: list[str] = []
     build_kwargs: dict[str, object] = {}
+    followup_store = FakeSalesFollowupStore()
+    _install_sales_followup_scheduler(monkeypatch, followup_store)
 
     def fake_build_one_day_plan(profile, **kwargs):
         assert profile.age == 44
@@ -4563,6 +4610,8 @@ async def test_telegram_one_day_worker_processor_sends_trial_delivery_and_cta_af
     snapshot = OneDayGenerationRequestSnapshot(
         request_kind="telegram_trial",
         request_payload={
+            "source": "telegram_trial",
+            "chat_type": "private",
             "include_calculation_report": True,
             "include_default_after_plan_keyboard": False,
             "include_entitlement_status": False,
@@ -4616,6 +4665,61 @@ async def test_telegram_one_day_worker_processor_sends_trial_delivery_and_cta_af
     assert events[4].startswith("telegram:summary:")
     assert events[-1] == "history:remember"
     assert bot.sent_messages[-1]["text"] == TRIAL_SUBSCRIPTION_TEXT + "\n\ntrial-status"
+    assert len(followup_store.create_calls) == 1
+    assert followup_store.create_calls[0]["chat_id"] == chat_id
+    assert followup_store.create_calls[0]["trigger_job_id"] == job.job_id
+
+
+@pytest.mark.anyio
+async def test_telegram_one_day_worker_processor_does_not_schedule_non_private_trial(
+    monkeypatch,
+) -> None:
+    chat_id = 91_038
+    bot = FakeInvoiceBot()
+    plan = _one_day_plan_for_runtime_tests()
+    followup_store = FakeSalesFollowupStore()
+    _install_sales_followup_scheduler(monkeypatch, followup_store)
+
+    async def fake_remember_history(*_args, **_kwargs) -> None:
+        return None
+
+    async def fake_format_entitlement_status(_chat_id: int) -> str:
+        return "trial-status"
+
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(telegram_app, "_remember_recipe_history_items_best_effort_async", fake_remember_history)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status_async", fake_format_entitlement_status)
+
+    snapshot = OneDayGenerationRequestSnapshot(
+        request_kind="telegram_trial",
+        request_payload={
+            "source": "telegram_trial",
+            "chat_type": "group",
+            "include_trial_subscription_cta": True,
+        },
+        profile=telegram_app._profile_to_dict(profile_with(age=44)),
+        generation_seed="1234",
+    )
+    job = OneDayGenerationJob(
+        job_id=uuid4(),
+        chat_id=chat_id,
+        idempotency_key="telegram_trial_session:91038:trial-token:one_day",
+        status="running",
+        consumption_source="free_trial",
+        refund_status="not_required",
+        delivery_status="not_started",
+        expected_value_messages=0,
+        delivered_value_messages=0,
+        stale_after=datetime(2026, 5, 8, tzinfo=UTC),
+        request_snapshot=snapshot,
+    )
+
+    delivery = await telegram_app._TelegramOneDayGenerationJobProcessor(bot).prepare_delivery(job)
+    if delivery.after_success is not None:
+        await delivery.after_success()
+
+    assert bot.sent_messages[-1]["text"] == TRIAL_SUBSCRIPTION_TEXT + "\n\ntrial-status"
+    assert followup_store.create_calls == []
 
 
 @pytest.mark.anyio
