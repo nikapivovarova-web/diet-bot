@@ -2158,7 +2158,7 @@ def _ranked_recipe_window_selection_score(
         - sodium_pressure
         - min(3, format_count) * 0.08
         - min(4, ingredient_overlap) * 0.03
-        - candidate.rank * 0.02
+        - candidate.rank * 0.01
     )
     return (-selected_count, pressure_score, candidate.score, -candidate.rank)
 
