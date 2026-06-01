@@ -99,7 +99,7 @@ reportlab==4.5.1
     # via telegram-diet-bot (pyproject.toml)
 sniffio==1.3.1
     # via openai
-starlette==1.2.0
+starlette==1.2.1
     # via fastapi
 tqdm==4.67.3
     # via openai
