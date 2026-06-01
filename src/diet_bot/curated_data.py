@@ -8,6 +8,7 @@ from typing import Any
 
 from .chef import clean_recipe_instruction_text
 from .domain import Food, MealRole, NutrientVector
+from .recipe_models import RecipeTemplate
 
 
 DATA_DIR = Path(__file__).with_name("data")
@@ -381,8 +382,6 @@ def curated_foods() -> tuple[Food, ...]:
 
 @lru_cache(maxsize=1)
 def curated_recipes():
-    from .recipe_catalog import RecipeTemplate
-
     recipes = _load_json("curated_recipes.json")
     ingredients = _load_json("curated_recipe_ingredients.json")
     nutrition = _load_json("curated_recipe_nutrition.json")
