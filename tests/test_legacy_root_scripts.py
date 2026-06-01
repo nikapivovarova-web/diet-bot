@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,35 @@ LOCAL_PATH_PATTERNS = (
 )
 
 
+def _python_env_with_openpyxl_blocked(tmp_path: Path) -> dict[str, str]:
+    (tmp_path / "sitecustomize.py").write_text(
+        "\n".join(
+            [
+                "import importlib.abc",
+                "import sys",
+                "",
+                "class BlockOpenPyXL(importlib.abc.MetaPathFinder):",
+                "    def find_spec(self, fullname, path=None, target=None):",
+                "        if fullname == 'openpyxl' or fullname.startswith('openpyxl.'):",
+                "            raise ModuleNotFoundError(\"No module named 'openpyxl'\")",
+                "        return None",
+                "",
+                "sys.meta_path.insert(0, BlockOpenPyXL())",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(tmp_path)
+        if not existing_pythonpath
+        else str(tmp_path) + os.pathsep + existing_pythonpath
+    )
+    return env
+
+
 def test_root_legacy_scripts_do_not_hard_code_local_workbook_paths() -> None:
     for script_name in ROOT_LEGACY_SCRIPTS:
         source = (REPO_ROOT / script_name).read_text(encoding="utf-8")
@@ -72,6 +102,47 @@ def test_python_root_legacy_scripts_require_explicit_paths(script_name: str) -> 
     assert "usage:" in combined_output.lower()
     for pattern in LOCAL_PATH_PATTERNS:
         assert pattern not in combined_output
+
+
+def test_repair_workbook_open_view_no_args_does_not_import_openpyxl(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "repair_workbook_open_view.py")],
+        cwd=REPO_ROOT,
+        env=_python_env_with_openpyxl_blocked(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == 2
+    assert "usage:" in combined_output.lower()
+    assert "openpyxl" not in combined_output.lower()
+
+
+def test_repair_workbook_open_view_reports_missing_openpyxl_for_valid_args(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "repair_workbook_open_view.py"),
+            str(REPO_ROOT / "repair_workbook_open_view.py"),
+            str(tmp_path / "repaired.xlsx"),
+            "--allow-external",
+        ],
+        cwd=REPO_ROOT,
+        env=_python_env_with_openpyxl_blocked(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    combined_output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "openpyxl" in combined_output.lower()
+    assert "repair workbooks" in combined_output.lower()
+    assert "traceback" not in combined_output.lower()
 
 
 @pytest.mark.parametrize("script_name", ROOT_LEGACY_MJS_SCRIPTS)

@@ -5,9 +5,6 @@ import shutil
 from copy import copy
 from pathlib import Path
 
-from openpyxl import load_workbook
-from openpyxl.worksheet.views import Selection
-
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -55,7 +52,20 @@ def parse_args(argv: list[str] | None = None) -> tuple[Path, Path, Path | None]:
     return source, output, desktop_copy
 
 
+def _load_workbook_dependencies():
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.worksheet.views import Selection
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "error: repair_workbook_open_view.py requires openpyxl to repair workbooks. "
+            "Install the optional workbook dependency and rerun."
+        ) from exc
+    return load_workbook, Selection
+
+
 def main(source: Path, output: Path, desktop_copy: Path | None) -> None:
+    load_workbook, Selection = _load_workbook_dependencies()
     wb = load_workbook(source)
     wb.active = 0
 
