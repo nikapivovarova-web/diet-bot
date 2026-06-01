@@ -4,12 +4,12 @@ Audit-only stage. The script reads curated JSON data and writes findings only; i
 
 ## Summary
 
-- total recipes checked: 665
-- total ingredients checked: 6130
-- total foods checked: 359
-- total nutrition rows checked: 665
+- total recipes checked: 710
+- total ingredients checked: 6478
+- total foods checked: 366
+- total nutrition rows checked: 710
 - blocking findings count: 0
-- warning findings count: 1221
+- warning findings count: 1322
 - full CSV findings: `docs/recovery-integration/recipe-content-audit-round2-findings.csv`
 
 ## Counts By Finding Type
@@ -17,12 +17,12 @@ Audit-only stage. The script reads curated JSON data and writes findings only; i
 | finding type | blockers | warnings | total |
 |---|---:|---:|---:|
 | title/ingredient mismatch | 0 | 0 | 0 |
-| ingredient missing from steps | 0 | 917 | 917 |
+| ingredient missing from steps | 0 | 996 | 996 |
 | steps mention missing ingredient | 0 | 0 | 0 |
-| truncation/fragments | 0 | 171 | 171 |
+| truncation/fragments | 0 | 192 | 192 |
 | non-CIS/unclear ingredients | 0 | 0 | 0 |
 | tiny gram anomalies | 0 | 0 | 0 |
-| missing approximate measures | 0 | 133 | 133 |
+| missing approximate measures | 0 | 134 | 134 |
 
 ## Known Blocker Search Summary
 
@@ -172,7 +172,7 @@ Audit-only stage. The script reads curated JSON data and writes findings only; i
 - `warning` `ingredient_not_named_in_steps` r098 `r098_veganskie_burrito_s_tofu_skremblom_i_chernoy_fasolyu` `red_beans` line 10: `red_beans` is in ingredients but not found in instructions by known aliases Evidence: красная фасоль вареная или консервированная — 22,5 г, промыть и обсушить
 - `warning` `ingredient_not_named_in_steps` r098 `r098_veganskie_burrito_s_tofu_skremblom_i_chernoy_fasolyu` `bell_pepper` line 11: `bell_pepper` is in ingredients but not found in instructions by known aliases Evidence: запеченный красный сладкий перец — 0,25 шт., тонко нарезать
 - `warning` `ingredient_not_named_in_steps` r098 `r098_veganskie_burrito_s_tofu_skremblom_i_chernoy_fasolyu` `green_onion` line 13: `green_onion` is in ingredients but not found in instructions by known aliases Evidence: маринованный красный лук или зеленый лук — 12,5 г
-- ... 797 additional findings are in the CSV.
+- ... 876 additional findings are in the CSV.
 
 ### Steps Mention Missing Ingredient
 
@@ -300,7 +300,7 @@ Audit-only stage. The script reads curated JSON data and writes findings only; i
 - `warning` `weak_serving_finish` r518 `r518_kuritsa_s_risom_i_ovoschami_na_skovorode`: last instruction sentence does not clearly finish with serving/ready wording Evidence: Тушите под крышкой 20 минут
 - `warning` `weak_serving_finish` r520 `r520_pasta_s_kuritsey_v_tomatnom_souse`: last instruction sentence does not clearly finish with serving/ready wording Evidence: Потушите 10 минут и смешайте с пастой
 - `warning` `weak_serving_finish` r522 `r522_tefteli_v_tomatnom_souse`: last instruction sentence does not clearly finish with serving/ready wording Evidence: Разогрейте растительное масло в сковороде, добавьте соус из томатной пасты и воды и потушите тефтели 25-30 минут
-- ... 51 additional findings are in the CSV.
+- ... 72 additional findings are in the CSV.
 
 ### Non-Cis/Unclear Ingredients
 
@@ -432,7 +432,7 @@ Audit-only stage. The script reads curated JSON data and writes findings only; i
 - `warning` `gram_only_user_hostile_measure` r564 `r564_enchilada_v_kukuruznyh_tortilyah` `tomato` line 3: gram-only ingredient should get an approximate household measure in the fix stage Evidence: томаты в собственном соку — 120 г (без добавленного соуса)
 - `warning` `gram_only_user_hostile_measure` r564 `r564_enchilada_v_kukuruznyh_tortilyah` `gouda` line 5: gram-only ingredient should get an approximate household measure in the fix stage Evidence: сыр гауда — 40 г
 - `warning` `gram_only_user_hostile_measure` r565 `r565_kuritsa_s_pesto_i_kartofelem` `gouda` line 5: gram-only ingredient should get an approximate household measure in the fix stage Evidence: сыр гауда — 40 г
-- ... 13 additional findings are in the CSV.
+- ... 14 additional findings are in the CSV.
 
 ## Notes For Fix Stage
 

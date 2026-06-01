@@ -378,6 +378,48 @@ def test_curated_recipe_ingredient_mapping_avoids_known_false_matches() -> None:
     assert by_no_and_raw[(306, "поджаренный грецкий орех или пекан — 5 г (примерно 1 ст. л.)")]["food_id"] == "pecans"
 
 
+def test_final_audit_recipe_blocker_profile_and_text_are_fixed() -> None:
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+
+    foods_by_id = {row["food_id"]: row for row in foods}
+    acai = foods_by_id["acai_puree"]
+    assert "chocolate" not in acai["source_description"].lower()
+    assert acai["nutrients_per_100g"]["energy_kcal"] == 80.0
+    assert acai["nutrients_per_100g"]["fat_g"] == 6.0
+
+    by_no_line = {
+        (row["recipe_no"], row["line_index"]): row
+        for row in ingredients
+    }
+    assert by_no_line[(57, 1)]["food_id"] == "acai_puree"
+    assert by_no_line[(154, 1)]["food_id"] == "cooked_rice"
+
+    recipe_id_by_no = {
+        int(row["recipe_no"]): row["recipe_id"]
+        for row in recipes
+    }
+    nutrition_by_id = {
+        row["recipe_id"]: row
+        for row in nutrition
+    }
+    hard_outlier_limits = {
+        57: {"energy_kcal": 1000.0, "fat_g": 80.0, "carbohydrate_g": 140.0},
+        154: {"energy_kcal": 1000.0, "carbohydrate_g": 140.0},
+    }
+    for recipe_no, limits in hard_outlier_limits.items():
+        row = nutrition_by_id[recipe_id_by_no[recipe_no]]
+        for field, limit in limits.items():
+            assert float(row[field]) <= limit
+
+    r678 = next(row for row in recipes if row["recipe_no"] == 678)
+    instruction_text = r678["instructions_ru"].lower()
+    assert "подде" not in instruction_text
+    assert "нкции" not in instruction_text
+
+
 def test_curated_recipe_data_fixes_manual_smoke_ingredient_anomalies() -> None:
     foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
     recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))

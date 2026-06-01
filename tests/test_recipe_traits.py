@@ -227,14 +227,14 @@ def test_all_curated_recipes_produce_traits_with_broad_unknown_thresholds() -> N
     traits = [infer_recipe_traits(recipe) for recipe in curated_recipes]
     recipe_nos = {trait.recipe_no for trait in traits}
 
-    assert len(traits) == 665
+    assert len(traits) == 710
     assert set(range(1, 401)) <= recipe_nos
     assert set(range(401, 611)) <= recipe_nos
-    assert set(range(611, 666)) <= recipe_nos
+    assert set(range(611, 711)) <= recipe_nos
     assert Counter(trait.source_batch for trait in traits) == {
         "r001-r400": 400,
         "r401-r610": 210,
-        "r611+": 55,
+        "r611+": 100,
     }
 
     unknown_counts = Counter(

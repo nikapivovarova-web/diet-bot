@@ -2918,11 +2918,11 @@
     "raw_text": "оливковое масло первого холодного отжима — 67,9 мл",
     "ingredient_name_ru": "оливковое масло",
     "food_id": "olive_oil",
-    "grams": 61.79,
+    "grams": 7.8,
     "quantity_text": "67,9 мл",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "67.9 мл * плотность 0.91",
+    "conversion_note": "Final audit: count retained pan oil, not full frying bath.",
     "parse_method": "explicit_ml"
   },
   {
@@ -6166,11 +6166,11 @@
     "raw_text": "белая фасоль консервированная — 0,5 банки по 425 г, слить и промыть",
     "ingredient_name_ru": "красная фасоль консервированная",
     "food_id": "red_beans",
-    "grams": 425.0,
+    "grams": 212.5,
     "quantity_text": "0,5 банки по 425 г, слить и промыть",
     "state": "drained",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: 0.5 of a 425 g can.",
     "parse_method": "explicit_g"
   },
   {
@@ -9749,12 +9749,12 @@
     "line_index": 1,
     "raw_text": "очень горячий вареный короткозерный бурый или белый рис — 1–1,5 стакана",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 231.25,
     "quantity_text": "1–1,5 стакана",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "1.25 * 185 г",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "cup"
   },
   {
@@ -9959,12 +9959,12 @@
     "line_index": 6,
     "raw_text": "готовый бурый рис — 175 г",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 175.0,
     "quantity_text": "175 г",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "explicit_g"
   },
   {
@@ -14860,11 +14860,11 @@
     "raw_text": "куриные бедра на кости с кожей — 1 шт., примерно 170 г",
     "ingredient_name_ru": "куриное бедро",
     "food_id": "chicken_thigh",
-    "grams": 170.0,
+    "grams": 115.0,
     "quantity_text": "1 шт., примерно 170 г",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: edible meat/skin portion for bone-in thigh.",
     "parse_method": "explicit_g"
   },
   {
@@ -18877,12 +18877,12 @@
     "line_index": 9,
     "raw_text": "готовый длиннозерный белый рис — 1,25 стаканов, охлажденный",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 231.25,
     "quantity_text": "1,25 стаканов, охлажденный",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "1.25 * 185 г",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "cup"
   },
   {
@@ -22615,12 +22615,12 @@
     "line_index": 13,
     "raw_text": "готовый рис с кинзой и лаймом или обычный рис — 1 порции",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 150.0,
     "quantity_text": "1 порции",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "1 * 150 г",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "unit"
   },
   {
@@ -22865,14 +22865,14 @@
     "recipe_id": "r154_tofu_v_kislo_sladkom_souse_general_tso_s_brokkoli_i_ri",
     "recipe_no": 154,
     "line_index": 1,
-    "raw_text": "готовый белый или бурый рис — 2 стакана",
+    "raw_text": "готовый белый или бурый рис — 1 стакан (185 г)",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
-    "grams": 370.0,
-    "quantity_text": "2 стакана",
+    "food_id": "cooked_rice",
+    "grams": 185.0,
+    "quantity_text": "1 стакан (185 г)",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "2 * 185 г",
+    "conversion_note": "Final audit: single-serving cooked rice portion.",
     "parse_method": "cup"
   },
   {
@@ -23624,11 +23624,11 @@
     "raw_text": "чеддер — 0,4 стакана, натереть и разделить",
     "ingredient_name_ru": "чеддер",
     "food_id": "cheddar",
-    "grams": 96.0,
+    "grams": 45.0,
     "quantity_text": "0,4 стакана, натереть и разделить",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "0.4 * 240 г",
+    "conversion_note": "Final audit: shredded cheddar cup conversion.",
     "parse_method": "cup"
   },
   {
@@ -24030,11 +24030,11 @@
     "raw_text": "красная фасоль — 0,4 банки по 425 г, промыть и обсушить",
     "ingredient_name_ru": "красная фасоль консервированная",
     "food_id": "red_beans",
-    "grams": 425.0,
+    "grams": 170.0,
     "quantity_text": "0,4 банки по 425 г, промыть и обсушить",
     "state": "drained",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: 0.4 of a 425 g can.",
     "parse_method": "explicit_g"
   },
   {
@@ -24310,11 +24310,11 @@
     "raw_text": "красная фасоль — 0,29 банки по 425 г, промыть и обсушить",
     "ingredient_name_ru": "красная фасоль консервированная",
     "food_id": "red_beans",
-    "grams": 425.0,
+    "grams": 123.25,
     "quantity_text": "0,29 банки по 425 г, промыть и обсушить",
     "state": "drained",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: 0.29 of a 425 g can.",
     "parse_method": "explicit_g"
   },
   {
@@ -24827,12 +24827,12 @@
     "line_index": 19,
     "raw_text": "Отварной рис — 150 г готового риса",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 150.0,
     "quantity_text": "150 г готового риса",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "explicit_g"
   },
   {
@@ -25597,12 +25597,12 @@
     "line_index": 19,
     "raw_text": "Готовый белый рис — 150 г",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 150.0,
     "quantity_text": "150 г",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "explicit_g"
   },
   {
@@ -25821,12 +25821,12 @@
     "line_index": 16,
     "raw_text": "Готовый рис — 150 г",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 150.0,
     "quantity_text": "150 г",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "explicit_g"
   },
   {
@@ -26507,12 +26507,12 @@
     "line_index": 17,
     "raw_text": "Готовый рис — 150 г",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 150.0,
     "quantity_text": "150 г",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "explicit_g"
   },
   {
@@ -26997,12 +26997,12 @@
     "line_index": 2,
     "raw_text": "говяжий фарш — 75 г",
     "ingredient_name_ru": "говяжий фарш",
-    "food_id": "beef_ground",
+    "food_id": "lean_beef_ground",
     "grams": 75.0,
     "quantity_text": "75 г",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: lean beef profile for generic ground beef.",
     "parse_method": "explicit_g"
   },
   {
@@ -29655,14 +29655,14 @@
     "recipe_id": "r186_boul_s_batatom_fasolyu_i_risom",
     "recipe_no": 186,
     "line_index": 4,
-    "raw_text": "белый или бурый рис — 0,5 стакана",
+    "raw_text": "готовый белый или бурый рис — около 0,5 стакана (92,5 г)",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 92.5,
-    "quantity_text": "0,5 стакана",
-    "state": "dry",
+    "quantity_text": "около 0,5 стакана (92,5 г)",
+    "state": "cooked",
     "is_optional": false,
-    "conversion_note": "0.5 * 185 г",
+    "conversion_note": "Final audit: cooked rice portion for assembled bowl.",
     "parse_method": "cup"
   },
   {
@@ -29686,11 +29686,11 @@
     "raw_text": "красная фасоль — 0,5 банки по 425 г, слегка слить",
     "ingredient_name_ru": "красная фасоль консервированная",
     "food_id": "red_beans",
-    "grams": 425.0,
+    "grams": 212.5,
     "quantity_text": "0,5 банки по 425 г, слегка слить",
     "state": "drained",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: 0.5 of a 425 g can.",
     "parse_method": "explicit_g"
   },
   {
@@ -31799,12 +31799,12 @@
     "line_index": 2,
     "raw_text": "готовый рис — 120 г",
     "ingredient_name_ru": "рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 120.0,
     "quantity_text": "120 г",
     "state": "cooked",
     "is_optional": false,
-    "conversion_note": "",
+    "conversion_note": "Final audit: cooked rice profile.",
     "parse_method": "explicit_g"
   },
   {
@@ -39276,11 +39276,11 @@
     "raw_text": "бекон — 4 полоски",
     "ingredient_name_ru": "бекон",
     "food_id": "bacon",
-    "grams": 112.0,
+    "grams": 32.0,
     "quantity_text": "4 полоски",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "4 * 28 г",
+    "conversion_note": "Final audit: four cooked bacon strips at 8 g each.",
     "parse_method": "slice"
   },
   {
@@ -60993,11 +60993,11 @@
     "raw_text": "печень трески — 1/2 банка",
     "ingredient_name_ru": "печень трески консервированная без лишнего масла",
     "food_id": "cod_liver_canned_drained",
-    "grams": 115.0,
+    "grams": 57.5,
     "quantity_text": "1/2 банка",
     "state": "drained",
     "is_optional": false,
-    "conversion_note": "cod liver mapping confirmed by user decision; cod liver canned/drained mapping readiness confirmed; no extra jar oil unless recipe explicitly uses oil; not a future scalable protein anchor",
+    "conversion_note": "Final audit: half of the 115 g drained can baseline.",
     "parse_method": "intake_grams_estimate"
   },
   {
@@ -61083,11 +61083,11 @@
     "raw_text": "печень трески — 1/2 банка",
     "ingredient_name_ru": "печень трески консервированная без лишнего масла",
     "food_id": "cod_liver_canned_drained",
-    "grams": 115.0,
+    "grams": 57.5,
     "quantity_text": "1/2 банка",
     "state": "drained",
     "is_optional": false,
-    "conversion_note": "cod liver mapping confirmed by user decision; cod liver canned/drained mapping readiness confirmed; no extra jar oil unless recipe explicitly uses oil; not a future scalable protein anchor",
+    "conversion_note": "Final audit: half of the 115 g drained can baseline.",
     "parse_method": "intake_grams_estimate"
   },
   {
@@ -70238,12 +70238,12 @@
     "line_index": 2,
     "raw_text": "сливки 20% (для соуса) — 80 мл",
     "ingredient_name_ru": "сливки",
-    "food_id": "cream",
+    "food_id": "cream_20_percent",
     "grams": 80.0,
     "quantity_text": "80 мл",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "для соуса; from source",
+    "conversion_note": "Final audit: explicit 20% cream profile.",
     "parse_method": "intake_grams_estimate"
   },
   {
@@ -70958,12 +70958,12 @@
     "line_index": 3,
     "raw_text": "сливки 10% — 100 мл",
     "ingredient_name_ru": "сливки",
-    "food_id": "cream",
+    "food_id": "cream_10_percent",
     "grams": 100.0,
     "quantity_text": "100 мл",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "scaled from source",
+    "conversion_note": "Final audit: explicit 10% cream profile.",
     "parse_method": "intake_grams_estimate"
   },
   {
@@ -76866,14 +76866,14 @@
     "recipe_no": 552,
     "recipe_key": "batch2_048",
     "line_index": 1,
-    "raw_text": "Рис — 60 г",
+    "raw_text": "Готовый рис — 60 г",
     "ingredient_name_ru": "Рис",
-    "food_id": "rice",
+    "food_id": "cooked_rice",
     "grams": 60.0,
     "quantity_text": "60 г",
-    "state": "dry",
+    "state": "cooked",
     "is_optional": false,
-    "conversion_note": "Количество восстановлено редакционно из названия/шага.",
+    "conversion_note": "Final audit: instructions use ready rice.",
     "parse_method": "batch2_grams_estimate"
   },
   {
@@ -76883,12 +76883,12 @@
     "line_index": 2,
     "raw_text": "говяжий фарш — 140 г",
     "ingredient_name_ru": "говяжий фарш",
-    "food_id": "beef_ground",
+    "food_id": "lean_beef_ground",
     "grams": 140.0,
     "quantity_text": "140 г",
     "state": "raw",
     "is_optional": false,
-    "conversion_note": "Количество восстановлено редакционно из названия/шага.",
+    "conversion_note": "Final audit: lean beef profile for generic ground beef.",
     "parse_method": "batch2_grams_estimate"
   },
   {
