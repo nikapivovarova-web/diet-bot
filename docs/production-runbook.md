@@ -341,6 +341,7 @@ Required restore coverage:
 - `weekly_pdf_jobs`
 - `chat_profiles`
 - `chat_recipe_history`
+- `chat_privacy_consents`
 - `chat_state_json_import_runs`
 - `one_day_generation_jobs`
 - `one_day_generation_job_value_messages`

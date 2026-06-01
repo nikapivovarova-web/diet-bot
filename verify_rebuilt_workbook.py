@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -8,10 +9,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-BASE = Path(r"C:\Users\adck8\Desktop\bolshaya_tablica_receptov_s_foto_ready_for_sale.xlsx")
-WORKBOOK = Path(
-    r"C:\Users\adck8\Documents\New project 2\outputs\recipes_final_400_rebuild\bolshaya_tablica_receptov_s_foto_400_final_opens_from_start.xlsx"
-)
+REPO_ROOT = Path(__file__).resolve().parent
 EXPECTED_PHOTO_MISMATCHES = [
     15,
     43,
@@ -88,6 +86,46 @@ NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
+def _resolve_cli_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def _is_inside_repo(path: Path) -> bool:
+    try:
+        path.relative_to(REPO_ROOT)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_cli_path(parser: argparse.ArgumentParser, label: str, path: Path, allow_external: bool) -> None:
+    if allow_external or _is_inside_repo(path):
+        return
+    parser.error(f"{label} must be inside {REPO_ROOT} unless --allow-external is set: {path}")
+
+
+def parse_args(argv: list[str] | None = None) -> tuple[Path, Path]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Legacy non-release rebuilt workbook verifier. Requires explicit base/workbook "
+            "paths and refuses outside-repo paths unless --allow-external is set."
+        )
+    )
+    parser.add_argument("base_workbook", help="Original/base workbook for photo comparison.")
+    parser.add_argument("workbook", help="Rebuilt workbook to verify.")
+    parser.add_argument(
+        "--allow-external",
+        action="store_true",
+        help="Permit paths outside this repository for legacy maintenance.",
+    )
+    args = parser.parse_args(argv)
+    base = _resolve_cli_path(args.base_workbook)
+    workbook = _resolve_cli_path(args.workbook)
+    _validate_cli_path(parser, "base_workbook", base, args.allow_external)
+    _validate_cli_path(parser, "workbook", workbook, args.allow_external)
+    return base, workbook
+
+
 def q(ns: str, tag: str) -> str:
     return f"{{{ns}}}{tag}"
 
@@ -158,22 +196,22 @@ def hyperlink_count(zf: zipfile.ZipFile) -> int:
     return len(node.findall(q(NS_MAIN, "hyperlink")))
 
 
-def main() -> None:
-    with zipfile.ZipFile(WORKBOOK, "r") as zf:
+def main(base_workbook: Path, workbook: Path) -> None:
+    with zipfile.ZipFile(workbook, "r") as zf:
         rows = rows_from_sheet(zf)
         hyperlinks = hyperlink_count(zf)
     nums = [int(float(row.get("A", "0") or 0)) for row in rows]
     bad_portions = [row.get("A") for row in rows if (row.get("D") or "").strip() != "1 порция"]
     notes = [row.get("A") for row in rows if (row.get("J") or "").strip()]
-    rebuilt_images = image_map(WORKBOOK)
-    base_images = image_map(BASE)
+    rebuilt_images = image_map(workbook)
+    base_images = image_map(base_workbook)
     mismatched_photos = [
         n for n in range(1, 401) if rebuilt_images.get(n, {}).get("sha256") != base_images.get(n, {}).get("sha256")
     ]
     print(
         json.dumps(
             {
-                "workbook": str(WORKBOOK),
+                "workbook": str(workbook),
                 "row_count": len(rows),
                 "missing_numbers": [n for n in range(1, 401) if n not in nums],
                 "duplicate_numbers": sorted({n for n in nums if nums.count(n) > 1}),
@@ -195,4 +233,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(*parse_args())

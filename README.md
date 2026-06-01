@@ -1,17 +1,19 @@
-# Telegram Diet Bot MVP
+# FoodBalance Telegram Diet Bot
 
-MVP for a Telegram nutrition assistant for adults 18+.
+Telegram nutrition assistant for adults 18+.
 
-The current build focuses on the deterministic nutrition core:
+The current release candidate combines deterministic meal planning with the
+operational surfaces needed for controlled QA:
 
 - BMI, BMR, TDEE, calories, macros, and micronutrient targets.
 - Allergy, gluten, lactose, and disease caution filters.
-- A small built-in food catalog.
-- A one-day nutrition builder with portion and diversity guardrails.
-- Deterministic meal templates and shopping-list aggregation.
-- Telegram `/start`, `/plan`, and `/cancel` flow using `aiogram`.
-
-The OpenAI chef/dietitian adapters will sit on top of this core after the deterministic engine is stable.
+- A curated recipe and food catalog with local recipe photos.
+- One-day ration generation with portion and diversity guardrails.
+- Weekly ration PDF rendering with shopping-list aggregation.
+- Postgres-backed production storage and durable one-day / weekly-PDF queues.
+- Controlled payment, promo, admin, reconciliation, and recovery tooling that
+  remains disabled until explicit approval.
+- Telegram `/start`, `/plan`, and `/cancel` flows using `aiogram`.
 
 ## Run Telegram Bot
 
@@ -29,14 +31,18 @@ enablement require an explicit enablement decision.
 
 Production operators should follow
 [`docs/production-runbook.md`](docs/production-runbook.md) before any cutover.
+Controlled QA without a production cutover is documented in
+[`docs/controlled-qa-runbook.md`](docs/controlled-qa-runbook.md).
 
-MVP commands:
+User commands:
 
 - `/start`
 - `/plan`
 - `/cancel`
 
-The bot also shows reply-keyboard buttons for starting a plan, choosing sex, goal, activity, meal count, and generating another one-day plan from the same profile.
+The bot also shows reply-keyboard buttons for starting a plan, choosing sex,
+goal, activity, meal count, and generating another one-day plan from the same
+profile.
 
 ## Run Tests
 

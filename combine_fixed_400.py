@@ -1,19 +1,60 @@
 from __future__ import annotations
 
+import argparse
 import tempfile
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-FIRST_200 = Path(r"C:\Users\adck8\Documents\New project 2\outputs\recipes_1_200\bolshaya_tablica_receptov_s_foto_1_200_one_portion.xlsx")
-SECOND_200 = Path(r"C:\Users\adck8\Documents\New project 2\outputs\recipe_workbook\bolshaya_tablica_receptov_s_foto_ready_for_sale_rows_200_404_fixed.xlsx")
-OUTPUT_DIR = Path(r"C:\Users\adck8\Documents\New project 2\outputs\recipes_final_400")
-OUTPUT = OUTPUT_DIR / "bolshaya_tablica_receptov_s_foto_400_fixed_one_portion.xlsx"
-
+REPO_ROOT = Path(__file__).resolve().parent
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_XML = "http://www.w3.org/XML/1998/namespace"
 ET.register_namespace("", NS_MAIN)
+
+
+def _is_inside_repo(path: Path) -> bool:
+    try:
+        path.relative_to(REPO_ROOT)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_cli_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def _validate_cli_path(parser: argparse.ArgumentParser, label: str, path: Path, allow_external: bool) -> None:
+    if allow_external or _is_inside_repo(path):
+        return
+    parser.error(f"{label} must be inside {REPO_ROOT} unless --allow-external is set: {path}")
+
+
+def parse_args(argv: list[str] | None = None) -> tuple[Path, Path, Path]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Legacy non-release workbook combiner. Requires explicit paths and "
+            "refuses outside-repo paths unless --allow-external is set."
+        )
+    )
+    parser.add_argument("first_200", help="Corrected first-block .xlsx workbook.")
+    parser.add_argument("second_200", help="Base second-block .xlsx workbook.")
+    parser.add_argument("output", help="Destination combined .xlsx workbook.")
+    parser.add_argument(
+        "--allow-external",
+        action="store_true",
+        help="Permit input/output paths outside this repository for legacy workbook maintenance.",
+    )
+    args = parser.parse_args(argv)
+
+    first_200 = _resolve_cli_path(args.first_200)
+    second_200 = _resolve_cli_path(args.second_200)
+    output = _resolve_cli_path(args.output)
+    _validate_cli_path(parser, "first_200", first_200, args.allow_external)
+    _validate_cli_path(parser, "second_200", second_200, args.allow_external)
+    _validate_cli_path(parser, "output", output, args.allow_external)
+    return first_200, second_200, output
 
 
 def q(tag: str) -> str:
@@ -89,14 +130,14 @@ def load_sheet_and_shared(root: Path):
     return shared_tree, sheet_tree, strings, cells
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(first_200: Path, second_200: Path, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="recipes_final_base_") as base_name, tempfile.TemporaryDirectory(prefix="recipes_first_") as first_name:
         base_dir = Path(base_name)
         first_dir = Path(first_name)
-        with zipfile.ZipFile(SECOND_200, "r") as zf:
+        with zipfile.ZipFile(second_200, "r") as zf:
             zf.extractall(base_dir)
-        with zipfile.ZipFile(FIRST_200, "r") as zf:
+        with zipfile.ZipFile(first_200, "r") as zf:
             zf.extractall(first_dir)
 
         base_shared_tree, base_sheet_tree, base_strings, base_cells = load_sheet_and_shared(base_dir)
@@ -144,16 +185,16 @@ def main() -> None:
             base_shared_tree.write(base_dir / "xl" / "sharedStrings.xml", encoding="utf-8", xml_declaration=True)
         base_sheet_tree.write(base_dir / "xl" / "worksheets" / "sheet1.xml", encoding="utf-8", xml_declaration=True)
 
-        if OUTPUT.exists():
-            OUTPUT.unlink()
-        with zipfile.ZipFile(OUTPUT, "w", zipfile.ZIP_DEFLATED) as zf:
+        if output.exists():
+            output.unlink()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in base_dir.rglob("*"):
                 if path.is_file():
                     zf.write(path, path.relative_to(base_dir).as_posix())
 
         print(f"Copied corrected first-block cells: {copied_cells}")
-        print(f"Saved: {OUTPUT}")
+        print(f"Saved: {output}")
 
 
 if __name__ == "__main__":
-    main()
+    main(*parse_args())

@@ -1,16 +1,40 @@
 import fs from "node:fs/promises";
-import { FileBlob, SpreadsheetFile } from "@oai/artifact-tool";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const outputPath = "C:/Users/adck8/Documents/New project 2/outputs/recipes_1_200/bolshaya_tablica_receptov_s_foto_1_200_one_portion.xlsx";
-const previewDir = "C:/Users/adck8/Documents/New project 2/outputs/recipes_1_200/previews";
+const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
+function usage() {
+  console.error(`usage: node ${path.basename(process.argv[1])} <workbook> <preview-dir> [--allow-external]`);
+  process.exit(2);
+}
+
+function isInsideRepo(candidate) {
+  const relative = path.relative(repoRoot, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const allowExternalIndex = args.indexOf("--allow-external");
+  const allowExternal = allowExternalIndex !== -1;
+  if (allowExternal) args.splice(allowExternalIndex, 1);
+  if (args.length !== 2) usage();
+  const outputPath = path.resolve(args[0]);
+  const previewDir = path.resolve(args[1]);
+  if (!allowExternal && (!isInsideRepo(outputPath) || !isInsideRepo(previewDir))) usage();
+  return { outputPath, previewDir };
+}
+
+const { outputPath, previewDir } = parseArgs();
+const { FileBlob, SpreadsheetFile } = await import("@oai/artifact-tool");
 const input = await FileBlob.load(outputPath);
 const workbook = await SpreadsheetFile.importXlsx(input);
-const sheet = workbook.worksheets.getItem("Рецепты");
+const sheet = workbook.worksheets.getItem("Р РµС†РµРїС‚С‹");
 
 const rows = sheet.getRange("A5:H204").values;
 const badPortions = rows
-  .filter((row) => String(row[3] ?? "").trim() !== "1 порция")
+  .filter((row) => String(row[3] ?? "").trim() !== "1 РїРѕСЂС†РёСЏ")
   .map((row) => ({ num: row[0], title: row[2], portions: row[3] }));
 
 console.log(`Bad portions in recipes 1-200: ${badPortions.length}`);
@@ -40,11 +64,11 @@ for (const [name, range] of [
   ["end_1_200", "A190:J204"],
 ]) {
   const preview = await workbook.render({
-    sheetName: "Рецепты",
+    sheetName: "Р РµС†РµРїС‚С‹",
     range,
     scale: 1,
     format: "png",
   });
-  await fs.writeFile(`${previewDir}/${name}.png`, new Uint8Array(await preview.arrayBuffer()));
+  await fs.writeFile(path.join(previewDir, `${name}.png`), new Uint8Array(await preview.arrayBuffer()));
   console.log(`Rendered ${name}: ${range}`);
 }

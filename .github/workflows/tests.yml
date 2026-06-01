@@ -35,8 +35,12 @@ jobs:
           python -m pip install -r requirements/dev.txt
           python -m pip install --no-deps -e .
           python -m pip check
-      - name: Compile Python sources
-        run: python -m compileall -q src scripts tests
+      - name: Compile Python and legacy root utility sources
+        run: |
+          python -m compileall -q src scripts tests *.py
+          for file in *.mjs scripts/*.mjs; do
+            node --check "$file"
+          done
       - name: Import package smoke
         run: python -c "import diet_bot; import diet_bot.healthcheck; import diet_bot.production_preflight"
       - name: Run pytest

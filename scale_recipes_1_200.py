@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
@@ -10,14 +11,54 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-INPUT = Path(r"C:\Users\adck8\Desktop\bolshaya_tablica_receptov_s_foto_ready_for_sale.xlsx")
-OUTPUT_DIR = Path(r"C:\Users\adck8\Documents\New project 2\outputs\recipes_1_200")
-OUTPUT = OUTPUT_DIR / "bolshaya_tablica_receptov_s_foto_1_200_one_portion.xlsx"
-REPORT = OUTPUT_DIR / "conversion_report.json"
+REPO_ROOT = Path(__file__).resolve().parent
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_XML = "http://www.w3.org/XML/1998/namespace"
 ET.register_namespace("", NS_MAIN)
+
+
+def _resolve_cli_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def _is_inside_repo(path: Path) -> bool:
+    try:
+        path.relative_to(REPO_ROOT)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_cli_path(parser: argparse.ArgumentParser, label: str, path: Path, allow_external: bool) -> None:
+    if allow_external or _is_inside_repo(path):
+        return
+    parser.error(f"{label} must be inside {REPO_ROOT} unless --allow-external is set: {path}")
+
+
+def parse_args(argv: list[str] | None = None) -> tuple[Path, Path, Path]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Legacy non-release 1-200 workbook scaler. Requires explicit input/output/report "
+            "paths and refuses outside-repo paths unless --allow-external is set."
+        )
+    )
+    parser.add_argument("input_workbook", help="Source workbook.")
+    parser.add_argument("output_workbook", help="Destination scaled workbook.")
+    parser.add_argument("report", help="Destination JSON report.")
+    parser.add_argument(
+        "--allow-external",
+        action="store_true",
+        help="Permit paths outside this repository for legacy maintenance.",
+    )
+    args = parser.parse_args(argv)
+    input_workbook = _resolve_cli_path(args.input_workbook)
+    output_workbook = _resolve_cli_path(args.output_workbook)
+    report = _resolve_cli_path(args.report)
+    _validate_cli_path(parser, "input_workbook", input_workbook, args.allow_external)
+    _validate_cli_path(parser, "output_workbook", output_workbook, args.allow_external)
+    _validate_cli_path(parser, "report", report, args.allow_external)
+    return input_workbook, output_workbook, report
 
 
 def q(tag: str) -> str:
@@ -250,11 +291,11 @@ def scale_description_measurements(text: str, divisor: float) -> str:
     return work
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(input_workbook: Path, output_workbook: Path, report_path: Path) -> None:
+    output_workbook.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="recipes_xlsx_") as tmp_name:
         tmp = Path(tmp_name)
-        with zipfile.ZipFile(INPUT, "r") as zf:
+        with zipfile.ZipFile(input_workbook, "r") as zf:
             zf.extractall(tmp)
 
         shared_path = tmp / "xl" / "sharedStrings.xml"
@@ -319,19 +360,20 @@ def main() -> None:
         shared_tree.write(shared_path, encoding="utf-8", xml_declaration=True)
         sheet_tree.write(sheet_path, encoding="utf-8", xml_declaration=True)
 
-        if OUTPUT.exists():
-            OUTPUT.unlink()
-        with zipfile.ZipFile(OUTPUT, "w", zipfile.ZIP_DEFLATED) as zf:
+        if output_workbook.exists():
+            output_workbook.unlink()
+        with zipfile.ZipFile(output_workbook, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in tmp.rglob("*"):
                 if path.is_file():
                     zf.write(path, path.relative_to(tmp).as_posix())
 
-        REPORT.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Saved: {OUTPUT}")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Saved: {output_workbook}")
         print(f"Changed ingredient rows: {sum(1 for item in report if item['ingredients_changed'])}")
         print(f"Changed description rows: {sum(1 for item in report if item['description_changed'])}")
         print(f"Rows normalized to one portion: {len(report)}")
 
 
 if __name__ == "__main__":
-    main()
+    main(*parse_args())
