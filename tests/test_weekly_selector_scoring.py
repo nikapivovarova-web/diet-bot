@@ -877,6 +877,103 @@ def test_weekly_selection_timeout_stops_unproductive_recent_fallback(
     assert len(calls) <= 4
 
 
+def test_empty_recent_repeat_fallback_is_not_started_after_total_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    clock = {"now": 0.0}
+
+    def fake_perf_counter() -> float:
+        return clock["now"]
+
+    def slow_repeat_reason(*_args: object, **_kwargs: object) -> str:
+        clock["now"] = 2.0
+        return "repeat_fallback_slot_pool_below_threshold:main:1<21"
+
+    def fail_repeat_fallback(
+        *_args: object,
+        **_kwargs: object,
+    ) -> telegram_app._WeekPlanBuildResult:
+        raise AssertionError("repeat fallback must not start after total timeout is exhausted")
+
+    monkeypatch.setattr(telegram_app.time, "perf_counter", fake_perf_counter)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(telegram_app, "_weekly_no_recent_repeat_fallback_reason", slow_repeat_reason)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", fail_repeat_fallback)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset(),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.plans == ()
+    assert result.avoidance_phase == "timeout"
+
+
+def test_empty_recent_no_recent_timeout_does_not_use_repeat_fallback_for_normal_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    fallback_calls: list[int] = []
+
+    def timeout_week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del profile, seed, avoided_recipe_ids, avoided_recipe_keys
+        raise telegram_app._WeeklySelectionTimeout(
+            scope="phase",
+            phase=selection_phase,
+            elapsed_s=2.1,
+            timeout_s=2.0,
+            day_index=6,
+            candidate_index=0,
+        )
+
+    def repeat_fallback(
+        profile: UserProfile,
+        seed: int,
+        **_kwargs: object,
+    ) -> telegram_app._WeekPlanBuildResult:
+        fallback_calls.append(seed)
+        return telegram_app._WeekPlanBuildResult(
+            plans=_complete_week(profile, "repeat_heavy"),
+            avoidance_phase="repeats_fallback",
+            repeat_fallback_used=True,
+            repeat_recipe_count=19,
+        )
+
+    monkeypatch.setattr(telegram_app, "_weekly_no_recent_repeat_fallback_reason", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", timeout_week_builder)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", repeat_fallback)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset(),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.plans == ()
+    assert result.avoidance_phase == "timeout"
+    assert fallback_calls == []
+
+
 def test_live_seed_604374606_local_state_weekly_selection_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

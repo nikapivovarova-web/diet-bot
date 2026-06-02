@@ -748,6 +748,8 @@ class _WeeklySelectionScopedGuard:
 
 
 def _weekly_selection_phase_timeout(phase: str) -> float:
+    if phase == "repeats_fallback":
+        return 0.0
     if phase == "no_recent":
         return float(WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS)
     return float(WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS)
@@ -768,6 +770,27 @@ def _weekly_selection_diag(event: str, *, always: bool = False, **fields: object
         return
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     logger.warning("weekly_selection_diag event=%s %s", event, details)
+
+
+def _weekly_selection_timeout_result(
+    exc: _WeeklySelectionTimeout,
+    *,
+    recipe_cache: _RecipePlanCache,
+) -> _WeekPlanBuildResult:
+    _weekly_selection_diag(
+        "timeout",
+        always=True,
+        scope=exc.scope,
+        phase=_weekly_selection_phase_label(exc.phase),
+        raw_phase=exc.phase,
+        elapsed_s=f"{exc.elapsed_s:.3f}",
+        timeout_s=f"{exc.timeout_s:.3f}",
+        day_index=exc.day_index,
+        candidate_index=exc.candidate_index,
+        stage=exc.stage,
+        **_recipe_cache_diag_counts(recipe_cache),
+    )
+    return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
 
 
 def _recipe_cache_diag_counts(recipe_cache: _RecipePlanCache) -> dict[str, int]:
@@ -4441,7 +4464,12 @@ def _build_week_plans_with_repeats_fallback(
     *,
     recipe_cache: _RecipePlanCache,
     failure_reason: str | None = None,
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> _WeekPlanBuildResult:
+    if selection_guard is not None:
+        selection_guard.begin_phase("repeats_fallback")
+        selection_guard.check(stage="before_repeats_fallback")
+
     safety = evaluate_safety(profile)
     if not safety.can_generate_plan:
         return _WeekPlanBuildResult(
@@ -4462,7 +4490,10 @@ def _build_week_plans_with_repeats_fallback(
         profile,
         seed,
         recipe_cache=recipe_cache,
+        selection_guard=selection_guard,
     )
+    if selection_guard is not None:
+        selection_guard.check(stage="after_repeats_fallback_day_pool")
     if not day_pool:
         return _WeekPlanBuildResult(
             plans=(),
@@ -4471,7 +4502,13 @@ def _build_week_plans_with_repeats_fallback(
             failure_reason="repeats_fallback_no_valid_day_pool",
         )
 
-    scheduled_plans = _schedule_weekly_repeat_fallback_pool(day_pool, profile)
+    scheduled_plans = _schedule_weekly_repeat_fallback_pool(
+        day_pool,
+        profile,
+        selection_guard=selection_guard,
+    )
+    if selection_guard is not None:
+        selection_guard.check(stage="after_repeats_fallback_schedule")
     repeat_count = _weekly_repeated_recipe_count(scheduled_plans)
     if not _week_plans_are_complete(scheduled_plans, profile):
         return _WeekPlanBuildResult(
@@ -4494,6 +4531,7 @@ def _build_weekly_repeat_fallback_day_pool(
     seed: int,
     *,
     recipe_cache: _RecipePlanCache,
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[MealPlan, ...]:
     safety = evaluate_safety(profile)
     if "dairy" in safety.excluded_food_names:
@@ -4505,7 +4543,16 @@ def _build_weekly_repeat_fallback_day_pool(
         )
 
     for build_pool in builders:
-        day_pool = build_pool(profile, seed, recipe_cache=recipe_cache)
+        if selection_guard is not None:
+            selection_guard.check(stage=f"before_{build_pool.__name__}")
+        day_pool = build_pool(
+            profile,
+            seed,
+            recipe_cache=recipe_cache,
+            selection_guard=selection_guard,
+        )
+        if selection_guard is not None:
+            selection_guard.check(stage=f"after_{build_pool.__name__}")
         if day_pool:
             return day_pool
     return ()
@@ -4516,6 +4563,7 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
     seed: int,
     *,
     recipe_cache: _RecipePlanCache,
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[MealPlan, ...]:
     plans: list[MealPlan] = []
     seen_signatures: set[tuple[str, ...]] = set()
@@ -4529,6 +4577,8 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
         if len(plans) >= builder_pool_size:
             break
 
+        if selection_guard is not None:
+            selection_guard.check(stage="repeats_fallback_builder_day", candidate_index=offset)
         plan = generated_by_offset.get(offset)
         if plan is None:
             plan = build_one_day_plan(
@@ -4537,8 +4587,15 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
                 recipe_source="curated_only",
                 allow_curated_seed_fallback=False,
                 recipe_cache=recipe_cache,
+                selection_guard=(
+                    _WeeklySelectionScopedGuard(selection_guard, None, offset)
+                    if selection_guard is not None
+                    else None
+                ),
             )
             generated_by_offset[offset] = plan
+        if selection_guard is not None:
+            selection_guard.check(stage="after_repeats_fallback_builder_day", candidate_index=offset)
 
         if not _week_day_plan_is_complete(plan, profile):
             continue
@@ -4558,7 +4615,10 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
     seed: int,
     *,
     recipe_cache: _RecipePlanCache,
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[MealPlan, ...]:
+    if selection_guard is not None:
+        selection_guard.check(stage="before_repeats_fallback_slots_context")
     context, _context_failure_reason = _weekly_repeat_fallback_context(profile, recipe_cache)
     if context is None:
         return ()
@@ -4576,6 +4636,7 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
             total_energy * energy_slot.target_ratio,
             Counter(),
             frozenset(),
+            selection_guard=selection_guard,
         )
         for meal_index, energy_slot in enumerate(slots)
     )
@@ -4591,6 +4652,7 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
         target,
         Counter(),
         frozenset(),
+        selection_guard=selection_guard,
     )
     for offset, recipes_for_day in enumerate(
         ranked_combinations[:WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT]
@@ -4598,6 +4660,8 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
         if len(plans) >= WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE:
             break
 
+        if selection_guard is not None:
+            selection_guard.check(stage="repeats_fallback_fast_combo", candidate_index=offset)
         signature = tuple(recipe.id for recipe in recipes_for_day)
         if signature in seen_signatures:
             continue
@@ -4677,12 +4741,18 @@ def _weekly_repeat_fallback_fast_slot_options(
     slot_energy_target: float,
     week_recipe_counts: Counter[str],
     previous_day_recipe_ids: frozenset[str],
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[_WeeklyRepeatFallbackFastOption, ...]:
     del meal_index
     options: list[tuple[tuple[float, float, float, float, str], _WeeklyRepeatFallbackFastOption]] = []
     empty_used_grams: defaultdict[str, float] = defaultdict(float)
     empty_total = NutrientVector()
-    for recipe in recipes:
+    for recipe_index, recipe in enumerate(recipes):
+        if selection_guard is not None and recipe_index % 16 == 0:
+            selection_guard.check(
+                stage=f"repeats_fallback_slot_options:{slot}",
+                candidate_index=recipe_index,
+            )
         eligibility = _recipe_slot_eligibility_cached(
             recipe,
             slot,
@@ -4749,9 +4819,15 @@ def _weekly_repeat_fallback_ranked_combinations(
     target: NutrientVector,
     week_recipe_counts: Counter[str],
     previous_day_recipe_ids: frozenset[str],
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[tuple[RecipeTemplate, ...], ...]:
     ranked: list[tuple[tuple[float, float, float, float, float, tuple[str, ...]], tuple[RecipeTemplate, ...]]] = []
-    for combination in itertools.product(*slot_options):
+    for combination_index, combination in enumerate(itertools.product(*slot_options)):
+        if selection_guard is not None and combination_index % 64 == 0:
+            selection_guard.check(
+                stage="repeats_fallback_ranked_combinations",
+                candidate_index=combination_index,
+            )
         recipe_ids = tuple(option.recipe.id for option in combination)
         if len(set(recipe_ids)) != len(recipe_ids):
             continue
@@ -4852,6 +4928,8 @@ def _weekly_repeated_recipe_count(plans: Sequence[MealPlan]) -> int:
 def _schedule_weekly_repeat_fallback_pool(
     day_pool: tuple[MealPlan, ...],
     profile: UserProfile,
+    *,
+    selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[MealPlan, ...]:
     if not day_pool:
         return ()
@@ -4861,6 +4939,8 @@ def _schedule_weekly_repeat_fallback_pool(
     previous_day_recipe_ids: frozenset[str] = frozenset()
 
     for day_index in range(WEEK_PLAN_DAYS):
+        if selection_guard is not None:
+            selection_guard.check(stage="repeats_fallback_schedule_day", day_index=day_index)
         candidates = list(day_pool)
         non_adjacent_candidates = [
             plan
@@ -4936,10 +5016,18 @@ def _build_week_plans_with_recent_fallback(
     timed_out = False
     repeat_fallback_reason: str | None = None
     if _recent_avoidance_is_empty(recent_avoidance):
+        try:
+            guard.check(stage="before_repeat_fallback_precheck")
+        except _WeeklySelectionTimeout as exc:
+            return _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
         repeat_fallback_reason = _weekly_no_recent_repeat_fallback_reason(
             profile,
             recipe_cache=recipe_cache,
         )
+        try:
+            guard.check(stage="after_repeat_fallback_precheck")
+        except _WeeklySelectionTimeout as exc:
+            return _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
         if repeat_fallback_reason in {"safety_cannot_generate", "no_safe_foods"}:
             return _WeekPlanBuildResult(
                 plans=(),
@@ -4953,12 +5041,16 @@ def _build_week_plans_with_recent_fallback(
                 seed=seed,
                 reason=repeat_fallback_reason,
             )
-            return _build_week_plans_with_repeats_fallback(
-                profile,
-                seed,
-                recipe_cache=recipe_cache,
-                failure_reason=repeat_fallback_reason,
-            )
+            try:
+                return _build_week_plans_with_repeats_fallback(
+                    profile,
+                    seed,
+                    recipe_cache=recipe_cache,
+                    failure_reason=repeat_fallback_reason,
+                    selection_guard=guard,
+                )
+            except _WeeklySelectionTimeout as exc:
+                return _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
 
     for phase, avoided_recipe_ids, avoided_recipe_keys in _weekly_recent_avoidance_phases(
         recent_avoidance
@@ -5006,19 +5098,7 @@ def _build_week_plans_with_recent_fallback(
             )
         except _WeeklySelectionTimeout as exc:
             timed_out = True
-            _weekly_selection_diag(
-                "timeout",
-                always=True,
-                scope=exc.scope,
-                phase=_weekly_selection_phase_label(exc.phase),
-                raw_phase=exc.phase,
-                elapsed_s=f"{exc.elapsed_s:.3f}",
-                timeout_s=f"{exc.timeout_s:.3f}",
-                day_index=exc.day_index,
-                candidate_index=exc.candidate_index,
-                stage=exc.stage,
-                **_recipe_cache_diag_counts(recipe_cache),
-            )
+            _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
             if exc.scope == "total":
                 return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
             continue
@@ -5059,22 +5139,12 @@ def _build_week_plans_with_recent_fallback(
     if timed_out or (
         total_timeout_s > 0 and time.perf_counter() - guard.total_started_at > total_timeout_s
     ):
-        if _recent_avoidance_is_empty(recent_avoidance) and not (
-            total_timeout_s > 0 and time.perf_counter() - guard.total_started_at > total_timeout_s
-        ):
-            return _build_week_plans_with_repeats_fallback(
-                profile,
-                seed,
-                recipe_cache=recipe_cache,
-                failure_reason="strict_weekly_selection_timeout",
-            )
         return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
     if _recent_avoidance_is_empty(recent_avoidance):
-        return _build_week_plans_with_repeats_fallback(
-            profile,
-            seed,
-            recipe_cache=recipe_cache,
-            failure_reason=repeat_fallback_reason or "strict_weekly_selection_failed",
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            failure_reason="strict_weekly_selection_failed",
         )
     return _WeekPlanBuildResult(plans=(), avoidance_phase="failed", failure_reason="strict_weekly_selection_failed")
 
