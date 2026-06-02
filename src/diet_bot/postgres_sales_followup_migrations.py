@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 MIGRATIONS = (
     PostgresMigration(
-        version="202605310001",
+        version="202605310003",
         description="Create sales follow-up storage tables",
         statements=(
             """

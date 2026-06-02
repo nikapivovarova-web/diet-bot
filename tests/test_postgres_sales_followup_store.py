@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
+from diet_bot.postgres_chat_state_store import PostgresChatStateStore
 from diet_bot.postgres_sales_followup_migrations import MIGRATIONS
 from diet_bot.postgres_sales_followup_store import (
     SALES_FOLLOWUP_SCHEMA_EXPECTATION,
@@ -161,6 +162,17 @@ def test_schema_init_is_idempotent(store: PostgresSalesFollowupStore) -> None:
         "sales_followup_preferences",
         "sales_followup_campaigns",
     }
+
+
+def test_sales_followup_migrations_validate_after_chat_state_migrations_in_shared_schema(
+    store: PostgresSalesFollowupStore,
+) -> None:
+    chat_state_store = PostgresChatStateStore(store.dsn, connect_timeout=1, connect_attempts=1)
+    chat_state_store.initialize()
+
+    store.initialize()
+    store.validate_schema()
+    chat_state_store.validate_schema()
 
 
 def test_create_chain_is_idempotent_and_creates_exact_eight_jobs(store: PostgresSalesFollowupStore) -> None:

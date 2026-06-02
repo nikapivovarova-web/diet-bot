@@ -8,6 +8,7 @@ from diet_bot import (
     postgres_one_day_generation_job_migrations,
     postgres_payment_migrations,
     postgres_promo_migrations,
+    postgres_sales_followup_migrations,
     postgres_weekly_pdf_job_migrations,
 )
 
@@ -19,6 +20,7 @@ POSTGRES_MIGRATION_MODULES = (
     postgres_one_day_generation_job_migrations,
     postgres_chat_state_migrations,
     postgres_promo_migrations,
+    postgres_sales_followup_migrations,
 )
 
 
