@@ -2,6 +2,18 @@
 
 ## Current Stage
 
+Operational launch blocker closure for B-1/M-2 is recorded in
+`docs/recovery-integration/operational-launch-blockers-b1-m2.md`. H-1, M-1,
+M-2, and B-1 are closed for the pre-payment validation process. M-2
+backup/restore drill evidence is closed for a disposable local Postgres drill:
+the repo backup script produced a custom-format backup, the repo restore-drill
+script restored it into a generated disposable database, all `17` required
+table row counts matched, no mismatch waiver was used, and generated databases
+were cleaned up. B-1 production-env visibility is closed for validation:
+strict healthcheck, controlled-QA preflight, and production-mode preflight have
+passed in the verified non-payment readiness gate. Payments/provider acceptance
+remains the only gate before paid launch or large advertising.
+
 The promo `per_user_limit` low finding is closed locally. Postgres promo
 redemption/reservation now enforces `per_user_limit` as an active redemption
 count per `(code, chat_id)` under the locked promo row, and migration
