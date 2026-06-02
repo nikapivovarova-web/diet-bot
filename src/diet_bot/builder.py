@@ -134,6 +134,7 @@ MAINTENANCE_PROTEIN_COMFORT_OVERAGE_PENALTY = 18.0
 MAINTENANCE_FAT_ENERGY_SHARE_BUFFER = 1.10
 MAINTENANCE_FAT_SHARE_OVERAGE_PENALTY = 24.0
 RECIPE_PLAN_CANDIDATE_COUNT = 1
+CURATED_ONLY_SEED_FALLBACK_ATTEMPTS = 4
 CONTROLLED_RECIPE_WINDOW_SIZE = 8
 CONTROLLED_RECIPE_SCORE_DELTA = 1.75
 CONTROLLED_RECIPE_MAX_EXTRA_ENERGY_GAP = 0.06
@@ -549,6 +550,10 @@ class _RankedRecipeCandidate:
     rank: int
 
 
+def _should_manage_sodium(target: NutrientVector) -> bool:
+    return target.get("sodium_mg") > 0
+
+
 def build_one_day_plan(
     profile: UserProfile,
     foods: list[Food] | None = None,
@@ -557,6 +562,7 @@ def build_one_day_plan(
     avoided_recipe_keys: set[str] | frozenset[str] | None = None,
     recipe_source: RecipeSource = "all",
     allow_avoided_recipe_relaxation: bool = True,
+    allow_curated_seed_fallback: bool = True,
     recipe_cache: _RecipePlanCache | None = None,
     selection_guard: _SelectionGuard | None = None,
 ) -> MealPlan:
@@ -585,6 +591,7 @@ def build_one_day_plan(
         if not candidates:
             return MealPlan(meals=(), targets=targets, safety=safety)
 
+        manage_sodium = _should_manage_sodium(targets.targets)
         _check_selection_guard(selection_guard, "before_recipe_plan_primary")
         recipe_meals = _build_recipe_plan_for_time(
             candidates,
@@ -596,7 +603,7 @@ def build_one_day_plan(
             avoided_recipe_keys or frozenset(),
             recipe_source,
             excluded_food_names=safety.excluded_food_names,
-            manage_sodium=bool(safety.excluded_food_names),
+            manage_sodium=manage_sodium,
             recipe_cache=recipe_cache,
             selection_guard=selection_guard,
         )
@@ -612,7 +619,7 @@ def build_one_day_plan(
                 frozenset(),
                 recipe_source,
                 excluded_food_names=safety.excluded_food_names,
-                manage_sodium=bool(safety.excluded_food_names),
+                manage_sodium=manage_sodium,
                 recipe_cache=recipe_cache,
                 selection_guard=selection_guard,
             )
@@ -628,13 +635,38 @@ def build_one_day_plan(
                 frozenset(),
                 recipe_source,
                 excluded_food_names=safety.excluded_food_names,
-                manage_sodium=bool(safety.excluded_food_names),
+                manage_sodium=manage_sodium,
                 recipe_cache=recipe_cache,
                 selection_guard=selection_guard,
             )
         if recipe_meals:
             return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
         if recipe_source == "curated_only":
+            if allow_curated_seed_fallback:
+                fallback_avoided_recipe_ids = (
+                    frozenset()
+                    if allow_avoided_recipe_relaxation
+                    else avoided_recipe_ids or frozenset()
+                )
+                fallback_avoided_recipe_keys = (
+                    frozenset()
+                    if allow_avoided_recipe_relaxation
+                    else avoided_recipe_keys or frozenset()
+                )
+                recipe_meals = _build_curated_only_recipe_plan_with_seed_fallback(
+                    candidates,
+                    targets.targets,
+                    profile.meal_count,
+                    profile.cooking_time,
+                    variety_seed,
+                    fallback_avoided_recipe_ids,
+                    fallback_avoided_recipe_keys,
+                    excluded_food_names=safety.excluded_food_names,
+                    manage_sodium=manage_sodium,
+                    recipe_cache=recipe_cache,
+                )
+                if recipe_meals:
+                    return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
             return MealPlan(meals=(), targets=targets, safety=safety)
 
         _check_selection_guard(selection_guard, "before_food_fallback")
@@ -756,6 +788,47 @@ def _build_recipe_plan_for_time(
                 )
             return meals
 
+    return []
+
+
+def _build_curated_only_recipe_plan_with_seed_fallback(
+    candidates: list[Food],
+    target: NutrientVector,
+    meal_count: int,
+    cooking_time: CookingTimePreference,
+    variety_seed: int,
+    avoided_recipe_ids: set[str] | frozenset[str],
+    avoided_recipe_keys: set[str] | frozenset[str],
+    *,
+    excluded_food_names: frozenset[str] = frozenset(),
+    manage_sodium: bool = False,
+    recipe_cache: _RecipePlanCache | None = None,
+    selection_guard: _SelectionGuard | None = None,
+) -> list[Meal]:
+    for seed_offset in range(1, CURATED_ONLY_SEED_FALLBACK_ATTEMPTS + 1):
+        _check_selection_guard(selection_guard, "curated_seed_fallback_attempt")
+        retry_seed = variety_seed + seed_offset
+        recipe_meals = _build_recipe_plan_for_time(
+            candidates,
+            target,
+            meal_count,
+            cooking_time,
+            retry_seed,
+            avoided_recipe_ids,
+            avoided_recipe_keys,
+            "curated_only",
+            excluded_food_names=excluded_food_names,
+            manage_sodium=manage_sodium,
+            recipe_cache=recipe_cache,
+            selection_guard=selection_guard,
+        )
+        if recipe_meals:
+            logger.info(
+                "Curated-only one-day seed fallback selected complete plan: original_seed=%s retry_seed=%s",
+                variety_seed,
+                retry_seed,
+            )
+            return recipe_meals
     return []
 
 

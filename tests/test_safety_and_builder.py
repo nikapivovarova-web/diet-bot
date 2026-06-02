@@ -183,6 +183,51 @@ def test_excluded_fish_profile_does_not_receive_sardine_recipe() -> None:
     assert validate_plan(plan).ok
 
 
+def test_no_meat_no_fish_curated_one_day_seed_regressions_do_not_return_empty_safe_plans() -> None:
+    profile = profile_with(
+        meal_count=5,
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "meat"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),
+        ),
+    )
+
+    for seed in (129, 131, 136):
+        plan = build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only")
+
+        assert plan.safety.can_generate_plan is True
+        assert len(plan.meals) == profile.meal_count
+        assert validate_plan(plan).ok
+
+
+def test_public_curated_high_bmi_one_day_seed_169_passes_sodium_validation() -> None:
+    profile = UserProfile(
+        age=40,
+        sex=Sex.FEMALE,
+        height_cm=165,
+        weight_kg=100,
+        goal=Goal.LOSE,
+        activity=ActivityLevel.MODERATE,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    plan = build_one_day_plan(profile, variety_seed=169, recipe_source="curated_only")
+    validation = validate_plan(plan)
+
+    assert len(plan.meals) == profile.meal_count
+    assert validation.ok, validation.errors
+
+
+def test_public_weekly_seed_101_days_pass_sodium_validation() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.QUICK)
+
+    plans = telegram_app._build_week_plans(profile, 101, set(), set())
+
+    assert telegram_app._week_plans_are_complete(plans, profile)
+    assert all(validate_plan(plan).ok for plan in plans)
+
+
 def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(monkeypatch) -> None:
     profile = constrained_weekly_profile("dairy", "meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)

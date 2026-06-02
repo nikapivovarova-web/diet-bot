@@ -53,6 +53,7 @@ from .builder import (
     _recipe_title_uses_excluded_food,
     _resolve_recipe_ingredients,
     _scaled_recipe_portions,
+    _should_manage_sodium,
     build_one_day_plan,
     filter_foods,
     recipe_plan_diagnostic_context,
@@ -1124,6 +1125,7 @@ WEEKLY_REPEATS_FALLBACK_POOL_MULTIPLIER = 3
 WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS = 8
 WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT = 50
 WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE = 6
+WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE = 3
 WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS = 7
 WEEKLY_REPEATS_FALLBACK_NOTE = (
     "Из-за узких ограничений я повторил несколько блюд, "
@@ -4518,9 +4520,13 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
     plans: list[MealPlan] = []
     seen_signatures: set[tuple[str, ...]] = set()
     generated_by_offset: dict[int, MealPlan] = {}
+    builder_pool_size = min(
+        WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE,
+        WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE,
+    )
 
     for offset in range(WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS):
-        if len(plans) >= WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE:
+        if len(plans) >= builder_pool_size:
             break
 
         plan = generated_by_offset.get(offset)
@@ -4529,6 +4535,7 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
                 profile,
                 variety_seed=seed + offset,
                 recipe_source="curated_only",
+                allow_curated_seed_fallback=False,
                 recipe_cache=recipe_cache,
             )
             generated_by_offset[offset] = plan
@@ -4608,7 +4615,7 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
         if not _passes_hard_nutrition_gates(
             meals,
             target,
-            enforce_sodium=bool(context.safety.excluded_food_names),
+            enforce_sodium=_should_manage_sodium(target),
         ):
             continue
 
@@ -5140,7 +5147,11 @@ def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) ->
     return len(plans) == WEEK_PLAN_DAYS and all(_week_day_plan_is_complete(plan, profile) for plan in plans)
 
 def _week_day_plan_is_complete(plan: MealPlan, profile: UserProfile) -> bool:
-    return plan.safety.can_generate_plan and len(plan.meals) == _expected_meal_count(profile)
+    return (
+        plan.safety.can_generate_plan
+        and len(plan.meals) == _expected_meal_count(profile)
+        and validate_plan(plan).ok
+    )
 
 
 def _expected_meal_count(profile: UserProfile) -> int:
@@ -5490,6 +5501,7 @@ def _select_week_day_plan(
                     avoided_recipe_keys=avoided_recipe_keys,
                     recipe_source="curated_only",
                     allow_avoided_recipe_relaxation=False,
+                    allow_curated_seed_fallback=False,
                     recipe_cache=recipe_cache,
                     selection_guard=candidate_selection_guard,
                 )
@@ -5567,6 +5579,7 @@ def _select_week_day_plan(
             avoided_recipe_keys=avoided_recipe_keys,
             recipe_source="curated_only",
             allow_avoided_recipe_relaxation=False,
+            allow_curated_seed_fallback=False,
             recipe_cache=recipe_cache,
             selection_guard=(
                 _WeeklySelectionScopedGuard(selection_guard, day_index, None)

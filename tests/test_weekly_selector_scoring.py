@@ -64,21 +64,53 @@ def _food(food_id: str, energy: float, protein: float = 30, fat: float = 20, car
     )
 
 
-def _meal(recipe_id: str, food_id: str, energy: float) -> Meal:
+def _meal(
+    recipe_id: str,
+    food_id: str,
+    energy: float,
+    *,
+    protein: float = 30,
+    fat: float = 20,
+    carbohydrate: float = 80,
+) -> Meal:
     return Meal(
         name=f"meal {recipe_id}",
-        portions=(_food(food_id, energy).portion(100),),
+        portions=(
+            _food(
+                food_id,
+                energy,
+                protein=protein,
+                fat=fat,
+                carbohydrate=carbohydrate,
+            ).portion(100),
+        ),
         recipe="test recipe",
         recipe_id=recipe_id,
         recipe_key=f"slot:curated:{recipe_id}",
     )
 
 
-def _plan(profile: UserProfile, recipe_prefix: str, energy: float, food_ids: tuple[str, ...]) -> MealPlan:
+def _plan(
+    profile: UserProfile,
+    recipe_prefix: str,
+    energy: float,
+    food_ids: tuple[str, ...],
+    *,
+    protein: float = 30,
+    fat: float = 20,
+    carbohydrate: float = 80,
+) -> MealPlan:
     per_meal_energy = energy / len(food_ids)
     return MealPlan(
         meals=tuple(
-            _meal(f"{recipe_prefix}_{index}", food_id, per_meal_energy)
+            _meal(
+                f"{recipe_prefix}_{index}",
+                food_id,
+                per_meal_energy,
+                protein=protein,
+                fat=fat,
+                carbohydrate=carbohydrate,
+            )
             for index, food_id in enumerate(food_ids)
         ),
         targets=calculate_targets(profile),
@@ -191,16 +223,20 @@ def _recipes_for_feasibility_pool(
 
 
 def _complete_week(profile: UserProfile, prefix: str = "week") -> tuple[MealPlan, ...]:
-    target_energy = calculate_targets(profile).targets.get("energy_kcal")
+    target = calculate_targets(profile).targets
+    meal_count = profile.meal_count
     return tuple(
         _plan(
             profile,
             f"{prefix}_{day_index}",
-            target_energy,
+            target.get("energy_kcal"),
             tuple(
                 f"{prefix}_{day_index}_{meal_index}"
-                for meal_index in range(profile.meal_count)
+                for meal_index in range(meal_count)
             ),
+            protein=target.get("protein_g") / meal_count,
+            fat=target.get("fat_g") / meal_count,
+            carbohydrate=target.get("carbohydrate_g") / meal_count,
         )
         for day_index in range(telegram_app.WEEK_PLAN_DAYS)
     )
