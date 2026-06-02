@@ -19,6 +19,9 @@ CATEGORY_CHARGED_BUT_NOT_GRANTED = "charged_but_not_granted"
 CATEGORY_GRANTED_BUT_NO_PROVIDER_CHARGE = "granted_but_no_provider_charge"
 CATEGORY_DUPLICATE_PROVIDER_CHARGE_ORDER = "duplicate_provider_charge_order"
 CATEGORY_RECOVERY_SPOOL_CANDIDATE = "recovery_spool_candidate"
+CATEGORY_PROVIDER_REFUNDED_BUT_GRANTED = "provider_refunded_but_granted"
+CATEGORY_PROVIDER_CANCELED_BUT_GRANTED = "provider_canceled_but_granted"
+CATEGORY_PROVIDER_REVERSED_BUT_GRANTED = "provider_reversed_but_granted"
 
 RECONCILIATION_CATEGORIES = (
     CATEGORY_MATCHED_PAID_GRANTED,
@@ -27,7 +30,15 @@ RECONCILIATION_CATEGORIES = (
     CATEGORY_GRANTED_BUT_NO_PROVIDER_CHARGE,
     CATEGORY_DUPLICATE_PROVIDER_CHARGE_ORDER,
     CATEGORY_RECOVERY_SPOOL_CANDIDATE,
+    CATEGORY_PROVIDER_REFUNDED_BUT_GRANTED,
+    CATEGORY_PROVIDER_CANCELED_BUT_GRANTED,
+    CATEGORY_PROVIDER_REVERSED_BUT_GRANTED,
 )
+
+PROVIDER_PAID_STATUSES = frozenset({"paid", "succeeded", "success", "captured", "settled"})
+PROVIDER_REFUNDED_STATUSES = frozenset({"refunded", "refund"})
+PROVIDER_CANCELED_STATUSES = frozenset({"canceled", "cancelled", "voided"})
+PROVIDER_REVERSED_STATUSES = frozenset({"reversed", "chargeback", "charged_back"})
 
 
 @dataclass(frozen=True)
@@ -152,9 +163,23 @@ def reconcile_payment_exports(
     items.extend(_duplicate_provider_items(provider_by_external, provider_by_order))
     for charge in provider_charges:
         matches = _matching_rows(charge, ledger_by_external, ledger_by_order)
-        exact_granted = [ledger for ledger in matches if _is_exact_granted_match(charge, ledger)]
-        if exact_granted:
-            items.append(_item(CATEGORY_MATCHED_PAID_GRANTED, charge, reason="provider_charge_matches_grant"))
+        granted_matches = [ledger for ledger in matches if _is_granted_context_match(charge, ledger)]
+        if granted_matches:
+            reversal = _provider_reversal_category_and_reason(charge.status)
+            if reversal is not None:
+                category, reason = reversal
+                items.append(_item(category, charge, reason=reason))
+            elif not _provider_status_is_paid(charge.status):
+                normalized = _normalized_provider_status(charge.status) or "missing_status"
+                items.append(
+                    _item(
+                        CATEGORY_CHARGED_BUT_NOT_GRANTED,
+                        charge,
+                        reason=f"provider_status_{normalized}_not_paid",
+                    )
+                )
+            else:
+                items.append(_item(CATEGORY_MATCHED_PAID_GRANTED, charge, reason="provider_charge_matches_grant"))
         elif charge_id_mismatch := _first_charge_id_mismatch(charge, matches):
             ledger, mismatch_fields = charge_id_mismatch
             items.append(_charge_id_mismatch_item(charge, ledger, mismatch_fields))
@@ -331,6 +356,10 @@ def _matching_rows(
 
 
 def _is_exact_granted_match(left: _PaymentExportRow, right: _PaymentExportRow) -> bool:
+    return _is_granted_context_match(left, right) and _provider_status_allows_granted_match(left.status)
+
+
+def _is_granted_context_match(left: _PaymentExportRow, right: _PaymentExportRow) -> bool:
     return (
         right.status == ORDER_STATUS_GRANTED
         and left.provider == right.provider
@@ -338,6 +367,34 @@ def _is_exact_granted_match(left: _PaymentExportRow, right: _PaymentExportRow) -
         and _same_optional_text(left.currency, right.currency)
         and _charge_ids_compatible(left, right)
     )
+
+
+def _provider_status_allows_granted_match(status: str | None) -> bool:
+    normalized = _normalized_provider_status(status)
+    return normalized is None or normalized in PROVIDER_PAID_STATUSES
+
+
+def _provider_status_is_paid(status: str | None) -> bool:
+    normalized = _normalized_provider_status(status)
+    return normalized in PROVIDER_PAID_STATUSES
+
+
+def _provider_reversal_category_and_reason(status: str | None) -> tuple[str, str] | None:
+    normalized = _normalized_provider_status(status)
+    if normalized in PROVIDER_REFUNDED_STATUSES:
+        return CATEGORY_PROVIDER_REFUNDED_BUT_GRANTED, "provider_status_refunded"
+    if normalized in PROVIDER_CANCELED_STATUSES:
+        return CATEGORY_PROVIDER_CANCELED_BUT_GRANTED, "provider_status_canceled"
+    if normalized in PROVIDER_REVERSED_STATUSES:
+        return CATEGORY_PROVIDER_REVERSED_BUT_GRANTED, f"provider_status_{normalized}"
+    return None
+
+
+def _normalized_provider_status(status: str | None) -> str | None:
+    if status is None:
+        return None
+    text = str(status).strip().lower()
+    return text or None
 
 
 def _first_charge_id_mismatch(

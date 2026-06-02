@@ -41,11 +41,11 @@ def test_create_and_validate_order() -> None:
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
     )
 
-    assert order.amount == 400
+    assert order.amount == 450
     assert order.currency == "XTR"
     assert validation.valid
     assert validation.order == order
@@ -70,7 +70,7 @@ def test_pre_checkout_validation_does_not_require_chat_id() -> None:
         user_id=101,
         chat_id=None,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
     )
 
@@ -100,7 +100,7 @@ def test_pre_checkout_validation_rejects_expired_pending_order() -> None:
         user_id=101,
         chat_id=None,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
     )
 
@@ -136,7 +136,7 @@ def test_validate_order_rejects_mismatched_payment_context(kwargs: dict[str, Any
         "user_id": 101,
         "chat_id": 202,
         "provider": PROVIDER_TELEGRAM_STARS,
-        "amount": 400,
+        "amount": 450,
         "currency": "XTR",
     }
     request.update(kwargs)
@@ -169,7 +169,7 @@ def test_validate_order_rejects_nonce_mismatch() -> None:
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
     )
 
@@ -199,7 +199,7 @@ def test_duplicate_charge_does_not_grant_twice() -> None:
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
         telegram_payment_charge_id="tg-charge-1",
     )
@@ -208,7 +208,7 @@ def test_duplicate_charge_does_not_grant_twice() -> None:
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
         telegram_payment_charge_id="tg-charge-1",
     )
@@ -244,7 +244,7 @@ def test_same_order_payload_with_new_charge_after_grant_is_ignored() -> None:
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
         telegram_payment_charge_id="tg-charge-1",
     )
@@ -253,7 +253,7 @@ def test_same_order_payload_with_new_charge_after_grant_is_ignored() -> None:
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
         telegram_payment_charge_id="tg-charge-2",
     )
@@ -281,7 +281,7 @@ def test_unknown_and_orphan_successful_payments_record_event_without_grant() -> 
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
         telegram_payment_charge_id="tg-charge-unknown",
     )
@@ -290,7 +290,7 @@ def test_unknown_and_orphan_successful_payments_record_event_without_grant() -> 
         user_id=101,
         chat_id=202,
         provider=PROVIDER_TELEGRAM_STARS,
-        amount=400,
+        amount=450,
         currency="XTR",
         telegram_payment_charge_id="tg-charge-orphan",
     )
@@ -331,7 +331,7 @@ def test_grant_failure_marks_order_failed_and_reraises() -> None:
             user_id=101,
             chat_id=202,
             provider=PROVIDER_TELEGRAM_STARS,
-            amount=35,
+            amount=29,
             currency="XTR",
             telegram_payment_charge_id="tg-charge-fails",
         )

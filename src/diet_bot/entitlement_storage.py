@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Protocol
 
-from .subscriptions import Entitlement
+from .entitlement_model import Entitlement
 
 
 class EntitlementStorageError(RuntimeError):

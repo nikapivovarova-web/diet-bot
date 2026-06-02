@@ -1,7 +1,7 @@
 [project]
 name = "telegram-diet-bot"
 version = "0.1.0"
-description = "Telegram diet bot MVP with deterministic nutrition planning core."
+description = "Telegram nutrition assistant with deterministic planning, weekly PDFs, Postgres queues, and controlled payment operations."
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.4.0",

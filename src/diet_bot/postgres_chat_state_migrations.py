@@ -81,6 +81,25 @@ MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version="202605310001",
+        description="Create chat privacy consent table",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS chat_privacy_consents (
+                chat_id BIGINT PRIMARY KEY,
+                consent_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                version BIGINT NOT NULL DEFAULT 1,
+                CONSTRAINT chk_chat_privacy_consents_consent_json_object CHECK (
+                    jsonb_typeof(consent_json) = 'object'
+                ),
+                CONSTRAINT chk_chat_privacy_consents_version_positive CHECK (version >= 1)
+            )
+            """,
+        ),
+    ),
 )
 
 

@@ -546,7 +546,7 @@ def test_apply_dedupes_exact_duplicate_records_before_calling_payment_service(tm
 def _record(**overrides: object) -> PaymentRecoveryRecord:
     product = str(overrides.pop("product", PRODUCT_SUBSCRIPTION_MONTH))
     provider = str(overrides.get("provider", PROVIDER_YOOKASSA))
-    amount = int(overrides.get("total_amount", 59_900 if provider == PROVIDER_YOOKASSA else 400))
+    amount = int(overrides.get("total_amount", 79_900 if provider == PROVIDER_YOOKASSA else 450))
     currency = str(overrides.get("currency", "RUB" if provider == PROVIDER_YOOKASSA else "XTR"))
     values: dict[str, object] = {
         "provider": provider,
@@ -574,7 +574,7 @@ def _order(
     chat_id: int = 202,
     product: str = PRODUCT_SUBSCRIPTION_MONTH,
     provider: str = PROVIDER_YOOKASSA,
-    amount: int = 59_900,
+    amount: int = 79_900,
     currency: str = "RUB",
     nonce: str = NONCE,
     status: str = ORDER_STATUS_PENDING,
@@ -598,7 +598,7 @@ def _charge(
     provider: str = PROVIDER_YOOKASSA,
     telegram_payment_charge_id: str = "tg-charge-1",
     provider_payment_charge_id: str = "provider-charge-1",
-    amount: int = 59_900,
+    amount: int = 79_900,
     currency: str = "RUB",
 ) -> PaymentCharge:
     return PaymentCharge(

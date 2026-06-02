@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -10,7 +11,7 @@ import random
 import re
 import secrets
 import time
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -39,13 +40,20 @@ from .builder import (
     CookingEffortConstraints,
     _RecipePlanCache,
     _cooking_effort_constraints,
+    _finalize_recipe_meals,
     _food_by_id_cache_key,
+    _meal_emoji,
     _meal_energy_slots,
+    _meal_name,
+    _passes_hard_nutrition_gates,
     _recipe_matches_cooking_effort_cached,
     _recipe_memory_key_cached,
+    _recipe_scale,
     _recipe_slot_eligibility_cached,
     _recipe_title_uses_excluded_food,
     _resolve_recipe_ingredients,
+    _scaled_recipe_portions,
+    _should_manage_sodium,
     build_one_day_plan,
     filter_foods,
     recipe_plan_diagnostic_context,
@@ -89,8 +97,16 @@ from .recipe_catalog import RecipeTemplate, built_in_recipes
 from .recipe_traits import RecipeTraits, infer_recipe_traits
 from .promo_codes import (
     PromoCodeActivation,
+    PromoCodeDefinition,
+    PromoCodeKind,
+    PromoCodeRecord,
     activate_promo_code,
+    generate_promo_codes,
+    load_promo_codes,
+    normalize_promo_code,
+    promo_code_grant_charge_id,
     release_promo_code_activation,
+    save_promo_codes,
 )
 from .questionnaire import QuestionnaireSession, start_session
 from .runtime_config import (
@@ -102,6 +118,24 @@ from .runtime_config import (
     parse_optional_int as _parse_runtime_optional_int,
     validate_startup,
     weekly_selection_diagnostics_enabled,
+)
+from .sales_followup import (
+    DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+    SALES_FOLLOWUP_OPT_OUT_CALLBACK_DATA,
+    build_sales_followup_trigger_idempotency_key,
+    render_sales_followup_payload,
+    schedule_sales_followup_after_free_trial_delivery,
+)
+from .sales_followup_runtime import (
+    SalesFollowupEligibility,
+    SalesFollowupPermanentSendError,
+    SalesFollowupSendRequest,
+    SalesFollowupSendResult,
+    SalesFollowupTransientSendError,
+    SalesFollowupUnknownSendOutcome,
+    SalesFollowupWorker,
+    SalesFollowupWorkerSettings,
+    SalesFollowupJobRuntime,
 )
 from .safety import evaluate_safety
 from .entitlement_runtime import create_entitlement_store, validate_entitlement_store_for_startup
@@ -158,7 +192,7 @@ from .subscriptions import (
     save_entitlements,
     set_test_access_enabled,
 )
-from .telegram_send import TelegramSendError, safe_telegram_send
+from .telegram_send import TelegramSendError, TelegramSendFailureClass, safe_telegram_send
 from .telegram_media_validation import (
     TELEGRAM_CAPTION_MAX_CHARS,
     TELEGRAM_DOCUMENT_MAX_BYTES,
@@ -192,6 +226,7 @@ from .weekly_pdf_jobs import (
 SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
 QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID: dict[int, str] = {}
 _QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID: dict[int, asyncio.Lock] = {}
+PRIVACY_CONSENT_CHAT_IDS: set[int] = set()
 TRIAL_CHAT_IDS: set[int] = set()
 PROFILE_BY_CHAT_ID: dict[int, UserProfile] = {}
 PLAN_COUNT_BY_CHAT_ID: dict[int, int] = {}
@@ -200,7 +235,11 @@ RECENT_RECIPE_IDS_BY_CHAT_ID: dict[int, list[str]] = {}
 RECENT_RECIPE_KEYS_BY_CHAT_ID: dict[int, list[str]] = {}
 SUPPORT_REQUEST_CHAT_IDS: set[int] = set()
 PROMO_CODE_REQUEST_CHAT_IDS: set[int] = set()
+ADMIN_PROMO_ACTION_BY_CHAT_ID: dict[int, str] = {}
 router = Router()
+ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT = 20
+ADMIN_PROMO_ACTION_CREATE_DISCOUNT = "create_discount"
+ADMIN_PROMO_ACTION_DISABLE_DISCOUNT = "disable_discount"
 RECENT_RECIPE_HISTORY_DAYS = 28
 RECENT_RECIPE_HISTORY_LIMIT = 140
 RECENT_RECIPE_REDUCED_DAYS = 14
@@ -209,11 +248,23 @@ logger = logging.getLogger(__name__)
 ENTITLEMENT_STORAGE_ERROR_TEXT = "Не удалось проверить доступ. Попробуйте позже."
 CHAT_PROFILE_STORAGE_ERROR_TEXT = "Не удалось сохранить анкету. Попробуйте позже."
 CHAT_STATE_READ_ERROR_TEXT = "Не удалось загрузить данные чата. Попробуйте позже."
+PRIVACY_CONSENT_STORAGE_ERROR_TEXT = "Не удалось сохранить согласие. Попробуйте позже."
 
 
 def _entitlement_service() -> EntitlementService:
     config = replace(load_runtime_config(), subscriptions_state_file=SUBSCRIPTIONS_STATE_FILE)
     return EntitlementService(create_entitlement_store(config))
+
+
+def _postgres_promo_store(config):
+    if not config.database_url:
+        raise EntitlementStorageError("Postgres promo store requires DIET_BOT_DATABASE_URL.")
+    from .postgres_promo_store import PostgresPromoStore
+
+    return PostgresPromoStore(
+        config.database_url,
+        connect_timeout=config.postgres_connect_timeout,
+    )
 
 
 def _payment_service():
@@ -246,6 +297,46 @@ def _one_day_generation_job_runtime() -> OneDayGenerationJobRuntime | None:
     if _ONE_DAY_GENERATION_JOB_RUNTIME is None:
         return None
     return _ONE_DAY_GENERATION_JOB_RUNTIME  # type: ignore[return-value]
+
+
+_SALES_FOLLOWUP_STORE_NOT_LOADED = object()
+_SALES_FOLLOWUP_STORE: object | None = _SALES_FOLLOWUP_STORE_NOT_LOADED
+
+
+def _sales_followup_runtime_enabled() -> bool:
+    return bool(getattr(load_runtime_config(), "sales_followup_enabled", False))
+
+
+def _sales_followup_store():
+    global _SALES_FOLLOWUP_STORE
+    config = load_runtime_config()
+    if not getattr(config, "sales_followup_enabled", False):
+        return None
+    if getattr(config, "storage_backend", "json") != "postgres" or not getattr(config, "database_url", None):
+        return None
+    if _SALES_FOLLOWUP_STORE is _SALES_FOLLOWUP_STORE_NOT_LOADED:
+        from .postgres_connection import get_shared_postgres_connection_provider
+        from .postgres_sales_followup_store import PostgresSalesFollowupStore
+
+        _SALES_FOLLOWUP_STORE = PostgresSalesFollowupStore(
+            str(config.database_url),
+            connect_timeout=int(getattr(config, "postgres_connect_timeout", 5)),
+            connection_provider=get_shared_postgres_connection_provider(config),
+        )
+    return _SALES_FOLLOWUP_STORE
+
+
+_SALES_FOLLOWUP_JOB_RUNTIME_NOT_LOADED = object()
+_SALES_FOLLOWUP_JOB_RUNTIME: SalesFollowupJobRuntime | None | object = _SALES_FOLLOWUP_JOB_RUNTIME_NOT_LOADED
+
+
+def _sales_followup_job_runtime() -> SalesFollowupJobRuntime | None:
+    global _SALES_FOLLOWUP_JOB_RUNTIME
+    if _SALES_FOLLOWUP_JOB_RUNTIME is _SALES_FOLLOWUP_JOB_RUNTIME_NOT_LOADED:
+        _SALES_FOLLOWUP_JOB_RUNTIME = SalesFollowupJobRuntime.from_config(load_runtime_config())
+    if _SALES_FOLLOWUP_JOB_RUNTIME is None:
+        return None
+    return _SALES_FOLLOWUP_JOB_RUNTIME  # type: ignore[return-value]
 
 
 def _validate_entitlement_storage(config) -> None:
@@ -298,6 +389,61 @@ async def _run_chat_state_db_call(func: Callable[..., object], /, *args: object,
         raise ChatStateStorageError("DB executor is busy.") from exc
 
 
+async def _run_sales_followup_db_call(func: Callable[..., object], /, *args: object, **kwargs: object) -> object:
+    if not _should_dispatch_storage_db_calls():
+        return func(*args, **kwargs)
+    try:
+        return await run_db_call(func, *args, **kwargs)
+    except DbExecutorBusy as exc:
+        logger.warning("DB executor is busy during sales follow-up operation: %s", getattr(func, "__name__", func))
+        raise RuntimeError("Sales follow-up DB executor is busy.") from exc
+
+
+def _cancel_sales_followup_after_access_grant(chat_id: int, *, reason: str) -> None:
+    store = _sales_followup_store()
+    if store is None:
+        return
+    cancel_jobs = getattr(store, "cancel_active_jobs_for_chat_campaign", None)
+    if not callable(cancel_jobs):
+        return
+    try:
+        cancel_jobs(
+            chat_id=int(chat_id),
+            campaign_key=DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+            reason=reason,
+            chain_status="cancelled",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to cancel sales follow-up jobs after access grant chat_id=%s reason=%s",
+            _mask_chat_id(chat_id),
+            reason,
+        )
+
+
+async def _cancel_sales_followup_after_access_grant_async(chat_id: int, *, reason: str) -> None:
+    store = _sales_followup_store()
+    if store is None:
+        return
+    cancel_jobs = getattr(store, "cancel_active_jobs_for_chat_campaign", None)
+    if not callable(cancel_jobs):
+        return
+    try:
+        await _run_sales_followup_db_call(
+            cancel_jobs,
+            chat_id=int(chat_id),
+            campaign_key=DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+            reason=reason,
+            chain_status="cancelled",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to cancel sales follow-up jobs after access grant chat_id=%s reason=%s",
+            _mask_chat_id(chat_id),
+            reason,
+        )
+
+
 def _should_dispatch_storage_db_calls() -> bool:
     return load_runtime_config().storage_backend == "postgres"
 
@@ -312,6 +458,14 @@ async def _load_chat_history_async(chat_id: int) -> None:
 
 async def _save_chat_profile_async(chat_id: int, profile: UserProfile) -> None:
     await _run_chat_state_db_call(_save_chat_profile, chat_id, profile)
+
+
+async def _has_privacy_consent_async(chat_id: int) -> bool:
+    return await _run_chat_state_db_call(_has_privacy_consent, chat_id)  # type: ignore[return-value]
+
+
+async def _save_privacy_consent_async(chat_id: int) -> None:
+    await _run_chat_state_db_call(_save_privacy_consent, chat_id)
 
 
 async def _load_recent_recipe_avoidance_async(chat_id: int) -> _RecentRecipeAvoidance:
@@ -462,6 +616,28 @@ class _RecentRecipeAvoidance:
 class _WeekPlanBuildResult:
     plans: tuple[MealPlan, ...]
     avoidance_phase: str
+    repeat_fallback_used: bool = False
+    repeat_recipe_count: int = 0
+    repeat_note: str | None = None
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _WeeklyRepeatFallbackContext:
+    safety: object
+    targets: object
+    foods: tuple[Food, ...]
+    food_by_id: dict[str, Food]
+    food_cache_key: str
+    recipes: tuple[RecipeTemplate, ...]
+    recipe_cache: _RecipePlanCache
+
+
+@dataclass(frozen=True)
+class _WeeklyRepeatFallbackFastOption:
+    recipe: RecipeTemplate
+    estimated_protein_g: float
+    estimated_energy_kcal: float
 
 
 @dataclass(frozen=True)
@@ -572,6 +748,8 @@ class _WeeklySelectionScopedGuard:
 
 
 def _weekly_selection_phase_timeout(phase: str) -> float:
+    if phase == "repeats_fallback":
+        return 0.0
     if phase == "no_recent":
         return float(WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS)
     return float(WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS)
@@ -592,6 +770,27 @@ def _weekly_selection_diag(event: str, *, always: bool = False, **fields: object
         return
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     logger.warning("weekly_selection_diag event=%s %s", event, details)
+
+
+def _weekly_selection_timeout_result(
+    exc: _WeeklySelectionTimeout,
+    *,
+    recipe_cache: _RecipePlanCache,
+) -> _WeekPlanBuildResult:
+    _weekly_selection_diag(
+        "timeout",
+        always=True,
+        scope=exc.scope,
+        phase=_weekly_selection_phase_label(exc.phase),
+        raw_phase=exc.phase,
+        elapsed_s=f"{exc.elapsed_s:.3f}",
+        timeout_s=f"{exc.timeout_s:.3f}",
+        day_index=exc.day_index,
+        candidate_index=exc.candidate_index,
+        stage=exc.stage,
+        **_recipe_cache_diag_counts(recipe_cache),
+    )
+    return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
 
 
 def _recipe_cache_diag_counts(recipe_cache: _RecipePlanCache) -> dict[str, int]:
@@ -851,7 +1050,8 @@ def _parse_optional_int(raw: str | None) -> int | None:
 
 
 def _payments_enabled_from_env() -> bool:
-    return load_runtime_config().payments_enabled
+    config = load_runtime_config()
+    return config.payments_enabled and config.public_payments_enabled
 
 
 def _support_chat_id_from_env() -> int | None:
@@ -871,29 +1071,31 @@ def _is_support_chat(chat_id: int) -> bool:
 
 START_PLAN_TEXT = "🥗 Составить план"
 TRY_FREE_TEXT = "🥗 Попробовать бесплатно"
-SUBSCRIBE_MONTH_TEXT = "💳 Подписка на месяц - 599 ₽"
-SUBSCRIBE_CTA_TEXT = "💳 Оформить подписку"
-SUBSCRIPTION_PRICE_RUB = 599
+SUBSCRIPTION_PRICE_RUB = 799
 EXTRA_ONE_DAY_PRICE_RUB = 50
 EXTRA_WEEKLY_PDF_PRICE_RUB = 250
-SUBSCRIPTION_STARS_AMOUNT = 400
-EXTRA_ONE_DAY_STARS_AMOUNT = 35
-EXTRA_WEEKLY_PDF_STARS_AMOUNT = 170
+SUBSCRIPTION_STARS_AMOUNT = 450
+EXTRA_ONE_DAY_STARS_AMOUNT = 29
+EXTRA_WEEKLY_PDF_STARS_AMOUNT = 141
+SUBSCRIBE_MONTH_TEXT = f"💳 Доступ на 30 дней - {SUBSCRIPTION_PRICE_RUB} ₽"
+SUBSCRIBE_CTA_TEXT = "💳 Оформить месячный доступ"
 SUBSCRIPTION_PAYMENT_TEXT = (
     "FoodBalance - цифровой сервис персональных рационов питания.\n\n"
-    f"Месячный доступ - {SUBSCRIPTION_PRICE_RUB} ₽ или {SUBSCRIPTION_STARS_AMOUNT} Stars.\n\n"
+    f"YooKassa: разовый доступ на 30 дней - {SUBSCRIPTION_PRICE_RUB} ₽.\n"
+    f"Telegram Stars: автопродляемая подписка на месяц - {SUBSCRIPTION_STARS_AMOUNT} Stars.\n\n"
     "Включено:\n"
     f"• {MONTHLY_WEEKLY_PDF_LIMIT} недельных PDF-рациона\n"
     f"• {MONTHLY_ONE_DAY_LIMIT} рационов на 1 день\n"
-    "• рецепты и список покупок по анкете\n\n"
+    "• рецепты и список продуктов по анкете\n\n"
     "Сервис носит информационный характер и не является медицинской консультацией."
 )
 PAYMENTS_DISABLED_TEXT = (
-    "Оплата сейчас не настроена. Кнопки покупки временно скрыты, счет не создан.\n\n"
-    "Если нужна помощь, напишите в поддержку."
+    "Доступ по промокоду на этапе пилота.\n\n"
+    "Публичная оплата картой, SberPay и Telegram Stars пока выключена. "
+    "Введите промокод или обратитесь к администратору, если доступ уже согласован."
 )
-PAY_WITH_TELEGRAM_STARS_TEXT = f"⭐ Оплатить подписку - {SUBSCRIPTION_STARS_AMOUNT} Stars"
-PAY_WITH_RU_CARD_TEXT = f"💳 Оплатить картой / SberPay - {SUBSCRIPTION_PRICE_RUB} ₽"
+PAY_WITH_TELEGRAM_STARS_TEXT = f"⭐ Подписка с автопродлением - {SUBSCRIPTION_STARS_AMOUNT} Stars"
+PAY_WITH_RU_CARD_TEXT = f"💳 Разовый доступ на 30 дней - {SUBSCRIPTION_PRICE_RUB} ₽"
 BUY_EXTRA_ONE_DAY_TEXT = f"⭐ Купить 1 дневной рацион - {EXTRA_ONE_DAY_STARS_AMOUNT} Stars"
 BUY_EXTRA_WEEKLY_PDF_TEXT = f"⭐ Купить 1 недельный PDF - {EXTRA_WEEKLY_PDF_STARS_AMOUNT} Stars"
 BUY_EXTRA_ONE_DAY_RU_CARD_TEXT = f"🥗 Купить 1 дневной рацион - {EXTRA_ONE_DAY_PRICE_RUB} ₽"
@@ -906,7 +1108,7 @@ FEATURES_MESSAGE = (
     "• рассчитываю ИМТ, калории, воду, БЖУ, витамины и минералы\n"
     "• подбираю рацион под цель, режим и предпочтения\n"
     "• показываю понятные порции и состав блюд\n"
-    "• собираю PDF с меню, рецептами и списком покупок\n"
+    "• собираю PDF с меню, рецептами и списком продуктов\n"
     "• учитываю ограничения, исключения и доступные функции подписки\n\n"
     "Начните с анкеты - дальше бот соберет понятный план питания."
 )
@@ -915,6 +1117,11 @@ PROMO_CODE_PROMPT_TEXT = "Введите промокод одним сообщ�
 PROMO_CODE_EMPTY_TEXT = "Пожалуйста, отправьте промокод текстом."
 PROMO_CODE_NOT_FOUND_TEXT = "Не нашел такой промокод. Проверьте написание и отправьте код еще раз."
 PROMO_CODE_ALREADY_USED_TEXT = "Этот промокод уже был активирован. Каждый промокод действует только один раз."
+PROMO_CODE_DISABLED_TEXT = "Этот промокод сейчас не активен. Если вы получили его от поддержки, напишите нам."
+PROMO_CODE_EXPIRED_TEXT = "Срок действия этого промокода закончился."
+PROMO_CODE_NOT_ACCESS_TEXT = (
+    "Это промокод другого типа. Для активации доступа нужен промокод на месячный доступ."
+)
 SUPPORT_TEXT = "🛟 Техподдержка"
 SUPPORT_PROMPT_TEXT = (
     "Опишите проблему одним сообщением.\n\n"
@@ -937,6 +1144,16 @@ WEEK_PLAN_DAYS = 7
 WEEK_PLAN_CANDIDATE_COUNT = 4
 WEEK_PLAN_RESCUE_CANDIDATE_COUNT = 4
 WEEKLY_RECENT_FEASIBILITY_POOL_MULTIPLIER = 5
+WEEKLY_REPEATS_FALLBACK_POOL_MULTIPLIER = 3
+WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS = 8
+WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT = 50
+WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE = 6
+WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE = 3
+WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS = 7
+WEEKLY_REPEATS_FALLBACK_NOTE = (
+    "Из-за узких ограничений я повторил несколько блюд, "
+    "чтобы сохранить рацион полноценным и не нарушать ваши исключения."
+)
 WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS = 8.0
 WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS = 60.0
 WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS = 90.0
@@ -964,21 +1181,21 @@ PDF_MONTH_NAMES_RU = {
 }
 WEEK_PDF_STATUS_UPDATE_SECONDS = 4.0
 WEEK_PDF_STATUS_INITIAL_TEXT = (
-    "Собираю недельный PDF.\n\n"
-    "Это может занять до минуты. Пожалуйста, не запускайте расчет повторно."
+    "Собираю ваш недельный PDF. Обычно это занимает 1-3 минуты. "
+    "Можно закрыть Telegram — я пришлю файл сюда, когда он будет готов."
 )
 WEEK_PDF_STATUS_FRAMES = (
-    "Собираю недельный PDF.\n\nПодбираю блюда под вашу анкету.",
-    "Собираю недельный PDF..\n\nПроверяю аллергии, ограничения и исключенные продукты.",
-    "Собираю недельный PDF...\n\nСчитаю КБЖУ, витамины и минералы.",
-    "Собираю недельный PDF....\n\nГотовлю рецепты, список покупок и файл.",
+    "PDF собирается.\n\nПодбираю блюда под вашу анкету. Файл придет сюда автоматически.",
+    "PDF собирается.\n\nПроверяю аллергии, ограничения и исключенные продукты.",
+    "PDF собирается.\n\nСчитаю КБЖУ, витамины и минералы.",
+    "PDF собирается.\n\nОформляю рецепты, список продуктов и сам файл.",
 )
 WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
-WEEK_PDF_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
-WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
+WEEK_PDF_ACCEPTED_TEXT = "Готовлю недельный PDF. Я пришлю его сюда, как только он будет готов."
+WEEK_PDF_ALREADY_RUNNING_TEXT = "Не переживайте, файл уже генерируется. Я пришлю PDF сюда, когда он будет готов."
 ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
 ONE_DAY_PLAN_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u0440\u0430\u0446\u0438\u043e\u043d. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_ALREADY_RUNNING_TEXT = "\u041d\u0435 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0439\u0442\u0435, \u0440\u0430\u0446\u0438\u043e\u043d \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
@@ -1008,10 +1225,27 @@ _CHAT_STATE_STORE_KEY: tuple[str, str] | None = None
 ADMIN_USER_IDS = set(_RUNTIME_CONFIG.admin_user_ids)
 TESTER_CHAT_IDS = set(_RUNTIME_CONFIG.tester_chat_ids)
 TELEGRAM_PROVIDER_TOKEN = _RUNTIME_CONFIG.telegram_provider_token
-PAYMENTS_ENABLED = _RUNTIME_CONFIG.payments_enabled
+PUBLIC_PAYMENTS_ENABLED = _RUNTIME_CONFIG.public_payments_enabled
+PAYMENT_TEST_PRICES_ENABLED = _RUNTIME_CONFIG.payment_test_prices_enabled
+PAYMENTS_ENABLED = _RUNTIME_CONFIG.payments_enabled and _RUNTIME_CONFIG.public_payments_enabled
 SUPPORT_CHAT_ID = _RUNTIME_CONFIG.support_chat_id
 PRIVACY_POLICY_URL = _RUNTIME_CONFIG.privacy_policy_url
 PRIVACY_POLICY_TEXT = "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438"
+PRIVACY_POLICY_BODY_TEXT = (
+    "Политика конфиденциальности FoodBalance\n\n"
+    "FoodBalance использует данные анкеты, сообщения в чате, технические данные Telegram и сведения об оплате "
+    "только для расчета персонального рациона, проверки доступа, поддержки и улучшения сервиса.\n\n"
+    "Мы не продаем персональные данные. Платежные данные обрабатываются платежными провайдерами; бот хранит только "
+    "служебные статусы, идентификаторы операций и историю доступа, необходимые для восстановления и поддержки.\n\n"
+    "Рекомендации FoodBalance носят информационный характер и не заменяют консультацию врача. Если нужно удалить "
+    "данные или задать вопрос по обработке данных, напишите в техподдержку."
+)
+PRIVACY_CONSENT_TEXT = (
+    "Перед началом нужно подтвердить согласие с политикой конфиденциальности FoodBalance. "
+    "Мы используем данные анкеты только для расчета рациона, проверки доступа и поддержки."
+)
+PRIVACY_CONSENT_ACCEPT_TEXT = "✅ Принять и продолжить"
+PRIVACY_CONSENT_SCHEMA_VERSION = 1
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
 CALLBACK_NEW = "diet:new"
@@ -1024,11 +1258,41 @@ CALLBACK_BUY_EXTRA_ONE_DAY = "diet:buy_extra_one_day"
 CALLBACK_BUY_EXTRA_WEEKLY_PDF = "diet:buy_extra_weekly_pdf"
 CALLBACK_FEATURES = "diet:features"
 CALLBACK_PROMO_CODE = "diet:promo_code"
+CALLBACK_PRIVACY_POLICY = "diet:privacy_policy"
+CALLBACK_PRIVACY_CONSENT = "diet:privacy_consent"
+CALLBACK_PRIVACY_CONSENT_TRIAL = "diet:privacy_consent:trial"
 CALLBACK_SUPPORT = "diet:support"
+CALLBACK_SALES_FOLLOWUP_OPT_OUT = SALES_FOLLOWUP_OPT_OUT_CALLBACK_DATA
+SALES_FOLLOWUP_OPT_OUT_CONFIRMATION_TEXT = "Хорошо, больше не буду напоминать."
+CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE = "diet:admin:create_monthly_access_code"
+CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO = "diet:admin:create_discount_promo"
+CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS = "diet:admin:list_discount_promos"
+CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO = "diet:admin:disable_discount_promo"
+ADMIN_PROMO_CALLBACKS = frozenset(
+    {
+        CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE,
+        CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO,
+        CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+        CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO,
+    }
+)
 CALLBACK_ONE_DAY_PLAN = "diet:one_day"
 CALLBACK_WEEK_PLAN_PDF = "diet:week_pdf"
 CALLBACK_ANSWER_PREFIX = "diet:answer:"
+SELECTED_ANSWER_PREFIX = "✅ "
 STALE_QUESTIONNAIRE_CALLBACK_TEXT = "Этот вопрос уже не активен. Продолжайте с последнего вопроса."
+ADMIN_CREATE_MONTHLY_ACCESS_CODE_TEXT = "🎟 Создать код на месяц"
+ADMIN_CREATE_DISCOUNT_PROMO_TEXT = "🏷 Создать/обновить скидку"
+ADMIN_LIST_DISCOUNT_PROMOS_TEXT = "📋 Список скидок"
+ADMIN_DISABLE_DISCOUNT_PROMO_TEXT = "🚫 Отключить скидку"
+ADMIN_PROMO_PANEL_TEXT = "Админ-панель\n\nВыберите действие:"
+ADMIN_DISCOUNT_PROMO_INPUT_TEXT = (
+    "Отправьте discount promo в формате:\n"
+    "CODE PERCENT\n\n"
+    "Пример: ANNA20 20"
+)
+ADMIN_DISABLE_DISCOUNT_PROMO_INPUT_TEXT = "Отправьте CODE скидки, которую нужно отключить."
+ADMIN_PROMO_STORAGE_ERROR_TEXT = "Promo storage is unavailable. Try again later."
 PAYMENT_CALLBACKS = {
     CALLBACK_PAY_TELEGRAM_STARS,
     CALLBACK_PAY_RU_CARD,
@@ -1084,6 +1348,15 @@ PAYMENT_ACTIVATION_DELAYED_TEXT = (
     "\u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 "
     "\u0432\u043a\u043b\u044e\u0447\u0438\u0442 \u0434\u043e\u0441\u0442\u0443\u043f."
 )
+PAYMENT_PENDING_INVOICE_ALREADY_OPEN_TEXT = (
+    "\u0421\u0447\u0435\u0442 \u0443\u0436\u0435 \u0441\u043e\u0437\u0434\u0430\u043d. "
+    "\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 "
+    "\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0443\u044e "
+    "\u0441\u0441\u044b\u043b\u043a\u0443 \u0434\u043b\u044f "
+    "\u043e\u043f\u043b\u0430\u0442\u044b \u0438\u043b\u0438 "
+    "\u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 "
+    "\u043f\u043e\u0437\u0436\u0435."
+)
 PAYMENT_RECOVERY_SPOOL_ENV = "DIET_BOT_PAYMENT_RECOVERY_SPOOL"
 PAYMENT_PAYLOAD_AMOUNTS = {
     PAYLOAD_SUBSCRIPTION_MONTH: SUBSCRIPTION_STARS_AMOUNT,
@@ -1096,22 +1369,22 @@ RUB_PAYMENT_PAYLOAD_AMOUNTS = {
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: EXTRA_WEEKLY_PDF_PRICE_RUB * 100,
 }
 PAYMENT_PAYLOAD_TITLES = {
-    PAYLOAD_SUBSCRIPTION_MONTH: "FoodBalance: подписка на месяц",
+    PAYLOAD_SUBSCRIPTION_MONTH: "FoodBalance: подписка на месяц с автопродлением",
     PAYLOAD_EXTRA_ONE_DAY: "FoodBalance: 1 дневной рацион",
     PAYLOAD_EXTRA_WEEKLY_PDF: "FoodBalance: 1 недельный PDF",
 }
 RUB_PAYMENT_PAYLOAD_TITLES = {
-    PAYLOAD_RU_SUBSCRIPTION_MONTH: "FoodBalance: подписка на месяц",
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: "FoodBalance: доступ на 30 дней",
     PAYLOAD_RU_EXTRA_ONE_DAY: "FoodBalance: 1 дневной рацион",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "FoodBalance: 1 недельный PDF",
 }
 PAYMENT_PAYLOAD_DESCRIPTIONS = {
-    PAYLOAD_SUBSCRIPTION_MONTH: "30 дней доступа: 4 недельных PDF и 5 дневных рационов.",
+    PAYLOAD_SUBSCRIPTION_MONTH: "Автопродляемая подписка: 4 недельных PDF и 5 дневных рационов в месяц.",
     PAYLOAD_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
 RUB_PAYMENT_PAYLOAD_DESCRIPTIONS = {
-    PAYLOAD_RU_SUBSCRIPTION_MONTH: "30 дней доступа: 4 недельных PDF и 5 дневных рационов.",
+    PAYLOAD_RU_SUBSCRIPTION_MONTH: "Разовый доступ на 30 дней: 4 недельных PDF и 5 дневных рационов.",
     PAYLOAD_RU_EXTRA_ONE_DAY: "Разовая дополнительная попытка для рациона на 1 день.",
     PAYLOAD_RU_EXTRA_WEEKLY_PDF: "Разовая дополнительная попытка для недельного PDF-рациона.",
 }
@@ -1140,16 +1413,22 @@ WELCOME_TEXT = (
     "без хаоса, ручных подсчётов и скучных однотипных меню.\n\n"
     "Начнём с короткой анкеты, чтобы я лучше понял, что вам подходит 👇"
 )
-PRIVATE_CHAT_ONLY_TEXT = "Bot works only in private chat."
+PRIVATE_CHAT_REQUIRED_TEXT = "Пожалуйста, откройте бота в личном чате, чтобы продолжить."
+PRIVATE_CHAT_CALLBACK_TEXT = "Откройте бота в личном чате, чтобы использовать эту кнопку."
+PRIVATE_CHAT_ONLY_TEXT = PRIVATE_CHAT_REQUIRED_TEXT
 TRIAL_SUBSCRIPTION_TEXT = (
-    "Это пробный рацион на 1 день, чтобы вы могли увидеть, как работает FoodBalance.\n\n"
-    "В месячную подписку входят 4 недельных рациона и 5 дополнительных дневных рационов. "
-    "Если рацион на какой-то день не подойдёт, вы сможете заменить его на другой.\n\n"
-    "Чтобы получать полноценные рационы, оформите доступ на месяц."
+    "Понравился рацион?\n\n"
+    "На неделю вперёд я составлю тебе такое же меню: каждый день завтрак, обед, ужин и перекусы. "
+    "Рецепты с граммовками, КБЖУ по каждому блюду и полная таблица витаминов и минералов за день.\n\n"
+    "В конце недели будет список всех продуктов, которые нужно купить, чтобы всё это приготовить.\n\n"
+    "Месячный доступ — это 4 недельных рациона плюс 5 дополнительных дней, "
+    "если захочешь что-то поменять."
 )
 BOT_COMMANDS = (
     BotCommand(command="start", description="Открыть стартовое меню"),
     BotCommand(command="plan", description="Заполнить анкету для рациона"),
+    BotCommand(command="promo", description="Ввести промокод"),
+    BotCommand(command="privacy", description="Политика конфиденциальности"),
     BotCommand(command="cancel", description="Сбросить активную анкету"),
 )
 
@@ -1160,6 +1439,8 @@ async def start(message: Message) -> None:
         return
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    _clear_questionnaire_session(message.chat.id)
+    TRIAL_CHAT_IDS.discard(message.chat.id)
     if _is_support_chat(message.chat.id):
         return
     await _send_welcome_photo(message)
@@ -1225,7 +1506,26 @@ async def plan(message: Message) -> None:
     if profile is not None:
         await _send_calculation_options(message, profile)
         return
-    await _start_questionnaire(message)
+    await _start_questionnaire_with_privacy_consent(message)
+
+
+@router.message(Command("promo"))
+async def promo(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
+    if _is_support_chat(message.chat.id):
+        return
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+    await _start_promo_code_request(message)
+
+
+@router.message(Command("privacy"))
+async def privacy(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
+    if _is_support_chat(message.chat.id):
+        return
+    await _send_privacy_policy(message)
 
 
 @router.message(Command("cancel"))
@@ -1236,6 +1536,7 @@ async def cancel(message: Message) -> None:
     TRIAL_CHAT_IDS.discard(message.chat.id)
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
     if _is_support_chat(message.chat.id):
         return
     await message.answer("Анкета сброшена ✅", reply_markup=_main_menu_keyboard(message.chat.id))
@@ -1265,6 +1566,13 @@ async def myid(message: Message) -> None:
 async def secret_access_command(message: Message) -> None:
     if await _reject_non_private_message(message):
         return
+    if _is_admin_panel_command_text(message.text or ""):
+        if not _is_admin_message(message):
+            await message.answer("Command is available only to admins.")
+            return
+        await _send_admin_promo_panel(message)
+        return
+
     action, target_chat_id = _parse_test_access_command(message.text or "")
     if target_chat_id is not None:
         if not _is_admin_message(message):
@@ -1356,6 +1664,46 @@ async def handle_callback(callback: CallbackQuery) -> None:
         SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
     if data != CALLBACK_PROMO_CODE:
         PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    if data not in ADMIN_PROMO_CALLBACKS:
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+
+    if data == CALLBACK_SALES_FOLLOWUP_OPT_OUT:
+        await _handle_sales_followup_opt_out_callback(callback, message)
+        return
+
+    if data == CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await _send_admin_monthly_access_code(message, admin_user_id=_callback_user_id(callback))
+        return
+
+    if data == CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        await _start_admin_discount_promo_create(message)
+        return
+
+    if data == CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await _send_admin_discount_promo_list(message)
+        return
+
+    if data == CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO:
+        if not _is_admin_callback(callback):
+            await callback.answer("Command is available only to admins.")
+            return
+        await callback.answer()
+        await _start_admin_discount_promo_disable(message)
+        return
 
     if data in PAYMENT_CALLBACKS and not _payments_enabled():
         await callback.answer()
@@ -1369,12 +1717,22 @@ async def handle_callback(callback: CallbackQuery) -> None:
 
     if data == CALLBACK_START:
         await callback.answer()
-        await _start_questionnaire(message, is_trial=True)
+        await _start_questionnaire_with_privacy_consent(message, is_trial=True)
         return
 
     if data == CALLBACK_NEW:
         await callback.answer()
-        await _start_questionnaire(message)
+        await _start_questionnaire_with_privacy_consent(message)
+        return
+
+    if data in {CALLBACK_PRIVACY_CONSENT, CALLBACK_PRIVACY_CONSENT_TRIAL}:
+        await callback.answer()
+        try:
+            await _save_privacy_consent_async(message.chat.id)
+        except ChatStateStorageError:
+            await message.answer(PRIVACY_CONSENT_STORAGE_ERROR_TEXT)
+            return
+        await _start_questionnaire(message, is_trial=data == CALLBACK_PRIVACY_CONSENT_TRIAL)
         return
 
     if data == CALLBACK_SUBSCRIBE:
@@ -1434,6 +1792,11 @@ async def handle_callback(callback: CallbackQuery) -> None:
         await _start_promo_code_request(message)
         return
 
+    if data == CALLBACK_PRIVACY_POLICY:
+        await callback.answer()
+        await _send_privacy_policy(message)
+        return
+
     if data == CALLBACK_REPEAT:
         await callback.answer()
         await _repeat_plan(message, idempotency_key=_one_day_callback_idempotency_key(callback))
@@ -1445,7 +1808,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_one_day_plan_with_access(
             message,
@@ -1460,7 +1823,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_week_plan_with_access(
             message,
@@ -1496,6 +1859,13 @@ async def handle_callback(callback: CallbackQuery) -> None:
                 await _answer_stale_questionnaire_callback(callback, message, session)
                 return
 
+            await _mark_questionnaire_answer_selected(
+                message,
+                session.current_question,
+                option_index,
+                chat_id=message.chat.id,
+                step_index=session.step_index,
+            )
             await callback.answer(answer)
             await _handle_questionnaire_answer(message, answer)
         return
@@ -1584,9 +1954,13 @@ async def handle_answer(message: Message) -> None:
     if normalized_command == "myid":
         await myid(message)
         return
+    if normalized_command == "privacy":
+        await privacy(message)
+        return
     if _is_support_chat(chat_id):
         SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(chat_id, None)
         return
     if normalized_command == "330366":
         await secret_access_command(message)
@@ -1597,17 +1971,23 @@ async def handle_answer(message: Message) -> None:
     if chat_id in SUPPORT_REQUEST_CHAT_IDS and normalized_command is None:
         await _handle_support_request(message, text)
         return
+    if chat_id in ADMIN_PROMO_ACTION_BY_CHAT_ID and normalized_command is None:
+        await _handle_admin_promo_action_input(message, text)
+        return
     if text == PROMO_CODE_TEXT:
         await _start_promo_code_request(message)
+        return
+    if text == PRIVACY_POLICY_TEXT:
+        await _send_privacy_policy(message)
         return
     if chat_id in PROMO_CODE_REQUEST_CHAT_IDS and normalized_command is None:
         await _handle_promo_code_request(message, text)
         return
     if text == TRY_FREE_TEXT:
-        await _start_questionnaire(message, is_trial=True)
+        await _start_questionnaire_with_privacy_consent(message, is_trial=True)
         return
     if text in {START_PLAN_TEXT, NEW_PROFILE_TEXT, CHANGE_PROFILE_TEXT}:
-        await _start_questionnaire(message)
+        await _start_questionnaire_with_privacy_consent(message)
         return
     if text == SUBSCRIBE_MONTH_TEXT:
         await _send_subscription_payment_options(message)
@@ -1626,7 +2006,7 @@ async def handle_answer(message: Message) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_one_day_plan_with_access(
             message,
@@ -1639,7 +2019,7 @@ async def handle_answer(message: Message) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_week_plan_with_access(message, profile)
         return
@@ -1732,26 +2112,81 @@ async def run_bot() -> None:
     single_poller_guard = _acquire_postgres_single_poller_guard(config)
     one_day_worker_task: asyncio.Task | None = None
     weekly_pdf_worker_task: asyncio.Task | None = None
+    sales_followup_worker_task: asyncio.Task | None = None
     try:
         bot = Bot(config.bot_token)
         await _set_bot_commands(bot)
         dispatcher = create_dispatcher()
         weekly_pdf_worker_task = _start_weekly_pdf_worker_if_configured(config, bot)
         one_day_worker_task = _start_one_day_generation_worker_if_configured(config, bot)
+        sales_followup_worker_task = _start_sales_followup_worker_if_configured(config, bot)
+        worker_tasks = [
+            task
+            for task in (weekly_pdf_worker_task, one_day_worker_task, sales_followup_worker_task)
+            if task is not None
+        ]
+        polling_task = asyncio.create_task(dispatcher.start_polling(bot), name="telegram-polling")
         try:
-            await dispatcher.start_polling(bot)
+            await _run_polling_with_worker_supervision(polling_task, worker_tasks)
         finally:
-            if weekly_pdf_worker_task is not None:
-                weekly_pdf_worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await weekly_pdf_worker_task
-            if one_day_worker_task is not None:
-                one_day_worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await one_day_worker_task
+            await _cancel_background_task(polling_task)
+            for worker_task in worker_tasks:
+                await _cancel_background_task(worker_task)
     finally:
         if single_poller_guard is not None:
             single_poller_guard.close()
+
+
+async def _run_polling_with_worker_supervision(
+    polling_task: asyncio.Task,
+    worker_tasks: Sequence[asyncio.Task],
+) -> None:
+    if not worker_tasks:
+        await polling_task
+        return
+
+    pending: set[asyncio.Task] = {polling_task, *worker_tasks}
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task is not polling_task:
+                await _cancel_background_task(polling_task)
+                _raise_worker_task_stopped(task)
+        if polling_task in done:
+            await polling_task
+            return
+
+
+def _raise_worker_task_stopped(task: asyncio.Task) -> None:
+    label = _worker_task_label(task)
+    if not task.cancelled():
+        with suppress(Exception):
+            task.exception()
+    raise RuntimeError(f"{label} stopped unexpectedly")
+
+
+def _worker_task_label(task: asyncio.Task) -> str:
+    task_name = task.get_name()
+    if task_name == "one-day-generation-worker":
+        return "One-day worker"
+    if task_name == "weekly-pdf-worker":
+        return "Weekly PDF worker"
+    if task_name == "sales-followup-worker":
+        return "Sales follow-up worker"
+    return "Worker"
+
+
+async def _cancel_background_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
 
 
 def _start_weekly_pdf_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
@@ -1779,6 +2214,25 @@ def _start_one_day_generation_worker_if_configured(config, bot: Bot) -> asyncio.
     worker = OneDayGenerationWorker(runtime, _TelegramOneDayGenerationJobProcessor(bot), settings)
     task = asyncio.create_task(worker.run_forever(), name="one-day-generation-worker")
     _observe_worker_task(task, "One-day worker")
+    return task
+
+
+def _start_sales_followup_worker_if_configured(config, bot: Bot) -> asyncio.Task | None:
+    if not getattr(config, "sales_followup_worker_enabled", False):
+        return None
+    runtime = _sales_followup_job_runtime()
+    if runtime is None:
+        logger.warning("Sales follow-up worker enabled but Postgres job runtime is unavailable")
+        return None
+    settings = SalesFollowupWorkerSettings.from_config(config)
+    worker = SalesFollowupWorker(
+        runtime,
+        _TelegramSalesFollowupSender(bot),
+        eligibility_checker=_sales_followup_production_eligibility,
+        settings=settings,
+    )
+    task = asyncio.create_task(worker.run_forever(), name="sales-followup-worker")
+    _observe_worker_task(task, "Sales follow-up worker")
     return task
 
 
@@ -1830,28 +2284,113 @@ def _is_private_chat_message(message: Message) -> bool:
     return str(getattr(chat_type, "value", chat_type)).lower() == "private"
 
 
+def _message_chat_type(message: Message) -> str | None:
+    chat_type = getattr(getattr(message, "chat", None), "type", None)
+    if chat_type is None:
+        return None
+    return str(getattr(chat_type, "value", chat_type)).lower()
+
+
+def _chat_type_is_private(chat_type: object) -> bool:
+    if chat_type is None:
+        return False
+    return str(getattr(chat_type, "value", chat_type)).lower() == "private"
+
+
+def _sales_followup_production_eligibility(job: object) -> SalesFollowupEligibility:
+    chat_type = _sales_followup_job_chat_type(job)
+    if chat_type is not None and not _chat_type_is_private(chat_type):
+        return SalesFollowupEligibility.blocked("non_private_chat")
+
+    chat_id = int(getattr(job, "chat_id"))
+    if _has_active_paid_access(chat_id):
+        return SalesFollowupEligibility.blocked("active_paid_access")
+    if _weekly_pdf_attempt_available(chat_id):
+        return SalesFollowupEligibility.blocked("weekly_pdf_access")
+    return SalesFollowupEligibility.allowed()
+
+
+def _sales_followup_job_chat_type(job: object) -> object | None:
+    chat_type = getattr(job, "chat_type", None)
+    if chat_type is not None:
+        return chat_type
+    payload = getattr(job, "payload", None)
+    if isinstance(payload, Mapping):
+        return payload.get("chat_type")
+    return None
+
+
 async def _reject_non_private_message(message: Message) -> bool:
     if _is_private_chat_message(message):
         return False
-    await message.answer(PRIVATE_CHAT_ONLY_TEXT)
+    await message.answer(PRIVATE_CHAT_REQUIRED_TEXT)
     return True
 
 
 async def _reject_non_private_callback(callback: CallbackQuery, message: Message) -> bool:
     if _is_private_chat_message(message):
         return False
-    await callback.answer(PRIVATE_CHAT_ONLY_TEXT)
+    with suppress(TypeError):
+        await callback.answer(PRIVATE_CHAT_CALLBACK_TEXT, show_alert=True)
+        return True
+    await callback.answer(PRIVATE_CHAT_CALLBACK_TEXT)
     return True
+
+
+async def _handle_sales_followup_opt_out_callback(callback: CallbackQuery, message: Message) -> None:
+    store = _sales_followup_store()
+    if store is not None:
+        try:
+            await _run_sales_followup_db_call(
+                store.set_opt_out,
+                message.chat.id,
+                opt_out_source="telegram_callback",
+            )
+            cancel_jobs = getattr(store, "cancel_active_jobs_for_chat_campaign", None)
+            if callable(cancel_jobs):
+                await _run_sales_followup_db_call(
+                    cancel_jobs,
+                    chat_id=message.chat.id,
+                    campaign_key=DEFAULT_SALES_FOLLOWUP_CAMPAIGN_KEY,
+                    reason="opted_out",
+                    chain_status="opted_out",
+                )
+        except Exception:
+            logger.exception(
+                "Failed to persist sales follow-up opt-out for chat_id=%s",
+                _mask_chat_id(message.chat.id),
+            )
+            await callback.answer("Не удалось сохранить настройку. Попробуйте позже.")
+            return
+
+    await callback.answer()
+    await _confirm_sales_followup_opt_out(message)
+
+
+async def _confirm_sales_followup_opt_out(message: Message) -> None:
+    edit_text = getattr(message, "edit_text", None)
+    if callable(edit_text):
+        try:
+            await edit_text(SALES_FOLLOWUP_OPT_OUT_CONFIRMATION_TEXT, reply_markup=None)
+            return
+        except Exception:
+            logger.exception(
+                "Failed to edit sales follow-up opt-out confirmation for chat_id=%s",
+                _mask_chat_id(message.chat.id),
+            )
+    await message.answer(SALES_FOLLOWUP_OPT_OUT_CONFIRMATION_TEXT)
 
 
 async def _start_support_request(message: Message) -> None:
     PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
     SUPPORT_REQUEST_CHAT_IDS.add(message.chat.id)
     await message.answer(SUPPORT_PROMPT_TEXT)
 
 
 async def _start_promo_code_request(message: Message) -> None:
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
     _clear_questionnaire_session(message.chat.id)
     TRIAL_CHAT_IDS.discard(message.chat.id)
     PROMO_CODE_REQUEST_CHAT_IDS.add(message.chat.id)
@@ -1879,7 +2418,32 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
     if activation.status == "already_used":
         await message.answer(PROMO_CODE_ALREADY_USED_TEXT)
         return
+    if activation.status == "disabled":
+        await message.answer(PROMO_CODE_DISABLED_TEXT)
+        return
+    if activation.status == "expired":
+        await message.answer(PROMO_CODE_EXPIRED_TEXT)
+        return
+    if activation.status == "not_access_code":
+        await message.answer(PROMO_CODE_NOT_ACCESS_TEXT)
+        return
     await message.answer(PROMO_CODE_NOT_FOUND_TEXT)
+
+
+async def _send_privacy_policy(message: Message) -> None:
+    text = PRIVACY_POLICY_BODY_TEXT
+    if PRIVACY_POLICY_URL:
+        text = f"{text}\n\nПолная версия: {PRIVACY_POLICY_URL}"
+    await message.answer(text, reply_markup=_privacy_policy_actions_keyboard())
+
+
+def _privacy_policy_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
+            [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
+        ],
+    )
 
 
 async def _handle_support_request(message: Message, text: str) -> None:
@@ -2035,12 +2599,28 @@ async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> N
     )
 
 
+async def _start_questionnaire_with_privacy_consent(message: Message, *, is_trial: bool = False) -> None:
+    SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
+    try:
+        has_consent = await _has_privacy_consent_async(message.chat.id)
+    except ChatStateStorageError:
+        await _send_chat_state_read_error(message)
+        return
+    if has_consent:
+        await _start_questionnaire(message, is_trial=is_trial)
+        return
+    await message.answer(
+        PRIVACY_CONSENT_TEXT,
+        reply_markup=_privacy_consent_keyboard(is_trial=is_trial),
+    )
+
+
 async def _repeat_plan(message: Message, *, idempotency_key: str | None = None) -> None:
     profile_loaded, profile = await _load_profile_for_message_or_notice(message)
     if not profile_loaded:
         return
     if profile is None:
-        await _start_questionnaire(message)
+        await _start_questionnaire_with_privacy_consent(message)
         return
     await _send_one_day_plan_with_access(
         message,
@@ -2077,18 +2657,18 @@ async def _send_trial_plan(
     *,
     idempotency_key: str | None = None,
 ) -> None:
+    trial_idempotency_key = idempotency_key or _trial_plan_idempotency_key(
+        message.chat.id,
+        QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
+        profile,
+    )
     runtime = _one_day_generation_job_runtime()
     if runtime is not None:
         await _send_trial_plan_with_postgres_job(
             message,
             profile,
             runtime=runtime,
-            idempotency_key=idempotency_key
-            or _trial_plan_idempotency_key(
-                message.chat.id,
-                QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.get(message.chat.id),
-                profile,
-            ),
+            idempotency_key=trial_idempotency_key,
         )
         return
 
@@ -2115,6 +2695,13 @@ async def _send_trial_plan(
 
     if sent:
         await _send_trial_subscription_cta(message)
+        await _schedule_sales_followup_after_trial_success(
+            chat_id=message.chat.id,
+            chat_type=_message_chat_type(message),
+            source=consumption.source,
+            include_trial_subscription_cta=True,
+            trigger_id=trial_idempotency_key,
+        )
 
 
 def _trial_plan_idempotency_key(chat_id: int, session_token: str | None, profile: UserProfile) -> str:
@@ -2151,6 +2738,62 @@ async def _send_trial_subscription_cta(message: Message) -> None:
     )
 
 
+async def _schedule_sales_followup_after_trial_success(
+    *,
+    chat_id: int,
+    chat_type: object,
+    source: str | None,
+    include_trial_subscription_cta: bool,
+    trigger_id: object,
+    trigger_job_id: object | None = None,
+) -> None:
+    feature_enabled = _sales_followup_runtime_enabled()
+    store = _sales_followup_store() if feature_enabled else None
+    has_active_paid_access = False
+    has_weekly_pdf_access = False
+    if feature_enabled and store is not None:
+        try:
+            has_active_paid_access = await _has_active_paid_access_async(chat_id)
+            has_weekly_pdf_access = await _weekly_pdf_attempt_available_async(chat_id)
+        except Exception:
+            logger.exception(
+                "Sales follow-up eligibility check failed for chat_id=%s; skipping schedule",
+                _mask_chat_id(chat_id),
+            )
+            return
+
+    try:
+        result = schedule_sales_followup_after_free_trial_delivery(
+            store=store,
+            chat_id=chat_id,
+            chat_is_private=_chat_type_is_private(chat_type),
+            feature_enabled=feature_enabled,
+            delivery_succeeded=True,
+            source=source,
+            include_trial_subscription_cta=include_trial_subscription_cta,
+            has_active_paid_access=has_active_paid_access,
+            has_weekly_pdf_access=has_weekly_pdf_access,
+            trigger_idempotency_key=build_sales_followup_trigger_idempotency_key(
+                chat_id=chat_id,
+                trigger_id=trigger_id,
+            ),
+            triggered_at=datetime.now(UTC),
+            trigger_job_id=trigger_job_id,
+        )
+    except Exception:
+        logger.exception(
+            "Sales follow-up schedule admission failed for chat_id=%s",
+            _mask_chat_id(chat_id),
+        )
+        return
+
+    logger.info(
+        "Sales follow-up schedule admission result for chat_id=%s status=%s",
+        _mask_chat_id(chat_id),
+        result.status.value,
+    )
+
+
 async def _send_trial_plan_with_postgres_job(
     message: Message,
     profile: UserProfile,
@@ -2182,6 +2825,7 @@ async def _send_trial_plan_with_postgres_job(
                 request_kind="telegram_trial",
                 request_payload={
                     "source": "telegram_trial",
+                    "chat_type": _message_chat_type(message),
                     "include_calculation_report": True,
                     "include_default_after_plan_keyboard": False,
                     "include_entitlement_status": False,
@@ -2873,7 +3517,8 @@ async def _send_plan(
         return False
     recent_recipe_ids = set(RECENT_RECIPE_IDS_BY_CHAT_ID.get(chat_id, []))
     recent_recipe_keys = set(RECENT_RECIPE_KEYS_BY_CHAT_ID.get(chat_id, []))
-    plan_result = build_one_day_plan(
+    plan_result = await asyncio.to_thread(
+        build_one_day_plan,
         profile,
         variety_seed=seed,
         avoided_recipe_ids=recent_recipe_ids,
@@ -2940,6 +3585,50 @@ class _TelegramOneDayGenerationJobProcessor:
         return await _prepare_one_day_generation_delivery(job, self.bot)
 
 
+class _TelegramSalesFollowupSender:
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+
+    async def send(self, request: SalesFollowupSendRequest) -> SalesFollowupSendResult:
+        payload = dict(request.payload or {})
+        payload.setdefault("message_text", request.message_text)
+        if request.button_label is not None:
+            payload.setdefault("button_label", request.button_label)
+        if request.target_callback_data is not None:
+            payload.setdefault("target_callback_data", request.target_callback_data)
+        rendered = render_sales_followup_payload(payload)
+        if not rendered.sendable:
+            raise SalesFollowupPermanentSendError(rendered.failure_reason or "sales_followup_not_sendable")
+
+        try:
+            sent = await safe_telegram_send(
+                lambda: self.bot.send_message(
+                    chat_id=request.chat_id,
+                    text=rendered.message_text,
+                    reply_markup=_sales_followup_inline_keyboard(rendered.keyboard),
+                ),
+                operation_name="sales_followup_worker_send_message",
+            )
+        except TelegramSendError as exc:
+            if exc.result.classification == TelegramSendFailureClass.RETRYABLE:
+                raise SalesFollowupTransientSendError(str(exc)) from exc
+            if exc.result.classification == TelegramSendFailureClass.PERMANENT:
+                raise SalesFollowupPermanentSendError(str(exc)) from exc
+            raise SalesFollowupUnknownSendOutcome(str(exc)) from exc
+        return SalesFollowupSendResult(telegram_message_id=getattr(sent, "message_id", None))
+
+
+def _sales_followup_inline_keyboard(
+    rows: tuple[tuple[tuple[str, str], ...], ...],
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=text, callback_data=callback_data) for text, callback_data in row]
+            for row in rows
+        ],
+    )
+
+
 class _OneDayJobChat:
     def __init__(self, chat_id: int) -> None:
         self.id = chat_id
@@ -2975,7 +3664,8 @@ async def _prepare_one_day_generation_delivery(job: OneDayGenerationJob, bot: Bo
 
     request_payload = dict(snapshot.request_payload)
     message = _OneDayJobMessage(bot=bot, chat_id=job.chat_id)
-    plan_result = build_one_day_plan(
+    plan_result = await asyncio.to_thread(
+        build_one_day_plan,
         profile,
         variety_seed=_generation_seed_from_snapshot(snapshot),
         avoided_recipe_ids=set(snapshot.recent_recipe_ids),
@@ -3035,6 +3725,14 @@ async def _prepare_one_day_generation_delivery(job: OneDayGenerationJob, bot: Bo
         )
         if request_payload.get("include_trial_subscription_cta"):
             await _send_trial_subscription_cta(message)
+            await _schedule_sales_followup_after_trial_success(
+                chat_id=job.chat_id,
+                chat_type=request_payload.get("chat_type"),
+                source=job.consumption_source,
+                include_trial_subscription_cta=True,
+                trigger_id=job.job_id,
+                trigger_job_id=job.job_id,
+            )
 
     return OneDayGenerationDelivery(
         value_messages=tuple(value_messages),
@@ -3135,6 +3833,7 @@ async def _prepare_weekly_pdf_delivery(job: WeeklyPdfJob, bot: Bot) -> WeeklyPdf
             ration_kind="weekly_pdf",
             context="weekly_pdf_worker_success",
         )
+        await _cancel_sales_followup_after_access_grant_async(job.chat_id, reason="weekly_pdf_delivered")
 
     return WeeklyPdfDelivery(send=send, after_success=after_success)
 
@@ -3728,6 +4427,577 @@ def _weekly_phase_feasibility_counts_summary(
         for count in counts
     )
 
+def _recent_avoidance_is_empty(recent_avoidance: _RecentRecipeAvoidance) -> bool:
+    return not (
+        recent_avoidance.full_recipe_ids
+        or recent_avoidance.full_recipe_keys
+        or recent_avoidance.reduced_recipe_ids
+        or recent_avoidance.reduced_recipe_keys
+    )
+
+
+def _weekly_no_recent_repeat_fallback_reason(
+    profile: UserProfile,
+    *,
+    recipe_cache: _RecipePlanCache,
+) -> str | None:
+    feasibility = _weekly_phase_feasibility(
+        profile,
+        set(),
+        set(),
+        phase="full_recent",
+        recipe_cache=recipe_cache,
+    )
+    if feasibility.reason in {"safety_cannot_generate", "no_safe_foods"}:
+        return feasibility.reason
+
+    for count in feasibility.slot_counts:
+        threshold = count.weekly_required * WEEKLY_REPEATS_FALLBACK_POOL_MULTIPLIER
+        available = _weekly_phase_slot_gating_count(count)
+        if available < threshold:
+            return f"repeat_fallback_slot_pool_below_threshold:{count.slot}:{available}<{threshold}"
+    return None
+
+
+def _build_week_plans_with_repeats_fallback(
+    profile: UserProfile,
+    seed: int,
+    *,
+    recipe_cache: _RecipePlanCache,
+    failure_reason: str | None = None,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> _WeekPlanBuildResult:
+    if selection_guard is not None:
+        selection_guard.begin_phase("repeats_fallback")
+        selection_guard.check(stage="before_repeats_fallback")
+
+    safety = evaluate_safety(profile)
+    if not safety.can_generate_plan:
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            failure_reason="safety_cannot_generate",
+        )
+
+    if not filter_foods(built_in_foods(), safety):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="no_safe_foods",
+        )
+
+    day_pool = _build_weekly_repeat_fallback_day_pool(
+        profile,
+        seed,
+        recipe_cache=recipe_cache,
+        selection_guard=selection_guard,
+    )
+    if selection_guard is not None:
+        selection_guard.check(stage="after_repeats_fallback_day_pool")
+    if not day_pool:
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="repeats_fallback_no_valid_day_pool",
+        )
+
+    scheduled_plans = _schedule_weekly_repeat_fallback_pool(
+        day_pool,
+        profile,
+        selection_guard=selection_guard,
+    )
+    if selection_guard is not None:
+        selection_guard.check(stage="after_repeats_fallback_schedule")
+    repeat_count = _weekly_repeated_recipe_count(scheduled_plans)
+    if not _week_plans_are_complete(scheduled_plans, profile):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="repeats_fallback_incomplete_week",
+        )
+    return _WeekPlanBuildResult(
+        plans=scheduled_plans,
+        avoidance_phase="repeats_fallback",
+        repeat_fallback_used=True,
+        repeat_recipe_count=repeat_count,
+        repeat_note=WEEKLY_REPEATS_FALLBACK_NOTE if repeat_count else None,
+    )
+
+
+def _build_weekly_repeat_fallback_day_pool(
+    profile: UserProfile,
+    seed: int,
+    *,
+    recipe_cache: _RecipePlanCache,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[MealPlan, ...]:
+    safety = evaluate_safety(profile)
+    if "dairy" in safety.excluded_food_names:
+        builders = (_build_weekly_repeat_fallback_day_pool_from_slots,)
+    else:
+        builders = (
+            _build_weekly_repeat_fallback_day_pool_from_builder,
+            _build_weekly_repeat_fallback_day_pool_from_slots,
+        )
+
+    for build_pool in builders:
+        if selection_guard is not None:
+            selection_guard.check(stage=f"before_{build_pool.__name__}")
+        day_pool = build_pool(
+            profile,
+            seed,
+            recipe_cache=recipe_cache,
+            selection_guard=selection_guard,
+        )
+        if selection_guard is not None:
+            selection_guard.check(stage=f"after_{build_pool.__name__}")
+        if day_pool:
+            return day_pool
+    return ()
+
+
+def _build_weekly_repeat_fallback_day_pool_from_builder(
+    profile: UserProfile,
+    seed: int,
+    *,
+    recipe_cache: _RecipePlanCache,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[MealPlan, ...]:
+    plans: list[MealPlan] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+    generated_by_offset: dict[int, MealPlan] = {}
+    builder_pool_size = min(
+        WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE,
+        WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE,
+    )
+
+    for offset in range(WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS):
+        if len(plans) >= builder_pool_size:
+            break
+
+        if selection_guard is not None:
+            selection_guard.check(stage="repeats_fallback_builder_day", candidate_index=offset)
+        plan = generated_by_offset.get(offset)
+        if plan is None:
+            plan = build_one_day_plan(
+                profile,
+                variety_seed=seed + offset,
+                recipe_source="curated_only",
+                allow_curated_seed_fallback=False,
+                recipe_cache=recipe_cache,
+                selection_guard=(
+                    _WeeklySelectionScopedGuard(selection_guard, None, offset)
+                    if selection_guard is not None
+                    else None
+                ),
+            )
+            generated_by_offset[offset] = plan
+        if selection_guard is not None:
+            selection_guard.check(stage="after_repeats_fallback_builder_day", candidate_index=offset)
+
+        if not _week_day_plan_is_complete(plan, profile):
+            continue
+
+        signature = _plan_recipe_ids(plan)
+        if not signature or signature in seen_signatures:
+            continue
+
+        seen_signatures.add(signature)
+        plans.append(plan)
+
+    return tuple(plans)
+
+
+def _build_weekly_repeat_fallback_day_pool_from_slots(
+    profile: UserProfile,
+    seed: int,
+    *,
+    recipe_cache: _RecipePlanCache,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[MealPlan, ...]:
+    if selection_guard is not None:
+        selection_guard.check(stage="before_repeats_fallback_slots_context")
+    context, _context_failure_reason = _weekly_repeat_fallback_context(profile, recipe_cache)
+    if context is None:
+        return ()
+
+    target = context.targets.targets
+    total_energy = target.get("energy_kcal")
+    slots = _meal_energy_slots(profile.meal_count)
+    slot_options = tuple(
+        _weekly_repeat_fallback_fast_slot_options(
+            context.recipes,
+            energy_slot.slot,
+            meal_index,
+            context,
+            target,
+            total_energy * energy_slot.target_ratio,
+            Counter(),
+            frozenset(),
+            selection_guard=selection_guard,
+        )
+        for meal_index, energy_slot in enumerate(slots)
+    )
+    if any(not options for options in slot_options):
+        return ()
+
+    plans: list[MealPlan] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+
+    ranked_combinations = _weekly_repeat_fallback_ranked_combinations(
+        slot_options,
+        slots,
+        target,
+        Counter(),
+        frozenset(),
+        selection_guard=selection_guard,
+    )
+    for offset, recipes_for_day in enumerate(
+        ranked_combinations[:WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT]
+    ):
+        if len(plans) >= WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE:
+            break
+
+        if selection_guard is not None:
+            selection_guard.check(stage="repeats_fallback_fast_combo", candidate_index=offset)
+        signature = tuple(recipe.id for recipe in recipes_for_day)
+        if signature in seen_signatures:
+            continue
+
+        meals = _weekly_repeat_fallback_build_combo_meals(
+            recipes_for_day,
+            slots,
+            context,
+            target,
+            total_energy,
+            seed + offset,
+        )
+        if len(meals) != len(slots):
+            continue
+        if not _passes_hard_nutrition_gates(
+            meals,
+            target,
+            enforce_sodium=_should_manage_sodium(target),
+        ):
+            continue
+
+        plan = MealPlan(meals=tuple(meals), targets=context.targets, safety=context.safety)
+        if not _week_day_plan_is_complete(plan, profile):
+            continue
+        seen_signatures.add(signature)
+        plans.append(plan)
+
+    return tuple(plans)
+
+
+def _weekly_repeat_fallback_context(
+    profile: UserProfile,
+    recipe_cache: _RecipePlanCache,
+) -> tuple[_WeeklyRepeatFallbackContext | None, str | None]:
+    safety = evaluate_safety(profile)
+    targets = calculate_targets(profile)
+    if not safety.can_generate_plan:
+        return None, "safety_cannot_generate"
+
+    foods = tuple(filter_foods(built_in_foods(), safety))
+    if not foods:
+        return None, "no_safe_foods"
+
+    food_by_id = {food.id: food for food in foods}
+    food_cache_key = _food_by_id_cache_key(food_by_id)
+    recipes = _weekly_phase_feasible_base_recipes(
+        food_by_id,
+        food_cache_key,
+        set(),
+        set(),
+        safety.excluded_food_names,
+        recipe_cache,
+    )
+    if not recipes:
+        return None, "no_safe_recipes"
+
+    return (
+        _WeeklyRepeatFallbackContext(
+            safety=safety,
+            targets=targets,
+            foods=foods,
+            food_by_id=food_by_id,
+            food_cache_key=food_cache_key,
+            recipes=recipes,
+            recipe_cache=recipe_cache,
+        ),
+        None,
+    )
+
+
+def _weekly_repeat_fallback_fast_slot_options(
+    recipes: tuple[RecipeTemplate, ...],
+    slot: str,
+    meal_index: int,
+    context: _WeeklyRepeatFallbackContext,
+    target: NutrientVector,
+    slot_energy_target: float,
+    week_recipe_counts: Counter[str],
+    previous_day_recipe_ids: frozenset[str],
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[_WeeklyRepeatFallbackFastOption, ...]:
+    del meal_index
+    options: list[tuple[tuple[float, float, float, float, str], _WeeklyRepeatFallbackFastOption]] = []
+    empty_used_grams: defaultdict[str, float] = defaultdict(float)
+    empty_total = NutrientVector()
+    for recipe_index, recipe in enumerate(recipes):
+        if selection_guard is not None and recipe_index % 16 == 0:
+            selection_guard.check(
+                stage=f"repeats_fallback_slot_options:{slot}",
+                candidate_index=recipe_index,
+            )
+        eligibility = _recipe_slot_eligibility_cached(
+            recipe,
+            slot,
+            context.food_by_id,
+            slot_energy_target,
+            target,
+            recipe_cache=context.recipe_cache,
+            food_cache_key=context.food_cache_key,
+        )
+        if not eligibility.eligible:
+            continue
+        resolved = _resolve_recipe_ingredients(
+            recipe,
+            context.food_by_id,
+            recipe_cache=context.recipe_cache,
+            food_cache_key=context.food_cache_key,
+        )
+        if resolved is None:
+            continue
+        base_energy = NutrientVector.sum(
+            food.portion(grams).nutrients for food, grams in resolved
+        ).get("energy_kcal")
+        portions = _scaled_recipe_portions(
+            resolved,
+            _recipe_scale(slot_energy_target, base_energy),
+            empty_used_grams,
+            empty_total,
+            target,
+            meal_slot=slot,
+        )
+        if not portions:
+            continue
+        nutrients = NutrientVector.sum(portion.nutrients for portion in portions)
+        repeat_weight = 2.0 if slot == "main" else 1.0
+        sort_key = (
+            -float(recipe.id in previous_day_recipe_ids),
+            -(week_recipe_counts[recipe.id] * repeat_weight),
+            nutrients.get("protein_g"),
+            -abs(nutrients.get("energy_kcal") - slot_energy_target),
+            recipe.id,
+        )
+        options.append(
+            (
+                sort_key,
+                _WeeklyRepeatFallbackFastOption(
+                    recipe=recipe,
+                    estimated_protein_g=nutrients.get("protein_g"),
+                    estimated_energy_kcal=nutrients.get("energy_kcal"),
+                ),
+            )
+        )
+
+    return tuple(
+        option
+        for _, option in sorted(options, key=lambda item: item[0], reverse=True)[
+            :WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS
+        ]
+    )
+
+
+def _weekly_repeat_fallback_ranked_combinations(
+    slot_options: tuple[tuple[_WeeklyRepeatFallbackFastOption, ...], ...],
+    slots,
+    target: NutrientVector,
+    week_recipe_counts: Counter[str],
+    previous_day_recipe_ids: frozenset[str],
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[tuple[RecipeTemplate, ...], ...]:
+    ranked: list[tuple[tuple[float, float, float, float, float, tuple[str, ...]], tuple[RecipeTemplate, ...]]] = []
+    for combination_index, combination in enumerate(itertools.product(*slot_options)):
+        if selection_guard is not None and combination_index % 64 == 0:
+            selection_guard.check(
+                stage="repeats_fallback_ranked_combinations",
+                candidate_index=combination_index,
+            )
+        recipe_ids = tuple(option.recipe.id for option in combination)
+        if len(set(recipe_ids)) != len(recipe_ids):
+            continue
+        adjacent_count = len(set(recipe_ids) & previous_day_recipe_ids)
+        repeat_pressure = sum(week_recipe_counts[recipe_id] for recipe_id in recipe_ids)
+        main_repeat_pressure = sum(
+            week_recipe_counts[recipe_ids[index]]
+            for index, energy_slot in enumerate(slots)
+            if energy_slot.slot == "main"
+        )
+        estimated_protein = sum(option.estimated_protein_g for option in combination)
+        estimated_energy = sum(option.estimated_energy_kcal for option in combination)
+        score = (
+            -float(adjacent_count),
+            -abs(estimated_protein - target.get("protein_g")),
+            -abs(estimated_energy - target.get("energy_kcal")),
+            -float(main_repeat_pressure),
+            -float(repeat_pressure),
+            recipe_ids,
+        )
+        ranked.append((score, tuple(option.recipe for option in combination)))
+    return tuple(
+        recipes
+        for _, recipes in sorted(ranked, key=lambda item: item[0], reverse=True)
+    )
+
+
+def _weekly_repeat_fallback_build_combo_meals(
+    recipes_for_day: tuple[RecipeTemplate, ...],
+    slots,
+    context: _WeeklyRepeatFallbackContext,
+    target: NutrientVector,
+    total_energy: float,
+    seed: int,
+) -> list[Meal]:
+    meals: list[Meal] = []
+    used_grams: defaultdict[str, float] = defaultdict(float)
+    current_total = NutrientVector()
+    for meal_index, (recipe, energy_slot) in enumerate(zip(recipes_for_day, slots)):
+        resolved = _resolve_recipe_ingredients(
+            recipe,
+            context.food_by_id,
+            recipe_cache=context.recipe_cache,
+            food_cache_key=context.food_cache_key,
+        )
+        if resolved is None:
+            return []
+        base_energy = NutrientVector.sum(
+            food.portion(grams).nutrients for food, grams in resolved
+        ).get("energy_kcal")
+        portions = _scaled_recipe_portions(
+            resolved,
+            _recipe_scale(total_energy * energy_slot.target_ratio, base_energy),
+            used_grams,
+            current_total,
+            target,
+            meal_slot=energy_slot.slot,
+        )
+        if not portions:
+            return []
+        for portion in portions:
+            used_grams[portion.food.id] += portion.grams
+        meal = Meal(
+            name=f"{_meal_emoji(energy_slot.slot, meal_index)} {_meal_name(energy_slot.slot, meal_index)}: {recipe.title}",
+            portions=tuple(portions),
+            recipe=recipe.instructions,
+            image_url=recipe.image_url,
+            image_attribution=recipe.image_attribution,
+            source_url=recipe.source_url,
+            recipe_id=recipe.id,
+            recipe_key=_recipe_memory_key_cached(
+                recipe,
+                energy_slot.slot,
+                recipe_cache=context.recipe_cache,
+            ),
+        )
+        meals.append(meal)
+        current_total = current_total.plus(meal.nutrients)
+
+    if current_total.get("protein_g") + 0.01 < target.get("protein_g") * 0.85:
+        return []
+    return _finalize_recipe_meals(meals, list(context.foods), target, seed)
+
+
+def _plan_recipe_ids(plan: MealPlan) -> tuple[str, ...]:
+    return tuple(meal.recipe_id for meal in plan.meals if meal.recipe_id)
+
+
+def _weekly_repeated_recipe_count(plans: Sequence[MealPlan]) -> int:
+    counts: Counter[str] = Counter(
+        recipe_id
+        for plan in plans
+        for recipe_id in _plan_recipe_ids(plan)
+    )
+    return sum(count - 1 for count in counts.values() if count > 1)
+
+
+def _schedule_weekly_repeat_fallback_pool(
+    day_pool: tuple[MealPlan, ...],
+    profile: UserProfile,
+    *,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[MealPlan, ...]:
+    if not day_pool:
+        return ()
+
+    scheduled: list[MealPlan] = []
+    recipe_counts: Counter[str] = Counter()
+    previous_day_recipe_ids: frozenset[str] = frozenset()
+
+    for day_index in range(WEEK_PLAN_DAYS):
+        if selection_guard is not None:
+            selection_guard.check(stage="repeats_fallback_schedule_day", day_index=day_index)
+        candidates = list(day_pool)
+        non_adjacent_candidates = [
+            plan
+            for plan in candidates
+            if not (set(_plan_recipe_ids(plan)) & previous_day_recipe_ids)
+        ]
+        if non_adjacent_candidates:
+            candidates = non_adjacent_candidates
+        selected = max(
+            enumerate(candidates),
+            key=lambda item: _weekly_repeat_fallback_pool_score(
+                item[1],
+                recipe_counts,
+                previous_day_recipe_ids,
+                profile,
+                pool_index=item[0],
+            ),
+        )[1]
+        scheduled.append(selected)
+        previous_day_recipe_ids = frozenset(_plan_recipe_ids(selected))
+        recipe_counts.update(previous_day_recipe_ids)
+    return tuple(scheduled)
+
+
+def _weekly_repeat_fallback_pool_score(
+    plan: MealPlan,
+    recipe_counts: Counter[str],
+    previous_day_recipe_ids: frozenset[str],
+    profile: UserProfile,
+    *,
+    pool_index: int,
+) -> tuple[float, float, float, float, float, float, int]:
+    recipe_ids = _plan_recipe_ids(plan)
+    adjacent_count = len(set(recipe_ids) & previous_day_recipe_ids)
+    repeated_recipe_additions = sum(1 for recipe_id in recipe_ids if recipe_counts[recipe_id] > 0)
+    repeat_pressure = sum(recipe_counts[recipe_id] for recipe_id in recipe_ids)
+    max_after = max((recipe_counts[recipe_id] + 1 for recipe_id in recipe_ids), default=0)
+    main_repeat_pressure = sum(
+        recipe_counts[meal.recipe_id]
+        for meal in plan.meals
+        if meal.recipe_id and _meal_slot(meal) == "main"
+    )
+    new_recipe_count = sum(1 for recipe_id in recipe_ids if recipe_counts[recipe_id] == 0)
+    protein_gap = _relative_gap(plan.totals, plan.targets.targets, "protein_g")
+    return (
+        -float(repeated_recipe_additions),
+        -float(adjacent_count),
+        -float(repeat_pressure),
+        -float(main_repeat_pressure),
+        -float(max_after),
+        float(new_recipe_count),
+        -protein_gap,
+        -pool_index,
+    )
+
+
 def _load_recent_recipe_avoidance(
     chat_id: int,
     *,
@@ -3745,6 +5015,44 @@ def _build_week_plans_with_recent_fallback(
     guard = _WeeklySelectionGuard()
     recipe_cache = _RecipePlanCache()
     timed_out = False
+    repeat_fallback_reason: str | None = None
+    if _recent_avoidance_is_empty(recent_avoidance):
+        try:
+            guard.check(stage="before_repeat_fallback_precheck")
+        except _WeeklySelectionTimeout as exc:
+            return _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
+        repeat_fallback_reason = _weekly_no_recent_repeat_fallback_reason(
+            profile,
+            recipe_cache=recipe_cache,
+        )
+        try:
+            guard.check(stage="after_repeat_fallback_precheck")
+        except _WeeklySelectionTimeout as exc:
+            return _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
+        if repeat_fallback_reason in {"safety_cannot_generate", "no_safe_foods"}:
+            return _WeekPlanBuildResult(
+                plans=(),
+                avoidance_phase="failed",
+                failure_reason=repeat_fallback_reason,
+            )
+        if repeat_fallback_reason is not None:
+            _weekly_selection_diag(
+                "repeats_fallback_start",
+                phase="repeats_fallback",
+                seed=seed,
+                reason=repeat_fallback_reason,
+            )
+            try:
+                return _build_week_plans_with_repeats_fallback(
+                    profile,
+                    seed,
+                    recipe_cache=recipe_cache,
+                    failure_reason=repeat_fallback_reason,
+                    selection_guard=guard,
+                )
+            except _WeeklySelectionTimeout as exc:
+                return _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
+
     for phase, avoided_recipe_ids, avoided_recipe_keys in _weekly_recent_avoidance_phases(
         recent_avoidance
     ):
@@ -3791,19 +5099,7 @@ def _build_week_plans_with_recent_fallback(
             )
         except _WeeklySelectionTimeout as exc:
             timed_out = True
-            _weekly_selection_diag(
-                "timeout",
-                always=True,
-                scope=exc.scope,
-                phase=_weekly_selection_phase_label(exc.phase),
-                raw_phase=exc.phase,
-                elapsed_s=f"{exc.elapsed_s:.3f}",
-                timeout_s=f"{exc.timeout_s:.3f}",
-                day_index=exc.day_index,
-                candidate_index=exc.candidate_index,
-                stage=exc.stage,
-                **_recipe_cache_diag_counts(recipe_cache),
-            )
+            _weekly_selection_timeout_result(exc, recipe_cache=recipe_cache)
             if exc.scope == "total":
                 return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
             continue
@@ -3845,7 +5141,13 @@ def _build_week_plans_with_recent_fallback(
         total_timeout_s > 0 and time.perf_counter() - guard.total_started_at > total_timeout_s
     ):
         return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
-    return _WeekPlanBuildResult(plans=(), avoidance_phase="failed")
+    if _recent_avoidance_is_empty(recent_avoidance):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            failure_reason="strict_weekly_selection_failed",
+        )
+    return _WeekPlanBuildResult(plans=(), avoidance_phase="failed", failure_reason="strict_weekly_selection_failed")
 
 def _weekly_recent_avoidance_phases(
     recent_avoidance: _RecentRecipeAvoidance,
@@ -3916,7 +5218,11 @@ def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) ->
     return len(plans) == WEEK_PLAN_DAYS and all(_week_day_plan_is_complete(plan, profile) for plan in plans)
 
 def _week_day_plan_is_complete(plan: MealPlan, profile: UserProfile) -> bool:
-    return plan.safety.can_generate_plan and len(plan.meals) == _expected_meal_count(profile)
+    return (
+        plan.safety.can_generate_plan
+        and len(plan.meals) == _expected_meal_count(profile)
+        and validate_plan(plan).ok
+    )
 
 
 def _expected_meal_count(profile: UserProfile) -> int:
@@ -4266,6 +5572,7 @@ def _select_week_day_plan(
                     avoided_recipe_keys=avoided_recipe_keys,
                     recipe_source="curated_only",
                     allow_avoided_recipe_relaxation=False,
+                    allow_curated_seed_fallback=False,
                     recipe_cache=recipe_cache,
                     selection_guard=candidate_selection_guard,
                 )
@@ -4343,6 +5650,7 @@ def _select_week_day_plan(
             avoided_recipe_keys=avoided_recipe_keys,
             recipe_source="curated_only",
             allow_avoided_recipe_relaxation=False,
+            allow_curated_seed_fallback=False,
             recipe_cache=recipe_cache,
             selection_guard=(
                 _WeeklySelectionScopedGuard(selection_guard, day_index, None)
@@ -4586,6 +5894,45 @@ def _save_chat_profile(chat_id: int, profile: UserProfile) -> None:
         raise ChatStateStorageError("Could not save chat profile") from exc
 
 
+def _has_privacy_consent(chat_id: int) -> bool:
+    if chat_id in PRIVACY_CONSENT_CHAT_IDS:
+        return True
+    chat_state = _load_chat_state(chat_id)
+    if not _is_privacy_consent_record(chat_state.get("privacy_consent")):
+        return False
+    PRIVACY_CONSENT_CHAT_IDS.add(chat_id)
+    return True
+
+
+def _save_privacy_consent(chat_id: int) -> None:
+    try:
+        _chat_state_store().save_chat_state(chat_id, {"privacy_consent": _privacy_consent_record()})
+    except ChatStateStorageError:
+        raise
+    except Exception as exc:
+        raise ChatStateStorageError("Could not save privacy consent") from exc
+    PRIVACY_CONSENT_CHAT_IDS.add(chat_id)
+
+
+def _privacy_consent_record(now: datetime | None = None) -> dict[str, object]:
+    record: dict[str, object] = {
+        "accepted": True,
+        "accepted_at": (now or datetime.now(UTC)).replace(microsecond=0).isoformat(),
+        "text_sha256": hashlib.sha256(PRIVACY_CONSENT_TEXT.encode("utf-8")).hexdigest(),
+        "schema_version": PRIVACY_CONSENT_SCHEMA_VERSION,
+    }
+    if PRIVACY_POLICY_URL:
+        record["policy_url"] = PRIVACY_POLICY_URL
+    return record
+
+
+def _is_privacy_consent_record(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    accepted_at = value.get("accepted_at")
+    return value.get("accepted") is True and isinstance(accepted_at, str) and bool(accepted_at.strip())
+
+
 def _load_chat_state(chat_id: int) -> dict[str, object]:
     try:
         store = _chat_state_store()
@@ -4675,9 +6022,9 @@ def _profile_from_dict(raw: dict[str, object]) -> UserProfile | None:
 
 
 def _privacy_policy_button() -> InlineKeyboardButton | None:
-    if not PRIVACY_POLICY_URL:
-        return None
-    return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, url=PRIVACY_POLICY_URL)
+    if PRIVACY_POLICY_URL:
+        return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, url=PRIVACY_POLICY_URL)
+    return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, callback_data=CALLBACK_PRIVACY_POLICY)
 
 
 def _rows_with_privacy_policy(
@@ -4719,6 +6066,22 @@ def _start_keyboard() -> InlineKeyboardMarkup:
     return _keyboard_with_privacy_policy(rows)
 
 
+def _privacy_consent_keyboard(*, is_trial: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=PRIVACY_CONSENT_ACCEPT_TEXT,
+                callback_data=CALLBACK_PRIVACY_CONSENT_TRIAL if is_trial else CALLBACK_PRIVACY_CONSENT,
+            ),
+        ],
+    ]
+    privacy_button = _privacy_policy_button()
+    if privacy_button is not None:
+        rows.append([privacy_button])
+    rows.append([InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     entitlement = _entitlement_for_chat(chat_id)
     if _has_active_paid_access(chat_id, entitlement):
@@ -4754,8 +6117,8 @@ def _subscriber_cabinet_keyboard(
     entitlement: Entitlement | None = None,
 ) -> InlineKeyboardMarkup:
     entitlement = entitlement or _entitlement_for_chat(chat_id)
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [
                 InlineKeyboardButton(
                     text=_subscriber_one_day_button_text(chat_id, entitlement),
@@ -4769,6 +6132,7 @@ def _subscriber_cabinet_keyboard(
                 ),
             ],
             [InlineKeyboardButton(text=CHANGE_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
@@ -4863,8 +6227,8 @@ async def _send_extra_purchase_subscription_notice_if_needed(message: Message) -
     if entitlement.is_subscription_active() and not _is_free_preview_mode(message.chat.id, entitlement):
         return False
     await message.answer(
-        "Разовые покупки доступны только при активной подписке.\n\n"
-        "Чтобы продолжить, оформите месячный доступ.",
+        "Разовые покупки доступны только при активном месячном доступе.\n\n"
+        "Чтобы продолжить, оформите месячный доступ или введите промокод.",
         reply_markup=_subscription_payment_keyboard(),
     )
     return True
@@ -4930,6 +6294,9 @@ async def _send_stars_invoice_link(message: Message, payload: str, *, payer_user
         logger.exception("Failed to create payment ledger order for Stars invoice")
         await _send_payment_ledger_unavailable_notice(message)
         return
+    if getattr(order, "reused_pending", False):
+        await message.answer(PAYMENT_PENDING_INVOICE_ALREADY_OPEN_TEXT)
+        return
 
     try:
         invoice_link = await message.bot.create_invoice_link(
@@ -4985,6 +6352,9 @@ async def _send_yookassa_invoice_link(message: Message, payload: str, *, payer_u
     except Exception:
         logger.exception("Failed to create payment ledger order for YooKassa invoice")
         await _send_payment_ledger_unavailable_notice(message)
+        return
+    if getattr(order, "reused_pending", False):
+        await message.answer(PAYMENT_PENDING_INVOICE_ALREADY_OPEN_TEXT)
         return
 
     try:
@@ -5275,12 +6645,24 @@ def _apply_successful_payment(
         raise
     except Exception as exc:
         raise PaymentLedgerUnavailable("payment_ledger_unavailable", "Payment ledger is unavailable.") from exc
-    return _payment_application_from_handling_result(result)
+    application = _payment_application_from_handling_result(result)
+    _cancel_sales_followup_after_payment_grant(chat_id, application)
+    return application
+
+
+def _cancel_sales_followup_after_payment_grant(chat_id: int, result: PaymentApplication) -> None:
+    if not result.processed:
+        return
+    if result.grant == "subscription":
+        _cancel_sales_followup_after_access_grant(chat_id, reason="subscription_granted")
+        return
+    if result.grant == "extra_weekly_pdf":
+        _cancel_sales_followup_after_access_grant(chat_id, reason="weekly_pdf_access_granted")
 
 
 def _payment_success_text(result: PaymentApplication) -> str:
     if result.grant == "subscription":
-        return "Подписка активна. Лимиты на этот месяц обновлены."
+        return "Месячный доступ активен. Лимиты на этот период обновлены."
     if result.grant == "extra_one_day":
         return "Готово: добавлена 1 попытка для дневного рациона."
     if result.grant == "extra_weekly_pdf":
@@ -5289,29 +6671,555 @@ def _payment_success_text(result: PaymentApplication) -> str:
 
 
 def _activate_promo_code_for_chat(chat_id: int, promo_code: str) -> PromoCodeActivation:
+    config = load_runtime_config()
+    if config.storage_backend == "postgres":
+        return _activate_postgres_promo_code_for_chat(config, chat_id, promo_code)
+
     activation = activate_promo_code(PROMO_CODES_STATE_FILE, promo_code, chat_id)
     if not activation.activated:
         return activation
 
     try:
-        _entitlement_service().apply_subscription_payment(chat_id, f"promo:{activation.code}")
+        grant_result = _entitlement_service().apply_subscription_payment(
+            chat_id,
+            promo_code_grant_charge_id(activation.code),
+            subscription_source="promo",
+            auto_renew_status="not_applicable",
+            last_subscription_payment_charge_id=promo_code_grant_charge_id(activation.code),
+        )
     except Exception:
         try:
             release_promo_code_activation(PROMO_CODES_STATE_FILE, activation.code, chat_id)
         except Exception:
             logger.exception("Failed to roll back promo activation after entitlement grant failure")
         raise
+    if getattr(grant_result, "processed", True):
+        _cancel_sales_followup_after_access_grant(chat_id, reason="monthly_access_promo_granted")
     return activation
+
+
+def _activate_postgres_promo_code_for_chat(config, chat_id: int, promo_code: str) -> PromoCodeActivation:
+    code = normalize_promo_code(promo_code)
+    if not code:
+        return PromoCodeActivation("not_found", "")
+
+    charge_id = promo_code_grant_charge_id(code)
+    store = _postgres_promo_store(config)
+    try:
+        reserve_result = store.reserve_promo_code(
+            promo_code,
+            chat_id=chat_id,
+            idempotency_key=f"promo:{code}:chat:{int(chat_id)}:activation",
+            kind=PromoCodeKind.MONTHLY_ACCESS,
+            entitlement_charge_id=charge_id,
+        )
+    except EntitlementStorageError:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to reserve promo code through Postgres promo store")
+        raise EntitlementStorageError("Postgres promo store is unavailable.") from exc
+
+    activation = _promo_activation_from_store_result(reserve_result, fallback_code=code, chat_id=chat_id)
+    if not activation.activated:
+        return activation
+
+    redemption_id = _promo_redemption_id_from_store_result(reserve_result)
+    try:
+        grant_result = _entitlement_service().apply_subscription_payment(
+            chat_id,
+            charge_id,
+            subscription_source="promo",
+            auto_renew_status="not_applicable",
+            last_subscription_payment_charge_id=charge_id,
+        )
+    except Exception:
+        try:
+            store.release_promo_redemption(redemption_id, failure_reason="entitlement_grant_failed")
+        except Exception:
+            logger.exception("Failed to release Postgres promo reservation after entitlement grant failure")
+        raise
+
+    if getattr(grant_result, "processed", True):
+        _cancel_sales_followup_after_access_grant(chat_id, reason="monthly_access_promo_granted")
+
+    try:
+        store.finalize_promo_redemption(redemption_id, entitlement_charge_id=charge_id)
+    except Exception as exc:
+        logger.exception("Failed to finalize Postgres promo redemption after entitlement grant")
+        raise EntitlementStorageError("Postgres promo redemption finalization failed.") from exc
+
+    return activation
+
+
+def _promo_activation_from_store_result(
+    result,
+    *,
+    fallback_code: str,
+    chat_id: int,
+) -> PromoCodeActivation:
+    status = str(getattr(result, "status", "not_found"))
+    result_code = normalize_promo_code(str(getattr(result, "code", fallback_code))) or fallback_code
+    result_chat_id = getattr(result, "chat_id", None)
+    used_by_chat_id = int(result_chat_id) if result_chat_id is not None else None
+    if status in {"reserved", "redeemed"}:
+        return PromoCodeActivation("activated", result_code, int(chat_id))
+    if status in {"already_redeemed", "already_used", "max_uses_reached"}:
+        return PromoCodeActivation("already_used", result_code, used_by_chat_id)
+    if status in {"not_found", "disabled", "expired", "not_access_code"}:
+        return PromoCodeActivation(status, result_code, used_by_chat_id)
+    raise EntitlementStorageError(f"Unexpected promo store activation status: {status}")
+
+
+def _promo_redemption_id_from_store_result(result) -> int:
+    redemption = getattr(result, "redemption", None)
+    redemption_id = getattr(redemption, "redemption_id", None)
+    if redemption_id is None:
+        raise EntitlementStorageError("Postgres promo store did not return a reservation id.")
+    return int(redemption_id)
 
 
 def _promo_code_success_text(chat_id: int) -> str:
     return (
         "Поздравляем! Промокод активирован.\n\n"
-        "У вас активировалась месячная подписка. Теперь вы можете сгенерировать "
+        "У вас активировался месячный доступ. Теперь вы можете сгенерировать "
         f"{MONTHLY_WEEKLY_PDF_LIMIT} недельных PDF-рациона и "
         f"{MONTHLY_ONE_DAY_LIMIT} дневных рационов.\n\n"
         f"{_format_entitlement_status(chat_id)}"
     )
+
+
+def _is_admin_panel_command_text(text: str) -> bool:
+    return _normalize_command_text(text) == "330366" and not text.split()[1:]
+
+
+def _admin_promo_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_CREATE_MONTHLY_ACCESS_CODE_TEXT,
+                    callback_data=CALLBACK_ADMIN_CREATE_MONTHLY_ACCESS_CODE,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_CREATE_DISCOUNT_PROMO_TEXT,
+                    callback_data=CALLBACK_ADMIN_CREATE_DISCOUNT_PROMO,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_LIST_DISCOUNT_PROMOS_TEXT,
+                    callback_data=CALLBACK_ADMIN_LIST_DISCOUNT_PROMOS,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=ADMIN_DISABLE_DISCOUNT_PROMO_TEXT,
+                    callback_data=CALLBACK_ADMIN_DISABLE_DISCOUNT_PROMO,
+                ),
+            ],
+        ],
+    )
+
+
+async def _send_admin_promo_panel(message: Message) -> None:
+    await message.answer(ADMIN_PROMO_PANEL_TEXT, reply_markup=_admin_promo_panel_keyboard())
+
+
+@dataclass(frozen=True)
+class _AdminDiscountPromoInput:
+    code: str
+    percent: int
+
+
+def _set_admin_promo_action(chat_id: int, action: str) -> None:
+    SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
+    PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
+    _clear_questionnaire_session(chat_id)
+    ADMIN_PROMO_ACTION_BY_CHAT_ID[chat_id] = action
+
+
+async def _start_admin_discount_promo_create(message: Message) -> None:
+    _set_admin_promo_action(message.chat.id, ADMIN_PROMO_ACTION_CREATE_DISCOUNT)
+    await message.answer(ADMIN_DISCOUNT_PROMO_INPUT_TEXT)
+
+
+async def _start_admin_discount_promo_disable(message: Message) -> None:
+    _set_admin_promo_action(message.chat.id, ADMIN_PROMO_ACTION_DISABLE_DISCOUNT)
+    await message.answer(ADMIN_DISABLE_DISCOUNT_PROMO_INPUT_TEXT)
+
+
+async def _handle_admin_promo_action_input(message: Message, text: str) -> None:
+    if not _is_admin_message(message):
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await message.answer("Command is available only to admins.")
+        return
+
+    action = ADMIN_PROMO_ACTION_BY_CHAT_ID.get(message.chat.id)
+    if action == ADMIN_PROMO_ACTION_CREATE_DISCOUNT:
+        parsed, error = _parse_admin_discount_promo_input(text)
+        if error is not None or parsed is None:
+            await message.answer(error or ADMIN_DISCOUNT_PROMO_INPUT_TEXT)
+            return
+        promo, error = _create_or_update_admin_discount_promo(
+            parsed,
+            admin_user_id=_message_user_id(message),
+        )
+        if error is not None or promo is None:
+            await message.answer(error or "Не удалось сохранить discount promo.")
+            return
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await message.answer(f"Скидка активна: {promo.code}\nРазмер скидки: {promo.discount_percent}%.")
+        return
+
+    if action == ADMIN_PROMO_ACTION_DISABLE_DISCOUNT:
+        code, error = _parse_admin_discount_code_input(text)
+        if error is not None or code is None:
+            await message.answer(error or ADMIN_DISABLE_DISCOUNT_PROMO_INPUT_TEXT)
+            return
+        promo, error = _disable_admin_discount_promo(code, admin_user_id=_message_user_id(message))
+        if error is not None or promo is None:
+            await message.answer(error or f"Discount promo code {code} не найден.")
+            return
+        ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+        await message.answer(f"Скидка отключена: {promo.code}.")
+        return
+
+    ADMIN_PROMO_ACTION_BY_CHAT_ID.pop(message.chat.id, None)
+
+
+def _parse_admin_discount_promo_input(text: str) -> tuple[_AdminDiscountPromoInput | None, str | None]:
+    parts = text.strip().split()
+    if len(parts) != 2:
+        return None, "Отправьте код и процент скидки в формате CODE PERCENT."
+
+    code = normalize_promo_code(parts[0])
+    if not code:
+        return None, "Код не должен быть пустым."
+    try:
+        percent = int(parts[1])
+    except ValueError:
+        return None, "Процент скидки должен быть числом."
+    if percent < 1 or percent > 90:
+        return None, "Процент скидки должен быть от 1 до 90."
+    return _AdminDiscountPromoInput(code=code, percent=percent), None
+
+
+def _parse_admin_discount_code_input(text: str) -> tuple[str | None, str | None]:
+    parts = text.strip().split()
+    if len(parts) != 1:
+        return None, "Код скидки должен быть без пробелов."
+    code = normalize_promo_code(parts[0])
+    if not code:
+        return None, "Код не должен быть пустым."
+    return code, None
+
+
+def _create_or_update_admin_discount_promo(
+    parsed: _AdminDiscountPromoInput,
+    *,
+    admin_user_id: int | None = None,
+) -> tuple[PromoCodeDefinition | None, str | None]:
+    config = load_runtime_config()
+    if config.storage_backend == "postgres":
+        return _create_or_update_postgres_admin_discount_promo(
+            config,
+            parsed,
+            admin_user_id=admin_user_id,
+        )
+
+    promo_codes = load_promo_codes(PROMO_CODES_STATE_FILE)
+    existing = promo_codes.get(parsed.code)
+    if existing is not None and not _promo_record_is_kind(existing, PromoCodeKind.DISCOUNT):
+        return None, f"Код {parsed.code} уже существует как {existing.kind}. Через discount flow его не меняю."
+
+    definition = PromoCodeDefinition(
+        code=parsed.code,
+        kind=PromoCodeKind.DISCOUNT,
+        active=True,
+        max_redemptions=existing.max_redemptions if existing is not None else 1,
+        per_user_limit=existing.per_user_limit if existing is not None else 1,
+        expires_at=existing.expires_at if existing is not None else None,
+        discount_percent=parsed.percent,
+    )
+    promo_codes[definition.code] = PromoCodeRecord.from_definition(definition)
+    save_promo_codes(PROMO_CODES_STATE_FILE, promo_codes)
+    return definition, None
+
+
+async def _send_admin_discount_promo_list(message: Message) -> None:
+    try:
+        promos = _list_admin_discount_promos()
+    except EntitlementStorageError:
+        logger.exception("Failed to list admin discount promos due to promo storage error")
+        await message.answer(ADMIN_PROMO_STORAGE_ERROR_TEXT)
+        return
+    await message.answer(_format_admin_discount_promo_list(promos))
+
+
+def _list_admin_discount_promos() -> list[PromoCodeDefinition]:
+    config = load_runtime_config()
+    if config.storage_backend == "postgres":
+        return _list_postgres_admin_discount_promos(config)
+
+    promos: list[PromoCodeDefinition] = []
+    for code, record in load_promo_codes(PROMO_CODES_STATE_FILE).items():
+        if not record.active or record.is_expired() or not _promo_record_is_kind(record, PromoCodeKind.DISCOUNT):
+            continue
+        promos.append(
+            PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.DISCOUNT,
+                active=record.active,
+                max_redemptions=record.max_redemptions,
+                per_user_limit=record.per_user_limit,
+                expires_at=record.expires_at,
+                discount_percent=record.discount_percent,
+                discount_amount=record.discount_amount,
+            )
+        )
+    return sorted(promos, key=lambda item: item.code)
+
+
+def _format_admin_discount_promo_list(promos: Sequence[PromoCodeDefinition]) -> str:
+    if not promos:
+        return "Активных discount promo codes нет."
+
+    lines = ["Активные discount promo codes:"]
+    for promo in promos:
+        discount = (
+            f"{promo.discount_percent}%"
+            if promo.discount_percent is not None
+            else f"{promo.discount_amount} minor units"
+        )
+        lines.append(f"{promo.code} — {discount}")
+    return "\n".join(lines)
+
+
+def _disable_admin_discount_promo(
+    code: str,
+    *,
+    admin_user_id: int | None = None,
+) -> tuple[PromoCodeDefinition | None, str | None]:
+    code = normalize_promo_code(code)
+    if not code:
+        return None, "Код не должен быть пустым."
+
+    config = load_runtime_config()
+    if config.storage_backend == "postgres":
+        return _disable_postgres_admin_discount_promo(
+            config,
+            code,
+            admin_user_id=admin_user_id,
+        )
+
+    promo_codes = load_promo_codes(PROMO_CODES_STATE_FILE)
+    existing = promo_codes.get(code)
+    if existing is None:
+        return None, f"Discount promo code {code} не найден."
+    if not _promo_record_is_kind(existing, PromoCodeKind.DISCOUNT):
+        return None, f"Код {code} имеет тип {existing.kind}. Через discount flow отключаются только discount promo."
+
+    disabled = PromoCodeDefinition(
+        code=code,
+        kind=PromoCodeKind.DISCOUNT,
+        active=False,
+        max_redemptions=existing.max_redemptions,
+        per_user_limit=existing.per_user_limit,
+        expires_at=existing.expires_at,
+        discount_percent=existing.discount_percent,
+        discount_amount=existing.discount_amount,
+    )
+    promo_codes[disabled.code] = PromoCodeRecord.from_definition(disabled)
+    save_promo_codes(PROMO_CODES_STATE_FILE, promo_codes)
+    return disabled, None
+
+
+async def _send_admin_monthly_access_code(message: Message, *, admin_user_id: int | None = None) -> None:
+    try:
+        promo = _create_admin_monthly_access_promo_code(admin_user_id=admin_user_id)
+    except EntitlementStorageError:
+        logger.exception("Failed to create admin monthly access promo due to promo storage error")
+        await message.answer(ADMIN_PROMO_STORAGE_ERROR_TEXT)
+        return
+    await message.answer("\n".join(["Created promo code:", promo.code, "Access: 1 month."]))
+
+
+def _create_admin_monthly_access_promo_code(
+    *,
+    admin_user_id: int | None = None,
+) -> PromoCodeDefinition:
+    config = load_runtime_config()
+    if config.storage_backend == "postgres":
+        return _create_postgres_admin_monthly_access_promo_code(
+            config,
+            admin_user_id=admin_user_id,
+        )
+
+    promo_codes = load_promo_codes(PROMO_CODES_STATE_FILE)
+    for _attempt in range(ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT):
+        code = generate_promo_codes(1, existing_codes=set(promo_codes))[0]
+        if code in promo_codes:
+            continue
+        definition = PromoCodeDefinition(
+            code=code,
+            kind=PromoCodeKind.MONTHLY_ACCESS,
+            active=True,
+            max_redemptions=1,
+            per_user_limit=1,
+            monthly_duration_months=1,
+        )
+        promo_codes[definition.code] = PromoCodeRecord.from_definition(definition)
+        save_promo_codes(PROMO_CODES_STATE_FILE, promo_codes)
+        return definition
+    raise RuntimeError("Could not generate a unique monthly access promo code.")
+
+
+def _create_postgres_admin_monthly_access_promo_code(
+    config,
+    *,
+    admin_user_id: int | None = None,
+) -> PromoCodeDefinition:
+    store = _postgres_promo_store(config)
+    for _attempt in range(ADMIN_ACCESS_PROMO_CODE_RETRY_LIMIT):
+        code = generate_promo_codes(1)[0]
+        try:
+            if store.get_promo_code(code) is not None:
+                continue
+            definition = PromoCodeDefinition(
+                code=code,
+                kind=PromoCodeKind.MONTHLY_ACCESS,
+                active=True,
+                max_redemptions=1,
+                per_user_limit=1,
+                monthly_duration_months=1,
+            )
+            stored = store.create_or_update_promo_code(
+                definition,
+                created_by=admin_user_id,
+                metadata=_admin_promo_metadata("create_monthly_access"),
+            )
+        except EntitlementStorageError:
+            raise
+        except Exception as exc:
+            raise EntitlementStorageError("Postgres promo store is unavailable.") from exc
+        return _promo_definition_from_store_promo(stored)
+    raise RuntimeError("Could not generate a unique monthly access promo code.")
+
+
+def _create_or_update_postgres_admin_discount_promo(
+    config,
+    parsed: _AdminDiscountPromoInput,
+    *,
+    admin_user_id: int | None = None,
+) -> tuple[PromoCodeDefinition | None, str | None]:
+    try:
+        store = _postgres_promo_store(config)
+        existing = store.get_promo_code(parsed.code)
+        existing_definition = _promo_definition_from_store_promo(existing) if existing is not None else None
+        if existing_definition is not None and existing_definition.kind != PromoCodeKind.DISCOUNT:
+            return (
+                None,
+                f"Код {parsed.code} уже существует как {existing_definition.kind}. Через discount flow его не меняю.",
+            )
+        definition = PromoCodeDefinition(
+            code=parsed.code,
+            kind=PromoCodeKind.DISCOUNT,
+            active=True,
+            max_redemptions=existing_definition.max_redemptions if existing_definition is not None else 1,
+            per_user_limit=existing_definition.per_user_limit if existing_definition is not None else 1,
+            expires_at=existing_definition.expires_at if existing_definition is not None else None,
+            discount_percent=parsed.percent,
+        )
+        stored = store.create_or_update_promo_code(
+            definition,
+            created_by=admin_user_id,
+            metadata=_admin_promo_metadata("create_discount"),
+        )
+    except EntitlementStorageError:
+        logger.exception("Failed to create or update admin discount promo due to promo storage error")
+        return None, ADMIN_PROMO_STORAGE_ERROR_TEXT
+    except Exception:
+        logger.exception("Failed to create or update admin discount promo through Postgres promo store")
+        return None, ADMIN_PROMO_STORAGE_ERROR_TEXT
+    return _promo_definition_from_store_promo(stored), None
+
+
+def _list_postgres_admin_discount_promos(config) -> list[PromoCodeDefinition]:
+    try:
+        store = _postgres_promo_store(config)
+        promos = [
+            _promo_definition_from_store_promo(promo)
+            for promo in store.list_active_promo_codes()
+            if _promo_store_promo_is_kind(promo, PromoCodeKind.DISCOUNT)
+        ]
+    except EntitlementStorageError:
+        logger.exception("Failed to list admin discount promos due to promo storage error")
+        raise
+    except Exception as exc:
+        raise EntitlementStorageError("Postgres promo store is unavailable.") from exc
+    return sorted(promos, key=lambda item: item.code)
+
+
+def _disable_postgres_admin_discount_promo(
+    config,
+    code: str,
+    *,
+    admin_user_id: int | None = None,
+) -> tuple[PromoCodeDefinition | None, str | None]:
+    try:
+        store = _postgres_promo_store(config)
+        existing = store.get_promo_code(code)
+        if existing is None:
+            return None, f"Discount promo code {code} не найден."
+        if not _promo_store_promo_is_kind(existing, PromoCodeKind.DISCOUNT):
+            existing_kind = getattr(existing, "kind", None)
+            return None, f"Код {code} имеет тип {existing_kind}. Через discount flow отключаются только discount promo."
+        disabled = store.disable_promo_code(code, disabled_by=admin_user_id)
+        if disabled is None:
+            return None, f"Discount promo code {code} не найден."
+    except EntitlementStorageError:
+        logger.exception("Failed to disable admin discount promo due to promo storage error")
+        return None, ADMIN_PROMO_STORAGE_ERROR_TEXT
+    except Exception:
+        logger.exception("Failed to disable admin discount promo through Postgres promo store")
+        return None, ADMIN_PROMO_STORAGE_ERROR_TEXT
+    return _promo_definition_from_store_promo(disabled), None
+
+
+def _promo_definition_from_store_promo(promo) -> PromoCodeDefinition:
+    to_definition = getattr(promo, "to_definition", None)
+    if callable(to_definition):
+        definition = to_definition()
+        return PromoCodeDefinition(**definition.to_dict())
+    return PromoCodeDefinition(
+        code=getattr(promo, "code"),
+        kind=getattr(promo, "kind", PromoCodeKind.MONTHLY_ACCESS),
+        active=bool(getattr(promo, "active", True)),
+        max_redemptions=int(getattr(promo, "max_redemptions", 1)),
+        per_user_limit=int(getattr(promo, "per_user_limit", 1)),
+        expires_at=getattr(promo, "expires_at", None),
+        discount_percent=getattr(promo, "discount_percent", None),
+        discount_amount=getattr(promo, "discount_amount", None),
+        monthly_duration_months=int(getattr(promo, "monthly_duration_months", 1)),
+    )
+
+
+def _promo_store_promo_is_kind(promo, kind: PromoCodeKind) -> bool:
+    return _promo_kind_matches(getattr(promo, "kind", None), kind)
+
+
+def _promo_kind_matches(value, kind: PromoCodeKind) -> bool:
+    return value == kind or str(value) == kind.value
+
+
+def _admin_promo_metadata(action: str) -> dict[str, str]:
+    return {"source": "telegram_admin_menu", "action": action}
+
+
+def _promo_record_is_kind(record: PromoCodeRecord, kind: PromoCodeKind) -> bool:
+    return str(record.kind) == kind.value or record.kind == kind
 
 
 def _message_user_id(message: Message) -> int | None:
@@ -5331,6 +7239,12 @@ def _normalize_command_text(text: str) -> str | None:
 def _is_admin_message(message: Message) -> bool:
     user_id = _message_user_id(message)
     return bool(user_id is not None and user_id in ADMIN_USER_IDS)
+
+
+def _is_admin_callback(callback: CallbackQuery) -> bool:
+    from_user = getattr(callback, "from_user", None)
+    user_id = getattr(from_user, "id", None)
+    return bool(user_id is not None and int(user_id) in ADMIN_USER_IDS)
 
 
 def _parse_test_access_command(text: str) -> tuple[str, int | None]:
@@ -5488,6 +7402,8 @@ def _record_successful_generation_history(
             ration_kind=consumption.ration_kind,
             context="after_successful_generation_delivery",
         )
+        if consumption.ration_kind == "weekly_pdf":
+            _cancel_sales_followup_after_access_grant(chat_id, reason="weekly_pdf_delivered")
 
 def _complete_generation_attempt(chat_id: int, consumption: AttemptConsumption) -> None:
     del chat_id, consumption
@@ -5586,6 +7502,8 @@ def _subscription_payment_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton(text=PAY_WITH_RU_CARD_TEXT, callback_data=CALLBACK_PAY_RU_CARD)],
             [InlineKeyboardButton(text=PAY_WITH_TELEGRAM_STARS_TEXT, callback_data=CALLBACK_PAY_TELEGRAM_STARS)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
+            [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
 
@@ -5631,6 +7549,8 @@ def _paywall_keyboard(*, preferred: str) -> InlineKeyboardMarkup:
             [extra_buttons[1]],
             [extra_buttons[2]],
             [extra_buttons[3]],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
+            [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
 
@@ -5641,6 +7561,8 @@ def _trial_subscription_keyboard() -> InlineKeyboardMarkup:
     return _keyboard_with_privacy_policy(
         [
             [InlineKeyboardButton(text=SUBSCRIBE_CTA_TEXT, callback_data=CALLBACK_SUBSCRIBE)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
+            [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
 
@@ -5648,6 +7570,7 @@ def _trial_subscription_keyboard() -> InlineKeyboardMarkup:
 def _payments_disabled_keyboard() -> InlineKeyboardMarkup:
     return _keyboard_with_privacy_policy(
         [
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
@@ -5658,21 +7581,23 @@ def _after_plan_keyboard(chat_id: int | None = None) -> InlineKeyboardMarkup:
         entitlement = _entitlement_for_chat(chat_id)
         if _has_active_paid_access(chat_id, entitlement):
             return _subscriber_cabinet_keyboard(chat_id, entitlement=entitlement)
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [InlineKeyboardButton(text=REPEAT_PLAN_TEXT, callback_data=CALLBACK_REPEAT)],
             [InlineKeyboardButton(text=NEW_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
 
 
 def _plan_choice_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return _keyboard_with_privacy_policy(
+        [
             [InlineKeyboardButton(text=ONE_DAY_PLAN_TEXT, callback_data=CALLBACK_ONE_DAY_PLAN)],
             [InlineKeyboardButton(text=WEEK_PLAN_PDF_TEXT, callback_data=CALLBACK_WEEK_PLAN_PDF)],
             [InlineKeyboardButton(text=CHANGE_PROFILE_TEXT, callback_data=CALLBACK_NEW)],
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
             [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
         ],
     )
@@ -5697,22 +7622,43 @@ def _question_answer_callback_data(
 def _question_keyboard(
     question,
     *,
+    selected_index: int | None = None,
     chat_id: int | None = None,
     step_index: int | None = None,
 ) -> InlineKeyboardMarkup | None:
     if not question:
         return None
-    return _optional_keyboard_with_privacy_policy(
+    rows = [
         [
-            [
-                InlineKeyboardButton(
-                    text=option,
-                    callback_data=_question_answer_callback_data(index, chat_id=chat_id, step_index=step_index),
-                )
-            ]
-            for index, option in enumerate(question.options)
-        ],
-    )
+            InlineKeyboardButton(
+                text=f"{SELECTED_ANSWER_PREFIX}{option}" if index == selected_index else option,
+                callback_data=_question_answer_callback_data(index, chat_id=chat_id, step_index=step_index),
+            )
+        ]
+        for index, option in enumerate(question.options)
+    ]
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _mark_questionnaire_answer_selected(
+    message: Message,
+    question,
+    option_index: int,
+    *,
+    chat_id: int,
+    step_index: int,
+) -> None:
+    with suppress(TelegramAPIError, AttributeError, TypeError):
+        await message.edit_reply_markup(
+            reply_markup=_question_keyboard(
+                question,
+                selected_index=option_index,
+                chat_id=chat_id,
+                step_index=step_index,
+            )
+        )
 
 
 async def _send_welcome_photo(message: Message) -> None:

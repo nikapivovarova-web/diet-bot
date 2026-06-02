@@ -53,6 +53,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(render_reconciliation_jsonl(report), end="")
     else:
         print(render_reconciliation_table(report), end="")
+    print(
+        "note: reconciliation is read-only; after verifying a provider refund/cancel/reversal event, "
+        "apply local ledger/access state with `python -m scripts.ops.apply_payment_reversal --dry-run` "
+        "first, then rerun with `--apply` only for the verified event.",
+        file=sys.stderr,
+    )
     if args.fail_on_findings and report.has_findings:
         return 1
     return 0

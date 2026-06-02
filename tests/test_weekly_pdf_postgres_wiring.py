@@ -163,6 +163,7 @@ async def test_postgres_admission_returns_accepted_without_entering_local_queue_
 
     assert sent is True
     assert message.texts == [(telegram_app.WEEK_PDF_ACCEPTED_TEXT, None)]
+    assert telegram_app.WEEK_PDF_ACCEPTED_TEXT != telegram_app.WEEK_PDF_STATUS_INITIAL_TEXT
     assert ("start", runtime.job.job_id, False) not in runtime.events
     assert runtime.events == [
         ("cleanup", chat_id),
@@ -783,6 +784,41 @@ async def test_json_history_save_failure_after_pdf_delivery_returns_success_with
     assert store.save_calls == 1
     assert chat_id not in telegram_app.RECENT_RECIPE_IDS_BY_CHAT_ID
     assert chat_id not in telegram_app.RECENT_RECIPE_KEYS_BY_CHAT_ID
+
+
+@pytest.mark.anyio
+async def test_json_weekly_generation_failure_refunds_consumed_weekly_attempt(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    chat_id = 201_021
+    subscriptions_path = tmp_path / "subscriptions.json"
+    message = FakeMessage(chat_id)
+    events: list[tuple] = []
+    entitlement = telegram_app.Entitlement()
+    telegram_app.apply_subscription_payment(
+        entitlement,
+        f"charge-{chat_id}",
+        now=datetime(2026, 5, 23, tzinfo=UTC),
+    )
+    entitlement.monthly_weekly_pdf_remaining = 1
+    telegram_app.save_entitlements(subscriptions_path, {chat_id: entitlement})
+    monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
+    monkeypatch.setattr(telegram_app, "_format_entitlement_status", lambda _chat_id: "status")
+
+    async def fake_send_week_plan(_message, *_args, **_kwargs) -> bool:
+        events.append(("send_failed",))
+        return False
+
+    monkeypatch.setattr(telegram_app, "_send_week_plan", fake_send_week_plan)
+
+    sent = await telegram_app._send_week_plan_after_queue_admission(message, profile_with())
+
+    saved_entitlement = telegram_app.load_entitlements(subscriptions_path)[chat_id]
+    assert sent is False
+    assert events == [("send_failed",)]
+    assert saved_entitlement.monthly_weekly_pdf_remaining == 1
+    assert saved_entitlement.extra_weekly_pdf_remaining == 0
 
 
 class FailingChatHistorySaveStore:

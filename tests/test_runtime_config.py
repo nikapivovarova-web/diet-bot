@@ -20,6 +20,8 @@ def _production_env() -> dict[str, str]:
         "DIET_BOT_ENV": "production",
         "DIET_BOT_STORAGE_BACKEND": "postgres",
         "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        "DIET_BOT_ONE_DAY_WORKER_ENABLED": "1",
+        "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED": "1",
         "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
         "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
     }
@@ -55,6 +57,32 @@ def test_payments_enabled_only_by_one() -> None:
 
     for raw in ("", "0", "true", "yes", "on", "2"):
         assert load_runtime_config({"DIET_BOT_PAYMENTS_ENABLED": raw}).payments_enabled is False
+
+
+def test_public_payments_default_to_payments_enabled_and_can_be_disabled() -> None:
+    enabled = load_runtime_config({"DIET_BOT_PAYMENTS_ENABLED": "1"})
+    hidden = load_runtime_config(
+        {
+            "DIET_BOT_PAYMENTS_ENABLED": "1",
+            "DIET_BOT_PUBLIC_PAYMENTS_ENABLED": "0",
+        }
+    )
+
+    assert enabled.public_payments_enabled is True
+    assert hidden.payments_enabled is True
+    assert hidden.public_payments_enabled is False
+
+
+def test_payment_test_prices_flag_is_rejected_in_production() -> None:
+    config = load_runtime_config(
+        {
+            **_production_env(),
+            "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED": "1",
+        }
+    )
+
+    assert config.payment_test_prices_enabled is True
+    assert "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED is not allowed in production." in config.validate_startup()
 
 
 def test_payments_enabled_requires_explicit_payment_recovery_spool() -> None:
@@ -147,6 +175,8 @@ def test_production_defaults_to_postgres_backend_when_unset() -> None:
             "DIET_BOT_TOKEN": "fake-token",
             "DIET_BOT_ENV": "production",
             "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+            "DIET_BOT_ONE_DAY_WORKER_ENABLED": "1",
+            "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED": "1",
             "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
             "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
         },

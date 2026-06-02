@@ -43,6 +43,7 @@ DEFAULT_ONE_DAY_GENERATION_WORKER_RETRY_DELAY_SECONDS = 30
 DEFAULT_ONE_DAY_GENERATION_WORKER_MAX_ATTEMPTS = 3
 DEFAULT_ONE_DAY_GENERATION_WORKER_IDLE_SLEEP_SECONDS = 1.0
 DEFAULT_ONE_DAY_GENERATION_WORKER_ERROR_BACKOFF_SECONDS = 5.0
+DEFAULT_ONE_DAY_GENERATION_WORKER_JOB_TIMEOUT_SECONDS = 15 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,7 @@ class OneDayGenerationWorkerSettings:
     max_attempts: int = DEFAULT_ONE_DAY_GENERATION_WORKER_MAX_ATTEMPTS
     idle_sleep_seconds: float = DEFAULT_ONE_DAY_GENERATION_WORKER_IDLE_SLEEP_SECONDS
     error_backoff_seconds: float = DEFAULT_ONE_DAY_GENERATION_WORKER_ERROR_BACKOFF_SECONDS
+    job_timeout_seconds: float = DEFAULT_ONE_DAY_GENERATION_WORKER_JOB_TIMEOUT_SECONDS
 
     @classmethod
     def from_config(cls, config: object, *, worker_id: str | None = None) -> "OneDayGenerationWorkerSettings":
@@ -200,6 +202,10 @@ class OneDayGenerationWorkerSettings:
             error_backoff_seconds=max(
                 0.1,
                 float(getattr(config, "one_day_worker_error_backoff_seconds", cls.error_backoff_seconds)),
+            ),
+            job_timeout_seconds=max(
+                0.001,
+                float(getattr(config, "one_day_worker_job_timeout_seconds", cls.job_timeout_seconds)),
             ),
         )
 
@@ -277,7 +283,8 @@ class OneDayGenerationWorker:
         heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(job.job_id, stop_heartbeat))
         send_started = False
         delivered_value_messages = 0
-        try:
+        async def process_job() -> None:
+            nonlocal send_started, delivered_value_messages
             if job.request_snapshot is None:
                 self.runtime.finish_failure_and_refund_once(job.job_id, reason="one_day_worker_missing_snapshot")
                 return
@@ -313,6 +320,25 @@ class OneDayGenerationWorker:
                     await delivery.after_success()
                 except Exception:
                     logger.exception("One-day post-success callback failed for chat_id=%s", job.chat_id)
+
+        try:
+            await asyncio.wait_for(
+                process_job(),
+                timeout=max(0.001, float(self.settings.job_timeout_seconds)),
+            )
+        except TimeoutError as exc:
+            logger.error(
+                "One-day worker job timed out; worker_id=%s job_id=%s timeout_seconds=%.3f",
+                self.settings.worker_id,
+                redact_identifier("job", job.job_id),
+                max(0.001, float(self.settings.job_timeout_seconds)),
+            )
+            self._handle_processing_failure(
+                job,
+                exc,
+                send_started=send_started,
+                delivered_value_messages=delivered_value_messages,
+            )
         except Exception as exc:
             self._handle_processing_failure(
                 job,

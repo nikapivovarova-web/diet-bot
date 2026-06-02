@@ -656,14 +656,22 @@ def _active_subscription_entitlement(
 
 
 def sample_meal_plan() -> MealPlan:
-    meals = tuple(sample_meal() for _ in range(4))
+    meals = tuple(sample_meal(index) for index in range(4))
     targets = NutritionTargets(
         bmi=22.0,
         bmi_category="normal",
         bmr_kcal=1500,
         tdee_kcal=2000,
         water_l=2.0,
-        targets=meals[0].nutrients,
+        targets=NutrientVector(
+            {
+                "energy_kcal": 1800,
+                "protein_g": 120,
+                "fat_g": 48,
+                "carbohydrate_g": 180,
+                "sodium_mg": 2300,
+            }
+        ),
         calorie_bounds=(1400, 2200),
         macro_bounds={},
     )
@@ -674,20 +682,22 @@ def _week_plan_build_result(plans: tuple[MealPlan, ...]) -> telegram_app._WeekPl
     return telegram_app._WeekPlanBuildResult(plans=plans, avoidance_phase="full_recent")
 
 
-def sample_meal() -> Meal:
+def sample_meal(index: int = 0) -> Meal:
     food = Food(
-        id="smoke_food",
-        name="Smoke food",
+        id=f"smoke_food_{index}",
+        name=f"Smoke food {index}",
         category="test",
         nutrients_per_100g=NutrientVector(
             {
-                "kcal": 120,
-                "protein_g": 8,
-                "fat_g": 4,
-                "carbs_g": 12,
-                "fiber_g": 2,
+                "energy_kcal": 300,
+                "protein_g": 20,
+                "fat_g": 8,
+                "carbohydrate_g": 30,
+                "fiber_g": 3,
+                "sodium_mg": 100,
             },
         ),
+        max_per_day_g=1000,
     )
     return Meal(
         name="Smoke meal",

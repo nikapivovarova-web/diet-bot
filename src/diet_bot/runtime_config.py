@@ -40,6 +40,8 @@ class RuntimeConfig:
     bot_token_source: str | None
     environment: str
     payments_enabled: bool
+    public_payments_enabled: bool
+    payment_test_prices_enabled: bool
     telegram_provider_token: str
     database_url: str | None
     postgres_pool_enabled: bool
@@ -71,6 +73,8 @@ class RuntimeConfig:
     weekly_pdf_worker_retry_delay_seconds: int = DEFAULT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS
     weekly_pdf_worker_max_attempts: int = DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS
     weekly_pdf_worker_idle_sleep_seconds: float = DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS
+    sales_followup_enabled: bool = False
+    sales_followup_worker_enabled: bool = False
     storage_backend: str = "json"
     config_errors: tuple[str, ...] = ()
 
@@ -80,6 +84,8 @@ class RuntimeConfig:
             "bot_token": "set" if self.bot_token else "missing",
             "bot_token_source": self.bot_token_source if self.bot_token else None,
             "payments_enabled": self.payments_enabled,
+            "public_payments_enabled": self.public_payments_enabled,
+            "payment_test_prices_enabled": self.payment_test_prices_enabled,
             "telegram_provider_token": "set" if self.telegram_provider_token else "missing",
             "database_url": "set" if self.database_url else "missing",
             "database_url_present": bool(self.database_url),
@@ -112,6 +118,8 @@ class RuntimeConfig:
             "weekly_pdf_worker_retry_delay_seconds": self.weekly_pdf_worker_retry_delay_seconds,
             "weekly_pdf_worker_max_attempts": self.weekly_pdf_worker_max_attempts,
             "weekly_pdf_worker_idle_sleep_seconds": self.weekly_pdf_worker_idle_sleep_seconds,
+            "sales_followup_enabled": self.sales_followup_enabled,
+            "sales_followup_worker_enabled": self.sales_followup_worker_enabled,
             "storage_backend": self.storage_backend,
         }
 
@@ -127,6 +135,16 @@ class RuntimeConfig:
             issues.append("DIET_BOT_WEEKLY_PDF_WORKER_ENABLED requires postgres storage backend.")
         if self.weekly_pdf_worker_enabled and not self.database_url:
             issues.append("DIET_BOT_DATABASE_URL is required when the weekly PDF worker is enabled.")
+        if self.sales_followup_enabled and self.storage_backend != "postgres":
+            issues.append("DIET_BOT_SALES_FOLLOWUP_ENABLED requires postgres storage backend.")
+        if self.sales_followup_enabled and not self.database_url:
+            issues.append("DIET_BOT_DATABASE_URL is required when sales follow-up is enabled.")
+        if self.sales_followup_worker_enabled and not self.sales_followup_enabled:
+            issues.append("DIET_BOT_SALES_FOLLOWUP_WORKER_ENABLED requires DIET_BOT_SALES_FOLLOWUP_ENABLED=1.")
+        if self.sales_followup_worker_enabled and self.storage_backend != "postgres":
+            issues.append("DIET_BOT_SALES_FOLLOWUP_WORKER_ENABLED requires postgres storage backend.")
+        if self.sales_followup_worker_enabled and not self.database_url:
+            issues.append("DIET_BOT_DATABASE_URL is required when the sales follow-up worker is enabled.")
         if self.payments_enabled:
             if self.storage_backend != "postgres":
                 issues.append("Payments require Postgres storage backend.")
@@ -136,11 +154,26 @@ class RuntimeConfig:
                 issues.append("DIET_BOT_PAYMENT_RECOVERY_SPOOL is required when payments are enabled.")
             elif not self.payment_recovery_spool.is_absolute():
                 issues.append("DIET_BOT_PAYMENT_RECOVERY_SPOOL must be an absolute path when payments are enabled.")
+        if self.public_payments_enabled and not self.payments_enabled:
+            issues.append("DIET_BOT_PUBLIC_PAYMENTS_ENABLED requires DIET_BOT_PAYMENTS_ENABLED=1.")
         if is_production_environment(self.environment):
+            if self.payment_test_prices_enabled:
+                issues.append("DIET_BOT_PAYMENT_TEST_PRICES_ENABLED is not allowed in production.")
             if not self.database_url:
                 issues.append("DIET_BOT_DATABASE_URL is required in production.")
             if self.storage_backend == "json":
                 issues.append("JSON storage is not allowed in production.")
+            if self.storage_backend == "postgres":
+                if not self.one_day_worker_enabled:
+                    issues.append(
+                        "Production Postgres one-day generation uses durable jobs; "
+                        "set DIET_BOT_ONE_DAY_WORKER_ENABLED=1 so queued one-day jobs are processed.",
+                    )
+                if not self.weekly_pdf_worker_enabled:
+                    issues.append(
+                        "Production Postgres weekly PDF generation uses durable jobs; "
+                        "set DIET_BOT_WEEKLY_PDF_WORKER_ENABLED=1 so queued weekly PDF jobs are processed.",
+                    )
             if self.support_chat_id is None:
                 issues.append("DIET_BOT_SUPPORT_CHAT_ID is required and must be a valid integer in production.")
             if not _is_valid_http_url(self.privacy_policy_url):
@@ -315,6 +348,8 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         bot_token_source=bot_token_source,
         environment=environment,
         payments_enabled=_text_from_env(source, "DIET_BOT_PAYMENTS_ENABLED") == "1",
+        public_payments_enabled=_public_payments_enabled_from_env(source),
+        payment_test_prices_enabled=_bool_from_env(source, "DIET_BOT_PAYMENT_TEST_PRICES_ENABLED"),
         telegram_provider_token=_text_from_env(source, "TELEGRAM_PROVIDER_TOKEN") or "",
         database_url=_text_from_env(source, "DIET_BOT_DATABASE_URL"),
         postgres_pool_enabled=_bool_from_env(source, "DIET_BOT_POSTGRES_POOL_ENABLED"),
@@ -346,6 +381,8 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         weekly_pdf_worker_retry_delay_seconds=weekly_pdf_worker_retry_delay_seconds,
         weekly_pdf_worker_max_attempts=weekly_pdf_worker_max_attempts,
         weekly_pdf_worker_idle_sleep_seconds=weekly_pdf_worker_idle_sleep_seconds,
+        sales_followup_enabled=_bool_from_env(source, "DIET_BOT_SALES_FOLLOWUP_ENABLED"),
+        sales_followup_worker_enabled=_bool_from_env(source, "DIET_BOT_SALES_FOLLOWUP_WORKER_ENABLED"),
         storage_backend=storage_backend,
         config_errors=postgres_config_errors + worker_config_errors + weekly_pdf_worker_config_errors,
     )
@@ -367,6 +404,13 @@ def weekly_selection_diagnostics_enabled(env: Mapping[str, str] | None = None) -
     source = os.environ if env is None else env
     raw = _text_from_env(source, "DIET_BOT_WEEKLY_SELECTION_DIAG")
     return bool(raw and raw.lower() in _TRUTHY_VALUES)
+
+
+def _public_payments_enabled_from_env(env: Mapping[str, str]) -> bool:
+    raw = _text_from_env(env, "DIET_BOT_PUBLIC_PAYMENTS_ENABLED")
+    if raw is None:
+        return _text_from_env(env, "DIET_BOT_PAYMENTS_ENABLED") == "1"
+    return raw.lower() in _TRUTHY_VALUES
 
 
 def _bool_from_env(env: Mapping[str, str], key: str) -> bool:

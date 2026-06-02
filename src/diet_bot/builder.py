@@ -134,6 +134,7 @@ MAINTENANCE_PROTEIN_COMFORT_OVERAGE_PENALTY = 18.0
 MAINTENANCE_FAT_ENERGY_SHARE_BUFFER = 1.10
 MAINTENANCE_FAT_SHARE_OVERAGE_PENALTY = 24.0
 RECIPE_PLAN_CANDIDATE_COUNT = 1
+CURATED_ONLY_SEED_FALLBACK_ATTEMPTS = 4
 CONTROLLED_RECIPE_WINDOW_SIZE = 8
 CONTROLLED_RECIPE_SCORE_DELTA = 1.75
 CONTROLLED_RECIPE_MAX_EXTRA_ENERGY_GAP = 0.06
@@ -141,6 +142,7 @@ CONTROLLED_RECIPE_MAX_EXTRA_PROTEIN_GAP = 0.05
 CONTROLLED_RECIPE_SODIUM_WORSE_MULTIPLIER = 1.25
 CONTROLLED_RECIPE_SODIUM_WORSE_BUFFER_MG = 120.0
 CONTROLLED_RECIPE_SLOT_SODIUM_MULTIPLIER = 1.35
+CONTROLLED_RECIPE_WINDOW_ROTATION_SCORE_TOLERANCE = 0.45
 SLOT_FLEX_PENALTY = 5.0
 EXPLICIT_SLOT_FLEX_PENALTY = 0.0
 EFFORT_FALLBACK_PENALTY = 7.0
@@ -548,6 +550,10 @@ class _RankedRecipeCandidate:
     rank: int
 
 
+def _should_manage_sodium(target: NutrientVector) -> bool:
+    return target.get("sodium_mg") > 0
+
+
 def build_one_day_plan(
     profile: UserProfile,
     foods: list[Food] | None = None,
@@ -556,6 +562,7 @@ def build_one_day_plan(
     avoided_recipe_keys: set[str] | frozenset[str] | None = None,
     recipe_source: RecipeSource = "all",
     allow_avoided_recipe_relaxation: bool = True,
+    allow_curated_seed_fallback: bool = True,
     recipe_cache: _RecipePlanCache | None = None,
     selection_guard: _SelectionGuard | None = None,
 ) -> MealPlan:
@@ -584,6 +591,7 @@ def build_one_day_plan(
         if not candidates:
             return MealPlan(meals=(), targets=targets, safety=safety)
 
+        manage_sodium = _should_manage_sodium(targets.targets)
         _check_selection_guard(selection_guard, "before_recipe_plan_primary")
         recipe_meals = _build_recipe_plan_for_time(
             candidates,
@@ -595,7 +603,7 @@ def build_one_day_plan(
             avoided_recipe_keys or frozenset(),
             recipe_source,
             excluded_food_names=safety.excluded_food_names,
-            manage_sodium=bool(safety.excluded_food_names),
+            manage_sodium=manage_sodium,
             recipe_cache=recipe_cache,
             selection_guard=selection_guard,
         )
@@ -611,7 +619,7 @@ def build_one_day_plan(
                 frozenset(),
                 recipe_source,
                 excluded_food_names=safety.excluded_food_names,
-                manage_sodium=bool(safety.excluded_food_names),
+                manage_sodium=manage_sodium,
                 recipe_cache=recipe_cache,
                 selection_guard=selection_guard,
             )
@@ -627,13 +635,38 @@ def build_one_day_plan(
                 frozenset(),
                 recipe_source,
                 excluded_food_names=safety.excluded_food_names,
-                manage_sodium=bool(safety.excluded_food_names),
+                manage_sodium=manage_sodium,
                 recipe_cache=recipe_cache,
                 selection_guard=selection_guard,
             )
         if recipe_meals:
             return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
         if recipe_source == "curated_only":
+            if allow_curated_seed_fallback:
+                fallback_avoided_recipe_ids = (
+                    frozenset()
+                    if allow_avoided_recipe_relaxation
+                    else avoided_recipe_ids or frozenset()
+                )
+                fallback_avoided_recipe_keys = (
+                    frozenset()
+                    if allow_avoided_recipe_relaxation
+                    else avoided_recipe_keys or frozenset()
+                )
+                recipe_meals = _build_curated_only_recipe_plan_with_seed_fallback(
+                    candidates,
+                    targets.targets,
+                    profile.meal_count,
+                    profile.cooking_time,
+                    variety_seed,
+                    fallback_avoided_recipe_ids,
+                    fallback_avoided_recipe_keys,
+                    excluded_food_names=safety.excluded_food_names,
+                    manage_sodium=manage_sodium,
+                    recipe_cache=recipe_cache,
+                )
+                if recipe_meals:
+                    return MealPlan(meals=tuple(recipe_meals), targets=targets, safety=safety)
             return MealPlan(meals=(), targets=targets, safety=safety)
 
         _check_selection_guard(selection_guard, "before_food_fallback")
@@ -758,6 +791,47 @@ def _build_recipe_plan_for_time(
     return []
 
 
+def _build_curated_only_recipe_plan_with_seed_fallback(
+    candidates: list[Food],
+    target: NutrientVector,
+    meal_count: int,
+    cooking_time: CookingTimePreference,
+    variety_seed: int,
+    avoided_recipe_ids: set[str] | frozenset[str],
+    avoided_recipe_keys: set[str] | frozenset[str],
+    *,
+    excluded_food_names: frozenset[str] = frozenset(),
+    manage_sodium: bool = False,
+    recipe_cache: _RecipePlanCache | None = None,
+    selection_guard: _SelectionGuard | None = None,
+) -> list[Meal]:
+    for seed_offset in range(1, CURATED_ONLY_SEED_FALLBACK_ATTEMPTS + 1):
+        _check_selection_guard(selection_guard, "curated_seed_fallback_attempt")
+        retry_seed = variety_seed + seed_offset
+        recipe_meals = _build_recipe_plan_for_time(
+            candidates,
+            target,
+            meal_count,
+            cooking_time,
+            retry_seed,
+            avoided_recipe_ids,
+            avoided_recipe_keys,
+            "curated_only",
+            excluded_food_names=excluded_food_names,
+            manage_sodium=manage_sodium,
+            recipe_cache=recipe_cache,
+            selection_guard=selection_guard,
+        )
+        if recipe_meals:
+            logger.info(
+                "Curated-only one-day seed fallback selected complete plan: original_seed=%s retry_seed=%s",
+                variety_seed,
+                retry_seed,
+            )
+            return recipe_meals
+    return []
+
+
 def _build_recipe_plan_candidates_for_attempt(
     candidates: list[Food],
     target: NutrientVector,
@@ -846,7 +920,6 @@ def _build_recipe_plan(
             )
             is not None
             and recipe.id not in avoided_recipe_ids
-            and _recipe_memory_key_cached(recipe, recipe_cache=recipe_cache) not in avoided_recipe_keys
             and (recipe_source != "curated_only" or "curated" in recipe.tags)
             and (
                 allowed_time_buckets is None
@@ -902,6 +975,7 @@ def _build_recipe_plan(
             ranking_mode,
             effort_phase,
             manage_sodium,
+            avoided_recipe_keys=avoided_recipe_keys,
             recipe_cache=recipe_cache,
             food_cache_key=food_cache_key,
             selection_guard=selection_guard,
@@ -1804,6 +1878,7 @@ def _rank_recipe_candidates(
     ranking_mode: RecipeRankingMode = "balanced",
     effort_phase: CookingEffortPhase | None = None,
     manage_sodium: bool = False,
+    avoided_recipe_keys: set[str] | frozenset[str] | None = None,
     recipe_cache: _RecipePlanCache | None = None,
     food_cache_key: _FoodByIdCacheKey | None = None,
     selection_guard: _SelectionGuard | None = None,
@@ -1825,6 +1900,8 @@ def _rank_recipe_candidates(
         if recipe_index % 32 == 0:
             _check_selection_guard(selection_guard, "eligibility_filter")
         if recipe.id in used_recipe_ids:
+            continue
+        if avoided_recipe_keys and _recipe_memory_key_cached(recipe, slot, recipe_cache=recipe_cache) in avoided_recipe_keys:
             continue
         eligibility = _recipe_slot_eligibility_cached(
             recipe,
@@ -2006,6 +2083,7 @@ def _rank_recipes(
     ranking_mode: RecipeRankingMode = "balanced",
     effort_phase: CookingEffortPhase | None = None,
     manage_sodium: bool = False,
+    avoided_recipe_keys: set[str] | frozenset[str] | None = None,
     recipe_cache: _RecipePlanCache | None = None,
     food_cache_key: _FoodByIdCacheKey | None = None,
     selection_guard: _SelectionGuard | None = None,
@@ -2029,6 +2107,7 @@ def _rank_recipes(
             ranking_mode,
             effort_phase,
             manage_sodium,
+            avoided_recipe_keys=avoided_recipe_keys,
             recipe_cache=recipe_cache,
             food_cache_key=food_cache_key,
             selection_guard=selection_guard,
@@ -2067,9 +2146,8 @@ def _select_ranked_recipe_from_window(
     if len(window) < 2:
         return top.recipe
 
-    selected = max(
-        window,
-        key=lambda candidate: _ranked_recipe_window_selection_score(
+    selection_scores = {
+        id(candidate): _ranked_recipe_window_selection_score(
             candidate,
             top,
             used_recipe_counts=used_recipe_counts,
@@ -2081,9 +2159,81 @@ def _select_ranked_recipe_from_window(
             variety_seed=variety_seed,
             index=index,
             recipe_cache=recipe_cache,
+        )
+        for candidate in window
+    }
+    lowest_selected_count = min(used_recipe_counts[candidate.recipe.id] for candidate in window)
+    least_repeated_window = tuple(
+        candidate
+        for candidate in window
+        if used_recipe_counts[candidate.recipe.id] == lowest_selected_count
+    )
+    best_pressure_score = max(selection_scores[id(candidate)][1] for candidate in least_repeated_window)
+    rotation_window = tuple(
+        candidate
+        for candidate in least_repeated_window
+        if (
+            selection_scores[id(candidate)][1]
+            >= best_pressure_score - CONTROLLED_RECIPE_WINDOW_ROTATION_SCORE_TOLERANCE
+        )
+    )
+    if len(rotation_window) < 2:
+        return max(least_repeated_window, key=lambda candidate: selection_scores[id(candidate)]).recipe
+
+    preferred_window_index = _ranked_recipe_window_preferred_index(variety_seed, index, len(rotation_window))
+    window_indexes = {id(candidate): candidate_index for candidate_index, candidate in enumerate(rotation_window)}
+    selected = max(
+        rotation_window,
+        key=lambda candidate: (
+            -abs(window_indexes[id(candidate)] - preferred_window_index),
+            selection_scores[id(candidate)],
         ),
     )
     return selected.recipe
+
+
+def _ranked_recipe_window_preferred_index(variety_seed: int, index: int, window_size: int) -> int:
+    if window_size <= 1:
+        return 0
+    return (variety_seed + index + 1) % window_size
+
+
+def _ranked_recipe_window_selection_score(
+    candidate: _RankedRecipeCandidate,
+    top: _RankedRecipeCandidate,
+    *,
+    used_recipe_counts: Counter[str],
+    used_food_ids: Counter[str],
+    used_formats: Counter[str],
+    current_total: NutrientVector,
+    target: NutrientVector,
+    slot_energy_target: float,
+    variety_seed: int,
+    index: int,
+    recipe_cache: _RecipePlanCache | None,
+) -> tuple[int, float, float, int]:
+    recipe = candidate.recipe
+    selected_count = used_recipe_counts[recipe.id]
+    score_gap = max(0.0, top.score - candidate.score)
+    normalized_gap = score_gap / max(0.01, CONTROLLED_RECIPE_SCORE_DELTA)
+    format_count = used_formats[_recipe_format_cached(recipe, recipe_cache)]
+    ingredient_overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
+    variety_score = _seeded_score(f"window:{recipe.id}", variety_seed, index)
+    sodium_pressure = _ranked_recipe_window_sodium_pressure(
+        candidate.projected,
+        current_total=current_total,
+        target=target,
+        slot_energy_target=slot_energy_target,
+    )
+    pressure_score = (
+        variety_score
+        - normalized_gap * 0.65
+        - sodium_pressure
+        - min(3, format_count) * 0.08
+        - min(4, ingredient_overlap) * 0.03
+        - candidate.rank * 0.01
+    )
+    return (-selected_count, pressure_score, candidate.score, -candidate.rank)
 
 
 def _ranked_recipe_candidate_passes_window_guard(
@@ -2175,45 +2325,6 @@ def _ranked_recipe_candidate_passes_sodium_guard(
         candidate_total_sodium <= sodium_limit
         or candidate_total_sodium <= top_total_sodium + CONTROLLED_RECIPE_SODIUM_WORSE_BUFFER_MG
     )
-
-
-def _ranked_recipe_window_selection_score(
-    candidate: _RankedRecipeCandidate,
-    top: _RankedRecipeCandidate,
-    *,
-    used_recipe_counts: Counter[str],
-    used_food_ids: Counter[str],
-    used_formats: Counter[str],
-    current_total: NutrientVector,
-    target: NutrientVector,
-    slot_energy_target: float,
-    variety_seed: int,
-    index: int,
-    recipe_cache: _RecipePlanCache | None,
-) -> tuple[int, float, float, int]:
-    recipe = candidate.recipe
-    selected_count = used_recipe_counts[recipe.id]
-    score_gap = max(0.0, top.score - candidate.score)
-    normalized_gap = score_gap / max(0.01, CONTROLLED_RECIPE_SCORE_DELTA)
-    format_count = used_formats[_recipe_format_cached(recipe, recipe_cache)]
-    ingredient_overlap = sum(used_food_ids[food_id] for food_id in recipe.ingredients_g)
-    variety_score = _seeded_score(f"window:{recipe.id}", variety_seed, index)
-    sodium_pressure = _ranked_recipe_window_sodium_pressure(
-        candidate.projected,
-        current_total=current_total,
-        target=target,
-        slot_energy_target=slot_energy_target,
-    )
-    pressure_score = (
-        variety_score
-        - normalized_gap * 0.65
-        - sodium_pressure
-        - min(3, format_count) * 0.08
-        - min(4, ingredient_overlap) * 0.03
-        - candidate.rank * 0.02
-    )
-    return (-selected_count, pressure_score, candidate.score, -candidate.rank)
-
 
 def _ranked_recipe_window_sodium_pressure(
     projected: NutrientVector | None,

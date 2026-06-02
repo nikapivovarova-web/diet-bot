@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import tempfile
@@ -8,16 +9,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-BASE_WITH_GOOD_PHOTOS = Path(r"C:\Users\adck8\Desktop\bolshaya_tablica_receptov_s_foto_ready_for_sale.xlsx")
-FIXED_1_200_TEXT = Path(
-    r"C:\Users\adck8\Documents\New project 2\outputs\recipes_1_200\bolshaya_tablica_receptov_s_foto_1_200_one_portion.xlsx"
-)
-FIXED_201_400_TEXT = Path(
-    r"C:\Users\adck8\Documents\New project 2\outputs\recipe_workbook\bolshaya_tablica_receptov_s_foto_ready_for_sale_rows_200_404_fixed.xlsx"
-)
-OUTPUT_DIR = Path(r"C:\Users\adck8\Documents\New project 2\outputs\recipes_final_400_rebuild")
-OUTPUT = OUTPUT_DIR / "bolshaya_tablica_receptov_s_foto_400_fixed_one_portion_original_photos.xlsx"
-REPORT = OUTPUT_DIR / "rebuild_report.json"
+REPO_ROOT = Path(__file__).resolve().parent
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_XML = "http://www.w3.org/XML/1998/namespace"
@@ -25,6 +17,58 @@ ET.register_namespace("", NS_MAIN)
 
 TEXT_COLUMNS = ("B", "C", "D", "E", "F", "G")
 ONE_PORTION = "1 \u043f\u043e\u0440\u0446\u0438\u044f"
+
+
+def _resolve_cli_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def _is_inside_repo(path: Path) -> bool:
+    try:
+        path.relative_to(REPO_ROOT)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_cli_path(parser: argparse.ArgumentParser, label: str, path: Path, allow_external: bool) -> None:
+    if allow_external or _is_inside_repo(path):
+        return
+    parser.error(f"{label} must be inside {REPO_ROOT} unless --allow-external is set: {path}")
+
+
+def parse_args(argv: list[str] | None = None) -> tuple[Path, Path, Path, Path, Path]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Legacy non-release 400-recipe workbook rebuilder. Requires explicit input/output/report "
+            "paths and refuses outside-repo paths unless --allow-external is set."
+        )
+    )
+    parser.add_argument("base_with_good_photos", help="Base workbook whose photos/media are preserved.")
+    parser.add_argument("fixed_1_200_text", help="Corrected text workbook for recipes 1-200.")
+    parser.add_argument("fixed_201_400_text", help="Corrected text workbook for recipes 201-400.")
+    parser.add_argument("output_workbook", help="Destination rebuilt workbook.")
+    parser.add_argument("report", help="Destination JSON report.")
+    parser.add_argument(
+        "--allow-external",
+        action="store_true",
+        help="Permit paths outside this repository for legacy maintenance.",
+    )
+    args = parser.parse_args(argv)
+    base_with_good_photos = _resolve_cli_path(args.base_with_good_photos)
+    fixed_1_200_text = _resolve_cli_path(args.fixed_1_200_text)
+    fixed_201_400_text = _resolve_cli_path(args.fixed_201_400_text)
+    output_workbook = _resolve_cli_path(args.output_workbook)
+    report = _resolve_cli_path(args.report)
+    for label, path in (
+        ("base_with_good_photos", base_with_good_photos),
+        ("fixed_1_200_text", fixed_1_200_text),
+        ("fixed_201_400_text", fixed_201_400_text),
+        ("output_workbook", output_workbook),
+        ("report", report),
+    ):
+        _validate_cli_path(parser, label, path, args.allow_external)
+    return base_with_good_photos, fixed_1_200_text, fixed_201_400_text, output_workbook, report
 
 
 def q(tag: str) -> str:
@@ -111,8 +155,14 @@ def zip_dir(src: Path, dest: Path) -> None:
                 zf.write(path, path.relative_to(src).as_posix())
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(
+    base_with_good_photos: Path,
+    fixed_1_200_text: Path,
+    fixed_201_400_text: Path,
+    output_workbook: Path,
+    report_path: Path,
+) -> None:
+    output_workbook.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="recipes_rebuild_base_") as base_tmp, tempfile.TemporaryDirectory(
         prefix="recipes_rebuild_1_200_"
     ) as first_tmp, tempfile.TemporaryDirectory(prefix="recipes_rebuild_201_400_") as second_tmp:
@@ -120,9 +170,9 @@ def main() -> None:
         first_dir = Path(first_tmp)
         second_dir = Path(second_tmp)
         for xlsx, target in (
-            (BASE_WITH_GOOD_PHOTOS, base_dir),
-            (FIXED_1_200_TEXT, first_dir),
-            (FIXED_201_400_TEXT, second_dir),
+            (base_with_good_photos, base_dir),
+            (fixed_1_200_text, first_dir),
+            (fixed_201_400_text, second_dir),
         ):
             with zipfile.ZipFile(xlsx, "r") as zf:
                 zf.extractall(target)
@@ -176,15 +226,16 @@ def main() -> None:
             base_shared_root.set("uniqueCount", str(len(base_strings)))
             base_shared_tree.write(base_dir / "xl" / "sharedStrings.xml", encoding="utf-8", xml_declaration=True)
         base_sheet_tree.write(base_dir / "xl" / "worksheets" / "sheet1.xml", encoding="utf-8", xml_declaration=True)
-        zip_dir(base_dir, OUTPUT)
+        zip_dir(base_dir, output_workbook)
 
-    REPORT.write_text(
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
         json.dumps(
             {
-                "base_with_good_photos": str(BASE_WITH_GOOD_PHOTOS),
-                "fixed_1_200_text": str(FIXED_1_200_TEXT),
-                "fixed_201_400_text": str(FIXED_201_400_TEXT),
-                "output": str(OUTPUT),
+                "base_with_good_photos": str(base_with_good_photos),
+                "fixed_1_200_text": str(fixed_1_200_text),
+                "fixed_201_400_text": str(fixed_201_400_text),
+                "output": str(output_workbook),
                 "copied_cells": copied,
                 "text_columns_copied": list(TEXT_COLUMNS),
                 "photos_policy": "all drawing/media files kept from base workbook",
@@ -194,8 +245,8 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    print(OUTPUT)
+    print(output_workbook)
 
 
 if __name__ == "__main__":
-    main()
+    main(*parse_args())

@@ -10,6 +10,8 @@ startup.
 - Do not enable live payments in this cutover.
 - Do not set `TELEGRAM_PROVIDER_TOKEN` unless payment QA or payment enablement is explicitly approved.
 - Do not enable `DIET_BOT_PAYMENTS_ENABLED` unless payment enablement is explicitly approved.
+- Do not seed or enable `FOOD20` until the promo campaign has explicit
+  campaign approval after the Postgres promo preflight and restore drill pass.
 - Do not perform Telegram API QA such as `getUpdates` unless separately approved.
 - Do not rely on bot startup to apply migrations.
 
@@ -18,12 +20,27 @@ startup.
 Production must use Postgres-backed storage. JSON storage is allowed only for
 local development and for the pre-cutover source backup.
 
+Use `.env.example` as the committed configuration checklist, then put real
+values only in the deployment secret manager or operator-controlled environment.
+Do not commit a filled `.env` file or paste production secrets into tickets,
+logs, docs, pull request text, or shell history.
+
+Promo runtime in production follows the same rule: when production uses
+`DIET_BOT_STORAGE_BACKEND=postgres`, monthly-access promo activation and
+existing admin promo actions must use the Postgres promo store. JSON promo state
+is an import seed or local fallback only; it is not the production source of
+truth after promo cutover.
+
 Required production configuration:
 
 - `DIET_BOT_ENV=production`
 - `DIET_BOT_TOKEN` or `TELEGRAM_BOT_TOKEN`
 - `DIET_BOT_STORAGE_BACKEND=postgres`
+- `DIET_BOT_ALLOW_JSON_STORAGE=0` if this compatibility guard is present in the
+  deployment template
 - `DIET_BOT_DATABASE_URL`
+- `DIET_BOT_ONE_DAY_WORKER_ENABLED=1`
+- `DIET_BOT_WEEKLY_PDF_WORKER_ENABLED=1`
 - `DIET_BOT_SUPPORT_CHAT_ID`
 - `DIET_BOT_PRIVACY_POLICY_URL`
 
@@ -33,11 +50,29 @@ Required support and privacy checks:
 - The privacy policy URL must be a public HTTP(S) URL.
 - The bot must be able to show support and privacy information before payment enablement is considered.
 
+Durable generation worker configuration:
+
+- Production Postgres mode enqueues one-day and weekly PDF generation jobs into
+  durable Postgres queues.
+- `DIET_BOT_ONE_DAY_WORKER_ENABLED=1` is required so accepted one-day
+  generation jobs are processed.
+- `DIET_BOT_WEEKLY_PDF_WORKER_ENABLED=1` is required so accepted weekly PDF
+  generation jobs are processed.
+- Strict production healthcheck, production preflight, and bot startup must fail
+  if either worker flag is missing in production Postgres mode.
+
 Payment configuration:
 
 - Payments remain off by default.
 - Leave `DIET_BOT_PAYMENTS_ENABLED` unset or set to `0`.
+- Leave `DIET_BOT_PUBLIC_PAYMENTS_ENABLED` unset or set to `0` unless public
+  payment UI enablement is explicitly approved.
+- Keep `DIET_BOT_PAYMENT_TEST_PRICES_ENABLED=0` in production; test prices are
+  rejected by production startup validation.
 - Leave `TELEGRAM_PROVIDER_TOKEN` unset unless payment QA or live payment enablement is explicitly approved.
+- YooKassa/card invoices use `TELEGRAM_PROVIDER_TOKEN` when payments are
+  enabled. Telegram Stars uses the Telegram invoice path and has no separate
+  provider-token environment variable in the current runtime.
 - Do not add any payment provider token to shell history, logs, docs, or pull request text.
 - When payments are enabled, set `DIET_BOT_PAYMENT_RECOVERY_SPOOL` to a
   durable absolute path outside the repository, temp directories, and other
@@ -306,12 +341,16 @@ Required restore coverage:
 - `weekly_pdf_jobs`
 - `chat_profiles`
 - `chat_recipe_history`
+- `chat_privacy_consents`
 - `chat_state_json_import_runs`
 - `one_day_generation_jobs`
 - `one_day_generation_job_value_messages`
 - `payment_orders`
 - `payment_charges`
 - `payment_events`
+- `promo_codes`
+- `promo_code_redemptions`
+- `promo_import_runs`
 
 If the drill reports a missing required table, restore verification failed. If
 the comparison reports a row-count mismatch, restore verification failed unless
@@ -513,6 +552,32 @@ below use placeholders only.
    enablement. It does not enable live payments, does not require
    `TELEGRAM_PROVIDER_TOKEN`, and does not call Telegram or a payment provider.
 
+9. Apply promo store migrations explicitly.
+
+   ```powershell
+   @'
+   from diet_bot.postgres_promo_store import PostgresPromoStore
+
+   PostgresPromoStore("<postgres-dsn>").initialize()
+   '@ | .\.venv\Scripts\python.exe -
+   ```
+
+   Production promo storage must stay Postgres-backed after this point.
+   JSON promo state is an import seed or local fallback only. It is not the
+   production runtime source of truth. If existing
+   `.diet_bot_state\promo_codes.json` state must be imported, import from the
+   read-only backup with a reviewed, strict operator path that records
+   `promo_import_runs`, preserves `used_by_chat_id` as
+   `promo_code_redemptions.status='redeemed'`, checks the expected fingerprint
+   and counts, and never deletes or overwrites existing Postgres promo rows
+   without a documented operator decision. Do not call the permissive local JSON
+   loader as the production import validator because corrupt input must fail
+   closed.
+
+   Do not seed or enable `FOOD20` in this migration step. `FOOD20` remains
+   disabled until the campaign approval stage after DSN-backed verification,
+   restore-drill evidence, and payment discount-flow approval.
+
 ## Healthcheck And Preflight Order
 
 Preflight should happen after configuration is loaded and after the required
@@ -520,15 +585,17 @@ schema/data migrations above are complete.
 
 1. Confirm production env values are present through the deployment secret manager.
 2. Confirm payments are disabled and provider token is absent unless separately approved.
-3. Run strict config healthcheck:
+3. Confirm `DIET_BOT_ONE_DAY_WORKER_ENABLED=1` and
+   `DIET_BOT_WEEKLY_PDF_WORKER_ENABLED=1` are present for production Postgres.
+4. Run strict config healthcheck:
 
    ```powershell
    .\.venv\Scripts\python.exe -m diet_bot.healthcheck --strict-production
    ```
 
-4. Confirm the healthcheck reports `issues: none`.
-5. Confirm the healthcheck prints only safe summaries such as `set` or `missing`, never secret values.
-6. Confirm there is exactly one intended poller before startup.
+5. Confirm the healthcheck reports `issues: none`.
+6. Confirm the healthcheck prints only safe summaries such as `set` or `missing`, never secret values.
+7. Confirm there is exactly one intended poller before startup.
 
 Bot startup validates runtime configuration and Postgres schema readiness. It
 must fail fast if required production config or schema is missing. Startup does
@@ -553,9 +620,13 @@ The preflight proves:
 
 - strict production runtime configuration is present;
 - `DIET_BOT_ENV` is `production` or `prod`;
+- production Postgres durable generation queues have
+  `DIET_BOT_ONE_DAY_WORKER_ENABLED=1` and
+  `DIET_BOT_WEEKLY_PDF_WORKER_ENABLED=1`;
 - Postgres connectivity works with `DIET_BOT_DATABASE_URL`;
 - entitlements, chat state, weekly PDF jobs, one-day generation jobs, and
-  payment ledger schema/migration expectations are present;
+  promo schema/migration expectations are present;
+- payment ledger schema/migration expectations are present;
 - payment recovery spool readiness when payments are enabled or
   `DIET_BOT_PAYMENT_RECOVERY_SPOOL` is configured;
 - the Postgres single-poller advisory guard can be acquired and released.
@@ -849,12 +920,20 @@ Run exactly one long-polling bot process for a bot token.
 7. Apply chat state schema migrations.
 8. Dry-run and then apply the JSON history/chat-state import.
 9. Apply payment ledger migrations with payments still disabled.
-10. Run strict production healthcheck.
-11. Run production preflight.
-12. Confirm only one poller will run.
-13. Stop the old poller.
-14. Start the new poller once.
-15. Monitor process logs and health signals.
+10. Apply promo store migrations and import reviewed JSON promo seed state only
+    if an approved production import is required.
+11. Run the Postgres backup and restore drill and confirm required promo tables
+    are present and row counts match when source comparison is enabled.
+12. Confirm `DIET_BOT_ONE_DAY_WORKER_ENABLED=1` and
+    `DIET_BOT_WEEKLY_PDF_WORKER_ENABLED=1` in the production secret manager.
+13. Run strict production healthcheck.
+14. Run production preflight.
+15. Confirm `FOOD20` remains disabled unless campaign approval is explicitly in
+    scope for a later stage.
+16. Confirm only one poller will run.
+17. Stop the old poller.
+18. Start the new poller once.
+19. Monitor process logs and health signals.
 
 Do not use Telegram API calls or manual Telegram QA as part of this sequence
 unless that QA is separately approved.
@@ -880,6 +959,8 @@ touching production services:
   production will use, with a recorded confirmation that only one poller can
   run for the token;
 - same migration order rehearsed against staging data;
+- same promo JSON import decision rehearsed against staging data, with JSON as
+  import seed/local fallback only and Postgres as the production runtime store;
 - monitoring, log redaction checks, queue-depth dashboards, and operator alert
   routes armed before the production window;
 - rollback target identified by previous git SHA, previous artifact hash or
@@ -921,5 +1002,7 @@ Rollback depends on whether the new poller has processed production traffic.
 - Do not put production DSNs or provider tokens into README examples.
 - Use a unique entitlement `--migration-id` for each attempted import.
 - Use a unique history/chat-state `--migration-id` for each attempted import.
+- Use a unique promo import id for each attempted promo JSON seed import and
+  preserve the matching `promo_import_runs` evidence.
 - Keep the JSON backup and migration output together for audit.
 - Treat payment enablement as a separate runbook and approval path.

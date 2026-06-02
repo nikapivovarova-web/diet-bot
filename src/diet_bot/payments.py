@@ -44,6 +44,18 @@ PAYMENT_CHARGE_STATUSES = (
 )
 PaymentChargeStatus = Literal["succeeded", "refunded", "canceled"]
 
+REVERSAL_STATUS_REFUNDED = "refunded"
+REVERSAL_STATUS_CANCELED = "canceled"
+REVERSAL_STATUS_REVERSED = "reversed"
+REVERSAL_STATUS_CHARGEBACK = "chargeback"
+PAYMENT_REVERSAL_STATUSES = (
+    REVERSAL_STATUS_REFUNDED,
+    REVERSAL_STATUS_CANCELED,
+    REVERSAL_STATUS_REVERSED,
+    REVERSAL_STATUS_CHARGEBACK,
+)
+PaymentReversalStatus = Literal["refunded", "canceled", "reversed", "chargeback"]
+
 EVENT_SUCCESSFUL_PAYMENT_RECEIVED = "successful_payment_received"
 EVENT_SUCCESSFUL_PAYMENT_DUPLICATE = "successful_payment_duplicate"
 EVENT_SUCCESSFUL_PAYMENT_UNKNOWN_PAYLOAD = "successful_payment_unknown_payload"
@@ -104,6 +116,7 @@ class PaymentOrder:
     granted_at: datetime | None = None
     failed_at: datetime | None = None
     failure_reason: str | None = None
+    reused_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,14 +168,25 @@ class PaymentHandlingResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class PaymentReversalResult:
+    processed: bool
+    grant: str | None = None
+    duplicate: bool = False
+    manual_review_required: bool = False
+    reason: str | None = None
+    order_id: str | None = None
+    charge_status: str | None = None
+
+
 PRODUCT_PRICES: dict[str, dict[str, PaymentProductPrice]] = {
     PROVIDER_TELEGRAM_STARS: {
-        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=400, currency="XTR"),
-        PRODUCT_EXTRA_ONE_DAY: PaymentProductPrice(amount=35, currency="XTR"),
-        PRODUCT_EXTRA_WEEKLY_PDF: PaymentProductPrice(amount=170, currency="XTR"),
+        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=450, currency="XTR"),
+        PRODUCT_EXTRA_ONE_DAY: PaymentProductPrice(amount=29, currency="XTR"),
+        PRODUCT_EXTRA_WEEKLY_PDF: PaymentProductPrice(amount=141, currency="XTR"),
     },
     PROVIDER_YOOKASSA: {
-        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=59_900, currency="RUB"),
+        PRODUCT_SUBSCRIPTION_MONTH: PaymentProductPrice(amount=79_900, currency="RUB"),
         PRODUCT_EXTRA_ONE_DAY: PaymentProductPrice(amount=5_000, currency="RUB"),
         PRODUCT_EXTRA_WEEKLY_PDF: PaymentProductPrice(amount=25_000, currency="RUB"),
     },

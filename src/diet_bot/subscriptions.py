@@ -1,92 +1,36 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, cast
+
+from .entitlement_model import (
+    AUTO_RENEW_STATUSES as AUTO_RENEW_STATUSES,
+    PROCESSED_CHARGE_ID_LIMIT,
+    SUBSCRIPTION_SOURCES as SUBSCRIPTION_SOURCES,
+    AutoRenewStatus,
+    Entitlement,
+    SubscriptionSource,
+    _format_datetime,
+    _normalize_now,
+)
 
 
 MONTHLY_ONE_DAY_LIMIT = 5
 MONTHLY_WEEKLY_PDF_LIMIT = 4
 SUBSCRIPTION_PERIOD_SECONDS = 2_592_000
 TEST_ACCESS_PERIOD_DAYS = 365
-PROCESSED_CHARGE_ID_LIMIT = 200
 
 RationKind = Literal["one_day", "weekly_pdf"]
 AttemptSource = Literal["monthly", "extra", "free_trial", "test_access"]
 PaymentGrant = Literal["subscription", "extra_one_day", "extra_weekly_pdf"]
+PaymentReversalStatus = Literal["refunded", "canceled", "reversed", "chargeback"]
 
-
-@dataclass
-class Entitlement:
-    free_trial_used: bool = False
-    subscription_period_start: str | None = None
-    subscription_period_end: str | None = None
-    test_access_until: str | None = None
-    test_access_enabled: bool = False
-    monthly_one_day_remaining: int = 0
-    monthly_weekly_pdf_remaining: int = 0
-    extra_one_day_remaining: int = 0
-    extra_weekly_pdf_remaining: int = 0
-    processed_payment_charge_ids: list[str] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Entitlement:
-        return cls(
-            free_trial_used=bool(data.get("free_trial_used", False)),
-            subscription_period_start=_optional_str(data.get("subscription_period_start")),
-            subscription_period_end=_optional_str(data.get("subscription_period_end")),
-            test_access_until=_optional_str(data.get("test_access_until")),
-            test_access_enabled=bool(data.get("test_access_enabled", bool(data.get("test_access_until")))),
-            monthly_one_day_remaining=_non_negative_int(data.get("monthly_one_day_remaining")),
-            monthly_weekly_pdf_remaining=_non_negative_int(data.get("monthly_weekly_pdf_remaining")),
-            extra_one_day_remaining=_non_negative_int(data.get("extra_one_day_remaining")),
-            extra_weekly_pdf_remaining=_non_negative_int(data.get("extra_weekly_pdf_remaining")),
-            processed_payment_charge_ids=[
-                str(charge_id)
-                for charge_id in data.get("processed_payment_charge_ids", [])
-                if str(charge_id)
-            ][-PROCESSED_CHARGE_ID_LIMIT:],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "free_trial_used": self.free_trial_used,
-            "subscription_period_start": self.subscription_period_start,
-            "subscription_period_end": self.subscription_period_end,
-            "test_access_until": self.test_access_until,
-            "test_access_enabled": self.test_access_enabled,
-            "monthly_one_day_remaining": self.monthly_one_day_remaining,
-            "monthly_weekly_pdf_remaining": self.monthly_weekly_pdf_remaining,
-            "extra_one_day_remaining": self.extra_one_day_remaining,
-            "extra_weekly_pdf_remaining": self.extra_weekly_pdf_remaining,
-            "processed_payment_charge_ids": self.processed_payment_charge_ids[-PROCESSED_CHARGE_ID_LIMIT:],
-        }
-
-    def subscription_end_datetime(self) -> datetime | None:
-        return _parse_datetime(self.subscription_period_end)
-
-    def test_access_end_datetime(self) -> datetime | None:
-        return _parse_datetime(self.test_access_until)
-
-    def is_subscription_active(self, now: datetime | None = None) -> bool:
-        end = self.subscription_end_datetime()
-        return bool(end and end > _normalize_now(now))
-
-    def is_test_access_available(self, now: datetime | None = None) -> bool:
-        end = self.test_access_end_datetime()
-        return bool(end and end > _normalize_now(now))
-
-    def is_test_access_active(self, now: datetime | None = None) -> bool:
-        return self.test_access_enabled and self.is_test_access_available(now)
-
-    def expire_if_needed(self, now: datetime | None = None) -> None:
-        if self.subscription_period_end and not self.is_subscription_active(now):
-            self.monthly_one_day_remaining = 0
-            self.monthly_weekly_pdf_remaining = 0
-        if self.test_access_until and not self.is_test_access_available(now):
-            self.test_access_until = None
-            self.test_access_enabled = False
+STARS_DUPLICATE_GUARD_AUTO_RENEW_STATUSES: frozenset[str] = frozenset(
+    {"enabled", "unknown", "canceled"}
+)
+_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -101,6 +45,15 @@ class PaymentApplication:
     processed: bool
     grant: PaymentGrant | None = None
     duplicate: bool = False
+
+
+@dataclass(frozen=True)
+class PaymentReversalApplication:
+    processed: bool
+    grant: PaymentGrant | None = None
+    duplicate: bool = False
+    manual_review_required: bool = False
+    reason: str | None = None
 
 
 def load_entitlements(path: Path) -> dict[int, Entitlement]:
@@ -200,12 +153,28 @@ def set_test_access_enabled(
     return True
 
 
+def has_active_managed_stars_subscription(
+    entitlement: Entitlement,
+    now: datetime | None = None,
+) -> bool:
+    return (
+        entitlement.subscription_source == "telegram_stars"
+        and entitlement.auto_renew_status in STARS_DUPLICATE_GUARD_AUTO_RENEW_STATUSES
+        and entitlement.is_subscription_active(now)
+    )
+
+
 def apply_subscription_payment(
     entitlement: Entitlement,
     charge_id: str,
     *,
     now: datetime | None = None,
     subscription_expiration_timestamp: int | None = None,
+    subscription_source: SubscriptionSource | None = None,
+    auto_renew_status: AutoRenewStatus | None = None,
+    stars_subscription_charge_id: str | None = None,
+    last_subscription_payment_charge_id: str | None | object = _UNSET,
+    current_period_payment_order_id: str | None = None,
 ) -> PaymentApplication:
     if has_processed_charge_id(entitlement, charge_id):
         return PaymentApplication(False, "subscription", duplicate=True)
@@ -220,8 +189,46 @@ def apply_subscription_payment(
     entitlement.subscription_period_end = _format_datetime(end)
     entitlement.monthly_one_day_remaining = MONTHLY_ONE_DAY_LIMIT
     entitlement.monthly_weekly_pdf_remaining = MONTHLY_WEEKLY_PDF_LIMIT
+    if subscription_source is not None:
+        entitlement.subscription_source = subscription_source
+        if subscription_source != "telegram_stars":
+            entitlement.stars_subscription_charge_id = None
+    if auto_renew_status is not None:
+        entitlement.auto_renew_status = auto_renew_status
+    if stars_subscription_charge_id is not None:
+        entitlement.stars_subscription_charge_id = stars_subscription_charge_id
+    elif subscription_source == "telegram_stars":
+        entitlement.stars_subscription_charge_id = charge_id
+    if last_subscription_payment_charge_id is not _UNSET:
+        entitlement.last_subscription_payment_charge_id = cast(str | None, last_subscription_payment_charge_id)
+    elif subscription_source is not None:
+        entitlement.last_subscription_payment_charge_id = charge_id
+    if current_period_payment_order_id is not None:
+        entitlement.current_period_payment_order_id = current_period_payment_order_id
     record_processed_charge_id(entitlement, charge_id)
     return PaymentApplication(True, "subscription")
+
+
+def apply_monthly_access_promo_grant(
+    entitlement: Entitlement,
+    charge_id: str,
+    *,
+    now: datetime | None = None,
+    months: int = 1,
+) -> PaymentApplication:
+    current_time = _normalize_now(now)
+    current_end = entitlement.subscription_end_datetime()
+    extension_base = current_end if current_end and current_end > current_time else current_time
+    duration = max(1, int(months)) * SUBSCRIPTION_PERIOD_SECONDS
+    return apply_subscription_payment(
+        entitlement,
+        charge_id,
+        now=current_time,
+        subscription_expiration_timestamp=int((extension_base + timedelta(seconds=duration)).timestamp()),
+        subscription_source="promo",
+        auto_renew_status="not_applicable",
+        last_subscription_payment_charge_id=charge_id,
+    )
 
 
 def apply_extra_one_day_payment(entitlement: Entitlement, charge_id: str) -> PaymentApplication:
@@ -240,40 +247,51 @@ def apply_extra_weekly_pdf_payment(entitlement: Entitlement, charge_id: str) -> 
     return PaymentApplication(True, "extra_weekly_pdf")
 
 
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+def apply_payment_reversal(
+    entitlement: Entitlement,
+    product: str,
+    charge_id: str,
+    *,
+    order_id: str | None = None,
+    reversal_status: str = "refunded",
+    now: datetime | None = None,
+) -> PaymentReversalApplication:
+    grant = _payment_grant_for_product(product)
+    normalized_status = _payment_reversal_status(reversal_status)
+    marker = _payment_reversal_marker(normalized_status, charge_id)
+    if has_processed_charge_id(entitlement, marker):
+        return PaymentReversalApplication(False, grant, duplicate=True)
 
-
-def _non_negative_int(value: Any) -> int:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _normalize_now(now: datetime | None) -> datetime:
-    if now is None:
-        return datetime.now(UTC)
-    if now.tzinfo is None:
-        return now.replace(tzinfo=UTC)
-    return now.astimezone(UTC)
-
-
-def _format_datetime(value: datetime) -> str:
-    return value.astimezone(UTC).isoformat()
-
-
-def _parse_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return _normalize_now(parsed)
+    record_processed_charge_id(entitlement, marker)
+    if not has_processed_charge_id(entitlement, charge_id):
+        return PaymentReversalApplication(
+            True,
+            grant,
+            manual_review_required=True,
+            reason="payment_charge_not_granted",
+        )
+    if product == "subscription_month":
+        return _apply_subscription_payment_reversal(
+            entitlement,
+            charge_id,
+            order_id=order_id,
+            reversal_status=normalized_status,
+            now=now,
+        )
+    if product in {"extra_one_day", "extra_weekly_pdf"}:
+        _apply_extra_payment_reversal(entitlement, product)
+        return PaymentReversalApplication(
+            True,
+            grant,
+            manual_review_required=True,
+            reason="extra_entitlement_requires_manual_review",
+        )
+    return PaymentReversalApplication(
+        True,
+        grant,
+        manual_review_required=True,
+        reason="unsupported_payment_product",
+    )
 
 
 def has_processed_charge_id(entitlement: Entitlement, charge_id: str) -> bool:
@@ -286,3 +304,77 @@ def record_processed_charge_id(entitlement: Entitlement, charge_id: str) -> bool
     entitlement.processed_payment_charge_ids.append(charge_id)
     entitlement.processed_payment_charge_ids = entitlement.processed_payment_charge_ids[-PROCESSED_CHARGE_ID_LIMIT:]
     return True
+
+
+def _apply_subscription_payment_reversal(
+    entitlement: Entitlement,
+    charge_id: str,
+    *,
+    order_id: str | None,
+    reversal_status: PaymentReversalStatus,
+    now: datetime | None,
+) -> PaymentReversalApplication:
+    if not _subscription_reversal_matches_current(entitlement, charge_id, order_id):
+        return PaymentReversalApplication(
+            True,
+            "subscription",
+            manual_review_required=True,
+            reason="subscription_charge_not_current",
+        )
+    reversed_at = _normalize_now(now)
+    entitlement.subscription_period_end = _format_datetime(reversed_at)
+    entitlement.monthly_one_day_remaining = 0
+    entitlement.monthly_weekly_pdf_remaining = 0
+    if entitlement.subscription_source == "telegram_stars" or reversal_status in {"canceled", "reversed", "chargeback"}:
+        entitlement.auto_renew_status = "canceled"
+    return PaymentReversalApplication(True, "subscription")
+
+
+def _apply_extra_payment_reversal(entitlement: Entitlement, product: str) -> None:
+    if product == "extra_one_day" and entitlement.extra_one_day_remaining > 0:
+        entitlement.extra_one_day_remaining -= 1
+    elif product == "extra_weekly_pdf" and entitlement.extra_weekly_pdf_remaining > 0:
+        entitlement.extra_weekly_pdf_remaining -= 1
+
+
+def _subscription_reversal_matches_current(
+    entitlement: Entitlement,
+    charge_id: str,
+    order_id: str | None,
+) -> bool:
+    charge_matches = charge_id in {
+        entitlement.last_subscription_payment_charge_id,
+        entitlement.stars_subscription_charge_id,
+    }
+    if not charge_matches:
+        return False
+    return (
+        order_id is None
+        or entitlement.current_period_payment_order_id is None
+        or entitlement.current_period_payment_order_id == order_id
+    )
+
+
+def _payment_reversal_status(value: str) -> PaymentReversalStatus:
+    normalized = str(value or "refunded").strip().lower()
+    if normalized == "cancelled":
+        normalized = "canceled"
+    if normalized == "refund":
+        normalized = "refunded"
+    if normalized in {"refunded", "canceled", "reversed", "chargeback"}:
+        return cast(PaymentReversalStatus, normalized)
+    return "reversed"
+
+
+def _payment_reversal_marker(status: PaymentReversalStatus, charge_id: str) -> str:
+    return f"reversal:{status}:{charge_id}"
+
+
+def _payment_grant_for_product(product: str) -> PaymentGrant | None:
+    if product == "subscription_month":
+        return "subscription"
+    if product == "extra_one_day":
+        return "extra_one_day"
+    if product == "extra_weekly_pdf":
+        return "extra_weekly_pdf"
+    return None

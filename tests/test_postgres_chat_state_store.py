@@ -70,6 +70,7 @@ def test_initialize_creates_schema_and_validate_schema_passes(store: PostgresCha
                     'schema_migrations',
                     'chat_profiles',
                     'chat_recipe_history',
+                    'chat_privacy_consents',
                     'chat_state_json_import_runs'
                   )
                 """
@@ -82,21 +83,31 @@ def test_initialize_creates_schema_and_validate_schema_passes(store: PostgresCha
                 WHERE conname IN (
                     'chat_profiles_pkey',
                     'chat_recipe_history_pkey',
+                    'chat_privacy_consents_pkey',
                     'chk_chat_profiles_profile_json_object',
                     'chk_chat_recipe_history_recipe_ids_array',
-                    'chk_chat_recipe_history_recipe_keys_array'
+                    'chk_chat_recipe_history_recipe_keys_array',
+                    'chk_chat_privacy_consents_consent_json_object'
                 )
                 """
             )
             constraints = {row["conname"] for row in cur.fetchall()}
 
-    assert tables == {"schema_migrations", "chat_profiles", "chat_recipe_history", "chat_state_json_import_runs"}
+    assert tables == {
+        "schema_migrations",
+        "chat_profiles",
+        "chat_recipe_history",
+        "chat_privacy_consents",
+        "chat_state_json_import_runs",
+    }
     assert constraints == {
         "chat_profiles_pkey",
         "chat_recipe_history_pkey",
+        "chat_privacy_consents_pkey",
         "chk_chat_profiles_profile_json_object",
         "chk_chat_recipe_history_recipe_ids_array",
         "chk_chat_recipe_history_recipe_keys_array",
+        "chk_chat_privacy_consents_consent_json_object",
     }
 
 
@@ -196,6 +207,30 @@ def test_profile_and_history_updates_do_not_overwrite_each_other(store: Postgres
         "recipe_ids": ["r010"],
         "recipe_keys": ["main:r011"],
     }
+
+
+def test_privacy_consent_roundtrip_does_not_overwrite_profile_or_history(store: PostgresChatStateStore) -> None:
+    chat_id = _chat_id()
+    profile = {"age": 41, "goal": "maintain"}
+    privacy_consent = {
+        "accepted": True,
+        "accepted_at": "2026-05-31T12:00:00+00:00",
+        "text_sha256": "f" * 64,
+        "policy_url": "https://foodbalance.example/privacy",
+        "schema_version": 1,
+    }
+
+    store.save_chat_state(chat_id, {"profile": profile})
+    store.save_chat_state(chat_id, {"recipe_ids": ["r010"], "recipe_keys": ["main:r010"]})
+    store.save_chat_state(chat_id, {"privacy_consent": privacy_consent})
+
+    assert store.load_chat_state(chat_id) == {
+        "profile": profile,
+        "recipe_ids": ["r010"],
+        "recipe_keys": ["main:r010"],
+        "privacy_consent": privacy_consent,
+    }
+    assert store.load_all()[str(chat_id)]["privacy_consent"] == privacy_consent
 
 
 def test_row_level_load_chat_state_reads_only_requested_chat(store: PostgresChatStateStore) -> None:

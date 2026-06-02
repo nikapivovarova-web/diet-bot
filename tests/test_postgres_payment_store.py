@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import re
 import shlex
@@ -13,10 +15,13 @@ import pytest
 
 import diet_bot.postgres_payment_store as postgres_payment_store
 from diet_bot.payments import (
+    CHARGE_STATUS_CANCELED,
+    CHARGE_STATUS_REFUNDED,
     ORDER_STATUS_FAILED,
     ORDER_STATUS_GRANTED,
     ORDER_STATUS_PAID,
     ORDER_STATUS_PENDING,
+    PRODUCT_EXTRA_ONE_DAY,
     PRODUCT_EXTRA_WEEKLY_PDF,
     PRODUCT_SUBSCRIPTION_MONTH,
     PROVIDER_TELEGRAM_STARS,
@@ -24,6 +29,7 @@ from diet_bot.payments import (
     PaymentCharge,
     PaymentEvent,
     PaymentOrder,
+    expected_payment_price,
 )
 from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
 from diet_bot.postgres_payment_store import PostgresPaymentStore
@@ -36,6 +42,7 @@ from diet_bot.subscriptions import (
     consume_weekly_pdf_attempt,
     refund_attempt,
 )
+from scripts.ops import apply_payment_reversal as payment_reversal_cli
 
 
 TEST_DATABASE_URL = os.getenv("DIET_BOT_TEST_DATABASE_URL")
@@ -145,7 +152,7 @@ def test_find_charge_by_external_id_is_read_only_and_returns_context(monkeypatch
         provider=PROVIDER_YOOKASSA,
         telegram_payment_charge_id="tg-charge-lookup",
         provider_payment_charge_id="provider-charge-lookup",
-        amount=59_900,
+        amount=79_900,
         currency="RUB",
     )
     cur = StaticSelectCursor(existing_row)
@@ -160,7 +167,7 @@ def test_find_charge_by_external_id_is_read_only_and_returns_context(monkeypatch
 
     assert charge is not None
     assert charge.order_id == "order_charge_lookup"
-    assert charge.amount == 59_900
+    assert charge.amount == 79_900
     normalized = [" ".join(query.split()).upper() for query in cur.queries]
     assert all(query.startswith("SELECT") for query in normalized)
     assert not any("FOR UPDATE" in query for query in normalized)
@@ -333,6 +340,112 @@ def test_order_lifecycle(store: PostgresPaymentStore) -> None:
     assert marked_failed.failure_reason == "provider_rejected"
 
 
+def test_create_or_reuse_pending_order_reuses_active_pending_order(store: PostgresPaymentStore) -> None:
+    first = store.create_or_reuse_pending_order(_order("order_pending_first", PRODUCT_SUBSCRIPTION_MONTH))
+    second = store.create_or_reuse_pending_order(_order("order_pending_second", PRODUCT_SUBSCRIPTION_MONTH))
+
+    assert second.order_id == first.order_id
+    assert second.nonce == first.nonce
+    assert second.reused_pending
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS count
+                FROM payment_orders
+                WHERE chat_id = %s
+                  AND product = %s
+                  AND provider = %s
+                  AND status = 'pending'
+                """,
+                (first.chat_id, first.product, first.provider),
+            )
+            assert int(cur.fetchone()["count"]) == 1
+
+
+def test_create_or_reuse_pending_order_allows_different_products(store: PostgresPaymentStore) -> None:
+    subscription = store.create_or_reuse_pending_order(_order("order_pending_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    extra_day = store.create_or_reuse_pending_order(_order("order_pending_day", PRODUCT_EXTRA_ONE_DAY))
+
+    assert extra_day.order_id != subscription.order_id
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT product
+                FROM payment_orders
+                WHERE chat_id = %s
+                  AND status = 'pending'
+                ORDER BY product
+                """,
+                (subscription.chat_id,),
+            )
+            products = {row["product"] for row in cur.fetchall()}
+    assert products == {PRODUCT_SUBSCRIPTION_MONTH, PRODUCT_EXTRA_ONE_DAY}
+
+
+def test_create_or_reuse_pending_order_expires_old_pending_before_new_order(
+    store: PostgresPaymentStore,
+) -> None:
+    first = store.create_or_reuse_pending_order(_order("order_pending_old", PRODUCT_SUBSCRIPTION_MONTH))
+    now = datetime(2026, 5, 31, 12, tzinfo=UTC)
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE payment_orders
+                SET created_at = %s
+                WHERE order_id = %s
+                """,
+                (now - timedelta(minutes=31), first.order_id),
+            )
+
+    second = store.create_or_reuse_pending_order(
+        _order("order_pending_new", PRODUCT_SUBSCRIPTION_MONTH),
+        pending_ttl=timedelta(minutes=30),
+        now=now,
+    )
+
+    assert second.order_id != first.order_id
+    assert not second.reused_pending
+    assert store.get_order(first.order_id).status == ORDER_STATUS_FAILED
+    assert store.get_order(first.order_id).failure_reason == "order_expired"
+    assert store.get_order(second.order_id).status == ORDER_STATUS_PENDING
+
+
+def test_concurrent_create_or_reuse_pending_order_is_safe(store: PostgresPaymentStore) -> None:
+    barrier = threading.Barrier(8)
+
+    def create(index: int) -> PaymentOrder:
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        return store.create_or_reuse_pending_order(
+            _order(f"order_concur_pending_{index}", PRODUCT_SUBSCRIPTION_MONTH),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(create, index) for index in range(8)]
+        orders = [future.result(timeout=10) for future in futures]
+
+    assert {order.order_id for order in orders} == {orders[0].order_id}
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS count
+                FROM payment_orders
+                WHERE chat_id = %s
+                  AND product = %s
+                  AND provider = %s
+                  AND status = 'pending'
+                """,
+                (orders[0].chat_id, PRODUCT_SUBSCRIPTION_MONTH, PROVIDER_TELEGRAM_STARS),
+            )
+            assert int(cur.fetchone()["count"]) == 1
+
+
 def test_charge_and_event_recording_are_idempotent(store: PostgresPaymentStore) -> None:
     order = store.create_order(_order("order_charge12345", PRODUCT_SUBSCRIPTION_MONTH))
     event = PaymentEvent(
@@ -353,8 +466,8 @@ def test_charge_and_event_recording_are_idempotent(store: PostgresPaymentStore) 
             provider=PROVIDER_TELEGRAM_STARS,
             telegram_payment_charge_id="tg-charge-1",
             provider_payment_charge_id=None,
-            amount=400,
-            currency="XTR",
+            amount=order.amount,
+            currency=order.currency,
             raw_payload={"ok": True},
         )
     )
@@ -364,8 +477,8 @@ def test_charge_and_event_recording_are_idempotent(store: PostgresPaymentStore) 
             provider=PROVIDER_TELEGRAM_STARS,
             telegram_payment_charge_id="tg-charge-1",
             provider_payment_charge_id=None,
-            amount=400,
-            currency="XTR",
+            amount=order.amount,
+            currency=order.currency,
             raw_payload={"ok": True},
         )
     )
@@ -391,8 +504,8 @@ def test_duplicate_provider_charge_is_not_inserted_twice(store: PostgresPaymentS
             provider=PROVIDER_YOOKASSA,
             telegram_payment_charge_id="tg-charge-yoo-1",
             provider_payment_charge_id="provider-charge-1",
-            amount=59_900,
-            currency="RUB",
+            amount=first_order.amount,
+            currency=first_order.currency,
         )
     )
     duplicate = store.record_charge(
@@ -401,8 +514,8 @@ def test_duplicate_provider_charge_is_not_inserted_twice(store: PostgresPaymentS
             provider=PROVIDER_YOOKASSA,
             telegram_payment_charge_id="tg-charge-yoo-2",
             provider_payment_charge_id="provider-charge-1",
-            amount=25_000,
-            currency="RUB",
+            amount=second_order.amount,
+            currency=second_order.currency,
         )
     )
 
@@ -429,8 +542,8 @@ def test_successful_payment_transaction_rolls_back_if_entitlement_grant_fails(
             provider=PROVIDER_TELEGRAM_STARS,
             telegram_payment_charge_id="tg-charge-rollback",
             provider_payment_charge_id=None,
-            amount=400,
-            currency="XTR",
+            amount=order.amount,
+            currency=order.currency,
             grant_entitlement=fail_grant,
         )
 
@@ -453,8 +566,8 @@ def test_successful_payment_transaction_grants_entitlement_tables(
         provider=PROVIDER_TELEGRAM_STARS,
         telegram_payment_charge_id="tg-charge-grant",
         provider_payment_charge_id=None,
-        amount=400,
-        currency="XTR",
+        amount=order.amount,
+        currency=order.currency,
         now=now,
         subscription_expiration_timestamp=int((now + timedelta(days=30)).timestamp()),
     )
@@ -485,6 +598,486 @@ def test_successful_payment_transaction_grants_entitlement_tables(
     assert int(entitlement["monthly_one_day_remaining"]) == MONTHLY_ONE_DAY_LIMIT
     assert int(entitlement["monthly_weekly_pdf_remaining"]) == MONTHLY_WEEKLY_PDF_LIMIT
     assert charge_ids == {"telegram_stars:tg-charge-grant"}
+
+
+def test_payment_reversal_refund_revokes_current_subscription_entitlement(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    paid_at = datetime(2026, 5, 22, tzinfo=UTC)
+    refunded_at = paid_at + timedelta(days=2)
+    order = store.create_order(_order("order_refund_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-refund-sub",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        now=paid_at,
+        subscription_expiration_timestamp=int((paid_at + timedelta(days=30)).timestamp()),
+    )
+
+    result = store.record_payment_reversal(
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-refund-sub",
+        provider_payment_charge_id=None,
+        reversal_status="refunded",
+        amount=order.amount,
+        currency=order.currency,
+        raw_payload={"provider_status": "refunded"},
+        now=refunded_at,
+    )
+
+    failed = store.get_order(order.order_id)
+    assert result.processed
+    assert not result.manual_review_required
+    assert failed is not None
+    assert failed.status == ORDER_STATUS_FAILED
+    assert failed.failure_reason == "payment_refunded"
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, raw_payload_json
+                FROM payment_charges
+                WHERE telegram_payment_charge_id = %s
+                """,
+                ("tg-charge-refund-sub",),
+            )
+            charge = cur.fetchone()
+            cur.execute(
+                """
+                SELECT subscription_period_end, auto_renew_status,
+                       monthly_one_day_remaining, monthly_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+
+    assert charge["status"] == CHARGE_STATUS_REFUNDED
+    assert charge["raw_payload_json"]["provider_status"] == "refunded"
+    assert entitlement["subscription_period_end"] == refunded_at.isoformat()
+    assert entitlement["auto_renew_status"] == "canceled"
+    assert int(entitlement["monthly_one_day_remaining"]) == 0
+    assert int(entitlement["monthly_weekly_pdf_remaining"]) == 0
+
+
+def test_payment_reversal_repeated_refund_is_idempotent(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    order = store.create_order(_order("order_refund_extra", PRODUCT_EXTRA_WEEKLY_PDF))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-refund-extra",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        product=order.product,
+    )
+
+    request = {
+        "provider": PROVIDER_TELEGRAM_STARS,
+        "telegram_payment_charge_id": "tg-charge-refund-extra",
+        "provider_payment_charge_id": None,
+        "reversal_status": "refunded",
+        "amount": order.amount,
+        "currency": order.currency,
+    }
+    first = store.record_payment_reversal(**request)
+    second = store.record_payment_reversal(**request)
+
+    assert first.processed
+    assert first.manual_review_required
+    assert first.reason == "extra_entitlement_requires_manual_review"
+    assert not second.processed
+    assert second.duplicate
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT extra_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute("SELECT count(*) AS count FROM payment_charges")
+            charge_count = int(cur.fetchone()["count"])
+
+    assert int(entitlement["extra_weekly_pdf_remaining"]) == 0
+    assert charge_count == 1
+
+
+def test_payment_reversal_preserves_later_valid_subscription(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    first_paid_at = datetime(2026, 5, 22, tzinfo=UTC)
+    second_paid_at = first_paid_at + timedelta(days=4)
+    first_order = store.create_order(_order("order_old_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    second_order = store.create_order(_order("order_new_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=first_order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-old-sub",
+        provider_payment_charge_id=None,
+        amount=first_order.amount,
+        currency=first_order.currency,
+        now=first_paid_at,
+        subscription_expiration_timestamp=int((first_paid_at + timedelta(days=30)).timestamp()),
+    )
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=second_order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-new-sub",
+        provider_payment_charge_id=None,
+        amount=second_order.amount,
+        currency=second_order.currency,
+        now=second_paid_at,
+        subscription_expiration_timestamp=int((second_paid_at + timedelta(days=30)).timestamp()),
+    )
+
+    result = store.record_payment_reversal(
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-old-sub",
+        provider_payment_charge_id=None,
+        reversal_status="canceled",
+        amount=first_order.amount,
+        currency=first_order.currency,
+        now=second_paid_at + timedelta(days=1),
+    )
+
+    assert result.processed
+    assert result.manual_review_required
+    assert result.reason == "subscription_charge_not_current"
+    assert store.get_order(first_order.order_id).status == ORDER_STATUS_FAILED
+    assert store.get_order(second_order.order_id).status == ORDER_STATUS_GRANTED
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT current_period_payment_order_id, last_subscription_payment_charge_id,
+                       subscription_period_end, auto_renew_status
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (first_order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute(
+                """
+                SELECT status
+                FROM payment_charges
+                WHERE telegram_payment_charge_id = %s
+                """,
+                ("tg-charge-old-sub",),
+            )
+            old_charge = cur.fetchone()
+
+    assert entitlement["current_period_payment_order_id"] == second_order.order_id
+    assert entitlement["last_subscription_payment_charge_id"] == "telegram_stars:tg-charge-new-sub"
+    assert entitlement["subscription_period_end"] == (second_paid_at + timedelta(days=30)).isoformat()
+    assert entitlement["auto_renew_status"] == "enabled"
+    assert old_charge["status"] == CHARGE_STATUS_CANCELED
+
+
+def test_apply_payment_reversal_cli_dry_run_does_not_mutate_ledger_or_access(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    paid_at = datetime(2026, 5, 22, tzinfo=UTC)
+    order = store.create_order(_order("order_cli_dry_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-cli-dry-sub",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        now=paid_at,
+        subscription_expiration_timestamp=int((paid_at + timedelta(days=30)).timestamp()),
+    )
+
+    exit_code, payload, stdout, stderr = _run_payment_reversal_cli(
+        store,
+        [
+            "--provider",
+            PROVIDER_TELEGRAM_STARS,
+            "--telegram-payment-charge-id",
+            "tg-charge-cli-dry-sub",
+            "--kind",
+            "refund",
+            "--event-timestamp",
+            "2026-05-31T12:00:00Z",
+            "--amount",
+            str(order.amount),
+            "--currency",
+            order.currency,
+            "--reason",
+            "verified provider refund",
+        ],
+    )
+
+    assert exit_code == 0
+    assert payload["action"] == "dry_run"
+    assert payload["status"] == "would_apply"
+    assert store.dsn not in stdout + stderr
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, raw_payload_json
+                FROM payment_charges
+                WHERE telegram_payment_charge_id = %s
+                """,
+                ("tg-charge-cli-dry-sub",),
+            )
+            charge = cur.fetchone()
+            cur.execute(
+                """
+                SELECT status, failure_reason
+                FROM payment_orders
+                WHERE order_id = %s
+                """,
+                (order.order_id,),
+            )
+            saved_order = cur.fetchone()
+            cur.execute(
+                """
+                SELECT subscription_period_end, monthly_one_day_remaining, monthly_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+
+    assert charge["status"] == "succeeded"
+    assert "reversal_status" not in charge["raw_payload_json"]
+    assert saved_order["status"] == ORDER_STATUS_GRANTED
+    assert saved_order["failure_reason"] is None
+    assert entitlement["subscription_period_end"] == (paid_at + timedelta(days=30)).isoformat()
+    assert int(entitlement["monthly_one_day_remaining"]) == MONTHLY_ONE_DAY_LIMIT
+    assert int(entitlement["monthly_weekly_pdf_remaining"]) == MONTHLY_WEEKLY_PDF_LIMIT
+
+
+def test_apply_payment_reversal_cli_apply_subscription_revokes_entitlement_once(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    paid_at = datetime(2026, 5, 22, tzinfo=UTC)
+    refunded_at = datetime(2026, 5, 31, 12, tzinfo=UTC)
+    order = store.create_order(_order("order_cli_apply_sub", PRODUCT_SUBSCRIPTION_MONTH))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-cli-apply-sub",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        now=paid_at,
+        subscription_expiration_timestamp=int((paid_at + timedelta(days=30)).timestamp()),
+    )
+
+    first_exit, first_payload, _stdout, _stderr = _run_payment_reversal_cli(
+        store,
+        _reversal_cli_args("tg-charge-cli-apply-sub", amount=order.amount, currency=order.currency),
+    )
+    second_exit, second_payload, _stdout, _stderr = _run_payment_reversal_cli(
+        store,
+        _reversal_cli_args("tg-charge-cli-apply-sub", amount=order.amount, currency=order.currency),
+    )
+
+    assert first_exit == 0
+    assert first_payload["status"] == "applied"
+    assert second_exit == 0
+    assert second_payload["status"] == "duplicate"
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT subscription_period_end, auto_renew_status,
+                       monthly_one_day_remaining, monthly_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute(
+                """
+                SELECT count(*) AS count
+                FROM entitlement_processed_charge_ids
+                WHERE chat_id = %s
+                  AND charge_id = %s
+                """,
+                (order.chat_id, "reversal:refunded:telegram_stars:tg-charge-cli-apply-sub"),
+            )
+            reversal_marker_count = int(cur.fetchone()["count"])
+
+    assert entitlement["subscription_period_end"] == refunded_at.isoformat()
+    assert entitlement["auto_renew_status"] == "canceled"
+    assert int(entitlement["monthly_one_day_remaining"]) == 0
+    assert int(entitlement["monthly_weekly_pdf_remaining"]) == 0
+    assert reversal_marker_count == 1
+
+
+def test_apply_payment_reversal_cli_apply_extra_one_day_decrements_once(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    order = store.create_order(_order("order_cli_extra_day", PRODUCT_EXTRA_ONE_DAY))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-cli-extra-day",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        product=order.product,
+    )
+
+    first_exit, first_payload, _stdout, _stderr = _run_payment_reversal_cli(
+        store,
+        _reversal_cli_args("tg-charge-cli-extra-day", amount=order.amount, currency=order.currency),
+    )
+    second_exit, second_payload, _stdout, _stderr = _run_payment_reversal_cli(
+        store,
+        _reversal_cli_args("tg-charge-cli-extra-day", amount=order.amount, currency=order.currency),
+    )
+
+    assert first_exit == 0
+    assert first_payload["status"] == "manual_review"
+    assert first_payload["result"]["reason"] == "extra_entitlement_requires_manual_review"
+    assert second_exit == 0
+    assert second_payload["status"] == "duplicate"
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT extra_one_day_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute(
+                """
+                SELECT count(*) AS count
+                FROM entitlement_processed_charge_ids
+                WHERE chat_id = %s
+                  AND charge_id = %s
+                """,
+                (order.chat_id, "reversal:refunded:telegram_stars:tg-charge-cli-extra-day"),
+            )
+            reversal_marker_count = int(cur.fetchone()["count"])
+
+    assert int(entitlement["extra_one_day_remaining"]) == 0
+    assert reversal_marker_count == 1
+
+
+def test_apply_payment_reversal_cli_apply_weekly_pdf_decrements_once(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    order = store.create_order(_order("order_cli_extra_pdf", PRODUCT_EXTRA_WEEKLY_PDF))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-cli-extra-pdf",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        product=order.product,
+    )
+
+    exit_code, payload, _stdout, _stderr = _run_payment_reversal_cli(
+        store,
+        _reversal_cli_args("tg-charge-cli-extra-pdf", amount=order.amount, currency=order.currency),
+    )
+
+    assert exit_code == 0
+    assert payload["status"] == "manual_review"
+    assert payload["result"]["reason"] == "extra_entitlement_requires_manual_review"
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT extra_weekly_pdf_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+
+    assert int(entitlement["extra_weekly_pdf_remaining"]) == 0
+
+
+def test_apply_payment_reversal_cli_mismatched_amount_manual_review_without_access_mutation(
+    store: PostgresPaymentStore,
+) -> None:
+    PostgresEntitlementStore(store.dsn, connect_timeout=1, connect_attempts=1).initialize()
+    order = store.create_order(_order("order_cli_mismatch", PRODUCT_EXTRA_ONE_DAY))
+    store.record_successful_payment_and_grant_entitlement(
+        order_id=order.order_id,
+        provider=PROVIDER_TELEGRAM_STARS,
+        telegram_payment_charge_id="tg-charge-cli-mismatch",
+        provider_payment_charge_id=None,
+        amount=order.amount,
+        currency=order.currency,
+        product=order.product,
+    )
+
+    exit_code, payload, _stdout, _stderr = _run_payment_reversal_cli(
+        store,
+        _reversal_cli_args("tg-charge-cli-mismatch", amount=order.amount + 1, currency=order.currency),
+    )
+
+    assert exit_code == 0
+    assert payload["status"] == "manual_review"
+    assert payload["result"]["reason"] == "partial_refund_manual_review"
+    with store._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT extra_one_day_remaining
+                FROM entitlements
+                WHERE chat_id = %s
+                """,
+                (order.chat_id,),
+            )
+            entitlement = cur.fetchone()
+            cur.execute(
+                """
+                SELECT status
+                FROM payment_charges
+                WHERE telegram_payment_charge_id = %s
+                """,
+                ("tg-charge-cli-mismatch",),
+            )
+            charge = cur.fetchone()
+            cur.execute(
+                """
+                SELECT status, failure_reason
+                FROM payment_orders
+                WHERE order_id = %s
+                """,
+                (order.order_id,),
+            )
+            saved_order = cur.fetchone()
+
+    assert int(entitlement["extra_one_day_remaining"]) == 1
+    assert charge["status"] == CHARGE_STATUS_REFUNDED
+    assert saved_order["status"] == ORDER_STATUS_FAILED
+    assert saved_order["failure_reason"] == "payment_refunded_manual_review"
 
 
 def test_concurrent_successful_payments_for_same_new_chat_preserve_both_grants(
@@ -702,8 +1295,8 @@ def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
         provider=PROVIDER_TELEGRAM_STARS,
         telegram_payment_charge_id="tg-charge-first",
         provider_payment_charge_id=None,
-        amount=400,
-        currency="XTR",
+        amount=order.amount,
+        currency=order.currency,
         grant_entitlement=lambda _cur, _order, charge: grants.append(str(charge.telegram_payment_charge_id)),
     )
     second = store.record_successful_payment_and_grant_entitlement(
@@ -711,8 +1304,8 @@ def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
         provider=PROVIDER_TELEGRAM_STARS,
         telegram_payment_charge_id="tg-charge-second",
         provider_payment_charge_id=None,
-        amount=400,
-        currency="XTR",
+        amount=order.amount,
+        currency=order.currency,
         grant_entitlement=lambda _cur, _order, charge: grants.append(str(charge.telegram_payment_charge_id)),
     )
 
@@ -731,7 +1324,7 @@ def test_successful_payment_transaction_rejects_new_charge_for_granted_order(
     ("override", "reason"),
     [
         ({"provider": PROVIDER_YOOKASSA}, "provider_mismatch"),
-        ({"amount": 401}, "amount_mismatch"),
+        ({"amount": "mismatched"}, "amount_mismatch"),
         ({"currency": "RUB"}, "currency_mismatch"),
     ],
 )
@@ -747,10 +1340,12 @@ def test_successful_payment_transaction_rejects_mismatched_payment_context(
         "provider": PROVIDER_TELEGRAM_STARS,
         "telegram_payment_charge_id": "tg-charge-bad-context",
         "provider_payment_charge_id": None,
-        "amount": 400,
-        "currency": "XTR",
+        "amount": order.amount,
+        "currency": order.currency,
         "grant_entitlement": lambda _cur, _order, charge: grants.append(str(charge.telegram_payment_charge_id)),
     }
+    if override.get("amount") == "mismatched":
+        override = {**override, "amount": order.amount + 1}
     request.update(override)
 
     result = store.record_successful_payment_and_grant_entitlement(**request)
@@ -769,22 +1364,58 @@ def test_successful_payment_transaction_rejects_mismatched_payment_context(
 
 
 def _order(order_id: str, product: str, *, provider: str = PROVIDER_TELEGRAM_STARS) -> PaymentOrder:
-    if provider == PROVIDER_TELEGRAM_STARS:
-        amount = 400 if product == PRODUCT_SUBSCRIPTION_MONTH else 170
-        currency = "XTR"
-    else:
-        amount = 59_900 if product == PRODUCT_SUBSCRIPTION_MONTH else 25_000
-        currency = "RUB"
+    price = expected_payment_price(provider, product)
     return PaymentOrder(
         order_id=order_id,
         user_id=101,
         chat_id=202,
         product=product,
         provider=provider,
-        amount=amount,
-        currency=currency,
+        amount=price.amount,
+        currency=price.currency,
         nonce=f"nonce_{order_id}",
     )
+
+
+def _run_payment_reversal_cli(
+    store: PostgresPaymentStore,
+    args: list[str],
+) -> tuple[int, dict[str, object], str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = payment_reversal_cli.main(
+        args,
+        env={"DIET_BOT_DATABASE_URL": store.dsn},
+        stdout=stdout,
+        stderr=stderr,
+    )
+    output = stdout.getvalue()
+    return exit_code, json.loads(output), output, stderr.getvalue()
+
+
+def _reversal_cli_args(
+    telegram_payment_charge_id: str,
+    *,
+    amount: int,
+    currency: str,
+) -> list[str]:
+    return [
+        "--provider",
+        PROVIDER_TELEGRAM_STARS,
+        "--telegram-payment-charge-id",
+        telegram_payment_charge_id,
+        "--kind",
+        "refund",
+        "--event-timestamp",
+        "2026-05-31T12:00:00Z",
+        "--amount",
+        str(amount),
+        "--currency",
+        currency,
+        "--reason",
+        "verified provider refund",
+        "--apply",
+    ]
 
 
 def _require_safe_test_database_url(database_url: str) -> None:
@@ -974,6 +1605,11 @@ class MissingEntitlementCursor:
                 "free_trial_used": False,
                 "subscription_period_start": None,
                 "subscription_period_end": None,
+                "subscription_source": "none",
+                "auto_renew_status": "not_applicable",
+                "stars_subscription_charge_id": None,
+                "last_subscription_payment_charge_id": None,
+                "current_period_payment_order_id": None,
                 "test_access_until": None,
                 "test_access_enabled": False,
                 "monthly_one_day_remaining": 0,

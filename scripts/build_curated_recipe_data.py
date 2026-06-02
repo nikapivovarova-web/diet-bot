@@ -111,7 +111,6 @@ OMEGA_3_NUTRIENT_IDS = {1272, 1278, 1280, 1404}
 MANUAL_NUTRIENT_OVERRIDES = {
     # USDA SR Legacy does not include iodine values; these conservative estimates
     # are derived from the NIH ODS iodine food-source table.
-    "american_cheese": {"iodine_mcg": 50},
     "buttermilk": {"iodine_mcg": 34},
     "calamari": {"iodine_mcg": 15},
     "cheddar": {"iodine_mcg": 50},
@@ -323,7 +322,6 @@ FOOD_DEFS: tuple[FoodDef, ...] = (
     fd("ricotta", "рикотта", "cheese ricotta whole milk", "dairy", ("рикотта",), tags=("lactose",), roles=("protein", "calcium"), max_per_meal_g=160, max_per_day_g=260),
     fd("goat_cheese", "козий сыр", "cheese goat soft type", "dairy", ("козий сыр",), tags=("lactose",), roles=("protein", "calcium"), max_per_meal_g=90, max_per_day_g=140),
     fd("mozzarella", "моцарелла", "cheese mozzarella whole milk", "dairy", ("моцарелла",), tags=("lactose",), roles=("protein", "calcium"), max_per_meal_g=120, max_per_day_g=180),
-    fd("american_cheese", "американский сыр", "cheese pasteurized process American", "dairy", ("американский сыр",), tags=("lactose", "high_sodium"), roles=("protein", "calcium"), gram_per_slice=20, max_per_meal_g=80, max_per_day_g=120),
     fd("nuts_mix", "смесь орехов", "nuts mixed nuts dry roasted without peanuts", "nuts_seeds", ("орехи и семена", "смесь орехов", "смесь семян", "смесь семечек"), roles=("fat", "booster"), gram_per_tbsp=10, max_per_meal_g=45, max_per_day_g=70),
     fd("pistachios", "фисташки", "nuts pistachio nuts raw", "nuts_seeds", ("фисташки жареные несоленые", "фисташки"), roles=("fat", "booster"), gram_per_tbsp=8, max_per_meal_g=45, max_per_day_g=70),
     fd("pecans", "пекан", "nuts pecans", "nuts_seeds", ("поджаренный грецкий орех или пекан", "пекан"), roles=("fat", "booster"), gram_per_tbsp=7, max_per_meal_g=45, max_per_day_g=70),
@@ -572,7 +570,6 @@ EXTRA_FOOD_DEFS: tuple[FoodDef, ...] = (
 FOOD_DEFS = FOOD_DEFS + EXTRA_FOOD_DEFS
 
 EXTRA_FOOD_DEFS_MORE: tuple[FoodDef, ...] = (
-    fd("harissa", "харисса", "harissa", "sauce", ("харисса",), tags=("very_spicy", "high_sodium"), density_g_per_ml=1.0, gram_per_tsp=5, gram_per_tbsp=15, max_per_meal_g=40, max_per_day_g=70, fallback={"energy_kcal": 120, "protein_g": 2.0, "fat_g": 8.0, "carbohydrate_g": 10.0, "fiber_g": 3.0, "sodium_mg": 900}),
     fd("wensleydale_cheese", "сыр венслидейл", "cheese feta", "dairy", ("сыр венслидейл или молодой рассольный сыр или вегетарианская альтернатива",), tags=("lactose", "high_sodium"), roles=("protein", "calcium"), max_per_meal_g=100, max_per_day_g=140),
     fd("mixed_spices", "смесь пряностей", "curry powder", "spice", ("смесь корицы",), gram_per_tbsp=6, gram_per_tsp=2, garnish_g=0.5, max_per_meal_g=10, max_per_day_g=20),
     fd("smoked_white_fish", "копченая белая рыба", "fish haddock smoked", "protein", ("копченая пикша",), tags=("high_sodium",), roles=("protein",), max_per_meal_g=220, max_per_day_g=360, fallback={"energy_kcal": 105, "protein_g": 23.0, "fat_g": 1.0, "sodium_mg": 700, "vitamin_b12_mcg": 2.0}),

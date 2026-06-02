@@ -6,6 +6,8 @@ import shlex
 import uuid
 from datetime import UTC, datetime, timedelta
 from inspect import signature
+from queue import Empty, Queue
+from threading import Thread
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
@@ -33,7 +35,7 @@ from diet_bot.one_day_generation_jobs import (
     SetExpectedValueMessagesResultStatus,
     StartJobResultStatus,
 )
-from diet_bot.postgres_entitlement_store import PostgresEntitlementStore
+from diet_bot.postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID, PostgresEntitlementStore
 from diet_bot.postgres_one_day_generation_job_migrations import MIGRATIONS
 from diet_bot.postgres_one_day_generation_job_store import (
     ONE_DAY_GENERATION_JOB_SCHEMA_EXPECTATION,
@@ -380,6 +382,49 @@ def test_admit_queued_job_duplicate_requests_do_not_double_consume(
     assert active_duplicate.job == first.job
     assert _active_job_count(store, chat_id) == 1
     assert _one_day_remaining(store, chat_id) == 2
+
+
+def test_durable_admission_does_not_wait_on_global_entitlement_lock_for_other_chat(
+    store: PostgresOneDayGenerationJobStore,
+) -> None:
+    now = datetime(2026, 5, 26, tzinfo=UTC)
+    blocked_chat_id = 1_270_001
+    admitted_chat_id = 1_270_002
+    _save_subscription(store, blocked_chat_id, now=now, one_day_remaining=1)
+    _save_subscription(store, admitted_chat_id, now=now, one_day_remaining=1)
+    outcomes: Queue[object] = Queue()
+
+    def admit_other_chat() -> None:
+        try:
+            result = store.admit_queued_job(
+                chat_id=admitted_chat_id,
+                idempotency_key="one-day-other-chat-while-global-lock-held",
+                stale_after=now + timedelta(minutes=30),
+                request_snapshot=_durable_snapshot("other-chat-lock"),
+                now=now,
+            )
+            outcomes.put(result.status)
+        except BaseException as exc:  # pragma: no cover - surfaced in assertion below.
+            outcomes.put(exc)
+
+    worker = Thread(target=admit_other_chat, daemon=True)
+    with store._connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
+                worker.start()
+                try:
+                    outcome = outcomes.get(timeout=0.75)
+                except Empty:
+                    outcome = "blocked-by-global-entitlement-lock"
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert outcome != "blocked-by-global-entitlement-lock"
+    if isinstance(outcome, BaseException):
+        raise outcome
+    assert outcome == QueuedJobAdmissionResultStatus.ADMITTED
+    assert _one_day_remaining(store, admitted_chat_id) == 0
 
 
 def test_admit_queued_job_denied_without_queued_job_or_quota_mutation(
@@ -822,7 +867,7 @@ def test_finish_failure_after_send_started_without_value_delivery_closes_unknown
     def fail_refund_path(*_args, **_kwargs):
         raise AssertionError("send-started failures must not enter entitlement refund handling")
 
-    monkeypatch.setattr(one_day_job_store, "_lock_entitlement_map_cur", fail_refund_path)
+    monkeypatch.setattr(one_day_job_store, "lock_chat_entitlement_cur", fail_refund_path)
     monkeypatch.setattr(one_day_job_store, "_load_entitlement_cur", fail_refund_path)
     monkeypatch.setattr(one_day_job_store, "refund_attempt", fail_refund_path)
     monkeypatch.setattr(one_day_job_store, "_upsert_entitlement_cur", fail_refund_path)

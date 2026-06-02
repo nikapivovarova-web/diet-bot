@@ -5,6 +5,19 @@ import sys
 from pathlib import Path
 
 
+def _production_postgres_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "DIET_BOT_TOKEN": "fake-token",
+        "DIET_BOT_ENV": "production",
+        "DIET_BOT_STORAGE_BACKEND": "postgres",
+        "DIET_BOT_DATABASE_URL": "postgresql://user:secret@example/db",
+        "DIET_BOT_SUPPORT_CHAT_ID": "-100555111222",
+        "DIET_BOT_PRIVACY_POLICY_URL": "https://foodbalance.example/privacy",
+    }
+    env.update(overrides)
+    return env
+
+
 def test_healthcheck_default_succeeds_with_fake_token_and_redacts(capsys) -> None:
     from diet_bot.healthcheck import main
 
@@ -93,6 +106,69 @@ def test_healthcheck_strict_production_reports_missing_db_and_json_backend(capsy
     assert '"storage_backend": "json"' in output
     assert "DIET_BOT_DATABASE_URL is required in production" in output
     assert "JSON storage is not allowed in production" in output
+
+
+def test_healthcheck_strict_production_requires_one_day_worker_for_postgres_queue(capsys) -> None:
+    from diet_bot.healthcheck import main
+
+    exit_code = main(
+        ["--strict-production"],
+        env=_production_postgres_env(DIET_BOT_WEEKLY_PDF_WORKER_ENABLED="1"),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_ONE_DAY_WORKER_ENABLED" in output
+
+
+def test_healthcheck_strict_production_requires_weekly_pdf_worker_for_postgres_queue(capsys) -> None:
+    from diet_bot.healthcheck import main
+
+    exit_code = main(
+        ["--strict-production"],
+        env=_production_postgres_env(DIET_BOT_ONE_DAY_WORKER_ENABLED="1"),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED" in output
+
+
+def test_healthcheck_strict_production_accepts_postgres_workers_enabled(capsys) -> None:
+    from diet_bot.healthcheck import main
+
+    exit_code = main(
+        ["--strict-production"],
+        env=_production_postgres_env(
+            DIET_BOT_ONE_DAY_WORKER_ENABLED="1",
+            DIET_BOT_WEEKLY_PDF_WORKER_ENABLED="1",
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "issues: none" in output
+    assert "DIET_BOT_ONE_DAY_WORKER_ENABLED" not in output
+    assert "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED" not in output
+
+
+def test_healthcheck_local_json_does_not_require_postgres_workers(capsys) -> None:
+    from diet_bot.healthcheck import main
+
+    exit_code = main(
+        [],
+        env={
+            "DIET_BOT_TOKEN": "fake-token",
+            "DIET_BOT_ENV": "development",
+            "DIET_BOT_STORAGE_BACKEND": "json",
+        },
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "issues: none" in output
+    assert "DIET_BOT_ONE_DAY_WORKER_ENABLED" not in output
+    assert "DIET_BOT_WEEKLY_PDF_WORKER_ENABLED" not in output
 
 
 def test_healthcheck_env_can_select_strict_mode(capsys) -> None:

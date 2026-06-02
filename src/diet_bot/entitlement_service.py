@@ -8,9 +8,11 @@ from datetime import datetime
 from .entitlement_storage import EntitlementStore
 from .subscriptions import (
     AttemptConsumption,
+    AutoRenewStatus,
     Entitlement,
     PaymentApplication,
     RationKind,
+    SubscriptionSource,
     apply_extra_one_day_payment as apply_extra_one_day_payment_to_entitlement,
     apply_extra_weekly_pdf_payment as apply_extra_weekly_pdf_payment_to_entitlement,
     apply_subscription_payment as apply_subscription_payment_to_entitlement,
@@ -157,13 +159,26 @@ class EntitlementService:
         *,
         now: datetime | None = None,
         subscription_expiration_timestamp: int | None = None,
+        subscription_source: SubscriptionSource | None = None,
+        auto_renew_status: AutoRenewStatus | None = None,
+        stars_subscription_charge_id: str | None = None,
+        last_subscription_payment_charge_id: str | None | object = None,
+        current_period_payment_order_id: str | None = None,
     ) -> PaymentApplication:
         with self._transact_chat_entitlement(chat_id) as entitlement:
+            kwargs = {}
+            if last_subscription_payment_charge_id is not None:
+                kwargs["last_subscription_payment_charge_id"] = last_subscription_payment_charge_id
             result = apply_subscription_payment_to_entitlement(
                 entitlement,
                 charge_id,
                 now=now,
                 subscription_expiration_timestamp=subscription_expiration_timestamp,
+                subscription_source=subscription_source,
+                auto_renew_status=auto_renew_status,
+                stars_subscription_charge_id=stars_subscription_charge_id,
+                current_period_payment_order_id=current_period_payment_order_id,
+                **kwargs,
             )
             return result
 

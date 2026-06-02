@@ -27,7 +27,6 @@ HERB_IDS = frozenset(
 )
 CHEESE_IDS = frozenset(
     {
-        "american_cheese",
         "cheddar",
         "cream_cheese",
         "feta",

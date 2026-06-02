@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from .postgres_connection import DirectPostgresConnectionProvider, PostgresConnectionProvider
-from .postgres_entitlement_store import ENTITLEMENT_MAP_LOCK_ID
+from .postgres_entitlement_store import lock_chat_entitlement_cur
 from .postgres_schema_validation import (
     SCHEMA_MIGRATIONS_COLUMNS,
     PostgresSchemaExpectation,
@@ -209,7 +209,7 @@ class PostgresWeeklyPdfJobStore:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    _lock_entitlement_map_cur(cur)
+                    lock_chat_entitlement_cur(cur, chat_id)
 
                     existing_idempotency = self._get_job_by_idempotency_key_cur(cur, idempotency_key)
                     if existing_idempotency is not None:
@@ -529,7 +529,7 @@ class PostgresWeeklyPdfJobStore:
                     if test_access:
                         consumption_source = "test_access"
                     else:
-                        _lock_entitlement_map_cur(cur)
+                        lock_chat_entitlement_cur(cur, job.chat_id)
                         entitlement = _load_entitlement_cur(cur, job.chat_id)
                         consumption = consume_weekly_pdf_attempt(entitlement, current_time)
                         _upsert_entitlement_cur(cur, job.chat_id, entitlement)
@@ -1124,7 +1124,7 @@ class PostgresWeeklyPdfJobStore:
 
         refund_status = job.refund_status
         if job.refund_status == REFUND_STATUS_PENDING and job.consumption_source in {"monthly", "extra"}:
-            _lock_entitlement_map_cur(cur)
+            lock_chat_entitlement_cur(cur, job.chat_id)
             entitlement = _load_entitlement_cur(cur, job.chat_id)
             refund_attempt(
                 entitlement,
@@ -1157,10 +1157,6 @@ class PostgresWeeklyPdfJobStore:
         self._connection_provider.close()
 
 
-def _lock_entitlement_map_cur(cur: Any) -> None:
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_MAP_LOCK_ID,))
-
-
 def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:
     cur.execute(
         """
@@ -1169,6 +1165,11 @@ def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:
             free_trial_used,
             subscription_period_start,
             subscription_period_end,
+            subscription_source,
+            auto_renew_status,
+            stars_subscription_charge_id,
+            last_subscription_payment_charge_id,
+            current_period_payment_order_id,
             test_access_until,
             test_access_enabled,
             monthly_one_day_remaining,
@@ -1188,6 +1189,11 @@ def _load_entitlement_cur(cur: Any, chat_id: int) -> Entitlement:
         free_trial_used=bool(row["free_trial_used"]),
         subscription_period_start=_optional_text(row["subscription_period_start"]),
         subscription_period_end=_optional_text(row["subscription_period_end"]),
+        subscription_source=_optional_text(row["subscription_source"]) or "none",
+        auto_renew_status=_optional_text(row["auto_renew_status"]) or "not_applicable",
+        stars_subscription_charge_id=_optional_text(row["stars_subscription_charge_id"]),
+        last_subscription_payment_charge_id=_optional_text(row["last_subscription_payment_charge_id"]),
+        current_period_payment_order_id=_optional_text(row["current_period_payment_order_id"]),
         test_access_until=_optional_text(row["test_access_until"]),
         test_access_enabled=bool(row["test_access_enabled"]),
         monthly_one_day_remaining=int(row["monthly_one_day_remaining"]),
@@ -1217,6 +1223,11 @@ def _upsert_entitlement_cur(cur: Any, chat_id: int, entitlement: Entitlement) ->
             free_trial_used,
             subscription_period_start,
             subscription_period_end,
+            subscription_source,
+            auto_renew_status,
+            stars_subscription_charge_id,
+            last_subscription_payment_charge_id,
+            current_period_payment_order_id,
             test_access_until,
             test_access_enabled,
             monthly_one_day_remaining,
@@ -1224,11 +1235,16 @@ def _upsert_entitlement_cur(cur: Any, chat_id: int, entitlement: Entitlement) ->
             extra_one_day_remaining,
             extra_weekly_pdf_remaining
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (chat_id) DO UPDATE SET
             free_trial_used = EXCLUDED.free_trial_used,
             subscription_period_start = EXCLUDED.subscription_period_start,
             subscription_period_end = EXCLUDED.subscription_period_end,
+            subscription_source = EXCLUDED.subscription_source,
+            auto_renew_status = EXCLUDED.auto_renew_status,
+            stars_subscription_charge_id = EXCLUDED.stars_subscription_charge_id,
+            last_subscription_payment_charge_id = EXCLUDED.last_subscription_payment_charge_id,
+            current_period_payment_order_id = EXCLUDED.current_period_payment_order_id,
             test_access_until = EXCLUDED.test_access_until,
             test_access_enabled = EXCLUDED.test_access_enabled,
             monthly_one_day_remaining = EXCLUDED.monthly_one_day_remaining,
@@ -1243,6 +1259,11 @@ def _upsert_entitlement_cur(cur: Any, chat_id: int, entitlement: Entitlement) ->
             entitlement.free_trial_used,
             entitlement.subscription_period_start,
             entitlement.subscription_period_end,
+            entitlement.subscription_source,
+            entitlement.auto_renew_status,
+            entitlement.stars_subscription_charge_id,
+            entitlement.last_subscription_payment_charge_id,
+            entitlement.current_period_payment_order_id,
             entitlement.test_access_until,
             entitlement.test_access_enabled,
             entitlement.monthly_one_day_remaining,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -17,6 +18,7 @@ from .subscriptions import Entitlement
 
 ENTITLEMENT_MAP_LOCK_ID = 4_382_026_052_200_001
 ENTITLEMENT_IMPORT_LOCK_ID = 4_382_026_052_200_002
+ENTITLEMENT_CHAT_LOCK_PERSON = b"fb-ent-chat-v1"
 
 ENTITLEMENT_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
     component="entitlement",
@@ -28,6 +30,11 @@ ENTITLEMENT_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "free_trial_used",
             "subscription_period_start",
             "subscription_period_end",
+            "subscription_source",
+            "auto_renew_status",
+            "stars_subscription_charge_id",
+            "last_subscription_payment_charge_id",
+            "current_period_payment_order_id",
             "test_access_until",
             "test_access_enabled",
             "monthly_one_day_remaining",
@@ -109,10 +116,12 @@ class PostgresEntitlementStore:
                 return self._load_chat_entitlement_cur(cur, int(chat_id))
 
     def save_chat_entitlement(self, chat_id: int, entitlement: Entitlement) -> None:
+        chat_id = int(chat_id)
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    self._upsert_entitlement_cur(cur, int(chat_id), entitlement)
+                    self._lock_chat_entitlement_cur(cur, chat_id)
+                    self._upsert_entitlement_cur(cur, chat_id, entitlement)
 
     def save_all(self, entitlements: Mapping[int, Entitlement]) -> None:
         with self._connect() as conn:
@@ -127,6 +136,7 @@ class PostgresEntitlementStore:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
+                    self._lock_chat_entitlement_cur(cur, chat_id)
                     cur.execute(
                         "INSERT INTO entitlements (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
                         (chat_id,),
@@ -227,6 +237,11 @@ class PostgresEntitlementStore:
                 free_trial_used,
                 subscription_period_start,
                 subscription_period_end,
+                subscription_source,
+                auto_renew_status,
+                stars_subscription_charge_id,
+                last_subscription_payment_charge_id,
+                current_period_payment_order_id,
                 test_access_until,
                 test_access_enabled,
                 monthly_one_day_remaining,
@@ -273,6 +288,11 @@ class PostgresEntitlementStore:
                 free_trial_used,
                 subscription_period_start,
                 subscription_period_end,
+                subscription_source,
+                auto_renew_status,
+                stars_subscription_charge_id,
+                last_subscription_payment_charge_id,
+                current_period_payment_order_id,
                 test_access_until,
                 test_access_enabled,
                 monthly_one_day_remaining,
@@ -323,6 +343,11 @@ class PostgresEntitlementStore:
                 free_trial_used,
                 subscription_period_start,
                 subscription_period_end,
+                subscription_source,
+                auto_renew_status,
+                stars_subscription_charge_id,
+                last_subscription_payment_charge_id,
+                current_period_payment_order_id,
                 test_access_until,
                 test_access_enabled,
                 monthly_one_day_remaining,
@@ -330,11 +355,16 @@ class PostgresEntitlementStore:
                 extra_one_day_remaining,
                 extra_weekly_pdf_remaining
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (chat_id) DO UPDATE SET
                 free_trial_used = EXCLUDED.free_trial_used,
                 subscription_period_start = EXCLUDED.subscription_period_start,
                 subscription_period_end = EXCLUDED.subscription_period_end,
+                subscription_source = EXCLUDED.subscription_source,
+                auto_renew_status = EXCLUDED.auto_renew_status,
+                stars_subscription_charge_id = EXCLUDED.stars_subscription_charge_id,
+                last_subscription_payment_charge_id = EXCLUDED.last_subscription_payment_charge_id,
+                current_period_payment_order_id = EXCLUDED.current_period_payment_order_id,
                 test_access_until = EXCLUDED.test_access_until,
                 test_access_enabled = EXCLUDED.test_access_enabled,
                 monthly_one_day_remaining = EXCLUDED.monthly_one_day_remaining,
@@ -349,6 +379,11 @@ class PostgresEntitlementStore:
                 entitlement.free_trial_used,
                 entitlement.subscription_period_start,
                 entitlement.subscription_period_end,
+                entitlement.subscription_source,
+                entitlement.auto_renew_status,
+                entitlement.stars_subscription_charge_id,
+                entitlement.last_subscription_payment_charge_id,
+                entitlement.current_period_payment_order_id,
                 entitlement.test_access_until,
                 entitlement.test_access_enabled,
                 entitlement.monthly_one_day_remaining,
@@ -377,6 +412,9 @@ class PostgresEntitlementStore:
 
     def _lock_import_cur(self, cur: Any) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (ENTITLEMENT_IMPORT_LOCK_ID,))
+
+    def _lock_chat_entitlement_cur(self, cur: Any, chat_id: int) -> None:
+        lock_chat_entitlement_cur(cur, chat_id)
 
     def _require_empty_json_import_target_cur(self, cur: Any) -> None:
         counts = self._json_import_target_counts_cur(cur)
@@ -412,6 +450,11 @@ def _entitlement_from_row(row: Mapping[str, Any]) -> Entitlement:
         free_trial_used=bool(row["free_trial_used"]),
         subscription_period_start=_optional_text(row["subscription_period_start"]),
         subscription_period_end=_optional_text(row["subscription_period_end"]),
+        subscription_source=_optional_text(row["subscription_source"]) or "none",
+        auto_renew_status=_optional_text(row["auto_renew_status"]) or "not_applicable",
+        stars_subscription_charge_id=_optional_text(row["stars_subscription_charge_id"]),
+        last_subscription_payment_charge_id=_optional_text(row["last_subscription_payment_charge_id"]),
+        current_period_payment_order_id=_optional_text(row["current_period_payment_order_id"]),
         test_access_until=_optional_text(row["test_access_until"]),
         test_access_enabled=bool(row["test_access_enabled"]),
         monthly_one_day_remaining=int(row["monthly_one_day_remaining"]),
@@ -445,6 +488,19 @@ def _unique_charge_ids(charge_ids: list[str]) -> list[str]:
         unique.append(text)
         seen.add(text)
     return unique
+
+
+def entitlement_chat_lock_id(chat_id: int) -> int:
+    digest = hashlib.blake2b(
+        f"entitlement-chat:{int(chat_id)}".encode("ascii"),
+        digest_size=8,
+        person=ENTITLEMENT_CHAT_LOCK_PERSON,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def lock_chat_entitlement_cur(cur: Any, chat_id: int) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (entitlement_chat_lock_id(chat_id),))
 
 
 def _optional_text(value: Any) -> str | None:

@@ -1,11 +1,35 @@
 from diet_bot.builder import build_one_day_plan
 from diet_bot.calculator import calculate_targets
 from diet_bot.chef import clean_recipe_instruction_text, format_display_grams, format_ingredient
-from diet_bot.domain import ConditionCode, CookingTimePreference, Food, FoodPortion, Goal, Meal, NutrientVector, Sex
+from diet_bot.domain import (
+    ConditionCode,
+    CookingTimePreference,
+    Food,
+    FoodPortion,
+    Goal,
+    Meal,
+    NutrientVector,
+    Sex,
+    normalize_cooking_time_preference,
+)
+import diet_bot.presentation as presentation
 from diet_bot.presentation import format_calculation_summary, format_meal_card, format_plan_response
 from diet_bot.questionnaire import QUESTIONS, start_session
 from diet_bot.safety import evaluate_safety
 from diet_bot.validation import validate_plan
+
+
+def _expected_meal_kbju_line(meal: Meal) -> str:
+    nutrients = meal.nutrients
+    label = meal.name
+    if ":" in label:
+        label = label.split(":", 1)[0].split()[-1]
+    return (
+        f"{label}: {nutrients.get('energy_kcal'):.0f} ккал, "
+        f"белки {nutrients.get('protein_g'):.0f} г, "
+        f"жиры {nutrients.get('fat_g'):.0f} г, "
+        f"углеводы {nutrients.get('carbohydrate_g'):.0f} г."
+    )
 
 
 def test_questionnaire_builds_profile_from_russian_answers() -> None:
@@ -18,7 +42,7 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
         "похудение",
         "умеренная",
         "4",
-        "до 15 минут",
+        "Побыстрее и попроще",
         "яблоко",
         "лактоза",
         "ХПН",
@@ -34,7 +58,7 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
     assert profile.age == 32
     assert profile.sex == Sex.MALE
     assert profile.goal == Goal.LOSE
-    assert profile.cooking_time == CookingTimePreference.QUICK
+    assert profile.cooking_time == CookingTimePreference.SIMPLE
     assert ConditionCode.LACTOSE_INTOLERANCE in profile.conditions
     assert ConditionCode.CKD in profile.conditions
     assert profile.restrictions[0].value == "яблоко"
@@ -46,7 +70,8 @@ def test_button_questions_have_options() -> None:
     assert questions["sex"].options == ("👨 Мужчина", "👩 Женщина")
     assert questions["goal"].options == ("⬇️ Похудение", "⚖️ Поддержание", "💪 Набор")
     assert questions["meal_count"].options == ("3", "4", "5")
-    assert questions["cooking_time"].options == ("до 15 минут", "15–30 минут", "более 30 минут")
+    assert questions["cooking_time"].prompt == "Какие рецепты вам больше подходят?"
+    assert questions["cooking_time"].options == ("Побыстрее и попроще", "Можно чуть интереснее")
     assert "⚡ Очень высокая" in questions["activity"].options
     assert questions["allergies"].options == ("Нет",)
     assert questions["intolerances"].options == ("Нет",)
@@ -64,7 +89,7 @@ def test_questionnaire_accepts_decimal_comma_weight() -> None:
         "поддержание",
         "легкая",
         "3",
-        "15–30 минут",
+        "Можно чуть интереснее",
         "нет",
         "нет",
         "нет",
@@ -76,6 +101,18 @@ def test_questionnaire_accepts_decimal_comma_weight() -> None:
         assert error is None
 
     assert session.build_profile().weight_kg == 62.5
+    assert session.build_profile().cooking_time == CookingTimePreference.INTERESTING
+
+
+def test_legacy_cooking_time_values_map_to_two_effort_modes() -> None:
+    assert normalize_cooking_time_preference("quick") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("до 15 минут") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("medium") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("15–30 минут") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("long") == CookingTimePreference.INTERESTING
+    assert normalize_cooking_time_preference("более 30 минут") == CookingTimePreference.INTERESTING
+    assert normalize_cooking_time_preference("") == CookingTimePreference.SIMPLE
+    assert normalize_cooking_time_preference("что-то непонятное") == CookingTimePreference.SIMPLE
 
 
 def test_questionnaire_rejects_invalid_meal_count() -> None:
@@ -110,7 +147,7 @@ def test_presentation_contains_plan_sections_and_shopping_list() -> None:
         "похудение",
         "умеренная",
         "4",
-        "15–30 минут",
+        "Можно чуть интереснее",
         "яблоко",
         "лактоза",
         "нет",
@@ -131,7 +168,8 @@ def test_presentation_contains_plan_sections_and_shopping_list() -> None:
     assert "добавленный сахар" not in text
     assert "Это ориентировочный расчёт" in text
     assert "Рацион на день" in text
-    assert "Список покупок" in text
+    assert "Список продуктов" in text
+    assert "Список покупок" not in text
     assert "Что осталось доработать" not in text
     assert "Техническая проверка" not in text
     assert "яблоко" not in {portion.food.name for meal in plan.meals for portion in meal.portions}
@@ -147,7 +185,7 @@ def test_totals_use_consistent_percent_style_and_status_dots() -> None:
         "похудение",
         "умеренная",
         "4",
-        "15–30 минут",
+        "Побыстрее и попроще",
         "нет",
         "нет",
         "нет",
@@ -171,6 +209,99 @@ def test_totals_use_consistent_percent_style_and_status_dots() -> None:
     )
 
 
+def test_nutrient_indicator_thresholds_for_telegram_display() -> None:
+    cases = (
+        (100, "🟢"),
+        (97, "🟢"),
+        (95, "🟢"),
+        (94, "🟡"),
+        (45, "🟡"),
+        (44, "🔴"),
+    )
+
+    assert tuple((percent, presentation._coverage_dot(percent, 100)) for percent, _expected in cases) == cases
+
+
+def test_calculation_summary_adds_stage16_intro_and_follow_up() -> None:
+    session = start_session()
+    for answer in [
+        "32",
+        "мужчина",
+        "178",
+        "86",
+        "похудение",
+        "умеренная",
+        "4",
+        "Побыстрее и попроще",
+        "нет",
+        "нет",
+        "нет",
+        "нет",
+    ]:
+        session, error = session.receive(answer)
+        assert error is None
+
+    profile = session.build_profile()
+    text = format_calculation_summary(calculate_targets(profile), evaluate_safety(profile))
+
+    assert text.startswith("Готово. Вот что я рассчитал специально под тебя:\n\n🧮 Ваш расчет")
+    assert (
+        "Твой рацион на сегодня составлен так, чтобы покрыть эти показатели "
+        "вкусной и разнообразной едой. Смотри:"
+    ) in text
+
+
+def test_plan_response_includes_per_meal_kbju_lines_from_real_nutrients() -> None:
+    session = start_session()
+    for answer in [
+        "32",
+        "мужчина",
+        "178",
+        "86",
+        "похудение",
+        "умеренная",
+        "4",
+        "Побыстрее и попроще",
+        "нет",
+        "нет",
+        "нет",
+        "нет",
+    ]:
+        session, error = session.receive(answer)
+        assert error is None
+
+    plan = build_one_day_plan(session.build_profile())
+    text = format_plan_response(plan, validate_plan(plan))
+
+    for meal in plan.meals:
+        assert _expected_meal_kbju_line(meal) in text
+
+
+def test_meal_card_includes_kbju_line_from_meal_nutrients() -> None:
+    food = Food(
+        id="balanced_bowl",
+        name="боул",
+        category="meal",
+        nutrients_per_100g=NutrientVector(
+            {
+                "energy_kcal": 210,
+                "protein_g": 14,
+                "fat_g": 7,
+                "carbohydrate_g": 26,
+            }
+        ),
+    )
+    meal = Meal(
+        name="Завтрак",
+        portions=(FoodPortion(food, 200),),
+        recipe="Собрать и подать.",
+    )
+
+    card = format_meal_card(meal)
+
+    assert "Завтрак: 420 ккал, белки 28 г, жиры 14 г, углеводы 52 г." in card
+
+
 def test_calculation_summary_warns_for_very_low_bmi_without_refusing() -> None:
     session = start_session()
     for answer in [
@@ -181,7 +312,7 @@ def test_calculation_summary_warns_for_very_low_bmi_without_refusing() -> None:
         "поддержание",
         "легкая",
         "4",
-        "15–30 минут",
+        "Можно чуть интереснее",
         "нет",
         "нет",
         "нет",
@@ -207,7 +338,7 @@ def test_calculation_summary_warns_for_high_bmi() -> None:
         "поддержание",
         "легкая",
         "4",
-        "15–30 минут",
+        "Можно чуть интереснее",
         "нет",
         "нет",
         "нет",
@@ -248,7 +379,7 @@ def test_meal_ingredients_include_household_measure_hints() -> None:
         "похудение",
         "умеренная",
         "4",
-        "15–30 минут",
+        "Можно чуть интереснее",
         "нет",
         "нет",
         "нет",
@@ -323,6 +454,24 @@ def test_yogurt_hint_uses_plausible_household_measure() -> None:
     assert "греческий йогурт - 50 г" in quarter_cup
     assert "несколько столовых ложек" in quarter_cup
     assert "1/2 стакана" not in quarter_cup
+
+
+def test_common_user_hostile_gram_amounts_get_practical_measures() -> None:
+    garlic = Food(id="garlic", name="чеснок", category="vegetable", nutrients_per_100g=NutrientVector())
+    dates = Food(id="dates", name="финики", category="fruit", nutrients_per_100g=NutrientVector())
+    hot_sauce = Food(id="hot_sauce", name="острый соус", category="sauce", nutrients_per_100g=NutrientVector())
+    meal = Meal(
+        name="Тестовый рецепт",
+        portions=(FoodPortion(garlic, 5), FoodPortion(dates, 45), FoodPortion(hot_sauce, 7.5)),
+        recipe="Смешайте и подайте.",
+    )
+
+    card = format_meal_card(meal)
+
+    assert "чеснок - 5 г (примерно 1 зубчик)" in card
+    assert "финики - 45 г (примерно 2-3 финика)" in card
+    assert "острый соус - 8 г" in card
+    assert "сухой крупы" not in card
 
 
 def test_small_spoon_hints_are_practical_not_surgical() -> None:
@@ -401,7 +550,7 @@ def test_meal_card_can_hide_photo_credit() -> None:
         "похудение",
         "умеренная",
         "4",
-        "15–30 минут",
+        "Побыстрее и попроще",
         "нет",
         "нет",
         "нет",

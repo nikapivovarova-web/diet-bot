@@ -10,6 +10,7 @@ from .chat_state_storage import (
     ChatStateStorageError,
     _normalize_chat_state,
     _normalize_state,
+    _privacy_consent_record,
 )
 from .postgres_chat_state_migrations import MIGRATIONS, run_chat_state_schema_migrations
 from .postgres_connection import DirectPostgresConnectionProvider, PostgresConnectionProvider
@@ -45,6 +46,13 @@ CHAT_STATE_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "updated_at",
             "version",
         ),
+        "chat_privacy_consents": (
+            "chat_id",
+            "consent_json",
+            "created_at",
+            "updated_at",
+            "version",
+        ),
         "chat_state_json_import_runs": (
             "migration_id",
             "source_fingerprint",
@@ -55,7 +63,7 @@ CHAT_STATE_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
             "finished_at",
         ),
     },
-    indexes=("chat_profiles_pkey", "chat_recipe_history_pkey"),
+    indexes=("chat_profiles_pkey", "chat_recipe_history_pkey", "chat_privacy_consents_pkey"),
     constraints=(
         "chk_chat_profiles_profile_json_object",
         "chk_chat_profiles_profile_format_version_positive",
@@ -63,6 +71,8 @@ CHAT_STATE_SCHEMA_EXPECTATION = PostgresSchemaExpectation(
         "chk_chat_recipe_history_recipe_ids_array",
         "chk_chat_recipe_history_recipe_keys_array",
         "chk_chat_recipe_history_version_positive",
+        "chk_chat_privacy_consents_consent_json_object",
+        "chk_chat_privacy_consents_version_positive",
         "chk_chat_state_json_import_runs_status",
     ),
     remediation="Run chat state migrations before startup.",
@@ -226,6 +236,13 @@ class PostgresChatStateStore:
                             normalized.get("recipe_keys", []),
                         )
 
+                    if "privacy_consent" in chat_state:
+                        privacy_consent = _privacy_consent_record(chat_state["privacy_consent"])
+                        if privacy_consent is None:
+                            cur.execute("DELETE FROM chat_privacy_consents WHERE chat_id = %s", (chat_id,))
+                        else:
+                            self._upsert_privacy_consent_cur(cur, chat_id, privacy_consent)
+
     def _load_all_cur(self, cur: Any) -> ChatStateByChatId:
         state: dict[str, ChatState] = {}
         cur.execute(
@@ -255,6 +272,19 @@ class PostgresChatStateStore:
             current["recipe_ids"] = list(row["recipe_ids"] or [])
             current["recipe_keys"] = list(row["recipe_keys"] or [])
             state[chat_id] = _normalize_chat_state(current, source=_MEMORY_SOURCE)
+
+        cur.execute(
+            """
+            SELECT chat_id, consent_json
+            FROM chat_privacy_consents
+            ORDER BY chat_id
+            """
+        )
+        for row in cur.fetchall():
+            chat_id = str(int(row["chat_id"]))
+            current = dict(state.get(chat_id, {}))
+            current["privacy_consent"] = dict(row["consent_json"] or {})
+            state[chat_id] = _normalize_chat_state(current, source=_MEMORY_SOURCE)
         return state
 
     def _load_chat_state_cur(self, cur: Any, chat_id: int) -> ChatState:
@@ -283,6 +313,18 @@ class PostgresChatStateStore:
         if history_row is not None:
             current["recipe_ids"] = list(history_row["recipe_ids"] or [])
             current["recipe_keys"] = list(history_row["recipe_keys"] or [])
+
+        cur.execute(
+            """
+            SELECT consent_json
+            FROM chat_privacy_consents
+            WHERE chat_id = %s
+            """,
+            (int(chat_id),),
+        )
+        consent_row = cur.fetchone()
+        if consent_row is not None:
+            current["privacy_consent"] = dict(consent_row["consent_json"] or {})
 
         if not current:
             return {}
@@ -314,9 +356,11 @@ class PostgresChatStateStore:
         if chat_ids:
             cur.execute("DELETE FROM chat_profiles WHERE NOT (chat_id = ANY(%s))", (chat_ids,))
             cur.execute("DELETE FROM chat_recipe_history WHERE NOT (chat_id = ANY(%s))", (chat_ids,))
+            cur.execute("DELETE FROM chat_privacy_consents WHERE NOT (chat_id = ANY(%s))", (chat_ids,))
         else:
             cur.execute("DELETE FROM chat_profiles")
             cur.execute("DELETE FROM chat_recipe_history")
+            cur.execute("DELETE FROM chat_privacy_consents")
 
         for chat_id_text in sorted(normalized, key=int):
             chat_id = int(chat_id_text)
@@ -331,6 +375,10 @@ class PostgresChatStateStore:
                 chat_state.get("recipe_ids", []),
                 chat_state.get("recipe_keys", []),
             )
+            if "privacy_consent" in chat_state:
+                self._upsert_privacy_consent_cur(cur, chat_id, chat_state["privacy_consent"])
+            else:
+                cur.execute("DELETE FROM chat_privacy_consents WHERE chat_id = %s", (chat_id,))
 
     def _upsert_profile_cur(self, cur: Any, chat_id: int, profile: object) -> None:
         if not isinstance(profile, Mapping):
@@ -375,6 +423,22 @@ class PostgresChatStateStore:
             ),
         )
 
+    def _upsert_privacy_consent_cur(self, cur: Any, chat_id: int, consent: object) -> None:
+        privacy_consent = _privacy_consent_record(consent)
+        if privacy_consent is None:
+            raise ChatStateStorageError(f"Invalid privacy consent value for chat_id {chat_id}")
+        cur.execute(
+            """
+            INSERT INTO chat_privacy_consents (chat_id, consent_json)
+            VALUES (%s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                consent_json = EXCLUDED.consent_json,
+                updated_at = clock_timestamp(),
+                version = chat_privacy_consents.version + 1
+            """,
+            (int(chat_id), _jsonb(privacy_consent)),
+        )
+
     def _lock_import_cur(self, cur: Any) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (CHAT_STATE_IMPORT_LOCK_ID,))
 
@@ -391,7 +455,7 @@ class PostgresChatStateStore:
 
     def _json_import_target_counts_cur(self, cur: Any) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for table_name in ("chat_profiles", "chat_recipe_history"):
+        for table_name in ("chat_profiles", "chat_recipe_history", "chat_privacy_consents"):
             cur.execute(f"SELECT count(*) AS count FROM {table_name}")
             counts[table_name] = int(cur.fetchone()["count"])
         return counts

@@ -11,6 +11,7 @@ from .domain import (
     RestrictionType,
     Sex,
     UserProfile,
+    normalize_cooking_time_preference,
     normalize_text,
 )
 
@@ -44,8 +45,8 @@ QUESTIONS: tuple[Question, ...] = (
     Question("meal_count", "🍽️ Сколько приемов пищи в день вы хотите?", ("3", "4", "5")),
     Question(
         "cooking_time",
-        "⏱️ Сколько времени вы готовы тратить на готовку в день?",
-        ("до 15 минут", "15–30 минут", "более 30 минут"),
+        "Какие рецепты вам больше подходят?",
+        ("Побыстрее и попроще", "Можно чуть интереснее"),
     ),
     Question(
         "allergies",
@@ -224,7 +225,10 @@ def _parse_cooking_time(value: str) -> CookingTimePreference:
         return CookingTimePreference.MEDIUM
     if normalized in {"3", "long"} or "более 30" in normalized or "больше 30" in normalized:
         return CookingTimePreference.LONG
-    raise ValueError("Выберите время готовки: до 15 минут, 15–30 минут или более 30 минут.")
+    try:
+        return normalize_cooking_time_preference(value, strict=True)
+    except ValueError as error:
+        raise ValueError("Выберите режим готовки: Побыстрее и попроще или Можно чуть интереснее.") from error
 
 
 def _split_list(value: str) -> list[str]:

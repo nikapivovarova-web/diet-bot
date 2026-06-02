@@ -40,6 +40,7 @@ DEFAULT_WEEKLY_PDF_WORKER_RETRY_DELAY_SECONDS = 30
 DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS = 3
 DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS = 1.0
 DEFAULT_WEEKLY_PDF_WORKER_ERROR_BACKOFF_SECONDS = 5.0
+DEFAULT_WEEKLY_PDF_WORKER_JOB_TIMEOUT_SECONDS = 15 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,7 @@ class WeeklyPdfWorkerSettings:
     max_attempts: int = DEFAULT_WEEKLY_PDF_WORKER_MAX_ATTEMPTS
     idle_sleep_seconds: float = DEFAULT_WEEKLY_PDF_WORKER_IDLE_SLEEP_SECONDS
     error_backoff_seconds: float = DEFAULT_WEEKLY_PDF_WORKER_ERROR_BACKOFF_SECONDS
+    job_timeout_seconds: float = DEFAULT_WEEKLY_PDF_WORKER_JOB_TIMEOUT_SECONDS
 
     @classmethod
     def from_config(cls, config: object, *, worker_id: str | None = None) -> "WeeklyPdfWorkerSettings":
@@ -182,6 +184,10 @@ class WeeklyPdfWorkerSettings:
             error_backoff_seconds=max(
                 0.1,
                 float(getattr(config, "weekly_pdf_worker_error_backoff_seconds", cls.error_backoff_seconds)),
+            ),
+            job_timeout_seconds=max(
+                0.001,
+                float(getattr(config, "weekly_pdf_worker_job_timeout_seconds", cls.job_timeout_seconds)),
             ),
         )
 
@@ -270,7 +276,7 @@ class WeeklyPdfWorker:
             self._require_delivered(self.runtime.mark_delivered(job.job_id))
             delivered = True
 
-        try:
+        async def process_job() -> None:
             if job.request_snapshot is None:
                 self.runtime.finish_failure_and_refund_once(job.job_id, reason="weekly_pdf_worker_missing_snapshot")
                 return
@@ -293,6 +299,20 @@ class WeeklyPdfWorker:
                     await delivery.after_success()
                 except Exception:
                     logger.exception("Weekly PDF post-success callback failed for chat_id=%s", job.chat_id)
+
+        try:
+            await asyncio.wait_for(
+                process_job(),
+                timeout=max(0.001, float(self.settings.job_timeout_seconds)),
+            )
+        except TimeoutError as exc:
+            logger.error(
+                "Weekly PDF worker job timed out; worker_id=%s job_id=%s timeout_seconds=%.3f",
+                self.settings.worker_id,
+                redact_identifier("job", job.job_id),
+                max(0.001, float(self.settings.job_timeout_seconds)),
+            )
+            self._handle_processing_failure(job, exc, send_started=send_started, delivered=delivered)
         except Exception as exc:
             self._handle_processing_failure(job, exc, send_started=send_started, delivered=delivered)
         finally:
