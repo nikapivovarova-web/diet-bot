@@ -999,13 +999,23 @@ def track_pdf_assets():
 
     pdf_renderer._image_from_source = image_from_source
 
-    original_cropped_image_source = remember("_cropped_image_source")
+    image_source_hook_name = next(
+        (
+            name
+            for name in ("_fixed_box_image_source", "_cropped_image_source")
+            if hasattr(pdf_renderer, name)
+        ),
+        None,
+    )
+    if image_source_hook_name is None:
+        raise RuntimeError("pdf_renderer has no supported meal image source hook")
+    original_image_source_hook = remember(image_source_hook_name)
 
-    def cropped_image_source(image_path):
+    def tracked_image_source(image_path):
         tracker.image_sources.append(str(Path(image_path)))
-        return original_cropped_image_source(image_path)
+        return original_image_source_hook(image_path)
 
-    pdf_renderer._cropped_image_source = cropped_image_source
+    setattr(pdf_renderer, image_source_hook_name, tracked_image_source)
 
     original_ttfont = remember("TTFont")
 

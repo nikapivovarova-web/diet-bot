@@ -48,3 +48,24 @@ def test_weekly_pdf_profile_measures_temp_pdf_read_and_delete(tmp_path: Path) ->
     assert metrics.read_seconds >= 0
     assert metrics.delete_seconds >= 0
     assert not created_pdf.exists()
+
+
+def test_weekly_pdf_profile_tracks_current_fixed_box_image_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import diet_bot.pdf_renderer as pdf_renderer
+
+    image_path = tmp_path / "meal.jpg"
+
+    def fake_fixed_box_image_source(path: Path) -> str:
+        return f"fixed:{Path(path).name}"
+
+    monkeypatch.setattr(pdf_renderer, "_fixed_box_image_source", fake_fixed_box_image_source)
+
+    with weekly_pdf_profile.track_pdf_assets() as tracker:
+        assert pdf_renderer._fixed_box_image_source(image_path) == "fixed:meal.jpg"
+
+    summary = tracker.summary()
+    assert summary.image_source_count == 1
+    assert str(image_path) in summary.image_sources

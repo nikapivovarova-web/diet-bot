@@ -36,8 +36,8 @@ def test_product_private_chat_guard_texts_are_available() -> None:
     assert telegram_app.PRIVATE_CHAT_CALLBACK_TEXT.startswith(
         "Откройте бота в личном чате, чтобы использовать эту кнопку."
     )
-    assert "private chat" in telegram_app.PRIVATE_CHAT_REQUIRED_TEXT
-    assert "private chat" in telegram_app.PRIVATE_CHAT_CALLBACK_TEXT
+    assert "private chat" not in telegram_app.PRIVATE_CHAT_REQUIRED_TEXT
+    assert "private chat" not in telegram_app.PRIVATE_CHAT_CALLBACK_TEXT
 
 
 class FakeChat:

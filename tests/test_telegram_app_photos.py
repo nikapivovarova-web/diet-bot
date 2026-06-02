@@ -992,9 +992,11 @@ async def test_support_chat_rejects_product_commands_and_myid(monkeypatch, tmp_p
     await telegram_app.start(start_message)
     await handle_answer(myid_message)
 
-    assert "private chat" in start_message.texts[-1][0]
+    assert start_message.texts[-1][0] == telegram_app.PRIVATE_CHAT_REQUIRED_TEXT
+    assert "private chat" not in start_message.texts[-1][0]
     assert start_message.photos == []
-    assert "private chat" in myid_message.texts[-1][0]
+    assert myid_message.texts[-1][0] == telegram_app.PRIVATE_CHAT_REQUIRED_TEXT
+    assert "private chat" not in myid_message.texts[-1][0]
 
 
 @pytest.mark.anyio
@@ -1022,7 +1024,8 @@ async def test_group_start_rejects_before_profile_session_or_state_stores(monkey
 
     await telegram_app.start(message)
 
-    assert "private chat" in message.texts[-1][0]
+    assert message.texts[-1][0] == telegram_app.PRIVATE_CHAT_REQUIRED_TEXT
+    assert "private chat" not in message.texts[-1][0]
     assert message.photos == []
     assert chat_id not in PROFILE_BY_CHAT_ID
     assert chat_id not in SESSION_BY_CHAT_ID
@@ -1040,7 +1043,8 @@ async def test_non_private_callback_rejects_before_state_mutation(monkeypatch, c
 
     await telegram_app.handle_callback(callback)
 
-    assert "private chat" in callback.answers[-1]
+    assert callback.answers[-1] == telegram_app.PRIVATE_CHAT_CALLBACK_TEXT
+    assert "private chat" not in callback.answers[-1]
     assert message.texts == []
     assert chat_id not in SESSION_BY_CHAT_ID
     assert chat_id not in TRIAL_CHAT_IDS
@@ -1060,7 +1064,8 @@ async def test_group_hidden_admin_command_denied_without_grant(monkeypatch, tmp_
 
     await secret_access_command(message)
 
-    assert "private chat" in message.texts[-1][0]
+    assert message.texts[-1][0] == telegram_app.PRIVATE_CHAT_REQUIRED_TEXT
+    assert "private chat" not in message.texts[-1][0]
     assert not subscriptions_path.exists()
 
 
@@ -3321,7 +3326,7 @@ async def test_week_plan_history_read_failure_stops_status_and_returns_false(mon
 
 
 @pytest.mark.anyio
-async def test_postgres_weekly_pdf_admission_does_not_send_duplicate_generation_message(monkeypatch) -> None:
+async def test_postgres_weekly_pdf_admission_sends_accepted_without_generation(monkeypatch) -> None:
     chat_id = 92_004
     runtime = FakeWeeklyPdfQueuedRuntime()
     message = FakeMessage(chat_id, message_id=92004)
@@ -3345,7 +3350,7 @@ async def test_postgres_weekly_pdf_admission_does_not_send_duplicate_generation_
         )
 
         assert sent is True
-        assert message.texts == []
+        assert message.texts == [(telegram_app.WEEK_PDF_ACCEPTED_TEXT, None)]
         admit_call = next(payload for name, payload in runtime.calls if name == "admit_queued")
         snapshot = admit_call["request_snapshot"]
         assert admit_call["idempotency_key"] == "weekly-pdf-key"

@@ -1194,7 +1194,7 @@ WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
-WEEK_PDF_ACCEPTED_TEXT = WEEK_PDF_STATUS_INITIAL_TEXT
+WEEK_PDF_ACCEPTED_TEXT = "Готовлю недельный PDF. Я пришлю его сюда, как только он будет готов."
 WEEK_PDF_ALREADY_RUNNING_TEXT = "Не переживайте, файл уже генерируется. Я пришлю PDF сюда, когда он будет готов."
 ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
 ONE_DAY_PLAN_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u0440\u0430\u0446\u0438\u043e\u043d. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
@@ -1413,8 +1413,8 @@ WELCOME_TEXT = (
     "без хаоса, ручных подсчётов и скучных однотипных меню.\n\n"
     "Начнём с короткой анкеты, чтобы я лучше понял, что вам подходит 👇"
 )
-PRIVATE_CHAT_REQUIRED_TEXT = "Пожалуйста, откройте бота в личном чате, чтобы продолжить. private chat"
-PRIVATE_CHAT_CALLBACK_TEXT = "Откройте бота в личном чате, чтобы использовать эту кнопку. private chat"
+PRIVATE_CHAT_REQUIRED_TEXT = "Пожалуйста, откройте бота в личном чате, чтобы продолжить."
+PRIVATE_CHAT_CALLBACK_TEXT = "Откройте бота в личном чате, чтобы использовать эту кнопку."
 PRIVATE_CHAT_ONLY_TEXT = PRIVATE_CHAT_REQUIRED_TEXT
 TRIAL_SUBSCRIPTION_TEXT = (
     "Понравился рацион?\n\n"
@@ -3227,6 +3227,7 @@ async def _send_week_plan_with_postgres_jobs(
         return False
 
     _mark_weekly_pdf_generation_seed_admitted(chat_id)
+    await message.answer(WEEK_PDF_ACCEPTED_TEXT)
     return True
 
 
