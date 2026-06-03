@@ -1,18 +1,24 @@
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
+import time
 
 from diet_bot.builder import _meal_energy_slots, _recipe_time_bucket, build_one_day_plan, filter_foods
+from diet_bot import telegram_app
 from diet_bot.catalog import built_in_foods
 from diet_bot.domain import (
     ActivityLevel,
     ConditionCode,
     CookingTimePreference,
     Goal,
+    NutrientVector,
     Restriction,
     RestrictionType,
     Sex,
     UserProfile,
 )
 from diet_bot.recipe_catalog import built_in_recipes
+from diet_bot.recipe_models import RecipeTemplate
 from diet_bot.safety import evaluate_safety
 from diet_bot.validation import validate_plan
 
@@ -36,6 +42,74 @@ def profile_with(**kwargs) -> UserProfile:
 
 def food_names(plan) -> set[str]:
     return {portion.food.name for meal in plan.meals for portion in meal.portions}
+
+
+def _empty_recent_avoidance() -> telegram_app._RecentRecipeAvoidance:
+    return telegram_app._RecentRecipeAvoidance(
+        full_recipe_ids=frozenset(),
+        full_recipe_keys=frozenset(),
+        reduced_recipe_ids=frozenset(),
+        reduced_recipe_keys=frozenset(),
+    )
+
+
+def constrained_weekly_profile(*excluded_foods: str) -> UserProfile:
+    return profile_with(
+        age=32,
+        sex=Sex.FEMALE,
+        height_cm=168,
+        weight_kg=72,
+        goal=Goal.LOSE,
+        activity=ActivityLevel.MODERATE,
+        meal_count=4,
+        cooking_time=CookingTimePreference.SIMPLE,
+        restrictions=tuple(
+            Restriction(RestrictionType.EXCLUDED_FOOD, food)
+            for food in excluded_foods
+        ),
+    )
+
+
+def _weekly_recipe_ids(plans) -> list[str]:
+    return [
+        meal.recipe_id
+        for plan in plans
+        for meal in plan.meals
+        if meal.recipe_id
+    ]
+
+
+def _weekly_repeat_count(plans) -> int:
+    return sum(
+        count - 1
+        for count in Counter(_weekly_recipe_ids(plans)).values()
+        if count > 1
+    )
+
+
+def _assert_no_excluded_foods_in_week(plans, profile: UserProfile) -> None:
+    eligible_ids = {
+        food.id
+        for food in filter_foods(built_in_foods(), evaluate_safety(profile))
+    }
+    planned_ids = {
+        portion.food.id
+        for plan in plans
+        for meal in plan.meals
+        for portion in meal.portions
+    }
+
+    assert planned_ids <= eligible_ids
+
+
+def _test_recipe_template(recipe_id: str) -> RecipeTemplate:
+    return RecipeTemplate(
+        id=recipe_id,
+        slot="main",
+        title=recipe_id,
+        ingredients_g={},
+        instructions="cook",
+    )
 
 
 def assert_meal_energy_distribution(plan) -> None:
@@ -68,6 +142,299 @@ def test_excluded_mushrooms_filter_curated_recipes_by_alias() -> None:
     assert len(plan.meals) == 5
     assert "mushrooms" not in food_ids
     assert not any("excluded" in error for error in validation.errors)
+
+
+def test_excluded_fish_filters_sardines_and_aquatic_catalog_foods() -> None:
+    profile = profile_with(restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),))
+    safety = evaluate_safety(profile)
+    eligible_ids = {food.id for food in filter_foods(built_in_foods(), safety)}
+
+    fish_like_ids = {
+        "anchovies",
+        "calamari",
+        "clam_stock",
+        "clams",
+        "cod_fillet",
+        "cod_liver_canned_drained",
+        "crab_sticks",
+        "fish_sauce",
+        "fish_stock",
+        "herring",
+        "mackerel",
+        "mussels",
+        "salmon",
+        "sardines",
+        "scallops",
+        "seafood_mix",
+        "shrimp",
+        "smoked_white_fish",
+        "sprats",
+        "trout",
+        "tuna",
+        "tuna_steak",
+        "white_fish",
+    }
+    non_fish_ids = {"chicken_breast", "greek_yogurt", "mushrooms", "tofu", "whole_grain_bread"}
+
+    assert fish_like_ids.isdisjoint(eligible_ids)
+    assert non_fish_ids <= eligible_ids
+
+
+def test_excluded_fish_profile_does_not_receive_sardine_recipe() -> None:
+    profile = profile_with(
+        sex=Sex.FEMALE,
+        restrictions=(Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),),
+        cooking_time=CookingTimePreference.QUICK,
+        meal_count=4,
+    )
+    plan = build_one_day_plan(profile, variety_seed=607, recipe_source="curated_only")
+    food_ids = {portion.food.id for meal in plan.meals for portion in meal.portions}
+
+    assert "sardines" not in food_ids
+    assert all("sardin" not in meal.recipe_id for meal in plan.meals if meal.recipe_id)
+    assert validate_plan(plan).ok
+
+
+def test_no_meat_no_fish_curated_one_day_seed_regressions_do_not_return_empty_safe_plans() -> None:
+    profile = profile_with(
+        meal_count=5,
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "meat"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),
+        ),
+    )
+
+    for seed in (129, 131, 136):
+        plan = build_one_day_plan(profile, variety_seed=seed, recipe_source="curated_only")
+
+        assert plan.safety.can_generate_plan is True
+        assert len(plan.meals) == profile.meal_count
+        assert validate_plan(plan).ok
+
+
+def test_public_curated_high_bmi_one_day_seed_169_passes_sodium_validation() -> None:
+    profile = UserProfile(
+        age=40,
+        sex=Sex.FEMALE,
+        height_cm=165,
+        weight_kg=100,
+        goal=Goal.LOSE,
+        activity=ActivityLevel.MODERATE,
+        meal_count=5,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    plan = build_one_day_plan(profile, variety_seed=169, recipe_source="curated_only")
+    validation = validate_plan(plan)
+
+    assert len(plan.meals) == profile.meal_count
+    assert validation.ok, validation.errors
+
+
+def test_public_weekly_seed_101_days_pass_sodium_validation() -> None:
+    profile = profile_with(cooking_time=CookingTimePreference.QUICK)
+
+    plans = telegram_app._build_week_plans(profile, 101, set(), set())
+
+    assert telegram_app._week_plans_are_complete(plans, profile)
+    assert all(validate_plan(plan).ok for plan in plans)
+
+
+def test_weekly_repeats_fallback_ranks_sodium_valid_combo_ahead_of_high_sodium_combo() -> None:
+    high_sodium = _test_recipe_template("high_sodium")
+    sodium_valid = _test_recipe_template("sodium_valid")
+    lunch = _test_recipe_template("lunch")
+    dinner = _test_recipe_template("dinner")
+    target = NutrientVector(
+        {
+            "protein_g": 90.0,
+            "energy_kcal": 1800.0,
+            "sodium_mg": 2300.0,
+        }
+    )
+
+    diagnostics = telegram_app._weekly_repeat_fallback_ranked_combinations_with_diagnostics(
+        (
+            (
+                telegram_app._WeeklyRepeatFallbackFastOption(
+                    recipe=high_sodium,
+                    estimated_protein_g=30.0,
+                    estimated_energy_kcal=600.0,
+                    estimated_sodium_mg=2300.0,
+                ),
+                telegram_app._WeeklyRepeatFallbackFastOption(
+                    recipe=sodium_valid,
+                    estimated_protein_g=28.0,
+                    estimated_energy_kcal=590.0,
+                    estimated_sodium_mg=100.0,
+                ),
+            ),
+            (
+                telegram_app._WeeklyRepeatFallbackFastOption(
+                    recipe=lunch,
+                    estimated_protein_g=30.0,
+                    estimated_energy_kcal=600.0,
+                    estimated_sodium_mg=100.0,
+                ),
+            ),
+            (
+                telegram_app._WeeklyRepeatFallbackFastOption(
+                    recipe=dinner,
+                    estimated_protein_g=30.0,
+                    estimated_energy_kcal=600.0,
+                    estimated_sodium_mg=100.0,
+                ),
+            ),
+        ),
+        _meal_energy_slots(3),
+        target,
+        Counter(),
+        frozenset(),
+    )
+    ranked = diagnostics.combinations
+
+    assert diagnostics.has_sodium_valid_combo is True
+    assert tuple(recipe.id for recipe in ranked[0]) == ("sodium_valid", "lunch", "dinner")
+
+
+def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(monkeypatch) -> None:
+    profile = constrained_weekly_profile("dairy", "meat", "fish")
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 30.0, raising=False)
+
+    started_at = time.perf_counter()
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+    elapsed_s = time.perf_counter() - started_at
+
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.repeat_fallback_used is True
+    assert result.repeat_note
+    assert elapsed_s < 20.0
+    assert _weekly_repeat_count(result.plans) > 0
+    _assert_no_excluded_foods_in_week(result.plans, profile)
+    assert all(validate_plan(plan).ok for plan in result.plans)
+
+
+def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_timeouts() -> None:
+    profile = profile_with(
+        age=32,
+        sex=Sex.MALE,
+        height_cm=178,
+        weight_kg=86,
+        goal=Goal.LOSE,
+        activity=ActivityLevel.MODERATE,
+        meal_count=4,
+        cooking_time=CookingTimePreference.SIMPLE,
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "dairy"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "meat"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),
+        ),
+    )
+
+    started_at = time.perf_counter()
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+    elapsed_s = time.perf_counter() - started_at
+    sodium_target = result.plans[0].targets.targets.get("sodium_mg") if result.plans else 0.0
+
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.repeat_fallback_used is True
+    assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
+    _assert_no_excluded_foods_in_week(result.plans, profile)
+    assert all(validate_plan(plan).ok for plan in result.plans)
+    assert all(plan.totals.get("sodium_mg") <= sodium_target + 0.01 for plan in result.plans)
+
+
+def test_weekly_no_meat_fish_no_longer_waits_for_no_recent_timeout(monkeypatch) -> None:
+    profile = constrained_weekly_profile("meat", "fish")
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 45.0, raising=False)
+
+    started_at = time.perf_counter()
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+    elapsed_s = time.perf_counter() - started_at
+    recipe_counts = Counter(_weekly_recipe_ids(result.plans))
+
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.repeat_fallback_used is True
+    assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
+    assert _weekly_repeat_count(result.plans) <= 18
+    assert len(recipe_counts) >= 10
+    assert max(recipe_counts.values()) <= 4
+    assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
+    _assert_no_excluded_foods_in_week(result.plans, profile)
+
+
+def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) -> None:
+    profile = constrained_weekly_profile("dairy", "meat", "fish")
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 30.0, raising=False)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+    recipe_counts = Counter(_weekly_recipe_ids(result.plans))
+
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.repeat_fallback_used is True
+    assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
+    assert 0 < _weekly_repeat_count(result.plans) <= 20
+    assert max(recipe_counts.values()) <= telegram_app.WEEK_PLAN_DAYS
+    assert len(recipe_counts) >= 8
+
+
+def test_weekly_baseline_and_single_exclusions_stay_low_repeat() -> None:
+    cases = (
+        (),
+        ("fish",),
+        ("dairy",),
+        ("meat",),
+    )
+
+    for exclusions in cases:
+        profile = constrained_weekly_profile(*exclusions)
+        result = telegram_app._build_week_plans_with_recent_fallback(
+            profile,
+            607,
+            _empty_recent_avoidance(),
+        )
+
+        assert telegram_app._week_plans_are_complete(result.plans, profile)
+        assert _weekly_repeat_count(result.plans) <= 1
+        _assert_no_excluded_foods_in_week(result.plans, profile)
+
+
+def test_weekly_impossible_profile_returns_structured_failure() -> None:
+    profile = constrained_weekly_profile("dairy", "meat", "fish")
+    profile = replace(profile, age=17)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+
+    assert result.plans == ()
+    assert result.avoidance_phase == "failed"
+    assert result.failure_reason == "safety_cannot_generate"
+    assert result.repeat_fallback_used is False
 
 
 def test_celiac_excludes_gluten_foods_and_oats_by_default() -> None:
