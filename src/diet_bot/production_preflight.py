@@ -232,6 +232,8 @@ def _production_runtime_issues(config: RuntimeConfig) -> tuple[str, ...]:
     issues.extend(validate_strict_production(config))
     if config.payments_enabled and not config.telegram_provider_token.strip():
         issues.append("TELEGRAM_PROVIDER_TOKEN is required when payments are enabled in production.")
+    if not config.payments_enabled and config.telegram_provider_token.strip():
+        issues.append("TELEGRAM_PROVIDER_TOKEN must be absent when payments are disabled in production.")
     return _dedupe(issues)
 
 

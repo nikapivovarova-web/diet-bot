@@ -445,6 +445,31 @@ def test_production_preflight_payment_enabled_requires_provider_token_without_pr
     assert "db-super-secret" not in output
 
 
+def test_production_preflight_no_payment_rejects_provider_token_without_printing_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from diet_bot import production_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_validate_postgres_connectivity",
+        lambda _config: (_ for _ in ()).throw(AssertionError("DB checks must not run after invalid config")),
+    )
+    env = _valid_env(tmp_path, TELEGRAM_PROVIDER_TOKEN="provider-super-secret")
+
+    exit_code = preflight.main([], env=env)
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "FAIL runtime config" in output
+    assert "TELEGRAM_PROVIDER_TOKEN must be absent when payments are disabled in production" in output
+    assert "provider-super-secret" not in output
+    assert "bot-super-secret" not in output
+    assert "db-super-secret" not in output
+
+
 def test_production_preflight_redacts_provider_token_and_dependency_error_text(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
