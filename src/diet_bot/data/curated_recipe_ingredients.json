@@ -48457,7 +48457,7 @@
     "recipe_id": "r306_zapechennye_ovsyanye_boul_s_bananom_i_pekanom",
     "recipe_no": 306,
     "line_index": 11,
-    "raw_text": "поджаренный грецкий орех или пекан — 5 г (примерно 1 ст. л.)",
+    "raw_text": "поджаренный грецкий орех или пекан — 5 г",
     "ingredient_name_ru": "пекан",
     "food_id": "pecans",
     "grams": 5.0,
