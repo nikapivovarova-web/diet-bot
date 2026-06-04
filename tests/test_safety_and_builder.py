@@ -17,8 +17,7 @@ from diet_bot.domain import (
     Sex,
     UserProfile,
 )
-from diet_bot.recipe_catalog import built_in_recipes
-from diet_bot.recipe_models import RecipeTemplate
+from diet_bot.recipe_catalog import RecipeTemplate, built_in_recipes
 from diet_bot.safety import evaluate_safety
 from diet_bot.validation import validate_plan
 
@@ -323,7 +322,7 @@ def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(
 def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_timeouts() -> None:
     profile = profile_with(
         age=32,
-        sex=Sex.MALE,
+        sex=Sex.FEMALE,
         height_cm=178,
         weight_kg=86,
         goal=Goal.LOSE,
@@ -344,15 +343,18 @@ def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_ti
         _empty_recent_avoidance(),
     )
     elapsed_s = time.perf_counter() - started_at
-    sodium_target = result.plans[0].targets.targets.get("sodium_mg") if result.plans else 0.0
 
     assert telegram_app._week_plans_are_complete(result.plans, profile)
     assert result.avoidance_phase == "repeats_fallback"
     assert result.repeat_fallback_used is True
     assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
+    targets = result.plans[0].targets.targets
+    assert targets.get("energy_kcal") == 2176
+    assert targets.get("protein_g") == 138
+    assert targets.get("sodium_mg") == 2300
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
-    assert all(plan.totals.get("sodium_mg") <= sodium_target + 0.01 for plan in result.plans)
+    assert all(plan.totals.get("sodium_mg") <= 2300.01 for plan in result.plans)
 
 
 def test_weekly_no_meat_fish_no_longer_waits_for_no_recent_timeout(monkeypatch) -> None:
