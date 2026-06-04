@@ -26,9 +26,11 @@ from diet_bot.subscriptions import Entitlement
 
 @pytest.fixture(autouse=True)
 def isolated_telegram_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "json")
     monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", tmp_path / "subscriptions.json")
     monkeypatch.setattr(telegram_app, "WEEK_PDF_STATUS_UPDATE_SECONDS", 60.0)
+    monkeypatch.setattr(telegram_app, "_WEEKLY_PDF_JOB_RUNTIME", None, raising=False)
     monkeypatch.setattr(telegram_app, "_RUNTIME_CONFIG_APPLIED", True, raising=False)
     monkeypatch.setattr(telegram_app, "PUBLIC_PAYMENTS_ENABLED", False, raising=False)
     monkeypatch.setattr(telegram_app, "PAYMENT_TEST_PRICES_ENABLED", False, raising=False)
@@ -656,14 +658,21 @@ def _active_subscription_entitlement(
 
 
 def sample_meal_plan() -> MealPlan:
-    meals = tuple(sample_meal() for _ in range(4))
+    meals = tuple(sample_meal(index) for index in range(4))
     targets = NutritionTargets(
         bmi=22.0,
         bmi_category="normal",
         bmr_kcal=1500,
         tdee_kcal=2000,
         water_l=2.0,
-        targets=meals[0].nutrients,
+        targets=NutrientVector(
+            {
+                "energy_kcal": 2000,
+                "protein_g": 120,
+                "fat_g": 56,
+                "carbohydrate_g": 240,
+            }
+        ),
         calorie_bounds=(1400, 2200),
         macro_bounds={},
     )
@@ -674,18 +683,17 @@ def _week_plan_build_result(plans: tuple[MealPlan, ...]) -> telegram_app._WeekPl
     return telegram_app._WeekPlanBuildResult(plans=plans, avoidance_phase="full_recent")
 
 
-def sample_meal() -> Meal:
+def sample_meal(index: int) -> Meal:
     food = Food(
-        id="smoke_food",
-        name="Smoke food",
+        id=f"smoke_food_{index}",
+        name=f"Smoke food {index + 1}",
         category="test",
         nutrients_per_100g=NutrientVector(
             {
-                "kcal": 120,
-                "protein_g": 8,
-                "fat_g": 4,
-                "carbs_g": 12,
-                "fiber_g": 2,
+                "energy_kcal": 333.3333333333,
+                "protein_g": 20,
+                "fat_g": 9.3333333333,
+                "carbohydrate_g": 40,
             },
         ),
     )
