@@ -14,10 +14,13 @@ from diet_bot.domain import (
     ConditionCode,
     CookingTimePreference,
     Goal,
+    Meal,
+    MealPlan,
     NutritionTargets,
     NutrientVector,
     Restriction,
     RestrictionType,
+    SafetyResult,
     Sex,
     UserProfile,
 )
@@ -115,6 +118,24 @@ def _test_recipe_template(recipe_id: str) -> RecipeTemplate:
     )
 
 
+def _synthetic_weekly_plan(recipe_id: str) -> MealPlan:
+    targets = NutritionTargets(
+        bmi=24.0,
+        bmi_category="normal",
+        bmr_kcal=1500.0,
+        tdee_kcal=2000.0,
+        water_l=2.0,
+        targets=NutrientVector({"energy_kcal": 1800.0, "protein_g": 90.0}),
+        calorie_bounds=(1600.0, 2000.0),
+        macro_bounds={},
+    )
+    return MealPlan(
+        meals=(Meal(name="Main", portions=(), recipe="cook", recipe_id=recipe_id),),
+        targets=targets,
+        safety=SafetyResult(can_generate_plan=True),
+    )
+
+
 def assert_meal_energy_distribution(plan) -> None:
     target_energy = plan.targets.targets.get("energy_kcal")
     for meal, slot in zip(plan.meals, _meal_energy_slots(len(plan.meals))):
@@ -204,6 +225,35 @@ def test_weekly_repeats_fallback_ranks_sodium_valid_combo_ahead_of_high_sodium_c
     assert tuple(recipe.id for recipe in ranked[0]) == ("sodium_valid", "lunch", "dinner")
 
 
+def test_weekly_repeats_fallback_day_pool_stops_when_repeat_cap_exhausted() -> None:
+    profile = constrained_weekly_profile()
+    candidates = tuple(
+        _synthetic_weekly_plan("repeated_recipe")
+        for _ in range(telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP + 1)
+    )
+
+    pool = telegram_app._select_weekly_repeat_fallback_day_pool(candidates, profile)
+    recipe_counts = Counter(_weekly_recipe_ids(pool))
+
+    assert len(pool) == telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+    assert max(recipe_counts.values()) <= telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+
+
+def test_weekly_repeats_fallback_scheduler_fails_when_repeat_cap_exhausted() -> None:
+    profile = constrained_weekly_profile()
+    day_pool = (_synthetic_weekly_plan("repeated_recipe"),)
+
+    scheduled, failure_reason = telegram_app._schedule_weekly_repeat_fallback_pool(
+        day_pool,
+        profile,
+    )
+    recipe_counts = Counter(_weekly_recipe_ids(scheduled))
+
+    assert len(scheduled) == telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+    assert max(recipe_counts.values()) <= telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+    assert failure_reason == "repeats_fallback_repeat_cap_exhausted"
+
+
 def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(monkeypatch) -> None:
     profile = constrained_weekly_profile("dairy", "meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
@@ -225,9 +275,12 @@ def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(
     assert _weekly_repeat_count(result.plans) > 0
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
+    assert max(Counter(_weekly_recipe_ids(result.plans)).values()) <= (
+        telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+    )
 
 
-def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_timeouts() -> None:
+def test_c01_weekly_no_dairy_meat_fish_seed_607_fails_closed_when_repeat_cap_exhausted() -> None:
     profile = profile_with(
         age=32,
         sex=Sex.FEMALE,
@@ -252,17 +305,11 @@ def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_ti
     )
     elapsed_s = time.perf_counter() - started_at
 
-    assert telegram_app._week_plans_are_complete(result.plans, profile)
-    assert result.avoidance_phase == "repeats_fallback"
+    assert result.plans == ()
+    assert result.avoidance_phase == "failed"
     assert result.repeat_fallback_used is True
+    assert result.failure_reason == "repeats_fallback_repeat_cap_exhausted"
     assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
-    targets = result.plans[0].targets.targets
-    assert targets.get("energy_kcal") == 2176
-    assert targets.get("protein_g") == 138
-    assert targets.get("sodium_mg") == 2300
-    _assert_no_excluded_foods_in_week(result.plans, profile)
-    assert all(validate_plan(plan).ok for plan in result.plans)
-    assert all(plan.totals.get("sodium_mg") <= 2300.01 for plan in result.plans)
 
 
 def test_c00_public_weekly_seed_607_stays_sodium_valid() -> None:
@@ -354,6 +401,14 @@ def test_weekly_no_meat_fish_no_longer_waits_for_no_recent_timeout(monkeypatch) 
         _empty_recent_avoidance(),
     )
     elapsed_s = time.perf_counter() - started_at
+
+    if result.failure_reason == "repeats_fallback_repeat_cap_exhausted":
+        assert result.plans == ()
+        assert result.avoidance_phase == "failed"
+        assert result.repeat_fallback_used is True
+        assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
+        return
+
     recipe_counts = Counter(_weekly_recipe_ids(result.plans))
 
     assert telegram_app._week_plans_are_complete(result.plans, profile)
@@ -383,7 +438,7 @@ def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) 
     assert result.repeat_fallback_used is True
     assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
     assert 0 < _weekly_repeat_count(result.plans) <= 20
-    assert max(recipe_counts.values()) <= telegram_app.WEEK_PLAN_DAYS
+    assert max(recipe_counts.values()) <= telegram_app.WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
     assert len(recipe_counts) >= 8
 
 

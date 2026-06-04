@@ -3874,13 +3874,20 @@ def _build_week_plans_with_repeats_fallback(
             failure_reason=day_pool_failure_reason or "repeats_fallback_no_valid_day_pool",
         )
 
-    scheduled_plans = _schedule_weekly_repeat_fallback_pool(
+    scheduled_plans, schedule_failure_reason = _schedule_weekly_repeat_fallback_pool(
         day_pool,
         profile,
         selection_guard=selection_guard,
     )
     if selection_guard is not None:
         selection_guard.check(stage="after_repeats_fallback_schedule")
+    if schedule_failure_reason == "repeats_fallback_repeat_cap_exhausted":
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason=schedule_failure_reason,
+        )
     repeat_count = _weekly_repeated_recipe_count(scheduled_plans)
     if not _week_plans_are_complete(scheduled_plans, profile):
         return _WeekPlanBuildResult(
@@ -3958,7 +3965,7 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
     )
 
     for offset in range(WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS):
-        if len(plans) >= builder_pool_size:
+        if len(candidate_plans) >= builder_pool_size:
             break
 
         if selection_guard is not None:
@@ -3988,9 +3995,9 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
             continue
 
         seen_signatures.add(signature)
-        plans.append(plan)
+        candidate_plans.append(plan)
 
-    return tuple(plans), None
+    return tuple(candidate_plans), None
 
 
 def _build_weekly_repeat_fallback_day_pool_from_slots(
@@ -4099,13 +4106,10 @@ def _select_weekly_repeat_fallback_day_pool(
         candidates = [
             (index, plan)
             for index, plan in enumerate(remaining)
-            if all(
-                recipe_counts[recipe_id] < WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
-                for recipe_id in _plan_recipe_ids(plan)
-            )
+            if _plan_fits_repeat_cap(plan, recipe_counts)
         ]
         if not candidates:
-            candidates = list(enumerate(remaining))
+            break
         selected_index, selected_plan = max(
             candidates,
             key=lambda item: _weekly_repeat_fallback_pool_score(
@@ -4118,7 +4122,7 @@ def _select_weekly_repeat_fallback_day_pool(
         )
         selected.append(selected_plan)
         recipe_ids = frozenset(_plan_recipe_ids(selected_plan))
-        recipe_counts.update(recipe_ids)
+        recipe_counts.update(_plan_recipe_ids(selected_plan))
         previous_day_recipe_ids = recipe_ids
         del remaining[selected_index]
 
@@ -4548,6 +4552,14 @@ def _plan_recipe_ids(plan: MealPlan) -> tuple[str, ...]:
     return tuple(meal.recipe_id for meal in plan.meals if meal.recipe_id)
 
 
+def _plan_fits_repeat_cap(plan: MealPlan, recipe_counts: Counter[str]) -> bool:
+    plan_counts = Counter(_plan_recipe_ids(plan))
+    return all(
+        recipe_counts[recipe_id] + count <= WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+        for recipe_id, count in plan_counts.items()
+    )
+
+
 def _weekly_repeated_recipe_count(plans: Sequence[MealPlan]) -> int:
     counts: Counter[str] = Counter(
         recipe_id
@@ -4562,9 +4574,9 @@ def _schedule_weekly_repeat_fallback_pool(
     profile: UserProfile,
     *,
     selection_guard: _WeeklySelectionGuard | None = None,
-) -> tuple[MealPlan, ...]:
+) -> tuple[tuple[MealPlan, ...], str | None]:
     if not day_pool:
-        return ()
+        return (), None
 
     scheduled: list[MealPlan] = []
     recipe_counts: Counter[str] = Counter()
@@ -4574,6 +4586,14 @@ def _schedule_weekly_repeat_fallback_pool(
         if selection_guard is not None:
             selection_guard.check(stage="repeats_fallback_schedule_day", day_index=day_index)
         candidates = list(day_pool)
+        capped_candidates = [
+            plan
+            for plan in candidates
+            if _plan_fits_repeat_cap(plan, recipe_counts)
+        ]
+        if not capped_candidates:
+            return tuple(scheduled), "repeats_fallback_repeat_cap_exhausted"
+        candidates = capped_candidates
         non_adjacent_candidates = [
             plan
             for plan in candidates
@@ -4581,16 +4601,6 @@ def _schedule_weekly_repeat_fallback_pool(
         ]
         if non_adjacent_candidates:
             candidates = non_adjacent_candidates
-        capped_candidates = [
-            plan
-            for plan in candidates
-            if all(
-                recipe_counts[recipe_id] < WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
-                for recipe_id in _plan_recipe_ids(plan)
-            )
-        ]
-        if capped_candidates:
-            candidates = capped_candidates
         selected = max(
             enumerate(candidates),
             key=lambda item: _weekly_repeat_fallback_pool_score(
@@ -4603,8 +4613,8 @@ def _schedule_weekly_repeat_fallback_pool(
         )[1]
         scheduled.append(selected)
         previous_day_recipe_ids = frozenset(_plan_recipe_ids(selected))
-        recipe_counts.update(previous_day_recipe_ids)
-    return tuple(scheduled)
+        recipe_counts.update(_plan_recipe_ids(selected))
+    return tuple(scheduled), None
 
 
 def _weekly_repeat_fallback_pool_score(
