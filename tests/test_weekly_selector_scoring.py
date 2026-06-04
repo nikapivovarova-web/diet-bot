@@ -48,7 +48,7 @@ def _profile(*, meal_count: int = 3) -> UserProfile:
     )
 
 
-def _food(food_id: str, energy: float, protein: float = 30, fat: float = 20, carbohydrate: float = 80) -> Food:
+def _food(food_id: str, energy: float, protein: float = 20, fat: float = 20, carbohydrate: float = 80) -> Food:
     return Food(
         id=food_id,
         name=f"{food_id} food",

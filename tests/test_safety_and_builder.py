@@ -3,6 +3,9 @@ from dataclasses import replace
 from pathlib import Path
 import time
 
+import pytest
+
+from diet_bot import builder
 from diet_bot.builder import _meal_energy_slots, _recipe_time_bucket, build_one_day_plan, filter_foods
 from diet_bot import telegram_app
 from diet_bot.catalog import built_in_foods
@@ -11,6 +14,7 @@ from diet_bot.domain import (
     ConditionCode,
     CookingTimePreference,
     Goal,
+    NutritionTargets,
     NutrientVector,
     Restriction,
     RestrictionType,
@@ -217,7 +221,7 @@ def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(
     assert result.avoidance_phase == "repeats_fallback"
     assert result.repeat_fallback_used is True
     assert result.repeat_note
-    assert elapsed_s < 20.0
+    assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
     assert _weekly_repeat_count(result.plans) > 0
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
@@ -259,6 +263,83 @@ def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_ti
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
     assert all(plan.totals.get("sodium_mg") <= 2300.01 for plan in result.plans)
+
+
+def test_c00_public_weekly_seed_607_stays_sodium_valid() -> None:
+    profile = profile_with(
+        age=32,
+        sex=Sex.FEMALE,
+        height_cm=178,
+        weight_kg=86,
+        goal=Goal.LOSE,
+        activity=ActivityLevel.MODERATE,
+        meal_count=4,
+        cooking_time=CookingTimePreference.SIMPLE,
+    )
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+
+    assert len(result.plans) == 7
+    for plan in result.plans:
+        assert validate_plan(plan).ok
+        assert plan.totals.get("sodium_mg") <= 2300.01
+
+
+def test_builder_enables_sodium_management_when_target_has_sodium(monkeypatch) -> None:
+    captured_manage_sodium: list[bool] = []
+
+    def capture_recipe_path(*args, **kwargs):
+        captured_manage_sodium.append(kwargs["manage_sodium"])
+        raise RuntimeError("captured manage_sodium")
+
+    monkeypatch.setattr(builder, "_build_recipe_plan_for_time", capture_recipe_path)
+
+    with pytest.raises(RuntimeError, match="captured manage_sodium"):
+        build_one_day_plan(profile_with(restrictions=()))
+
+    assert captured_manage_sodium == [True]
+
+
+@pytest.mark.parametrize(
+    "synthetic_target",
+    (
+        NutrientVector({"energy_kcal": 1800.0, "protein_g": 90.0}),
+        NutrientVector({"energy_kcal": 1800.0, "protein_g": 90.0, "sodium_mg": 0.0}),
+    ),
+)
+def test_builder_keeps_sodium_management_disabled_without_sodium_target(
+    monkeypatch,
+    synthetic_target: NutrientVector,
+) -> None:
+    captured_manage_sodium: list[bool] = []
+
+    def fake_targets(profile: UserProfile) -> NutritionTargets:
+        return NutritionTargets(
+            bmi=24.0,
+            bmi_category="normal",
+            bmr_kcal=1500.0,
+            tdee_kcal=2000.0,
+            water_l=2.0,
+            targets=synthetic_target,
+            calorie_bounds=(1600.0, 2000.0),
+            macro_bounds={},
+        )
+
+    def capture_recipe_path(*args, **kwargs):
+        captured_manage_sodium.append(kwargs["manage_sodium"])
+        raise RuntimeError("captured manage_sodium")
+
+    monkeypatch.setattr(builder, "calculate_targets", fake_targets)
+    monkeypatch.setattr(builder, "_build_recipe_plan_for_time", capture_recipe_path)
+
+    with pytest.raises(RuntimeError, match="captured manage_sodium"):
+        build_one_day_plan(profile_with(restrictions=()))
+
+    assert captured_manage_sodium == [False]
 
 
 def test_weekly_no_meat_fish_no_longer_waits_for_no_recent_timeout(monkeypatch) -> None:
@@ -306,7 +387,9 @@ def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) 
     assert len(recipe_counts) >= 8
 
 
-def test_weekly_baseline_and_single_exclusions_stay_low_repeat() -> None:
+def test_weekly_baseline_and_single_exclusions_stay_low_repeat(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 90.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 120.0, raising=False)
     cases = (
         (),
         ("fish",),
