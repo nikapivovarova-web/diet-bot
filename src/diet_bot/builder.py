@@ -548,6 +548,10 @@ class _RankedRecipeCandidate:
     rank: int
 
 
+def _should_manage_sodium(target: NutrientVector) -> bool:
+    return target.get("sodium_mg") > 0
+
+
 def build_one_day_plan(
     profile: UserProfile,
     foods: list[Food] | None = None,
@@ -595,7 +599,7 @@ def build_one_day_plan(
             avoided_recipe_keys or frozenset(),
             recipe_source,
             excluded_food_names=safety.excluded_food_names,
-            manage_sodium=bool(safety.excluded_food_names),
+            manage_sodium=_should_manage_sodium(targets.targets),
             recipe_cache=recipe_cache,
             selection_guard=selection_guard,
         )
@@ -611,7 +615,7 @@ def build_one_day_plan(
                 frozenset(),
                 recipe_source,
                 excluded_food_names=safety.excluded_food_names,
-                manage_sodium=bool(safety.excluded_food_names),
+                manage_sodium=_should_manage_sodium(targets.targets),
                 recipe_cache=recipe_cache,
                 selection_guard=selection_guard,
             )
@@ -627,7 +631,7 @@ def build_one_day_plan(
                 frozenset(),
                 recipe_source,
                 excluded_food_names=safety.excluded_food_names,
-                manage_sodium=bool(safety.excluded_food_names),
+                manage_sodium=_should_manage_sodium(targets.targets),
                 recipe_cache=recipe_cache,
                 selection_guard=selection_guard,
             )

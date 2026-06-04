@@ -4871,7 +4871,11 @@ def _week_plans_are_complete(plans: Sequence[MealPlan], profile: UserProfile) ->
     return len(plans) == WEEK_PLAN_DAYS and all(_week_day_plan_is_complete(plan, profile) for plan in plans)
 
 def _week_day_plan_is_complete(plan: MealPlan, profile: UserProfile) -> bool:
-    return plan.safety.can_generate_plan and len(plan.meals) == _expected_meal_count(profile)
+    return (
+        plan.safety.can_generate_plan
+        and len(plan.meals) == _expected_meal_count(profile)
+        and validate_plan(plan).ok
+    )
 
 
 def _expected_meal_count(profile: UserProfile) -> int:
