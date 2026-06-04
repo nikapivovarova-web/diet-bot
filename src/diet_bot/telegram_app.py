@@ -4069,6 +4069,8 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
         plan = MealPlan(meals=tuple(meals), targets=context.targets, safety=context.safety)
         if not _week_day_plan_is_complete(plan, profile):
             continue
+        if not validate_plan(plan).ok:
+            continue
         seen_signatures.add(signature)
         candidate_plans.append(plan)
 
