@@ -228,28 +228,17 @@ def test_all_curated_recipes_produce_traits_with_broad_unknown_thresholds() -> N
     recipe_nos = {trait.recipe_no for trait in traits}
     excluded_missing_food_recipe_nos = {
         416,
-        418,
         424,
         425,
         426,
         427,
         428,
-        429,
-        435,
         448,
         454,
-        471,
-        480,
-        484,
-        493,
-        495,
         496,
         502,
-        527,
         548,
         552,
-        562,
-        572,
         585,
         587,
         588,
@@ -259,8 +248,6 @@ def test_all_curated_recipes_produce_traits_with_broad_unknown_thresholds() -> N
         592,
         593,
         594,
-        684,
-        685,
         691,
         692,
     }
@@ -271,12 +258,12 @@ def test_all_curated_recipes_produce_traits_with_broad_unknown_thresholds() -> N
         | (set(range(666, 711)) - excluded_missing_food_recipe_nos)
     )
 
-    assert len(traits) == 674
+    assert len(traits) == 687
     assert recipe_nos == expected_recipe_nos
     assert Counter(trait.source_batch for trait in traits) == {
         "r001-r400": 400,
-        "r401-r610": 178,
-        "r611+": 96,
+        "r401-r610": 189,
+        "r611+": 98,
     }
 
     unknown_counts = Counter(
