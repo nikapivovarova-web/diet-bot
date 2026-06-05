@@ -340,6 +340,36 @@ def test_c05_weekly_no_meat_fish_seed_607_keeps_max_repeat_under_three() -> None
     assert _weekly_max_repeat(result.plans) <= 3
 
 
+def test_c05_no_recent_fallback_treats_near_threshold_main_pool_as_constrained(
+    monkeypatch,
+) -> None:
+    profile = constrained_weekly_profile("meat", "fish")
+
+    def feasible_near_threshold(*args, **kwargs):
+        return telegram_app._WeeklyPhaseFeasibility(
+            skipped=False,
+            reason="feasible",
+            slot_counts=(
+                telegram_app._WeeklyPhaseSlotFeasibility(
+                    slot="main",
+                    weekly_required=14,
+                    available_count=60,
+                    strict_simple_count=44,
+                    threshold=42,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(telegram_app, "_weekly_phase_feasibility", feasible_near_threshold)
+
+    reason = telegram_app._weekly_no_recent_repeat_fallback_reason(
+        profile,
+        recipe_cache=telegram_app._RecipePlanCache(),
+    )
+
+    assert reason == "repeat_fallback_constrained_profile:meat_fish:main:44/14"
+
+
 def test_c00_public_weekly_seed_607_stays_sodium_valid() -> None:
     profile = profile_with(
         age=32,
@@ -437,7 +467,7 @@ def test_weekly_no_meat_fish_no_longer_waits_for_no_recent_timeout(monkeypatch) 
     assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
     assert _weekly_repeat_count(result.plans) <= 18
     assert len(recipe_counts) >= 10
-    assert max(recipe_counts.values()) <= 4
+    assert max(recipe_counts.values()) <= 3
     assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
     _assert_no_excluded_foods_in_week(result.plans, profile)
 
@@ -477,6 +507,53 @@ def test_weekly_repeat_optimizer_uses_cap_three_when_it_is_feasible() -> None:
 
     assert len(scheduled) == 7
     assert all(validate_plan(plan).ok for plan in scheduled)
+    assert _weekly_max_repeat(scheduled) <= 3
+
+
+def test_weekly_repeat_fallback_skips_narrow_slots_pool_when_builder_can_cap_three(
+    monkeypatch,
+) -> None:
+    profile = replace(constrained_weekly_profile("meat", "fish"), meal_count=3)
+    slots_pool = (_synthetic_repeat_plan(("slot1", "slot2", "slot3")),)
+    builder_pool = (
+        _synthetic_repeat_plan(("a1", "a2", "a3")),
+        _synthetic_repeat_plan(("b1", "b2", "b3")),
+        _synthetic_repeat_plan(("c1", "c2", "c3")),
+    )
+    calls: list[str] = []
+
+    def fake_slots(*args, **kwargs):
+        calls.append("slots")
+        return slots_pool, None
+
+    def fake_builder(*args, **kwargs):
+        calls.append("builder")
+        return builder_pool, None
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_weekly_repeat_fallback_day_pool_from_slots",
+        fake_slots,
+    )
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_weekly_repeat_fallback_day_pool_from_builder",
+        fake_builder,
+    )
+
+    selected_pool, failure_reason = telegram_app._build_weekly_repeat_fallback_day_pool(
+        profile,
+        607,
+        recipe_cache=telegram_app._RecipePlanCache(),
+    )
+
+    assert calls == ["slots", "builder"]
+    assert failure_reason is None
+    assert selected_pool == builder_pool
+    scheduled = telegram_app._optimize_weekly_repeat_fallback_schedule(
+        selected_pool,
+        profile,
+    )
     assert _weekly_max_repeat(scheduled) <= 3
 
 

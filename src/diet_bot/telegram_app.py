@@ -992,6 +992,7 @@ WEEK_PLAN_CANDIDATE_COUNT = 4
 WEEK_PLAN_RESCUE_CANDIDATE_COUNT = 4
 WEEKLY_RECENT_FEASIBILITY_POOL_MULTIPLIER = 5
 WEEKLY_REPEATS_FALLBACK_POOL_MULTIPLIER = 3
+WEEKLY_REPEATS_FALLBACK_CONSTRAINED_MAIN_POOL_RATIO = 3.25
 WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS = 8
 WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT = 50
 WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE = 8
@@ -3849,7 +3850,40 @@ def _weekly_no_recent_repeat_fallback_reason(
         available = _weekly_phase_slot_gating_count(count)
         if available < threshold:
             return f"repeat_fallback_slot_pool_below_threshold:{count.slot}:{available}<{threshold}"
+        if (
+            count.slot == "main"
+            and _weekly_profile_excludes_meat_and_fish(profile, safety)
+            and count.weekly_required > 0
+            and available
+            <= math.ceil(
+                count.weekly_required
+                * WEEKLY_REPEATS_FALLBACK_CONSTRAINED_MAIN_POOL_RATIO
+            )
+        ):
+            return (
+                "repeat_fallback_constrained_profile:"
+                f"meat_fish:{count.slot}:{available}/{count.weekly_required}"
+            )
     return None
+
+
+def _weekly_profile_excludes_meat_and_fish(profile: UserProfile, safety) -> bool:
+    return {"meat", "fish"} <= _weekly_profile_exclusion_names(profile, safety)
+
+
+def _weekly_profile_is_c05_no_meat_no_fish(profile: UserProfile, safety) -> bool:
+    exclusions = _weekly_profile_exclusion_names(profile, safety)
+    return {"meat", "fish"} <= exclusions and "dairy" not in exclusions
+
+
+def _weekly_profile_exclusion_names(profile: UserProfile, safety) -> set[str]:
+    hard_exclusions = {
+        str(restriction.value).strip().lower()
+        for restriction in profile.restrictions
+        if restriction.type == RestrictionType.EXCLUDED_FOOD
+    }
+    excluded_names = {str(name).strip().lower() for name in safety.excluded_food_names}
+    return hard_exclusions | excluded_names
 
 
 def _weekly_repeat_fallback_search_limits(
@@ -3996,6 +4030,8 @@ def _build_weekly_repeat_fallback_day_pool(
         )
 
     failure_reason: str | None = None
+    fallback_pool: tuple[MealPlan, ...] = ()
+    require_target_cap_pool = _weekly_profile_is_c05_no_meat_no_fish(profile, safety)
     for build_pool in builders:
         if selection_guard is not None:
             selection_guard.check(stage=f"before_{build_pool.__name__}")
@@ -4009,9 +4045,41 @@ def _build_weekly_repeat_fallback_day_pool(
         if selection_guard is not None:
             selection_guard.check(stage=f"after_{build_pool.__name__}")
         if day_pool:
-            return day_pool, None
+            if (
+                not require_target_cap_pool
+                or _weekly_repeat_fallback_day_pool_can_schedule_with_target_cap(
+                    day_pool,
+                    profile,
+                    selection_guard=selection_guard,
+                    search_limits=search_limits,
+                )
+            ):
+                return day_pool, None
+            if not fallback_pool:
+                fallback_pool = day_pool
         failure_reason = pool_failure_reason or failure_reason
+    if fallback_pool:
+        return fallback_pool, None
     return (), failure_reason
+
+
+def _weekly_repeat_fallback_day_pool_can_schedule_with_target_cap(
+    day_pool: tuple[MealPlan, ...],
+    profile: UserProfile,
+    *,
+    selection_guard: _WeeklySelectionGuard | None = None,
+    search_limits: _WeeklyRepeatFallbackSearchLimits,
+) -> bool:
+    target_repeat_cap_order = tuple(
+        repeat_cap for repeat_cap in search_limits.repeat_cap_order if repeat_cap <= 3
+    ) or (3,)
+    scheduled = _optimize_weekly_repeat_fallback_schedule(
+        day_pool,
+        profile,
+        selection_guard=selection_guard,
+        search_limits=replace(search_limits, repeat_cap_order=target_repeat_cap_order),
+    )
+    return bool(scheduled) and _weekly_max_recipe_repeat(scheduled) <= 3
 
 
 def _build_weekly_repeat_fallback_day_pool_from_builder(
