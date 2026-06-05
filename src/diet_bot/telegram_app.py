@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import hashlib
 import itertools
 import json
@@ -504,6 +505,18 @@ class _WeeklyRepeatFallbackRankedCombinationResult:
 
 
 @dataclass(frozen=True)
+class _WeeklyRepeatFallbackSearchLimits:
+    day_pool_size: int = 8
+    builder_day_pool_size: int = 4
+    builder_attempts: int = 10
+    fast_slot_options: int = 8
+    fast_combo_limit: int = 50
+    candidate_recipe_repeat_cap: int = 4
+    schedule_beam_width: int = 1200
+    repeat_cap_order: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7)
+
+
+@dataclass(frozen=True)
 class _WeeklyPhaseSlotFeasibility:
     slot: str
     weekly_required: int
@@ -985,6 +998,15 @@ WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE = 8
 WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE = 4
 WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS = 10
 WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP = 4
+WEEKLY_REPEATS_FALLBACK_C01_DAY_POOL_SIZE = 12
+WEEKLY_REPEATS_FALLBACK_C01_FAST_SLOT_OPTIONS = 32
+WEEKLY_REPEATS_FALLBACK_C01_FAST_COMBO_LIMIT = 240
+WEEKLY_REPEATS_FALLBACK_C01_BUILDER_ATTEMPTS = 32
+WEEKLY_REPEATS_FALLBACK_C05_DAY_POOL_SIZE = 14
+WEEKLY_REPEATS_FALLBACK_C05_FAST_SLOT_OPTIONS = 20
+WEEKLY_REPEATS_FALLBACK_C05_FAST_COMBO_LIMIT = 80
+WEEKLY_REPEATS_FALLBACK_C05_BUILDER_ATTEMPTS = 24
+WEEKLY_REPEATS_FALLBACK_OPTIMIZER_BEAM_WIDTH = 1200
 WEEKLY_REPEATS_FALLBACK_NOTE = (
     "Из-за узких ограничений я повторил несколько блюд, "
     "чтобы сохранить рацион полноценным и не нарушать ваши исключения."
@@ -3830,6 +3852,50 @@ def _weekly_no_recent_repeat_fallback_reason(
     return None
 
 
+def _weekly_repeat_fallback_search_limits(
+    profile: UserProfile,
+    *,
+    safety=None,
+) -> _WeeklyRepeatFallbackSearchLimits:
+    safety = safety or evaluate_safety(profile)
+    hard_exclusions = {
+        str(restriction.value).strip().lower()
+        for restriction in profile.restrictions
+        if restriction.type == RestrictionType.EXCLUDED_FOOD
+    }
+    excluded_names = {str(name).strip().lower() for name in safety.excluded_food_names}
+    exclusions = hard_exclusions | excluded_names
+    has_dairy_meat_fish = {"dairy", "meat", "fish"} <= exclusions
+    has_meat_fish = {"meat", "fish"} <= exclusions
+
+    if has_dairy_meat_fish:
+        return _WeeklyRepeatFallbackSearchLimits(
+            day_pool_size=WEEKLY_REPEATS_FALLBACK_C01_DAY_POOL_SIZE,
+            builder_day_pool_size=WEEKLY_REPEATS_FALLBACK_C01_DAY_POOL_SIZE,
+            builder_attempts=WEEKLY_REPEATS_FALLBACK_C01_BUILDER_ATTEMPTS,
+            fast_slot_options=WEEKLY_REPEATS_FALLBACK_C01_FAST_SLOT_OPTIONS,
+            fast_combo_limit=WEEKLY_REPEATS_FALLBACK_C01_FAST_COMBO_LIMIT,
+            candidate_recipe_repeat_cap=3,
+        )
+    if has_meat_fish:
+        return _WeeklyRepeatFallbackSearchLimits(
+            day_pool_size=WEEKLY_REPEATS_FALLBACK_C05_DAY_POOL_SIZE,
+            builder_day_pool_size=12,
+            builder_attempts=WEEKLY_REPEATS_FALLBACK_C05_BUILDER_ATTEMPTS,
+            fast_slot_options=WEEKLY_REPEATS_FALLBACK_C05_FAST_SLOT_OPTIONS,
+            fast_combo_limit=WEEKLY_REPEATS_FALLBACK_C05_FAST_COMBO_LIMIT,
+            candidate_recipe_repeat_cap=3,
+        )
+    return _WeeklyRepeatFallbackSearchLimits(
+        day_pool_size=WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE,
+        builder_day_pool_size=WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE,
+        builder_attempts=WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS,
+        fast_slot_options=WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS,
+        fast_combo_limit=WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT,
+        candidate_recipe_repeat_cap=WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP,
+    )
+
+
 def _build_week_plans_with_repeats_fallback(
     profile: UserProfile,
     seed: int,
@@ -3858,11 +3924,13 @@ def _build_week_plans_with_repeats_fallback(
             failure_reason="no_safe_foods",
         )
 
+    search_limits = _weekly_repeat_fallback_search_limits(profile, safety=safety)
     day_pool, day_pool_failure_reason = _build_weekly_repeat_fallback_day_pool(
         profile,
         seed,
         recipe_cache=recipe_cache,
         selection_guard=selection_guard,
+        search_limits=search_limits,
     )
     if selection_guard is not None:
         selection_guard.check(stage="after_repeats_fallback_day_pool")
@@ -3874,10 +3942,11 @@ def _build_week_plans_with_repeats_fallback(
             failure_reason=day_pool_failure_reason or "repeats_fallback_no_valid_day_pool",
         )
 
-    scheduled_plans = _schedule_weekly_repeat_fallback_pool(
+    scheduled_plans = _optimize_weekly_repeat_fallback_schedule(
         day_pool,
         profile,
         selection_guard=selection_guard,
+        search_limits=search_limits,
     )
     if selection_guard is not None:
         selection_guard.check(stage="after_repeats_fallback_schedule")
@@ -3904,8 +3973,10 @@ def _build_weekly_repeat_fallback_day_pool(
     *,
     recipe_cache: _RecipePlanCache,
     selection_guard: _WeeklySelectionGuard | None = None,
+    search_limits: _WeeklyRepeatFallbackSearchLimits | None = None,
 ) -> tuple[tuple[MealPlan, ...], str | None]:
     safety = evaluate_safety(profile)
+    search_limits = search_limits or _weekly_repeat_fallback_search_limits(profile, safety=safety)
     hard_exclusion_count = sum(
         1
         for restriction in profile.restrictions
@@ -3933,6 +4004,7 @@ def _build_weekly_repeat_fallback_day_pool(
             seed,
             recipe_cache=recipe_cache,
             selection_guard=selection_guard,
+            search_limits=search_limits,
         )
         if selection_guard is not None:
             selection_guard.check(stage=f"after_{build_pool.__name__}")
@@ -3948,17 +4020,19 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
     *,
     recipe_cache: _RecipePlanCache,
     selection_guard: _WeeklySelectionGuard | None = None,
+    search_limits: _WeeklyRepeatFallbackSearchLimits | None = None,
 ) -> tuple[tuple[MealPlan, ...], str | None]:
     candidate_plans: list[MealPlan] = []
     seen_signatures: set[tuple[str, ...]] = set()
     generated_by_offset: dict[int, MealPlan] = {}
+    search_limits = search_limits or _weekly_repeat_fallback_search_limits(profile)
     builder_pool_size = min(
-        WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE,
-        WEEKLY_REPEATS_FALLBACK_BUILDER_DAY_POOL_SIZE,
+        search_limits.day_pool_size,
+        search_limits.builder_day_pool_size,
     )
 
-    for offset in range(WEEKLY_REPEATS_FALLBACK_BUILDER_ATTEMPTS):
-        if len(plans) >= builder_pool_size:
+    for offset in range(search_limits.builder_attempts):
+        if len(candidate_plans) >= builder_pool_size:
             break
 
         if selection_guard is not None:
@@ -3988,9 +4062,9 @@ def _build_weekly_repeat_fallback_day_pool_from_builder(
             continue
 
         seen_signatures.add(signature)
-        plans.append(plan)
+        candidate_plans.append(plan)
 
-    return tuple(plans), None
+    return tuple(candidate_plans), None
 
 
 def _build_weekly_repeat_fallback_day_pool_from_slots(
@@ -3999,12 +4073,14 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
     *,
     recipe_cache: _RecipePlanCache,
     selection_guard: _WeeklySelectionGuard | None = None,
+    search_limits: _WeeklyRepeatFallbackSearchLimits | None = None,
 ) -> tuple[tuple[MealPlan, ...], str | None]:
     if selection_guard is not None:
         selection_guard.check(stage="before_repeats_fallback_slots_context")
     context, _context_failure_reason = _weekly_repeat_fallback_context(profile, recipe_cache)
     if context is None:
         return (), None
+    search_limits = search_limits or _weekly_repeat_fallback_search_limits(profile, safety=context.safety)
 
     target = context.targets.targets
     total_energy = target.get("energy_kcal")
@@ -4020,6 +4096,7 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
             Counter(),
             frozenset(),
             selection_guard=selection_guard,
+            option_limit=search_limits.fast_slot_options,
         )
         for meal_index, energy_slot in enumerate(slots)
     )
@@ -4028,6 +4105,7 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
 
     candidate_plans: list[MealPlan] = []
     seen_signatures: set[tuple[str, ...]] = set()
+    candidate_recipe_counts: Counter[str] = Counter()
 
     ranked_result = _weekly_repeat_fallback_ranked_combinations_with_diagnostics(
         slot_options,
@@ -4036,17 +4114,23 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
         Counter(),
         frozenset(),
         selection_guard=selection_guard,
+        combination_limit=search_limits.fast_combo_limit,
     )
     ranked_combinations = ranked_result.combinations
     for offset, recipes_for_day in enumerate(
-        ranked_combinations[:WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT]
+        ranked_combinations[:search_limits.fast_combo_limit]
     ):
-        if len(candidate_plans) >= WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE * 3:
+        if len(candidate_plans) >= search_limits.day_pool_size * 3:
             break
         if selection_guard is not None:
             selection_guard.check(stage="repeats_fallback_fast_combo", candidate_index=offset)
         signature = tuple(recipe.id for recipe in recipes_for_day)
         if signature in seen_signatures:
+            continue
+        if any(
+            candidate_recipe_counts[recipe_id] >= search_limits.candidate_recipe_repeat_cap
+            for recipe_id in signature
+        ):
             continue
 
         meals = _weekly_repeat_fallback_build_combo_meals(
@@ -4073,6 +4157,7 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
             continue
         seen_signatures.add(signature)
         candidate_plans.append(plan)
+        candidate_recipe_counts.update(signature)
 
     failure_reason = None
     if (
@@ -4082,25 +4167,28 @@ def _build_weekly_repeat_fallback_day_pool_from_slots(
     ):
         failure_reason = "repeats_fallback_no_sodium_valid_combo"
 
-    plans = _select_weekly_repeat_fallback_day_pool(candidate_plans, profile)
+    plans = _select_weekly_repeat_fallback_day_pool(candidate_plans, profile, search_limits=search_limits)
     return plans, failure_reason
 
 
 def _select_weekly_repeat_fallback_day_pool(
     candidate_plans: Sequence[MealPlan],
     profile: UserProfile,
+    *,
+    search_limits: _WeeklyRepeatFallbackSearchLimits | None = None,
 ) -> tuple[MealPlan, ...]:
     remaining = list(candidate_plans)
     selected: list[MealPlan] = []
     recipe_counts: Counter[str] = Counter()
     previous_day_recipe_ids: frozenset[str] = frozenset()
+    search_limits = search_limits or _weekly_repeat_fallback_search_limits(profile)
 
-    while remaining and len(selected) < WEEKLY_REPEATS_FALLBACK_DAY_POOL_SIZE:
+    while remaining and len(selected) < search_limits.day_pool_size:
         candidates = [
             (index, plan)
             for index, plan in enumerate(remaining)
             if all(
-                recipe_counts[recipe_id] < WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
+                recipe_counts[recipe_id] < search_limits.candidate_recipe_repeat_cap
                 for recipe_id in _plan_recipe_ids(plan)
             )
         ]
@@ -4175,8 +4263,10 @@ def _weekly_repeat_fallback_fast_slot_options(
     week_recipe_counts: Counter[str],
     previous_day_recipe_ids: frozenset[str],
     selection_guard: _WeeklySelectionGuard | None = None,
+    option_limit: int | None = None,
 ) -> tuple[_WeeklyRepeatFallbackFastOption, ...]:
     del meal_index
+    limit = max(1, int(option_limit or WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS))
     options: list[tuple[tuple[float, float, float, float, str], _WeeklyRepeatFallbackFastOption]] = []
     empty_used_grams: defaultdict[str, float] = defaultdict(float)
     empty_total = NutrientVector()
@@ -4242,7 +4332,7 @@ def _weekly_repeat_fallback_fast_slot_options(
     return tuple(
         option
         for _, option in sorted(options, key=lambda item: item[0], reverse=True)[
-            :WEEKLY_REPEATS_FALLBACK_FAST_SLOT_OPTIONS
+            :limit
         ]
     )
 
@@ -4254,6 +4344,7 @@ def _weekly_repeat_fallback_ranked_combinations(
     week_recipe_counts: Counter[str],
     previous_day_recipe_ids: frozenset[str],
     selection_guard: _WeeklySelectionGuard | None = None,
+    combination_limit: int | None = None,
 ) -> tuple[tuple[RecipeTemplate, ...], ...]:
     return _weekly_repeat_fallback_ranked_combinations_with_diagnostics(
         slot_options,
@@ -4262,6 +4353,7 @@ def _weekly_repeat_fallback_ranked_combinations(
         week_recipe_counts,
         previous_day_recipe_ids,
         selection_guard=selection_guard,
+        combination_limit=combination_limit,
     ).combinations
 
 
@@ -4272,10 +4364,13 @@ def _weekly_repeat_fallback_ranked_combinations_with_diagnostics(
     week_recipe_counts: Counter[str],
     previous_day_recipe_ids: frozenset[str],
     selection_guard: _WeeklySelectionGuard | None = None,
+    combination_limit: int | None = None,
 ) -> _WeeklyRepeatFallbackRankedCombinationResult:
+    limit = max(1, int(combination_limit or WEEKLY_REPEATS_FALLBACK_FAST_COMBO_LIMIT))
     ranked: list[
         tuple[
             tuple[float, float, float, float, float, float, float, tuple[str, ...]],
+            int,
             tuple[RecipeTemplate, ...],
         ]
     ] = []
@@ -4318,11 +4413,16 @@ def _weekly_repeat_fallback_ranked_combinations_with_diagnostics(
             -float(repeat_pressure),
             recipe_ids,
         )
-        ranked.append((score, tuple(option.recipe for option in combination)))
+        recipes = tuple(option.recipe for option in combination)
+        ranked_item = (score, combination_index, recipes)
+        if len(ranked) < limit:
+            heapq.heappush(ranked, ranked_item)
+        elif ranked_item > ranked[0]:
+            heapq.heapreplace(ranked, ranked_item)
     return _WeeklyRepeatFallbackRankedCombinationResult(
         combinations=tuple(
             recipes
-            for _, recipes in sorted(ranked, key=lambda item: item[0], reverse=True)
+            for _, _, recipes in sorted(ranked, key=lambda item: (item[0], item[1]), reverse=True)
         ),
         has_sodium_valid_combo=has_sodium_valid_combo,
     )
@@ -4557,54 +4657,222 @@ def _weekly_repeated_recipe_count(plans: Sequence[MealPlan]) -> int:
     return sum(count - 1 for count in counts.values() if count > 1)
 
 
+def _weekly_max_recipe_repeat(plans: Sequence[MealPlan]) -> int:
+    counts: Counter[str] = Counter(
+        recipe_id
+        for plan in plans
+        for recipe_id in _plan_recipe_ids(plan)
+    )
+    return max(counts.values()) if counts else 0
+
+
+def _weekly_adjacent_recipe_overlap(plans: Sequence[MealPlan]) -> int:
+    overlap = 0
+    previous_recipe_ids: frozenset[str] = frozenset()
+    for plan in plans:
+        recipe_ids = frozenset(_plan_recipe_ids(plan))
+        overlap += len(recipe_ids & previous_recipe_ids)
+        previous_recipe_ids = recipe_ids
+    return overlap
+
+
+def _weekly_repeat_fallback_day_is_hard_valid(plan: MealPlan, profile: UserProfile) -> bool:
+    if not _week_day_plan_is_complete(plan, profile):
+        return False
+    target = plan.targets.targets
+    return _passes_hard_nutrition_gates(
+        list(plan.meals),
+        target,
+        enforce_sodium=_should_manage_sodium(target),
+    )
+
+
+def _optimize_weekly_repeat_fallback_schedule(
+    day_pool: tuple[MealPlan, ...],
+    profile: UserProfile,
+    *,
+    selection_guard: _WeeklySelectionGuard | None = None,
+    search_limits: _WeeklyRepeatFallbackSearchLimits | None = None,
+) -> tuple[MealPlan, ...]:
+    if not day_pool:
+        return ()
+    search_limits = search_limits or _weekly_repeat_fallback_search_limits(profile)
+    valid_day_pool = tuple(
+        plan
+        for plan in day_pool
+        if _weekly_repeat_fallback_day_is_hard_valid(plan, profile)
+    )
+    if not valid_day_pool:
+        return ()
+
+    for repeat_cap in search_limits.repeat_cap_order:
+        for avoid_adjacent in (True, False):
+            scheduled = _search_weekly_repeat_fallback_schedule_for_cap(
+                valid_day_pool,
+                profile,
+                repeat_cap=repeat_cap,
+                avoid_adjacent=avoid_adjacent,
+                beam_width=search_limits.schedule_beam_width,
+                selection_guard=selection_guard,
+            )
+            if scheduled:
+                return scheduled
+    return ()
+
+
+def _search_weekly_repeat_fallback_schedule_for_cap(
+    day_pool: tuple[MealPlan, ...],
+    profile: UserProfile,
+    *,
+    repeat_cap: int,
+    avoid_adjacent: bool,
+    beam_width: int,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> tuple[MealPlan, ...]:
+    recipe_ids_by_index = tuple(frozenset(_plan_recipe_ids(plan)) for plan in day_pool)
+    if len(day_pool) * repeat_cap < WEEK_PLAN_DAYS:
+        return ()
+    unique_recipe_capacity = len(set().union(*recipe_ids_by_index)) * repeat_cap
+    required_recipe_selections = WEEK_PLAN_DAYS * min(
+        (len(recipe_ids) for recipe_ids in recipe_ids_by_index),
+        default=0,
+    )
+    if unique_recipe_capacity < required_recipe_selections:
+        return ()
+
+    completed: list[tuple[int, ...]] = []
+    dead_states: set[tuple[int, int, tuple[tuple[str, int], ...]]] = set()
+    visited_states = 0
+    max_visited_states = max(4000, int(beam_width) * 24)
+    max_completed_schedules = 64
+
+    def search(
+        day_index: int,
+        selected_indices: tuple[int, ...],
+        recipe_counts: Counter[str],
+        previous_index: int,
+        previous_day_recipe_ids: frozenset[str],
+    ) -> bool:
+        nonlocal visited_states
+        visited_states += 1
+        if visited_states > max_visited_states:
+            return False
+        if selection_guard is not None and visited_states % 256 == 0:
+            selection_guard.check(
+                stage="repeats_fallback_optimize_day",
+                day_index=day_index,
+                candidate_index=repeat_cap,
+            )
+
+        state_key = (
+            day_index,
+            previous_index,
+            tuple(sorted((recipe_id, count) for recipe_id, count in recipe_counts.items() if count)),
+        )
+        if state_key in dead_states:
+            return False
+        if day_index == WEEK_PLAN_DAYS:
+            completed.append(selected_indices)
+            return len(completed) >= max_completed_schedules
+
+        candidates: list[tuple[tuple[float, ...], int, frozenset[str]]] = []
+        for pool_index, plan in enumerate(day_pool):
+            recipe_ids = recipe_ids_by_index[pool_index]
+            if avoid_adjacent and recipe_ids & previous_day_recipe_ids:
+                continue
+            if any(recipe_counts[recipe_id] >= repeat_cap for recipe_id in recipe_ids):
+                continue
+            score = _weekly_repeat_fallback_pool_score(
+                plan,
+                recipe_counts,
+                previous_day_recipe_ids,
+                profile,
+                pool_index=pool_index,
+            )
+            candidates.append((score, pool_index, recipe_ids))
+
+        for _score, pool_index, recipe_ids in sorted(
+            candidates,
+            key=lambda item: (item[0], -item[1]),
+            reverse=True,
+        ):
+            next_counts = recipe_counts.copy()
+            next_counts.update(recipe_ids)
+            if search(
+                day_index + 1,
+                (*selected_indices, pool_index),
+                next_counts,
+                pool_index,
+                recipe_ids,
+            ):
+                return True
+
+        dead_states.add(state_key)
+        return False
+
+    search(0, (), Counter(), -1, frozenset())
+    if not completed:
+        return ()
+
+    best_indices = max(
+        completed,
+        key=lambda indices: _weekly_repeat_fallback_schedule_score(
+            tuple(day_pool[index] for index in indices),
+            profile,
+            pool_indices=indices,
+        ),
+    )
+    for selected_indices in (best_indices,):
+        scheduled = tuple(day_pool[index] for index in selected_indices)
+        if _week_plans_are_complete(scheduled, profile):
+            return scheduled
+    return ()
+
+
+def _weekly_repeat_fallback_schedule_score(
+    plans: tuple[MealPlan, ...],
+    profile: UserProfile,
+    *,
+    pool_indices: tuple[int, ...],
+) -> tuple[float, ...]:
+    recipe_counts: Counter[str] = Counter()
+    previous_day_recipe_ids: frozenset[str] = frozenset()
+    normal_score = [0.0] * 8
+    for pool_index, plan in zip(pool_indices, plans):
+        score = _weekly_repeat_fallback_pool_score(
+            plan,
+            recipe_counts,
+            previous_day_recipe_ids,
+            profile,
+            pool_index=pool_index,
+        )
+        for index, value in enumerate(score):
+            normal_score[index] += float(value)
+        recipe_ids = frozenset(_plan_recipe_ids(plan))
+        recipe_counts.update(recipe_ids)
+        previous_day_recipe_ids = recipe_ids
+
+    return (
+        float(len(plans)),
+        -float(_weekly_max_recipe_repeat(plans)),
+        -float(_weekly_adjacent_recipe_overlap(plans)),
+        -float(_weekly_repeated_recipe_count(plans)),
+        *normal_score,
+        -float(sum(pool_indices)),
+    )
+
+
 def _schedule_weekly_repeat_fallback_pool(
     day_pool: tuple[MealPlan, ...],
     profile: UserProfile,
     *,
     selection_guard: _WeeklySelectionGuard | None = None,
 ) -> tuple[MealPlan, ...]:
-    if not day_pool:
-        return ()
-
-    scheduled: list[MealPlan] = []
-    recipe_counts: Counter[str] = Counter()
-    previous_day_recipe_ids: frozenset[str] = frozenset()
-
-    for day_index in range(WEEK_PLAN_DAYS):
-        if selection_guard is not None:
-            selection_guard.check(stage="repeats_fallback_schedule_day", day_index=day_index)
-        candidates = list(day_pool)
-        non_adjacent_candidates = [
-            plan
-            for plan in candidates
-            if not (set(_plan_recipe_ids(plan)) & previous_day_recipe_ids)
-        ]
-        if non_adjacent_candidates:
-            candidates = non_adjacent_candidates
-        capped_candidates = [
-            plan
-            for plan in candidates
-            if all(
-                recipe_counts[recipe_id] < WEEKLY_REPEATS_FALLBACK_RECIPE_REPEAT_CAP
-                for recipe_id in _plan_recipe_ids(plan)
-            )
-        ]
-        if capped_candidates:
-            candidates = capped_candidates
-        selected = max(
-            enumerate(candidates),
-            key=lambda item: _weekly_repeat_fallback_pool_score(
-                item[1],
-                recipe_counts,
-                previous_day_recipe_ids,
-                profile,
-                pool_index=item[0],
-            ),
-        )[1]
-        scheduled.append(selected)
-        previous_day_recipe_ids = frozenset(_plan_recipe_ids(selected))
-        recipe_counts.update(previous_day_recipe_ids)
-    return tuple(scheduled)
+    return _optimize_weekly_repeat_fallback_schedule(
+        day_pool,
+        profile,
+        selection_guard=selection_guard,
+    )
 
 
 def _weekly_repeat_fallback_pool_score(

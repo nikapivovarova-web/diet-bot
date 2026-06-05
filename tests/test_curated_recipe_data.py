@@ -13,9 +13,59 @@ from diet_bot.recipe_catalog import built_in_recipes
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 LEGACY_CURATED_RECIPE_COUNT = 400
 DOCX_RECIPE_COUNT = 55
-TOTAL_CURATED_RECIPE_COUNT = LEGACY_CURATED_RECIPE_COUNT + DOCX_RECIPE_COUNT
+RESTORED_R401_R610_RECIPE_COUNT = 178
+RESTORED_R666_R710_RECIPE_COUNT = 41
+TOTAL_CURATED_RECIPE_COUNT = (
+    LEGACY_CURATED_RECIPE_COUNT
+    + DOCX_RECIPE_COUNT
+    + RESTORED_R401_R610_RECIPE_COUNT
+    + RESTORED_R666_R710_RECIPE_COUNT
+)
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
+EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset(
+    {
+        416,
+        418,
+        424,
+        425,
+        426,
+        427,
+        428,
+        429,
+        435,
+        448,
+        454,
+        471,
+        480,
+        484,
+        493,
+        495,
+        496,
+        502,
+        527,
+        548,
+        552,
+        562,
+        572,
+        585,
+        587,
+        588,
+        589,
+        590,
+        591,
+        592,
+        593,
+        594,
+        684,
+        685,
+        691,
+        692,
+    }
+)
+RESTORED_R401_R610_RECIPE_NOS = frozenset(range(401, 611)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
+RESTORED_R666_R710_RECIPE_NOS = frozenset(range(666, 711)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
+RESTORED_RECIPE_NOS = RESTORED_R401_R610_RECIPE_NOS | RESTORED_R666_R710_RECIPE_NOS
 
 
 def test_curated_recipe_data_has_full_calculation_coverage() -> None:
@@ -76,6 +126,22 @@ def test_curated_recipe_data_has_local_photos() -> None:
         if not (DATA_DIR / recipe["image_url"]).exists()
     ]
     assert missing == []
+
+
+def test_restored_recipe_batches_have_expected_rows_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    recipes_by_no = {int(recipe["recipe_no"]): recipe for recipe in recipes}
+
+    assert len(RESTORED_R401_R610_RECIPE_NOS) == RESTORED_R401_R610_RECIPE_COUNT
+    assert len(RESTORED_R666_R710_RECIPE_NOS) == RESTORED_R666_R710_RECIPE_COUNT
+    assert set(recipes_by_no) & EXCLUDED_MISSING_FOOD_RECIPE_NOS == set()
+    assert RESTORED_R401_R610_RECIPE_NOS <= set(recipes_by_no)
+    assert RESTORED_R666_R710_RECIPE_NOS <= set(recipes_by_no)
+    assert all(
+        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.jpg"
+        for recipe_no in RESTORED_RECIPE_NOS
+    )
+    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.jpg").exists() for recipe_no in RESTORED_RECIPE_NOS)
 
 
 def test_curated_recipe_instructions_use_regular_salt_wording() -> None:
@@ -141,7 +207,9 @@ def test_docx_recipe_batch_r611_r665_has_required_rows_and_photos() -> None:
 
     assert len(docx_rows) == DOCX_RECIPE_COUNT
     assert {int(row["recipe_no"]) for row in docx_rows} == DOCX_RECIPE_NOS
-    assert {row["recipe_no"] for row in recipes if 401 <= int(row["recipe_no"]) <= 610} == set()
+    assert {int(row["recipe_no"]) for row in recipes if 401 <= int(row["recipe_no"]) <= 610} == (
+        RESTORED_R401_R610_RECIPE_NOS
+    )
     assert all(str(row["recipe_key"]).startswith(DOCX_RECIPE_KEY_PREFIX) for row in docx_rows)
     assert all(row["recipe_id"] in nutrition_ids for row in docx_rows)
     assert all(ingredient_counts[row["recipe_id"]] >= 4 for row in docx_rows)

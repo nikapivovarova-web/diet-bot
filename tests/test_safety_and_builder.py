@@ -13,11 +13,16 @@ from diet_bot.domain import (
     ActivityLevel,
     ConditionCode,
     CookingTimePreference,
+    Food,
+    FoodPortion,
     Goal,
+    Meal,
+    MealPlan,
     NutritionTargets,
     NutrientVector,
     Restriction,
     RestrictionType,
+    SafetyResult,
     Sex,
     UserProfile,
 )
@@ -90,6 +95,11 @@ def _weekly_repeat_count(plans) -> int:
     )
 
 
+def _weekly_max_repeat(plans) -> int:
+    counts = Counter(_weekly_recipe_ids(plans))
+    return max(counts.values()) if counts else 0
+
+
 def _assert_no_excluded_foods_in_week(plans, profile: UserProfile) -> None:
     eligible_ids = {
         food.id
@@ -113,6 +123,52 @@ def _test_recipe_template(recipe_id: str) -> RecipeTemplate:
         ingredients_g={},
         instructions="cook",
     )
+
+
+def _synthetic_repeat_plan(recipe_ids: tuple[str, str, str]) -> MealPlan:
+    targets = NutritionTargets(
+        bmi=24.0,
+        bmi_category="normal",
+        bmr_kcal=1500.0,
+        tdee_kcal=2000.0,
+        water_l=2.0,
+        targets=NutrientVector(
+            {
+                "energy_kcal": 1800.0,
+                "protein_g": 90.0,
+                "sodium_mg": 2300.0,
+            }
+        ),
+        calorie_bounds=(1600.0, 2000.0),
+        macro_bounds={"protein_g": (72.0, 140.0)},
+    )
+    safety = SafetyResult(can_generate_plan=True)
+    meals: list[Meal] = []
+    for meal_index, recipe_id in enumerate(recipe_ids):
+        food = Food(
+            id=f"food_{recipe_id}",
+            name=f"food {recipe_id}",
+            category="test",
+            nutrients_per_100g=NutrientVector(
+                {
+                    "energy_kcal": 600.0,
+                    "protein_g": 30.0,
+                    "sodium_mg": 100.0,
+                }
+            ),
+            max_per_meal_g=200.0,
+            max_per_day_g=400.0,
+        )
+        meals.append(
+            Meal(
+                name=f"meal {meal_index}",
+                portions=(FoodPortion(food=food, grams=100.0),),
+                recipe="cook",
+                recipe_id=recipe_id,
+                recipe_key=recipe_id,
+            )
+        )
+    return MealPlan(meals=tuple(meals), targets=targets, safety=safety)
 
 
 def assert_meal_energy_distribution(plan) -> None:
@@ -263,6 +319,25 @@ def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_ti
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
     assert all(plan.totals.get("sodium_mg") <= 2300.01 for plan in result.plans)
+    assert _weekly_max_repeat(result.plans) <= 3
+
+
+def test_c05_weekly_no_meat_fish_seed_607_keeps_max_repeat_under_three() -> None:
+    profile = constrained_weekly_profile("meat", "fish")
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        607,
+        _empty_recent_avoidance(),
+    )
+
+    assert len(result.plans) == 7
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.repeat_fallback_used is True
+    _assert_no_excluded_foods_in_week(result.plans, profile)
+    assert all(validate_plan(plan).ok for plan in result.plans)
+    assert all(plan.totals.get("sodium_mg") <= 2300.01 for plan in result.plans)
+    assert _weekly_max_repeat(result.plans) <= 3
 
 
 def test_c00_public_weekly_seed_607_stays_sodium_valid() -> None:
@@ -385,6 +460,24 @@ def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) 
     assert 0 < _weekly_repeat_count(result.plans) <= 20
     assert max(recipe_counts.values()) <= telegram_app.WEEK_PLAN_DAYS
     assert len(recipe_counts) >= 8
+
+
+def test_weekly_repeat_optimizer_uses_cap_three_when_it_is_feasible() -> None:
+    profile = profile_with(meal_count=3)
+    day_pool = (
+        _synthetic_repeat_plan(("a1", "a2", "a3")),
+        _synthetic_repeat_plan(("b1", "b2", "b3")),
+        _synthetic_repeat_plan(("c1", "c2", "c3")),
+    )
+
+    scheduled = telegram_app._optimize_weekly_repeat_fallback_schedule(
+        day_pool,
+        profile,
+    )
+
+    assert len(scheduled) == 7
+    assert all(validate_plan(plan).ok for plan in scheduled)
+    assert _weekly_max_repeat(scheduled) <= 3
 
 
 def test_weekly_baseline_and_single_exclusions_stay_low_repeat(monkeypatch) -> None:
