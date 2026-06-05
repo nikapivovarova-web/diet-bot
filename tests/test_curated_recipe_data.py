@@ -4,6 +4,7 @@ from pathlib import Path
 
 from diet_bot.builder import _add_missing_garnishes
 from diet_bot.builder import build_one_day_plan
+from diet_bot.builder import _resolve_recipe_ingredients
 from diet_bot.curated_data import _cis_friendly_ingredient, _looks_incomplete_instruction, curated_foods, curated_recipes
 from diet_bot.domain import ActivityLevel, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, NutrientVector
@@ -13,41 +14,34 @@ from diet_bot.recipe_catalog import built_in_recipes
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 LEGACY_CURATED_RECIPE_COUNT = 400
 DOCX_RECIPE_COUNT = 55
-RESTORED_R401_R610_RECIPE_COUNT = 178
-RESTORED_R666_R710_RECIPE_COUNT = 41
+RESTORED_R401_R610_RECIPE_COUNT = 189
+RESTORED_R666_R710_RECIPE_COUNT = 43
+LOW_RISK_MISSING_FOOD_RECIPE_NOS = frozenset(
+    {418, 429, 435, 471, 480, 484, 493, 495, 527, 562, 572, 684, 685}
+)
 TOTAL_CURATED_RECIPE_COUNT = (
     LEGACY_CURATED_RECIPE_COUNT
     + DOCX_RECIPE_COUNT
     + RESTORED_R401_R610_RECIPE_COUNT
     + RESTORED_R666_R710_RECIPE_COUNT
 )
+SELECTABLE_CURATED_RECIPE_COUNT = 675
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
 EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset(
     {
         416,
-        418,
         424,
         425,
         426,
         427,
         428,
-        429,
-        435,
         448,
         454,
-        471,
-        480,
-        484,
-        493,
-        495,
         496,
         502,
-        527,
         548,
         552,
-        562,
-        572,
         585,
         587,
         588,
@@ -57,8 +51,6 @@ EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset(
         592,
         593,
         594,
-        684,
-        685,
         691,
         692,
     }
@@ -142,6 +134,42 @@ def test_restored_recipe_batches_have_expected_rows_and_photos() -> None:
         for recipe_no in RESTORED_RECIPE_NOS
     )
     assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.jpg").exists() for recipe_no in RESTORED_RECIPE_NOS)
+
+
+def test_low_risk_missing_food_recipes_are_restored_with_resolved_foods_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    foods = {food.id for food in curated_foods()}
+    recipes_by_no = {int(recipe["recipe_no"]): recipe for recipe in recipes}
+    recipe_ids = {
+        recipes_by_no[recipe_no]["recipe_id"]
+        for recipe_no in LOW_RISK_MISSING_FOOD_RECIPE_NOS
+    }
+
+    assert LOW_RISK_MISSING_FOOD_RECIPE_NOS <= set(recipes_by_no)
+    assert all(
+        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.jpg"
+        for recipe_no in LOW_RISK_MISSING_FOOD_RECIPE_NOS
+    )
+    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.jpg").exists() for recipe_no in LOW_RISK_MISSING_FOOD_RECIPE_NOS)
+    assert {
+        _cis_friendly_ingredient(row)[0]
+        for row in ingredients
+        if row["recipe_id"] in recipe_ids
+    } <= foods
+
+
+def test_green_beans_unblocks_existing_r209_recipe() -> None:
+    food_by_id = {food.id: food for food in curated_foods()}
+    recipes = [recipe for recipe in built_in_recipes() if "curated" in recipe.tags]
+    selectable_recipe_ids = {
+        recipe.id
+        for recipe in recipes
+        if _resolve_recipe_ingredients(recipe, food_by_id) is not None
+    }
+
+    assert len(selectable_recipe_ids) == SELECTABLE_CURATED_RECIPE_COUNT
+    assert "r209_kinoa_gado_gado_s_ovoschami_i_ostrym_arahisovym_sousom" in selectable_recipe_ids
 
 
 def test_curated_recipe_instructions_use_regular_salt_wording() -> None:
