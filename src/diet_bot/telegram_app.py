@@ -3853,6 +3853,7 @@ def _weekly_no_recent_repeat_fallback_reason(
         if (
             count.slot == "main"
             and _weekly_profile_excludes_meat_and_fish(profile, safety)
+            and not _weekly_profile_is_c05_no_meat_no_fish(profile, safety)
             and count.weekly_required > 0
             and available
             <= math.ceil(
@@ -5009,6 +5010,24 @@ def _build_week_plans_with_recent_fallback(
         )
         return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
 
+    def repeats_fallback_result(failure_reason: str) -> _WeekPlanBuildResult:
+        _weekly_selection_diag(
+            "repeats_fallback_start",
+            phase="repeats_fallback",
+            seed=seed,
+            reason=failure_reason,
+        )
+        try:
+            return _build_week_plans_with_repeats_fallback(
+                profile,
+                seed,
+                recipe_cache=recipe_cache,
+                failure_reason=failure_reason,
+                selection_guard=guard,
+            )
+        except _WeeklySelectionTimeout as exc:
+            return timeout_result(exc)
+
     if _recent_avoidance_is_empty(recent_avoidance):
         try:
             guard.check(stage="before_repeat_fallback_precheck")
@@ -5027,22 +5046,7 @@ def _build_week_plans_with_recent_fallback(
                 failure_reason=repeat_fallback_reason,
             )
         if repeat_fallback_reason is not None:
-            _weekly_selection_diag(
-                "repeats_fallback_start",
-                phase="repeats_fallback",
-                seed=seed,
-                reason=repeat_fallback_reason,
-            )
-            try:
-                return _build_week_plans_with_repeats_fallback(
-                    profile,
-                    seed,
-                    recipe_cache=recipe_cache,
-                    failure_reason=repeat_fallback_reason,
-                    selection_guard=guard,
-                )
-            except _WeeklySelectionTimeout as exc:
-                return timeout_result(exc)
+            return repeats_fallback_result(repeat_fallback_reason)
 
     for phase, avoided_recipe_ids, avoided_recipe_keys in _weekly_recent_avoidance_phases(
         recent_avoidance
@@ -5131,7 +5135,11 @@ def _build_week_plans_with_recent_fallback(
     if timed_out or (
         total_timeout_s > 0 and time.perf_counter() - guard.total_started_at > total_timeout_s
     ):
+        if _recent_avoidance_is_empty(recent_avoidance):
+            return repeats_fallback_result("no_recent_timeout")
         return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+    if _recent_avoidance_is_empty(recent_avoidance):
+        return repeats_fallback_result("no_recent_incomplete")
     return _WeekPlanBuildResult(
         plans=(),
         avoidance_phase="failed",

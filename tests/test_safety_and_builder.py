@@ -322,8 +322,12 @@ def test_c01_weekly_no_dairy_meat_fish_seed_607_passes_sodium_with_production_ti
     assert _weekly_max_repeat(result.plans) <= 3
 
 
-def test_c05_weekly_no_meat_fish_seed_607_keeps_max_repeat_under_three() -> None:
+def test_c05_weekly_no_meat_fish_seed_607_uses_no_recent_when_pool_is_sufficient(
+    monkeypatch,
+) -> None:
     profile = constrained_weekly_profile("meat", "fish")
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 120.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 150.0, raising=False)
 
     result = telegram_app._build_week_plans_with_recent_fallback(
         profile,
@@ -332,15 +336,18 @@ def test_c05_weekly_no_meat_fish_seed_607_keeps_max_repeat_under_three() -> None
     )
 
     assert len(result.plans) == 7
-    assert result.avoidance_phase == "repeats_fallback"
-    assert result.repeat_fallback_used is True
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.avoidance_phase == "no_recent"
+    assert result.repeat_fallback_used is False
+    assert sum(len(plan.meals) for plan in result.plans) == 28
+    assert len(set(_weekly_recipe_ids(result.plans))) == 28
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
     assert all(plan.totals.get("sodium_mg") <= 2300.01 for plan in result.plans)
-    assert _weekly_max_repeat(result.plans) <= 3
+    assert _weekly_max_repeat(result.plans) <= 2
 
 
-def test_c05_no_recent_fallback_treats_near_threshold_main_pool_as_constrained(
+def test_c05_no_recent_fallback_allows_near_threshold_main_pool(
     monkeypatch,
 ) -> None:
     profile = constrained_weekly_profile("meat", "fish")
@@ -367,7 +374,37 @@ def test_c05_no_recent_fallback_treats_near_threshold_main_pool_as_constrained(
         recipe_cache=telegram_app._RecipePlanCache(),
     )
 
-    assert reason == "repeat_fallback_constrained_profile:meat_fish:main:44/14"
+    assert reason is None
+
+
+def test_c01_no_recent_fallback_still_treats_below_threshold_main_pool_as_constrained(
+    monkeypatch,
+) -> None:
+    profile = constrained_weekly_profile("dairy", "meat", "fish")
+
+    def feasible_near_threshold(*args, **kwargs):
+        return telegram_app._WeeklyPhaseFeasibility(
+            skipped=False,
+            reason="feasible",
+            slot_counts=(
+                telegram_app._WeeklyPhaseSlotFeasibility(
+                    slot="main",
+                    weekly_required=14,
+                    available_count=19,
+                    strict_simple_count=19,
+                    threshold=42,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(telegram_app, "_weekly_phase_feasibility", feasible_near_threshold)
+
+    reason = telegram_app._weekly_no_recent_repeat_fallback_reason(
+        profile,
+        recipe_cache=telegram_app._RecipePlanCache(),
+    )
+
+    assert reason == "repeat_fallback_slot_pool_below_threshold:main:19<42"
 
 
 def test_c00_public_weekly_seed_607_stays_sodium_valid() -> None:
@@ -447,7 +484,7 @@ def test_builder_keeps_sodium_management_disabled_without_sodium_target(
     assert captured_manage_sodium == [False]
 
 
-def test_weekly_no_meat_fish_no_longer_waits_for_no_recent_timeout(monkeypatch) -> None:
+def test_weekly_no_meat_fish_falls_back_after_no_recent_timeout(monkeypatch) -> None:
     profile = constrained_weekly_profile("meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 45.0, raising=False)
