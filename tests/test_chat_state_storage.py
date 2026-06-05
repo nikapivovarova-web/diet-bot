@@ -147,7 +147,17 @@ def test_telegram_profile_save_read_uses_json_chat_state_store(
     path = tmp_path / "history.json"
     chat_id = 9191
     profile = _profile()
+    for env_name in (
+        "DIET_BOT_ENV",
+        "DIET_BOT_STORAGE_BACKEND",
+        "DIET_BOT_DATABASE_URL",
+        "DIET_BOT_TEST_DATABASE_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "json")
     monkeypatch.setattr(telegram_app, "STATE_FILE", path)
+    monkeypatch.setattr(telegram_app, "_CHAT_STATE_STORE", None)
+    monkeypatch.setattr(telegram_app, "_CHAT_STATE_STORE_KEY", None)
 
     try:
         telegram_app._save_chat_profile(chat_id, profile)
