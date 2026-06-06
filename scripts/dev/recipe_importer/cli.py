@@ -9,6 +9,10 @@ from scripts.dev.recipe_importer.loader import load_photo_prep_317
 from scripts.dev.recipe_importer.mapping import load_alias_config, map_ingredients
 from scripts.dev.recipe_importer.nutrition import calculate_nutrition, load_curated_foods
 from scripts.dev.recipe_importer.photos import build_photo_manifest
+from scripts.dev.recipe_importer.production_rows import (
+    generate_production_rows,
+    write_apply_preview,
+)
 from scripts.dev.recipe_importer.servings import resolve_servings
 from scripts.dev.recipe_importer.writer import write_audit_outputs
 
@@ -34,6 +38,8 @@ def _build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--photos", required=True, type=Path)
     audit.add_argument("--out", required=True, type=Path)
     audit.add_argument("--data-dir", type=Path, default=Path("src/diet_bot/data"))
+    audit.add_argument("--recipe-no-start", type=int)
+    audit.add_argument("--recipe-key-prefix")
     audit.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -77,6 +83,23 @@ def _run_audit(args: argparse.Namespace) -> int:
         )
         for recipe in loaded.recipes
     ]
+    production_rows = None
+    if args.recipe_no_start is not None or args.recipe_key_prefix is not None:
+        if args.recipe_no_start is None or args.recipe_key_prefix is None:
+            raise ValueError("--recipe-no-start and --recipe-key-prefix must be provided together")
+        production_rows = generate_production_rows(
+            loaded,
+            photos,
+            classifications,
+            ingredient_results=ingredient_results,
+            servings_results=servings_results,
+            mapping_results=mapping_results,
+            nutrition_results=nutrition_results,
+            recipe_no_start=args.recipe_no_start,
+            recipe_key_prefix=args.recipe_key_prefix,
+        )
+        production_rows.write(args.out / "production_rows")
+        write_apply_preview(args.out / "apply_preview.md", production_rows)
     write_audit_outputs(
         args.out,
         loaded,
@@ -89,6 +112,7 @@ def _run_audit(args: argparse.Namespace) -> int:
         input_dir=args.input,
         photos_dir=args.photos,
         dry_run=args.dry_run,
+        production_rows=production_rows,
     )
     return 0
 
