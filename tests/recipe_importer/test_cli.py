@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.dev.recipe_importer.cli import main
 from tests.recipe_importer.test_loader import _write_minimal_xlsx
 
@@ -156,6 +158,8 @@ def test_cli_audit_writes_production_rows_only_under_out(tmp_path: Path) -> None
 
 
 def test_cli_audit_accepts_excel_400_workbook_input(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
+
     workbook_path = tmp_path / "recipes.xlsx"
     photos_dir = tmp_path / "photos"
     data_dir = tmp_path / "data"

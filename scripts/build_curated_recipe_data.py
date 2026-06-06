@@ -16,9 +16,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from openpyxl import load_workbook
-
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -858,6 +855,8 @@ def ingredient_state(raw_name: str, line: str, food_def: FoodDef | None) -> str:
 
 
 def load_recipes(workbook_path: Path) -> list[dict[str, Any]]:
+    from openpyxl import load_workbook
+
     wb = load_workbook(workbook_path, read_only=True, data_only=True)
     ws = wb["Рецепты"]
     rows = ws.iter_rows(min_row=5, max_row=404, min_col=1, max_col=9, values_only=True)
