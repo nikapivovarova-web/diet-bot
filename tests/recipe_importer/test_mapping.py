@@ -121,6 +121,50 @@ def test_reordered_specific_butter_alias_maps_to_butter_not_generic_oil() -> Non
     assert result.rows[0].food_id == "butter"
 
 
+def test_combined_black_pepper_and_oil_line_does_not_prefix_map_black_pepper() -> None:
+    aliases = {
+        "\u0447\u0435\u0440\u043d\u044b\u0439 \u043f\u0435\u0440\u0435\u0446": "black_pepper",
+        "\u0440\u0430\u0441\u0442\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0435 \u043c\u0430\u0441\u043b\u043e": "vegetable_oil",
+    }
+
+    result = map_ingredients(
+        "c001",
+        [
+            ParsedIngredient(
+                name="\u0447\u0451\u0440\u043d\u044b\u0439 \u043f\u0435\u0440\u0435\u0446 \u0420\u0430\u0441\u0442\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0435 \u043c\u0430\u0441\u043b\u043e",
+                amount=10,
+                unit="g",
+                raw="\u0447\u0451\u0440\u043d\u044b\u0439 \u043f\u0435\u0440\u0435\u0446 \u0420\u0430\u0441\u0442\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0435 \u043c\u0430\u0441\u043b\u043e 10 \u0433",
+            )
+        ],
+        aliases,
+    )
+
+    assert result.status == "blocked"
+    assert result.rows[0].food_id == ""
+    assert result.rows[0].blocker_reason == "unknown_ingredient_alias"
+
+
+def test_exact_black_pepper_alias_still_maps() -> None:
+    aliases = {"\u0447\u0435\u0440\u043d\u044b\u0439 \u043f\u0435\u0440\u0435\u0446": "black_pepper"}
+
+    result = map_ingredients(
+        "c001",
+        [
+            ParsedIngredient(
+                name="\u0447\u0451\u0440\u043d\u044b\u0439 \u043f\u0435\u0440\u0435\u0446",
+                amount=2,
+                unit="g",
+                raw="\u0447\u0451\u0440\u043d\u044b\u0439 \u043f\u0435\u0440\u0435\u0446 2 \u0433",
+            )
+        ],
+        aliases,
+    )
+
+    assert result.status == "mapped"
+    assert result.rows[0].food_id == "black_pepper"
+
+
 def test_generic_pepper_alias_does_not_prefix_map_specific_pepper() -> None:
     aliases = {"перец": "bell_pepper"}
 

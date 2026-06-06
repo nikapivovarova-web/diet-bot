@@ -132,7 +132,13 @@ def _lookup_reordered_alias(normalized: str, aliases: dict[str, str]) -> str:
 def _is_prefix_fallback_match(normalized: str, alias: str) -> bool:
     if alias in GENERIC_PREFIX_FALLBACK_ALIASES or normalized in GENERIC_PREFIX_FALLBACK_ALIASES:
         return False
-    return alias.startswith(normalized) or normalized.startswith(alias)
+    normalized_tokens = _alias_tokens(normalized)
+    alias_tokens = _alias_tokens(alias)
+    if len(normalized_tokens) == 1 and len(alias_tokens) == 1:
+        return alias.startswith(normalized) or normalized.startswith(alias)
+    if len(normalized_tokens) > 1 and len(alias_tokens) > 1:
+        return alias.startswith(f"{normalized} ")
+    return False
 
 
 def _alias_tokens(value: str) -> list[str]:
