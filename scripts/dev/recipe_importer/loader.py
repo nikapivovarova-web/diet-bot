@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
+
+
+SHEET_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+RECIPES_SHEET_NAME = "Рецепты"
+EXCEL_400_FIRST_DATA_ROW = 5
 
 
 @dataclass(frozen=True)
@@ -52,6 +62,68 @@ def load_photo_prep_317(input_dir: Path) -> LoadedInput:
         source_counts={
             "photo_ready": len(recipes),
             "duplicate_risk": len(duplicate_risks),
+        },
+    )
+
+
+def load_excel_400_workbook(workbook_path: Path) -> LoadedInput:
+    workbook_path = Path(workbook_path)
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"missing required input file: {workbook_path}")
+    if workbook_path.is_dir():
+        raise IsADirectoryError(f"expected .xlsx workbook file, got directory: {workbook_path}")
+
+    sheet_rows = _read_xlsx_sheet_rows(workbook_path, RECIPES_SHEET_NAME)
+    recipes: list[NormalizedRecipe] = []
+    non_empty_rows = 0
+    for row_index in sorted(sheet_rows):
+        if row_index < EXCEL_400_FIRST_DATA_ROW:
+            continue
+        row = sheet_rows[row_index]
+        recipe_no = _pick(row, "A")
+        title = _pick(row, "C")
+        if not recipe_no and not title:
+            continue
+        non_empty_rows += 1
+        if not recipe_no:
+            raise ValueError(f"workbook row {row_index} is missing recipe number")
+        if not title:
+            raise ValueError(f"workbook row {row_index} is missing recipe title")
+
+        recipes.append(
+            NormalizedRecipe(
+                candidate_id=_excel_candidate_id(recipe_no),
+                title_ru=title,
+                meal_type=_pick(row, "B"),
+                duplicate_risk="",
+                structured_ingredients="",
+                raw_ingredient_text=_pick(row, "F"),
+                servings=_normalize_excel_servings(_pick(row, "D")),
+                nutrition="",
+                instructions=_pick(row, "G"),
+                time=_pick(row, "E"),
+                source=_pick(row, "H"),
+                raw={
+                    "workbook_path": str(workbook_path),
+                    "workbook_row": str(row_index),
+                    "recipe_no": recipe_no,
+                    "category": _pick(row, "B"),
+                    "title": title,
+                    "portions": _pick(row, "D"),
+                    "time": _pick(row, "E"),
+                    "ingredients": _pick(row, "F"),
+                    "instructions": _pick(row, "G"),
+                    "source": _pick(row, "H"),
+                },
+            )
+        )
+
+    return LoadedInput(
+        recipes=recipes,
+        duplicate_risks={},
+        source_counts={
+            "excel_400_workbook": len(recipes),
+            "workbook_non_empty_rows": non_empty_rows,
         },
     )
 
@@ -120,3 +192,119 @@ def _pick(row: dict[str, str], *keys: str) -> str:
         if value:
             return value.strip()
     return ""
+
+
+def _read_xlsx_sheet_rows(workbook_path: Path, sheet_name: str) -> dict[int, dict[str, str]]:
+    with ZipFile(workbook_path) as archive:
+        shared_strings = _read_shared_strings(archive)
+        sheet_path = _sheet_path_for_name(archive, sheet_name)
+        root = ET.fromstring(archive.read(sheet_path))
+
+    rows: dict[int, dict[str, str]] = {}
+    ns = {"main": SHEET_MAIN_NS}
+    for cell in root.findall(".//main:sheetData/main:row/main:c", ns):
+        ref = cell.attrib.get("r", "")
+        column, row_index = _split_cell_reference(ref)
+        if not column or row_index <= 0:
+            continue
+        value = _cell_value(cell, shared_strings)
+        if value:
+            rows.setdefault(row_index, {})[column] = value
+    return rows
+
+
+def _read_shared_strings(archive: ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    ns = {"main": SHEET_MAIN_NS}
+    strings: list[str] = []
+    for item in root.findall("main:si", ns):
+        parts = [node.text or "" for node in item.findall(".//main:t", ns)]
+        strings.append("".join(parts))
+    return strings
+
+
+def _sheet_path_for_name(archive: ZipFile, sheet_name: str) -> str:
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    relationships = {
+        rel.attrib["Id"]: rel.attrib["Target"]
+        for rel in rels.findall(f"{{{REL_NS}}}Relationship")
+        if "Id" in rel.attrib and "Target" in rel.attrib
+    }
+
+    for sheet in workbook.findall(f".//{{{SHEET_MAIN_NS}}}sheet"):
+        if sheet.attrib.get("name") != sheet_name:
+            continue
+        rel_id = sheet.attrib.get(f"{{{OFFICE_REL_NS}}}id")
+        target = relationships.get(rel_id or "")
+        if not target:
+            break
+        return _normalize_xlsx_part("xl", target)
+    raise ValueError(f"workbook is missing sheet: {sheet_name}")
+
+
+def _normalize_xlsx_part(base_dir: str, target: str) -> str:
+    if target.startswith("/"):
+        return target.lstrip("/")
+    parts: list[str] = []
+    for piece in f"{base_dir}/{target}".split("/"):
+        if piece in {"", "."}:
+            continue
+        if piece == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(piece)
+    return "/".join(parts)
+
+
+def _cell_value(cell: ET.Element, shared_strings: list[str]) -> str:
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        parts = [node.text or "" for node in cell.findall(f".//{{{SHEET_MAIN_NS}}}t")]
+        return _cell_text("".join(parts))
+
+    value_node = cell.find(f"{{{SHEET_MAIN_NS}}}v")
+    if value_node is None or value_node.text is None:
+        return ""
+    value = value_node.text
+    if cell_type == "s":
+        try:
+            return _cell_text(shared_strings[int(value)])
+        except (IndexError, ValueError):
+            return ""
+    return _cell_text(value)
+
+
+def _cell_text(value: object) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d+\.0", text):
+        return text[:-2]
+    return text
+
+
+def _split_cell_reference(ref: str) -> tuple[str, int]:
+    match = re.fullmatch(r"([A-Z]+)(\d+)", ref or "")
+    if not match:
+        return "", 0
+    return match.group(1), int(match.group(2))
+
+
+def _excel_candidate_id(recipe_no: str) -> str:
+    normalized = _cell_text(recipe_no)
+    if re.fullmatch(r"\d+", normalized):
+        return f"recipe_{int(normalized)}"
+    safe = re.sub(r"[^a-z0-9]+", "_", normalized.lower()).strip("_")
+    return f"recipe_{safe or normalized}"
+
+
+def _normalize_excel_servings(value: str) -> str:
+    match = re.search(r"\d+(?:[.,]\d+)?", value or "")
+    if not match:
+        return ""
+    number = match.group(0).replace(",", ".")
+    if re.fullmatch(r"\d+\.0", number):
+        return number[:-2]
+    return number

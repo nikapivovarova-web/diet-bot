@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 from pathlib import Path
 
 from scripts.dev.recipe_importer.apply import apply_run
 from scripts.dev.recipe_importer.classifier import classify_recipe
 from scripts.dev.recipe_importer.ingredients import parse_ingredients
-from scripts.dev.recipe_importer.loader import load_photo_prep_317
+from scripts.dev.recipe_importer.loader import DuplicateRisk, LoadedInput, load_excel_400_workbook, load_photo_prep_317
 from scripts.dev.recipe_importer.mapping import load_alias_config, map_ingredients
 from scripts.dev.recipe_importer.nutrition import calculate_nutrition, load_curated_foods
 from scripts.dev.recipe_importer.photos import build_photo_manifest
@@ -16,6 +18,12 @@ from scripts.dev.recipe_importer.production_rows import (
 )
 from scripts.dev.recipe_importer.servings import resolve_servings
 from scripts.dev.recipe_importer.writer import write_audit_outputs
+
+
+INPUT_LOADERS = {
+    "photo_prep_317": load_photo_prep_317,
+    "excel_400_workbook": load_excel_400_workbook,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,7 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     audit = subparsers.add_parser("audit")
     audit.add_argument("--input", required=True, type=Path)
-    audit.add_argument("--input-format", required=True, choices=["photo_prep_317"])
+    audit.add_argument("--input-format", required=True, choices=sorted(INPUT_LOADERS))
     audit.add_argument("--photos", required=True, type=Path)
     audit.add_argument("--out", required=True, type=Path)
     audit.add_argument("--data-dir", type=Path, default=Path("src/diet_bot/data"))
@@ -53,7 +61,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _run_audit(args: argparse.Namespace) -> int:
-    loaded = load_photo_prep_317(args.input)
+    loaded = INPUT_LOADERS[args.input_format](args.input)
+    loaded = _with_catalog_title_duplicates(loaded, args.data_dir)
     candidate_ids = [recipe.candidate_id for recipe in loaded.recipes]
     photos = build_photo_manifest(candidate_ids, args.photos)
     aliases = load_alias_config()
@@ -129,6 +138,53 @@ def _run_apply(args: argparse.Namespace) -> int:
     plan = apply_run(args.run, args.data_dir, write=args.write)
     print(plan.summary())
     return 0
+
+
+def _with_catalog_title_duplicates(loaded: LoadedInput, data_dir: Path) -> LoadedInput:
+    title_index = _load_catalog_title_index(data_dir)
+    if not title_index:
+        return loaded
+
+    risks = dict(loaded.duplicate_risks)
+    for recipe in loaded.recipes:
+        normalized = _normalize_title(recipe.title_ru)
+        if not normalized or normalized not in title_index:
+            continue
+        risks[recipe.candidate_id] = DuplicateRisk(
+            candidate_id=recipe.candidate_id,
+            duplicate_risk="exact_title_match",
+            duplicate_reason=f"catalog_title_match:{title_index[normalized]}",
+            possible_duplicate_candidate_ids=title_index[normalized],
+        )
+    return LoadedInput(
+        recipes=loaded.recipes,
+        duplicate_risks=risks,
+        source_counts={
+            **loaded.source_counts,
+            "catalog_title_duplicate_matches": len(risks) - len(loaded.duplicate_risks),
+        },
+    )
+
+
+def _load_catalog_title_index(data_dir: Path) -> dict[str, str]:
+    path = Path(data_dir) / "curated_recipes.json"
+    if not path.exists():
+        return {}
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    index: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title_ru") or row.get("title") or "").strip()
+        recipe_id = str(row.get("recipe_id") or row.get("id") or "").strip()
+        normalized = _normalize_title(title)
+        if normalized and recipe_id:
+            index.setdefault(normalized, recipe_id)
+    return index
+
+
+def _normalize_title(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").casefold()).strip()
 
 
 if __name__ == "__main__":

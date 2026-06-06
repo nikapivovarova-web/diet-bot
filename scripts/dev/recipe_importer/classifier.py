@@ -39,16 +39,16 @@ def classify_recipe(
     review_reasons: list[str] = []
 
     if not photo.found:
-        blockers.append("missing_photo")
+        _append_unique(blockers, "missing_photo")
 
     if ingredients.parse_status != "parsed":
-        blockers.append(ingredients.blocker_reason or "ingredients_not_parsed")
+        _append_unique(blockers, ingredients.blocker_reason or "ingredients_not_parsed")
     if servings.status != "valid":
-        blockers.append(servings.blocker_reason or "invalid_servings")
+        _append_unique(blockers, servings.blocker_reason or "invalid_servings")
     if mapping.status != "mapped":
-        blockers.append(mapping.blocker_reason or "ingredients_not_mapped")
+        _append_unique(blockers, mapping.blocker_reason or "ingredients_not_mapped")
     if nutrition.calculation_status != "ok":
-        blockers.append(nutrition.blocker_reason or "nutrition_not_calculated")
+        _append_unique(blockers, nutrition.blocker_reason or "nutrition_not_calculated")
 
     risk = (duplicate_risk.duplicate_risk if duplicate_risk else recipe.duplicate_risk).lower()
     if risk and risk not in {"low", "none"}:
@@ -74,3 +74,8 @@ def classify_recipe(
         mapping_status=mapping.status,
         nutrition_status=nutrition.calculation_status,
     )
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)

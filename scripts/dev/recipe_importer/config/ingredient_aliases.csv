@@ -2,3 +2,51 @@ alias,food_id,notes
 salt,salt,starter alias
 olive oil,olive_oil,starter alias
 water,water,starter alias
+авокадо,avocado,excel_400 safe direct alias
+арахисовая паста,peanut_butter,excel_400 safe direct alias
+банан,banana,excel_400 safe direct alias
+вода,water,excel_400 safe direct alias
+греческий йогурт,greek_yogurt,excel_400 safe direct alias
+зеленый лук,green_onion,excel_400 safe direct alias
+зелёный лук,green_onion,excel_400 safe direct alias
+какао,cocoa_powder,excel_400 safe direct alias
+кленовый сироп,maple_syrup,excel_400 safe direct alias
+корица,cinnamon,excel_400 safe direct alias
+красная фасоль консервированная,red_beans,excel_400 safe direct alias
+красный лук,onion,excel_400 safe direct alias
+куриная грудка готовая,turkey_or_chicken_breast,excel_400 safe direct alias
+листья салата,lettuce,excel_400 safe direct alias
+лимонный сок,lemon_juice,excel_400 safe direct alias
+манго,mango,excel_400 safe direct alias
+мед,honey,excel_400 safe direct alias
+мёд,honey,excel_400 safe direct alias
+молотая корица,cinnamon,excel_400 safe direct alias
+молотый кумин,cumin,excel_400 safe direct alias
+молотый черный перец,black_pepper,excel_400 safe direct alias
+морковь,carrot,excel_400 safe direct alias
+морская соль,salt,excel_400 safe direct alias
+огурец,cucumber,excel_400 safe direct alias
+оливки,olives,excel_400 safe direct alias
+оливковое масло,olive_oil,excel_400 safe direct alias
+овсяные хлопья,oats,excel_400 safe direct alias
+паприка,paprika,excel_400 safe direct alias
+петрушка,parsley,excel_400 safe direct alias
+помидор,tomato,excel_400 safe direct alias
+растительное масло,vegetable_oil,excel_400 safe direct alias
+разрыхлитель,baking_powder,excel_400 safe direct alias
+семена чиа,chia_seeds,excel_400 safe direct alias
+сливочное масло,butter,excel_400 safe direct alias
+соль,salt,excel_400 safe direct alias
+тонкий лаваш,thin_flatbread,excel_400 safe direct alias
+тунец консервированный в собственном соку,tuna,excel_400 safe direct alias
+творог 5%,cottage_cheese,excel_400 safe direct alias
+укроп,dill,excel_400 safe direct alias
+фета,feta,excel_400 safe direct alias
+филе индейки готовое,turkey_or_chicken_breast,excel_400 safe direct alias
+хлопья красного перца,red_pepper_flakes,excel_400 safe direct alias
+цельнозерновой хлеб,whole_grain_bread,excel_400 safe direct alias
+чеснок,garlic,excel_400 safe direct alias
+черный перец,black_pepper,excel_400 safe direct alias
+яблоко,apple,excel_400 safe direct alias
+яйца,egg,excel_400 safe direct alias
+яйцо,egg,excel_400 safe direct alias
