@@ -1,0 +1,73 @@
+from pathlib import Path
+
+import pytest
+
+from scripts.dev.recipe_importer.ingredients import ParsedIngredient
+from scripts.dev.recipe_importer.mapping import load_alias_config, map_ingredients
+
+
+def test_load_alias_config_normalizes_and_maps_alias_to_food_id(tmp_path: Path) -> None:
+    path = tmp_path / "ingredient_aliases.csv"
+    path.write_text(
+        "alias,food_id,notes\n Olive Oil ,olive_oil,\nwater,water,\n",
+        encoding="utf-8",
+    )
+
+    aliases = load_alias_config(path)
+
+    assert aliases["olive oil"] == "olive_oil"
+    assert aliases["water"] == "water"
+
+
+def test_load_alias_config_detects_duplicate_aliases(tmp_path: Path) -> None:
+    path = tmp_path / "ingredient_aliases.csv"
+    path.write_text(
+        "alias,food_id,notes\nOlive oil,olive_oil,\n olive   oil ,oil_alt,\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate alias"):
+        load_alias_config(path)
+
+
+def test_map_ingredients_blocks_unknown_alias(tmp_path: Path) -> None:
+    path = tmp_path / "ingredient_aliases.csv"
+    path.write_text("alias,food_id,notes\nolive oil,olive_oil,\n", encoding="utf-8")
+    aliases = load_alias_config(path)
+
+    result = map_ingredients(
+        "c001",
+        [ParsedIngredient(name="Honey", amount=10, unit="g", raw="Honey - 10 g")],
+        aliases,
+    )
+
+    assert result.status == "blocked"
+    assert result.blocker_reason == "unknown_ingredient_alias"
+    assert result.rows[0].mapping_status == "blocked"
+
+
+def test_map_ingredients_blocks_empty_parsed_ingredient_list(tmp_path: Path) -> None:
+    path = tmp_path / "ingredient_aliases.csv"
+    path.write_text("alias,food_id,notes\nwater,water,\n", encoding="utf-8")
+    aliases = load_alias_config(path)
+
+    result = map_ingredients("c001", [], aliases)
+
+    assert result.status == "blocked"
+    assert result.blocker_reason == "no_ingredients_to_map"
+    assert result.rows == []
+
+
+def test_water_maps_only_when_represented_in_config(tmp_path: Path) -> None:
+    path = tmp_path / "ingredient_aliases.csv"
+    path.write_text("alias,food_id,notes\nwater,water,zero nutrition allowed\n", encoding="utf-8")
+    aliases = load_alias_config(path)
+
+    result = map_ingredients(
+        "c001",
+        [ParsedIngredient(name="Water", amount=100, unit="ml", raw="Water - 100 ml")],
+        aliases,
+    )
+
+    assert result.status == "mapped"
+    assert result.rows[0].food_id == "water"
