@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from scripts.dev.recipe_importer.apply import apply_run
 from scripts.dev.recipe_importer.classifier import classify_recipe
 from scripts.dev.recipe_importer.ingredients import parse_ingredients
 from scripts.dev.recipe_importer.loader import load_photo_prep_317
@@ -23,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "audit":
         return _run_audit(args)
+    if args.command == "apply":
+        return _run_apply(args)
 
     parser.error("missing command")
     return 2
@@ -41,6 +44,11 @@ def _build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--recipe-no-start", type=int)
     audit.add_argument("--recipe-key-prefix")
     audit.add_argument("--dry-run", action="store_true")
+
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("--run", required=True, type=Path)
+    apply_parser.add_argument("--data-dir", required=True, type=Path)
+    apply_parser.add_argument("--write", action="store_true")
     return parser
 
 
@@ -114,6 +122,12 @@ def _run_audit(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         production_rows=production_rows,
     )
+    return 0
+
+
+def _run_apply(args: argparse.Namespace) -> int:
+    plan = apply_run(args.run, args.data_dir, write=args.write)
+    print(plan.summary())
     return 0
 
 

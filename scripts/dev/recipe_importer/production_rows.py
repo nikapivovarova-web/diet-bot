@@ -172,7 +172,7 @@ def write_apply_preview(path: Path, rows: ProductionRows) -> None:
         "",
         "- Review these artifacts before any separate production-data import.",
         "- Photo paths are targets only; this dry-run does not copy files.",
-        "- There is intentionally no apply --write command in this importer.",
+        "- Phase 3 apply requires approval.json and validates manifest hashes before writing.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

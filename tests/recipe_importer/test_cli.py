@@ -67,6 +67,7 @@ def test_cli_audit_writes_expected_files(tmp_path: Path) -> None:
         "classification.csv",
         "review_table.csv",
         "audit_report.md",
+        "manifest.json",
     }
     assert expected_files == {path.name for path in out_dir.iterdir()}
     classification = (out_dir / "classification.csv").read_text(encoding="utf-8")

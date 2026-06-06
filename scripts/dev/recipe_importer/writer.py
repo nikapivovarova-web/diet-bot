@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -51,6 +53,7 @@ def write_audit_outputs(
         dry_run=dry_run,
         production_rows=production_rows,
     )
+    _write_manifest(out_dir, input_dir=input_dir, photos_dir=photos_dir)
 
 
 def _write_normalized(path: Path, recipes: list[NormalizedRecipe]) -> None:
@@ -365,8 +368,46 @@ def _write_report(
         "- The importer audit is read-only and writes only audit artifacts.",
         "- Phase 2B adds read-only nutrition calculation from mapped ingredients.",
         "- Phase 2C writes production-shaped preview rows under the run output only.",
+        "- Phase 3 apply requires approval.json and manifest hash verification.",
         "- Photo-ready status alone is not enough for import_ready.",
         "- import_ready requires parsed ingredients, valid servings, mapped ingredients, calculated nutrition with sodium, photo, and low duplicate risk.",
         "- No production data is imported by this audit.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_manifest(out_dir: Path, *, input_dir: Path, photos_dir: Path) -> None:
+    tracked_files = [
+        "normalized_recipes.csv",
+        "photo_manifest.csv",
+        "structured_ingredients.csv",
+        "mapping_report.csv",
+        "nutrition_rows.csv",
+        "classification.csv",
+        "review_table.csv",
+        "audit_report.md",
+        "apply_preview.md",
+        "production_rows/curated_recipes.json",
+        "production_rows/curated_recipe_ingredients.json",
+        "production_rows/curated_recipe_nutrition.json",
+        "production_rows/photo_manifest.csv",
+    ]
+    files = [
+        {"path": relative, "sha256": _sha256(out_dir / relative)}
+        for relative in tracked_files
+        if (out_dir / relative).exists()
+    ]
+    manifest = {
+        "schema_version": 1,
+        "input_dir": str(input_dir),
+        "photos_dir": str(photos_dir),
+        "files": files,
+    }
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
