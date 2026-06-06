@@ -5,8 +5,11 @@ from collections import Counter
 from pathlib import Path
 
 from scripts.dev.recipe_importer.classifier import ClassificationResult
+from scripts.dev.recipe_importer.ingredients import IngredientParseResult
 from scripts.dev.recipe_importer.loader import LoadedInput, NormalizedRecipe
+from scripts.dev.recipe_importer.mapping import IngredientMappingResult
 from scripts.dev.recipe_importer.photos import PhotoRecord
+from scripts.dev.recipe_importer.servings import ServingsResult
 
 
 def write_audit_outputs(
@@ -15,6 +18,9 @@ def write_audit_outputs(
     photos: dict[str, PhotoRecord],
     classifications: list[ClassificationResult],
     *,
+    ingredient_results: dict[str, IngredientParseResult],
+    servings_results: dict[str, ServingsResult],
+    mapping_results: dict[str, IngredientMappingResult],
     input_dir: Path,
     photos_dir: Path,
     dry_run: bool,
@@ -22,6 +28,8 @@ def write_audit_outputs(
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_normalized(out_dir / "normalized_recipes.csv", loaded.recipes)
     _write_photo_manifest(out_dir / "photo_manifest.csv", photos)
+    _write_structured_ingredients(out_dir / "structured_ingredients.csv", ingredient_results)
+    _write_mapping_report(out_dir / "mapping_report.csv", mapping_results)
     _write_classifications(out_dir / "classification.csv", classifications)
     _write_review_table(out_dir / "review_table.csv", classifications)
     _write_report(
@@ -29,6 +37,9 @@ def write_audit_outputs(
         loaded=loaded,
         photos=photos,
         classifications=classifications,
+        ingredient_results=ingredient_results,
+        servings_results=servings_results,
+        mapping_results=mapping_results,
         input_dir=input_dir,
         photos_dir=photos_dir,
         dry_run=dry_run,
@@ -42,8 +53,12 @@ def _write_normalized(path: Path, recipes: list[NormalizedRecipe]) -> None:
         "meal_type",
         "duplicate_risk",
         "has_structured_ingredients",
+        "has_raw_ingredient_text",
         "has_servings",
         "has_nutrition",
+        "has_instructions",
+        "time",
+        "source",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -56,8 +71,12 @@ def _write_normalized(path: Path, recipes: list[NormalizedRecipe]) -> None:
                     "meal_type": recipe.meal_type,
                     "duplicate_risk": recipe.duplicate_risk,
                     "has_structured_ingredients": bool(recipe.structured_ingredients),
+                    "has_raw_ingredient_text": bool(recipe.raw_ingredient_text),
                     "has_servings": bool(recipe.servings),
                     "has_nutrition": bool(recipe.nutrition),
+                    "has_instructions": bool(recipe.instructions),
+                    "time": recipe.time,
+                    "source": recipe.source,
                 }
             )
 
@@ -88,6 +107,105 @@ def _write_photo_manifest(path: Path, photos: dict[str, PhotoRecord]) -> None:
             )
 
 
+def _write_structured_ingredients(
+    path: Path,
+    ingredient_results: dict[str, IngredientParseResult],
+) -> None:
+    fields = [
+        "candidate_id",
+        "ingredient_index",
+        "name",
+        "amount",
+        "unit",
+        "parse_status",
+        "blocker_reason",
+        "raw",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for candidate_id in sorted(ingredient_results):
+            result = ingredient_results[candidate_id]
+            if not result.ingredients:
+                writer.writerow(
+                    {
+                        "candidate_id": candidate_id,
+                        "ingredient_index": "",
+                        "name": "",
+                        "amount": "",
+                        "unit": "",
+                        "parse_status": result.parse_status,
+                        "blocker_reason": result.blocker_reason,
+                        "raw": "",
+                    }
+                )
+                continue
+            for index, ingredient in enumerate(result.ingredients, start=1):
+                writer.writerow(
+                    {
+                        "candidate_id": candidate_id,
+                        "ingredient_index": index,
+                        "name": ingredient.name,
+                        "amount": ingredient.amount,
+                        "unit": ingredient.unit,
+                        "parse_status": result.parse_status,
+                        "blocker_reason": result.blocker_reason,
+                        "raw": ingredient.raw,
+                    }
+                )
+
+
+def _write_mapping_report(
+    path: Path,
+    mapping_results: dict[str, IngredientMappingResult],
+) -> None:
+    fields = [
+        "candidate_id",
+        "ingredient_index",
+        "ingredient_name",
+        "normalized_alias",
+        "food_id",
+        "amount",
+        "unit",
+        "mapping_status",
+        "blocker_reason",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for candidate_id in sorted(mapping_results):
+            result = mapping_results[candidate_id]
+            if not result.rows:
+                writer.writerow(
+                    {
+                        "candidate_id": candidate_id,
+                        "ingredient_index": "",
+                        "ingredient_name": "",
+                        "normalized_alias": "",
+                        "food_id": "",
+                        "amount": "",
+                        "unit": "",
+                        "mapping_status": result.status,
+                        "blocker_reason": result.blocker_reason,
+                    }
+                )
+                continue
+            for index, row in enumerate(result.rows, start=1):
+                writer.writerow(
+                    {
+                        "candidate_id": candidate_id,
+                        "ingredient_index": index,
+                        "ingredient_name": row.ingredient_name,
+                        "normalized_alias": row.normalized_alias,
+                        "food_id": row.food_id,
+                        "amount": row.amount,
+                        "unit": row.unit,
+                        "mapping_status": row.mapping_status,
+                        "blocker_reason": row.blocker_reason,
+                    }
+                )
+
+
 def _write_classifications(path: Path, classifications: list[ClassificationResult]) -> None:
     fields = [
         "candidate_id",
@@ -97,6 +215,10 @@ def _write_classifications(path: Path, classifications: list[ClassificationResul
         "review_reasons",
         "duplicate_risk",
         "photo_status",
+        "parse_status",
+        "servings_status",
+        "mapping_status",
+        "nutrition_status",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -141,6 +263,10 @@ def _classification_row(result: ClassificationResult) -> dict[str, str]:
         "review_reasons": ";".join(result.review_reasons),
         "duplicate_risk": result.duplicate_risk,
         "photo_status": result.photo_status,
+        "parse_status": result.parse_status,
+        "servings_status": result.servings_status,
+        "mapping_status": result.mapping_status,
+        "nutrition_status": result.nutrition_status,
     }
 
 
@@ -150,14 +276,20 @@ def _write_report(
     loaded: LoadedInput,
     photos: dict[str, PhotoRecord],
     classifications: list[ClassificationResult],
+    ingredient_results: dict[str, IngredientParseResult],
+    servings_results: dict[str, ServingsResult],
+    mapping_results: dict[str, IngredientMappingResult],
     input_dir: Path,
     photos_dir: Path,
     dry_run: bool,
 ) -> None:
     class_counts = Counter(result.classification for result in classifications)
     photo_found = sum(1 for photo in photos.values() if photo.found)
+    parsed = sum(1 for result in ingredient_results.values() if result.parse_status == "parsed")
+    valid_servings = sum(1 for result in servings_results.values() if result.status == "valid")
+    mapped = sum(1 for result in mapping_results.values() if result.status == "mapped")
     lines = [
-        "# Recipe Importer Phase 1 Audit",
+        "# Recipe Importer Phase 2A Audit",
         "",
         f"input_dir: {input_dir}",
         f"photos_dir: {photos_dir}",
@@ -169,14 +301,18 @@ def _write_report(
         f"- duplicate risk rows: {loaded.source_counts.get('duplicate_risk', 0)}",
         f"- photos found: {photo_found}",
         f"- photos missing: {len(photos) - photo_found}",
+        f"- parsed ingredients: {parsed}",
+        f"- valid servings: {valid_servings}",
+        f"- mapped ingredients: {mapped}",
         f"- import_ready: {class_counts.get('import_ready', 0)}",
         f"- needs_review: {class_counts.get('needs_review', 0)}",
         f"- blocked: {class_counts.get('blocked', 0)}",
         "",
         "## Policy",
         "",
-        "- Phase 1 is read-only and writes only audit artifacts.",
+        "- Phase 2A is read-only and writes only audit artifacts.",
         "- Photo-ready status alone is not enough for import_ready.",
-        "- Missing structured ingredients, servings, or nutrition stays needs_review or blocked.",
+        "- import_ready requires parsed ingredients, valid servings, mapped ingredients, photo, and low duplicate risk.",
+        "- Nutrition is intentionally pending in Phase 2A and is not a readiness blocker.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

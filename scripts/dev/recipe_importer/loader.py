@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -12,9 +12,13 @@ class NormalizedRecipe:
     meal_type: str
     duplicate_risk: str
     structured_ingredients: str
-    servings: str
-    nutrition: str
-    raw: dict[str, str]
+    raw_ingredient_text: str = ""
+    servings: str = ""
+    nutrition: str = ""
+    instructions: str = ""
+    time: str = ""
+    source: str = ""
+    raw: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -76,8 +80,18 @@ def _normalize_photo_ready_row(row: dict[str, str]) -> NormalizedRecipe:
             "ingredients_json",
             "ingredients_structured_json",
         ),
+        raw_ingredient_text=_pick(
+            row,
+            "ingredient_text",
+            "ingredients_text",
+            "raw_ingredient_text",
+            "raw_ingredients",
+        ),
         servings=_pick(row, "servings", "servings_count", "default_servings"),
         nutrition=_pick(row, "nutrition", "nutrition_json", "nutrition_per_serving_json"),
+        instructions=_pick(row, "instructions", "directions", "method"),
+        time=_pick(row, "time", "total_time", "cook_time", "prep_time"),
+        source=_pick(row, "source_url", "source", "url"),
         raw=row,
     )
 

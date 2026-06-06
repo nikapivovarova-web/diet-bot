@@ -1,59 +1,111 @@
 from scripts.dev.recipe_importer.classifier import classify_recipe
+from scripts.dev.recipe_importer.ingredients import IngredientParseResult, ParsedIngredient
 from scripts.dev.recipe_importer.loader import DuplicateRisk, NormalizedRecipe
+from scripts.dev.recipe_importer.mapping import IngredientMappingResult, IngredientMappingRow
 from scripts.dev.recipe_importer.photos import PhotoRecord
+from scripts.dev.recipe_importer.servings import ServingsResult
+
+
+def _recipe(**overrides: str) -> NormalizedRecipe:
+    values = {
+        "candidate_id": "c001",
+        "title_ru": "Structured recipe",
+        "meal_type": "main",
+        "duplicate_risk": "low",
+        "structured_ingredients": '[{"name": "water", "amount": 100, "unit": "ml"}]',
+        "raw_ingredient_text": "",
+        "servings": "2",
+        "nutrition": "",
+        "instructions": "",
+        "time": "",
+        "source": "",
+        "raw": {},
+    }
+    values.update(overrides)
+    return NormalizedRecipe(**values)
+
+
+def _parsed(status: str = "parsed", blocker: str = "") -> IngredientParseResult:
+    return IngredientParseResult(
+        candidate_id="c001",
+        parse_status=status,
+        blocker_reason=blocker,
+        ingredients=[
+            ParsedIngredient(name="Water", amount=100, unit="ml", raw="Water - 100 ml")
+        ]
+        if status == "parsed"
+        else [],
+    )
+
+
+def _servings(status: str = "valid", blocker: str = "") -> ServingsResult:
+    return ServingsResult(
+        status=status,
+        servings=2 if status == "valid" else 0,
+        estimated=False,
+        source="explicit",
+        blocker_reason=blocker,
+    )
+
+
+def _mapping(status: str = "mapped", blocker: str = "") -> IngredientMappingResult:
+    return IngredientMappingResult(
+        candidate_id="c001",
+        status=status,
+        blocker_reason=blocker,
+        rows=[
+            IngredientMappingRow(
+                ingredient_name="Water",
+                normalized_alias="water",
+                food_id="water" if status == "mapped" else "",
+                amount=100,
+                unit="ml",
+                mapping_status=status,
+                blocker_reason=blocker,
+            )
+        ],
+    )
 
 
 def test_classifier_fail_closed_when_photo_ready_lacks_structured_recipe_data() -> None:
-    recipe = NormalizedRecipe(
-        candidate_id="c001",
-        title_ru="Photo ready only",
-        meal_type="main",
-        duplicate_risk="low",
-        structured_ingredients="",
-        servings="",
-        nutrition="",
-        raw={},
-    )
+    recipe = _recipe(title_ru="Photo ready only", structured_ingredients="", servings="")
     photo = PhotoRecord(candidate_id="c001", found=True, status="found")
 
-    result = classify_recipe(recipe, photo, duplicate_risk=None)
+    result = classify_recipe(
+        recipe,
+        photo,
+        duplicate_risk=None,
+        ingredients=_parsed("blocked", "missing_ingredients"),
+        servings=_servings("blocked", "invalid_servings"),
+        mapping=_mapping("blocked", "unknown_ingredient_alias"),
+    )
 
     assert result.classification == "needs_review"
-    assert "missing_structured_ingredients" in result.blockers
-    assert "missing_servings" in result.blockers
-    assert "missing_nutrition" in result.blockers
+    assert "missing_ingredients" in result.blockers
+    assert "invalid_servings" in result.blockers
+    assert "unknown_ingredient_alias" in result.blockers
+    assert "nutrition_pending" in result.review_reasons
 
 
 def test_classifier_blocks_missing_photo_even_with_structured_data() -> None:
-    recipe = NormalizedRecipe(
-        candidate_id="c002",
-        title_ru="Structured recipe",
-        meal_type="main",
-        duplicate_risk="low",
-        structured_ingredients='[{"name": "rice", "amount": 100, "unit": "g"}]',
-        servings="2",
-        nutrition='{"kcal": 300, "protein_g": 10, "fat_g": 5, "carbs_g": 40}',
-        raw={},
-    )
+    recipe = _recipe(candidate_id="c002")
     photo = PhotoRecord(candidate_id="c002", found=False, status="missing")
 
-    result = classify_recipe(recipe, photo, duplicate_risk=None)
+    result = classify_recipe(
+        recipe,
+        photo,
+        duplicate_risk=None,
+        ingredients=_parsed(),
+        servings=_servings(),
+        mapping=_mapping(),
+    )
 
     assert result.classification == "blocked"
     assert result.blockers == ["missing_photo"]
 
 
 def test_classifier_keeps_duplicate_risk_out_of_import_ready() -> None:
-    recipe = NormalizedRecipe(
-        candidate_id="c003",
-        title_ru="Structured duplicate",
-        meal_type="main",
-        duplicate_risk="medium",
-        structured_ingredients='[{"name": "rice", "amount": 100, "unit": "g"}]',
-        servings="2",
-        nutrition='{"kcal": 300, "protein_g": 10, "fat_g": 5, "carbs_g": 40}',
-        raw={},
-    )
+    recipe = _recipe(candidate_id="c003", title_ru="Structured duplicate", duplicate_risk="medium")
     photo = PhotoRecord(candidate_id="c003", found=True, status="found")
     duplicate = DuplicateRisk(
         candidate_id="c003",
@@ -62,7 +114,32 @@ def test_classifier_keeps_duplicate_risk_out_of_import_ready() -> None:
         possible_duplicate_candidate_ids="c090",
     )
 
-    result = classify_recipe(recipe, photo, duplicate_risk=duplicate)
+    result = classify_recipe(
+        recipe,
+        photo,
+        duplicate_risk=duplicate,
+        ingredients=_parsed(),
+        servings=_servings(),
+        mapping=_mapping(),
+    )
 
     assert result.classification == "needs_review"
     assert "duplicate_risk_medium" in result.review_reasons
+
+
+def test_classifier_import_ready_requires_phase2a_gates_but_not_nutrition() -> None:
+    recipe = _recipe(nutrition="")
+    photo = PhotoRecord(candidate_id="c001", found=True, status="found")
+
+    result = classify_recipe(
+        recipe,
+        photo,
+        duplicate_risk=None,
+        ingredients=_parsed(),
+        servings=_servings(),
+        mapping=_mapping(),
+    )
+
+    assert result.classification == "import_ready"
+    assert result.blockers == []
+    assert result.review_reasons == ["nutrition_pending"]

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+from scripts.dev.recipe_importer.ingredients import IngredientParseResult
 from scripts.dev.recipe_importer.loader import DuplicateRisk, NormalizedRecipe
+from scripts.dev.recipe_importer.mapping import IngredientMappingResult
 from scripts.dev.recipe_importer.photos import PhotoRecord
+from scripts.dev.recipe_importer.servings import ServingsResult
 
 
 @dataclass(frozen=True)
@@ -16,12 +18,20 @@ class ClassificationResult:
     review_reasons: list[str]
     duplicate_risk: str
     photo_status: str
+    parse_status: str
+    servings_status: str
+    mapping_status: str
+    nutrition_status: str
 
 
 def classify_recipe(
     recipe: NormalizedRecipe,
     photo: PhotoRecord,
     duplicate_risk: DuplicateRisk | None,
+    *,
+    ingredients: IngredientParseResult,
+    servings: ServingsResult,
+    mapping: IngredientMappingResult,
 ) -> ClassificationResult:
     blockers: list[str] = []
     review_reasons: list[str] = []
@@ -29,20 +39,25 @@ def classify_recipe(
     if not photo.found:
         blockers.append("missing_photo")
 
-    if not _has_structured_ingredients(recipe.structured_ingredients):
-        blockers.append("missing_structured_ingredients")
-    if not _has_positive_servings(recipe.servings):
-        blockers.append("missing_servings")
-    if not _has_nutrition(recipe.nutrition):
-        blockers.append("missing_nutrition")
+    if ingredients.parse_status != "parsed":
+        blockers.append(ingredients.blocker_reason or "ingredients_not_parsed")
+    if servings.status != "valid":
+        blockers.append(servings.blocker_reason or "invalid_servings")
+    if mapping.status != "mapped":
+        blockers.append(mapping.blocker_reason or "ingredients_not_mapped")
+
+    review_reasons.append("nutrition_pending")
 
     risk = (duplicate_risk.duplicate_risk if duplicate_risk else recipe.duplicate_risk).lower()
     if risk and risk not in {"low", "none"}:
         review_reasons.append(f"duplicate_risk_{risk}")
 
+    readiness_review_reasons = [
+        reason for reason in review_reasons if reason != "nutrition_pending"
+    ]
     if "missing_photo" in blockers:
         classification = "blocked"
-    elif blockers or review_reasons:
+    elif blockers or readiness_review_reasons:
         classification = "needs_review"
     else:
         classification = "import_ready"
@@ -55,33 +70,8 @@ def classify_recipe(
         review_reasons=review_reasons,
         duplicate_risk=risk or "",
         photo_status=photo.status,
+        parse_status=ingredients.parse_status,
+        servings_status=servings.status,
+        mapping_status=mapping.status,
+        nutrition_status="pending",
     )
-
-
-def _has_structured_ingredients(value: str) -> bool:
-    if not value:
-        return False
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(parsed, list) and bool(parsed)
-
-
-def _has_positive_servings(value: str) -> bool:
-    if not value:
-        return False
-    try:
-        return float(value) > 0
-    except ValueError:
-        return False
-
-
-def _has_nutrition(value: str) -> bool:
-    if not value:
-        return False
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(parsed, dict) and bool(parsed)
