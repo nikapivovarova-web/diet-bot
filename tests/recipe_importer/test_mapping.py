@@ -73,6 +73,95 @@ def test_water_maps_only_when_represented_in_config(tmp_path: Path) -> None:
     assert result.rows[0].food_id == "water"
 
 
+def test_generic_oil_alias_maps_only_exact_generic_oil() -> None:
+    aliases = {"масло": "olive_oil"}
+
+    exact = map_ingredients(
+        "c001",
+        [ParsedIngredient(name="масло", amount=10, unit="g", raw="масло 10 г")],
+        aliases,
+    )
+    specific = map_ingredients(
+        "c002",
+        [
+            ParsedIngredient(
+                name="масло сливочное",
+                amount=10,
+                unit="g",
+                raw="масло сливочное 10 г",
+            )
+        ],
+        aliases,
+    )
+
+    assert exact.status == "mapped"
+    assert exact.rows[0].food_id == "olive_oil"
+    assert specific.status == "blocked"
+    assert specific.rows[0].food_id == ""
+    assert specific.rows[0].blocker_reason == "unknown_ingredient_alias"
+
+
+def test_reordered_specific_butter_alias_maps_to_butter_not_generic_oil() -> None:
+    aliases = {"масло": "olive_oil", "сливочное масло": "butter"}
+
+    result = map_ingredients(
+        "c001",
+        [
+            ParsedIngredient(
+                name="масло сливочное",
+                amount=10,
+                unit="g",
+                raw="масло сливочное 10 г",
+            )
+        ],
+        aliases,
+    )
+
+    assert result.status == "mapped"
+    assert result.rows[0].food_id == "butter"
+
+
+def test_generic_pepper_alias_does_not_prefix_map_specific_pepper() -> None:
+    aliases = {"перец": "bell_pepper"}
+
+    result = map_ingredients(
+        "c001",
+        [
+            ParsedIngredient(
+                name="перец чили",
+                amount=10,
+                unit="g",
+                raw="перец чили 10 г",
+            )
+        ],
+        aliases,
+    )
+
+    assert result.status == "blocked"
+    assert result.rows[0].food_id == ""
+    assert result.rows[0].blocker_reason == "unknown_ingredient_alias"
+
+
+def test_non_generic_prefix_alias_still_maps_inflected_name() -> None:
+    aliases = {"кальмар": "calamari"}
+
+    result = map_ingredients(
+        "c001",
+        [
+            ParsedIngredient(
+                name="кальмары",
+                amount=100,
+                unit="g",
+                raw="кальмары 100 г",
+            )
+        ],
+        aliases,
+    )
+
+    assert result.status == "mapped"
+    assert result.rows[0].food_id == "calamari"
+
+
 def test_generated_food_definition_aliases_map_second_pass_names() -> None:
     aliases = load_alias_config(include_generated_aliases=True)
 

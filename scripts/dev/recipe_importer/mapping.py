@@ -99,16 +99,47 @@ def _lookup_alias(normalized: str, aliases: dict[str, str]) -> str:
     direct = aliases.get(normalized)
     if direct:
         return direct
+    reordered = _lookup_reordered_alias(normalized, aliases)
+    if reordered:
+        return reordered
     if len(normalized) < 5:
         return ""
     candidates = {
         food_id
         for alias, food_id in aliases.items()
-        if len(alias) >= 5 and (alias.startswith(normalized) or normalized.startswith(alias))
+        if len(alias) >= 5 and _is_prefix_fallback_match(normalized, alias)
     }
     if len(candidates) == 1:
         return next(iter(candidates))
     return ""
+
+
+def _lookup_reordered_alias(normalized: str, aliases: dict[str, str]) -> str:
+    normalized_tokens = _alias_tokens(normalized)
+    if len(normalized_tokens) < 2:
+        return ""
+    candidates = {
+        food_id
+        for alias, food_id in aliases.items()
+        if len(_alias_tokens(alias)) == len(normalized_tokens)
+        and sorted(_alias_tokens(alias)) == sorted(normalized_tokens)
+    }
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return ""
+
+
+def _is_prefix_fallback_match(normalized: str, alias: str) -> bool:
+    if alias in GENERIC_PREFIX_FALLBACK_ALIASES or normalized in GENERIC_PREFIX_FALLBACK_ALIASES:
+        return False
+    return alias.startswith(normalized) or normalized.startswith(alias)
+
+
+def _alias_tokens(value: str) -> list[str]:
+    return value.split()
+
+
+GENERIC_PREFIX_FALLBACK_ALIASES = frozenset({"масло", "сыр", "перец"})
 
 
 def _add_generated_aliases(aliases: dict[str, str]) -> None:
