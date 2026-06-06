@@ -33,6 +33,18 @@
 - Unsafe alias prefix fallback is narrowed: exact aliases still map, safe reordered aliases still map when the full ingredient name is represented, and a multi-word alias no longer maps when it is only the prefix of a longer combined ingredient string.
 - Nutrition dry-run treats ml as gram-equivalent for importer audit calculations so sodium can be calculated for liquid ingredients.
 
+## PR #102 content-blocker fix
+
+- The 157 imported recipe cards `r711-r868` except `r856` now have non-empty `time_text`, non-placeholder `short_description_ru`, and nonzero active time.
+- Source CSV did not provide exact time values for this import, so recipe cards use a conservative deterministic fallback recorded in `import_metadata.time_policy`.
+- Default time policy:
+  - `second_pass_default:no_cook_or_quick_assembly`: 15 active / 0 passive minutes for salads, tartars, muesli, and direct mixing/assembly without cooking.
+  - `second_pass_default:breakfast_or_snack`: 20 active / 0 passive minutes for breakfast/snack recipes without oven, simmering, soup, or stew signals.
+  - `second_pass_default:stovetop_main`: 25 active / 10 passive minutes for regular main dishes without longer passive cooking signals.
+  - `second_pass_default:baked_or_simmered_main`: 20 active / 25 passive minutes for oven, baked, simmered, soup, stew, or long-cooking signals.
+- Applied distribution after the fix: baked/simmered `93`, stovetop main `42`, no-cook/quick assembly `17`, breakfast/snack `5`.
+- User-facing recipe fields for the imported batch were sanitized for control characters, replacement characters, and `???` placeholders.
+
 ## Readiness result
 
 - Stale committed report before PR #102 review fix said `import_ready=38`.
