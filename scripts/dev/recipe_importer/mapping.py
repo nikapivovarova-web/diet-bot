@@ -30,7 +30,19 @@ class IngredientMappingResult:
     rows: list[IngredientMappingRow]
 
 
-def load_alias_config(path: Path = DEFAULT_ALIASES_PATH) -> dict[str, str]:
+GENERATED_ALIAS_OVERRIDES = {
+    "масло": "olive_oil",
+    "растительное масло": "vegetable_oil",
+    "сыр": "gouda",
+    "перец": "bell_pepper",
+}
+
+
+def load_alias_config(
+    path: Path = DEFAULT_ALIASES_PATH,
+    *,
+    include_generated_aliases: bool = False,
+) -> dict[str, str]:
     aliases: dict[str, str] = {}
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
@@ -38,9 +50,11 @@ def load_alias_config(path: Path = DEFAULT_ALIASES_PATH) -> dict[str, str]:
             food_id = (row.get("food_id") or row.get("canonical_name") or "").strip()
             if not alias or not food_id:
                 continue
-            if alias in aliases:
+            if alias in aliases and aliases[alias] != food_id:
                 raise ValueError(f"duplicate alias in ingredient_aliases.csv: {alias}")
             aliases[alias] = food_id
+    if include_generated_aliases:
+        _add_generated_aliases(aliases)
     return aliases
 
 
@@ -56,7 +70,7 @@ def map_ingredients(
     blocked = False
     for ingredient in ingredients:
         normalized = _normalize_alias(ingredient.name)
-        food_id = aliases.get(normalized, "")
+        food_id = _lookup_alias(normalized, aliases)
         if not food_id:
             blocked = True
             rows.append(_row(ingredient, normalized, "", "blocked", "unknown_ingredient_alias"))
@@ -74,7 +88,40 @@ def map_ingredients(
 
 
 def _normalize_alias(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip().lower())
+    normalized = (value or "").casefold().replace("ё", "е")
+    normalized = re.sub(r"\([^)]*\)", " ", normalized)
+    normalized = normalized.replace("•", " ")
+    normalized = re.sub(r"[^0-9a-zа-я_]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _lookup_alias(normalized: str, aliases: dict[str, str]) -> str:
+    direct = aliases.get(normalized)
+    if direct:
+        return direct
+    if len(normalized) < 5:
+        return ""
+    candidates = {
+        food_id
+        for alias, food_id in aliases.items()
+        if len(alias) >= 5 and (alias.startswith(normalized) or normalized.startswith(alias))
+    }
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return ""
+
+
+def _add_generated_aliases(aliases: dict[str, str]) -> None:
+    from scripts.build_curated_recipe_data import FOOD_DEFS
+
+    for alias, food_id in GENERATED_ALIAS_OVERRIDES.items():
+        aliases[_normalize_alias(alias)] = food_id
+    for food in FOOD_DEFS:
+        for alias in (food.name_ru, *food.aliases):
+            normalized = _normalize_alias(alias)
+            if not normalized:
+                continue
+            aliases.setdefault(normalized, food.id)
 
 
 def _row(

@@ -71,3 +71,29 @@ def test_water_maps_only_when_represented_in_config(tmp_path: Path) -> None:
 
     assert result.status == "mapped"
     assert result.rows[0].food_id == "water"
+
+
+def test_generated_food_definition_aliases_map_second_pass_names() -> None:
+    aliases = load_alias_config(include_generated_aliases=True)
+
+    result = map_ingredients(
+        "c001",
+        [
+            ParsedIngredient(
+                name="куриные бёдра",
+                amount=1200,
+                unit="g",
+                raw="куриные бёдра 1,2 кг",
+            ),
+            ParsedIngredient(
+                name="моцарелла",
+                amount=300,
+                unit="g",
+                raw="моцарелла 300 г",
+            ),
+        ],
+        aliases,
+    )
+
+    assert result.status == "mapped"
+    assert [row.food_id for row in result.rows] == ["chicken_thigh", "mozzarella"]

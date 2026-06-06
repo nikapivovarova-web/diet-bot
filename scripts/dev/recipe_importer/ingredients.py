@@ -11,12 +11,26 @@ _TEXT_PATTERN = re.compile(
     r"^\s*(?P<name>.+?)\s*(?:—|–|-|:)\s*(?P<quantity>.+?)\s*$"
 )
 _QUANTITY_PATTERN = re.compile(
-    r"(?:≈|~)?\s*"
-    r"(?P<amount>\d+(?:[.,]\d+)?)"
+    r"(?:до\s*)?(?:≈|~=|~)?\s*"
+    r"(?P<amount>\d+(?:[.,]\d+)?|\d+\s*/\s*\d+)"
     r"(?:\s*[–-]\s*\d+(?:[.,]\d+)?)?"
-    r"\s*(?P<unit>кг|kg|килограмм(?:а|ов)?|г|g|гр|грамм(?:а|ов)?|мл|ml)\b",
+    r"\s*(?P<unit>"
+    r"кг|kg|килограмм(?:а|ов)?|"
+    r"г|g|гр|грамм(?:а|ов)?|"
+    r"мл|ml|л|l|"
+    r"ст\.?\s*л\.?|tbsp|tablespoons?|"
+    r"ч\.?\s*л\.?|tsp|teaspoons?|"
+    r"шт\.?|штук(?:и)?|зуб(?:чик(?:а|ов)?)?|"
+    r"яйц[ао]?|кружк(?:ов|а)?|пуч(?:ок|ка)?|ломтик(?:а|ов)?|бан(?:ка|ки)"
+    r")\b",
     re.IGNORECASE,
 )
+_BULLET_RE = re.compile(r"\s*[•]\s*")
+_NORMALIZATION_TAIL_RE = re.compile(
+    r"\s+Нормализация\s+граммовок\s+для\s+импорта:.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_COMMA_SPLIT_RE = re.compile(r"(?<!\d)\s*,\s*(?=[^,]*\d)")
 
 
 @dataclass(frozen=True)
@@ -80,19 +94,17 @@ def _parse_structured(recipe: NormalizedRecipe) -> IngredientParseResult:
 
 def _parse_text(recipe: NormalizedRecipe) -> IngredientParseResult:
     ingredients: list[ParsedIngredient] = []
-    lines = [line.strip() for line in recipe.raw_ingredient_text.splitlines() if line.strip()]
+    lines = _ingredient_segments(recipe.raw_ingredient_text)
     if not lines:
         return _blocked(recipe.candidate_id, "missing_ingredients")
 
     for line in lines:
-        match = _TEXT_PATTERN.match(line)
-        if not match:
+        parsed = _parse_text_line(line)
+        if parsed is None:
+            if _is_ignorable_amountless_line(line):
+                continue
             return _blocked(recipe.candidate_id, "ambiguous_ingredient_text")
-        quantity = _parse_text_quantity(match.group("quantity"))
-        if quantity is None:
-            return _blocked(recipe.candidate_id, "ambiguous_ingredient_text")
-        amount, unit = quantity
-        name = match.group("name").strip()
+        name, amount, unit = parsed
         if not name:
             return _blocked(recipe.candidate_id, "missing_ingredient_name")
         ingredients.append(
@@ -103,6 +115,8 @@ def _parse_text(recipe: NormalizedRecipe) -> IngredientParseResult:
                 raw=line,
             )
         )
+    if not ingredients:
+        return _blocked(recipe.candidate_id, "missing_ingredients")
     return IngredientParseResult(recipe.candidate_id, "parsed", "", ingredients)
 
 
@@ -115,6 +129,11 @@ def _pick(row: dict[str, object], *keys: str) -> object:
 
 
 def _parse_positive_amount(value: object) -> float | None:
+    if isinstance(value, str) and "/" in value:
+        fraction = _parse_fraction(value)
+        if fraction is None:
+            return None
+        return fraction
     try:
         amount = float(str(value).replace(",", "."))
     except ValueError:
@@ -124,7 +143,49 @@ def _parse_positive_amount(value: object) -> float | None:
     return amount
 
 
-def _parse_text_quantity(value: str) -> tuple[float, str] | None:
+def _ingredient_segments(value: str) -> list[str]:
+    cleaned = _NORMALIZATION_TAIL_RE.sub("", value or "").strip()
+    if not cleaned:
+        return []
+
+    raw_segments: list[str] = []
+    for line in cleaned.splitlines():
+        pieces = _BULLET_RE.split(line)
+        raw_segments.extend(piece.strip() for piece in pieces if piece.strip())
+
+    segments: list[str] = []
+    for segment in raw_segments:
+        segments.extend(piece.strip() for piece in _COMMA_SPLIT_RE.split(segment) if piece.strip())
+    return segments
+
+
+def _parse_text_line(line: str) -> tuple[str, float, str] | None:
+    match = _TEXT_PATTERN.match(line)
+    if match:
+        quantity = _parse_text_quantity(match.group("quantity"), match.group("name"))
+        if quantity is None:
+            return None
+        amount, unit = quantity
+        return _clean_name(match.group("name")), amount, unit
+
+    quantity_matches = list(_QUANTITY_PATTERN.finditer(line or ""))
+    if not quantity_matches:
+        return None
+    quantity_match = _prefer_grams(quantity_matches)
+    amount = _parse_positive_amount(quantity_match.group("amount"))
+    if amount is None:
+        return None
+    raw_unit = quantity_match.group("unit")
+    before = line[: quantity_match.start()].strip()
+    after = line[quantity_match.end() :].strip()
+    name = before or _name_from_quantity_first_unit(raw_unit, after)
+    if not name:
+        return None
+    amount, unit = _normalize_amount_unit(_clean_name(name), amount, raw_unit)
+    return _clean_name(name), amount, unit
+
+
+def _parse_text_quantity(value: str, name: str = "") -> tuple[float, str] | None:
     matches = list(_QUANTITY_PATTERN.finditer(value or ""))
     if not matches:
         return None
@@ -133,7 +194,7 @@ def _parse_text_quantity(value: str) -> tuple[float, str] | None:
     amount = _parse_positive_amount(chosen.group("amount"))
     if amount is None:
         return None
-    return amount, _normalize_unit(chosen.group("unit"))
+    return _normalize_amount_unit(name, amount, chosen.group("unit"))
 
 
 def _prefer_grams(matches: list[re.Match[str]]) -> re.Match[str]:
@@ -151,7 +212,114 @@ def _normalize_unit(unit: str) -> str:
         return "g"
     if normalized in {"мл", "ml"}:
         return "ml"
+    if normalized in {"л", "l"}:
+        return "l"
+    if re.fullmatch(r"ст\.?\s*л\.?|tbsp|tablespoons?", normalized):
+        return "tbsp"
+    if re.fullmatch(r"ч\.?\s*л\.?|tsp|teaspoons?", normalized):
+        return "tsp"
+    if re.fullmatch(r"шт\.?|штук(?:и)?|зуб(?:чик(?:а|ов)?)?|яйц[ао]?|кружк(?:ов|а)?|пуч(?:ок|ка)?|ломтик(?:а|ов)?|бан(?:ка|ки)", normalized):
+        return "count"
     return normalized
+
+
+def _normalize_amount_unit(name: str, amount: float, raw_unit: str) -> tuple[float, str]:
+    unit = _normalize_unit(raw_unit)
+    if unit == "kg":
+        return round(amount * 1000, 2), "g"
+    if unit == "l":
+        return round(amount * 1000, 2), "ml"
+    if unit == "tbsp":
+        return round(amount * 15, 2), "ml"
+    if unit == "tsp":
+        return round(amount * 5, 2), "ml"
+    if unit == "count":
+        grams = _count_grams(name, raw_unit)
+        if grams is not None:
+            return round(amount * grams, 2), "g"
+    return round(amount, 2), unit
+
+
+def _parse_fraction(value: str) -> float | None:
+    parts = [part.strip() for part in value.split("/", 1)]
+    if len(parts) != 2:
+        return None
+    try:
+        numerator = float(parts[0].replace(",", "."))
+        denominator = float(parts[1].replace(",", "."))
+    except ValueError:
+        return None
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _clean_name(value: str) -> str:
+    cleaned = re.sub(r"\([^)]*\)", "", value or "")
+    cleaned = re.sub(r"\s+", " ", cleaned.replace("•", " ")).strip(" .:-;")
+    return cleaned
+
+
+def _name_from_quantity_first_unit(unit: str, after: str) -> str:
+    normalized = (unit or "").casefold()
+    if normalized.startswith("яйц"):
+        return "яйцо"
+    return after
+
+
+def _count_grams(name: str, unit: str) -> float | None:
+    text = f"{name} {unit}".casefold().replace("ё", "е")
+    if "зуб" in text or "чеснок" in text:
+        return 5.0
+    if "яй" in text:
+        return 50.0
+    if "лук" in text and "зелен" not in text:
+        return 100.0
+    if "помид" in text or "томат" in text:
+        return 120.0
+    if "перец" in text and "черн" not in text and "чили" not in text:
+        return 150.0
+    if "лимон" in text or "лайм" in text:
+        return 60.0
+    if "карто" in text:
+        return 150.0
+    if "морков" in text:
+        return 80.0
+    if "огур" in text:
+        return 100.0
+    if "яблок" in text:
+        return 180.0
+    if "банан" in text:
+        return 120.0
+    if "авокад" in text:
+        return 150.0
+    if "баклаж" in text:
+        return 300.0
+    if "кабач" in text or "цукини" in text:
+        return 200.0
+    if "свек" in text:
+        return 150.0
+    if "пуч" in text and ("базилик" in text or "зел" in text or "кинз" in text or "петруш" in text):
+        return 30.0
+    if "круж" in text and ("тесто" in text or "эмпанада" in text):
+        return 25.0
+    if "ломтик" in text and ("хлеб" in text or "тост" in text):
+        return 35.0
+    return None
+
+
+def _is_ignorable_amountless_line(line: str) -> bool:
+    normalized = (line or "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "по вкусу",
+            "по желанию",
+            "для подпыла",
+            "для подачи",
+            "украшения",
+        )
+    )
 
 
 def _blocked(candidate_id: str, reason: str) -> IngredientParseResult:

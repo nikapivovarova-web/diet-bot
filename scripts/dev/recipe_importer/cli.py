@@ -72,7 +72,7 @@ def _run_audit(args: argparse.Namespace) -> int:
     loaded = _with_catalog_title_duplicates(loaded, args.data_dir)
     candidate_ids = [recipe.candidate_id for recipe in loaded.recipes]
     photos = build_photo_manifest(candidate_ids, args.photos)
-    aliases = load_alias_config()
+    aliases = load_alias_config(include_generated_aliases=True)
     foods = load_curated_foods(args.data_dir)
     ingredient_results = {recipe.candidate_id: parse_ingredients(recipe) for recipe in loaded.recipes}
     servings_results = {

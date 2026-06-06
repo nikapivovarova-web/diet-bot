@@ -73,6 +73,28 @@ def test_parses_deterministic_text_ingredient_rows() -> None:
     ]
 
 
+def test_parses_second_pass_bullet_ingredients_with_household_units() -> None:
+    result = parse_ingredients(
+        _recipe(
+            raw_ingredient_text=(
+                "• куриные бёдра 1,2 кг • лимонный сок 2 ст. л. "
+                "• чеснок 2 зубчика • орегано 1 ч. л. "
+                "• соль до 1/4 ч. л., масло 2 ст. л."
+            )
+        )
+    )
+
+    assert result.parse_status == "parsed"
+    assert [(item.name, item.amount, item.unit) for item in result.ingredients] == [
+        ("куриные бёдра", 1200.0, "g"),
+        ("лимонный сок", 30.0, "ml"),
+        ("чеснок", 10.0, "g"),
+        ("орегано", 5.0, "ml"),
+        ("соль", 1.25, "ml"),
+        ("масло", 30.0, "ml"),
+    ]
+
+
 def test_parses_excel_400_dash_lines_and_prefers_explicit_grams() -> None:
     result = parse_ingredients(
         _recipe(
