@@ -1,0 +1,5 @@
+{
+  "mode": "audit_only",
+  "fail_closed_without_sodium_mg": true,
+  "notes": "Starter policy for Phase 1 normalizer. No production import decisions are made here."
+}
