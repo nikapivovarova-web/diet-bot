@@ -1,0 +1,8 @@
+{
+  "g": {"base_unit": "g", "factor": 1},
+  "kg": {"base_unit": "g", "factor": 1000},
+  "ml": {"base_unit": "ml", "factor": 1},
+  "l": {"base_unit": "ml", "factor": 1000},
+  "tsp": {"base_unit": "ml", "factor": 5},
+  "tbsp": {"base_unit": "ml", "factor": 15}
+}
