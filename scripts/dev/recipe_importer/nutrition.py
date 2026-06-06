@@ -107,6 +107,8 @@ def _grams(amount: float, unit: str) -> float | None:
         return amount
     if normalized in {"kg", "kilogram", "kilograms"}:
         return amount * 1000
+    if normalized in {"ml", "milliliter", "milliliters"}:
+        return amount
     return None
 
 

@@ -50,3 +50,243 @@ water,water,starter alias
 яблоко,apple,excel_400 safe direct alias
 яйца,egg,excel_400 safe direct alias
 яйцо,egg,excel_400 safe direct alias
+бульон вода,vegetable_broth,second_pass safe exact alias
+вода бульон,vegetable_broth,second_pass safe exact alias
+несоленый овощной или куриный бульон,vegetable_broth,second_pass safe exact alias
+несолёный овощной или куриный бульон,vegetable_broth,second_pass safe exact alias
+бульон рыбный,vegetable_broth,second_pass safe exact alias
+соевый соус с пониженным натрием,soy_sauce,second_pass safe exact alias
+соевый соус с пониженным натрием 1 ч л вода,soy_sauce,second_pass legacy combined alias before plus split
+томаты протертые,tomato,second_pass safe exact alias
+томаты протёртые,tomato,second_pass safe exact alias
+помидоры в собственном соку,tomato,second_pass safe exact alias
+помидоры 3 шт или протертые,tomato,second_pass safe exact alias
+крахмал,cornstarch,second_pass safe exact alias
+крахмал тапиоки,cornstarch,second_pass close exact alias
+горох зеленый,green_peas,second_pass safe exact alias
+горошек,green_peas,second_pass safe exact alias
+сыр тертый,gouda,second_pass generic exact alias
+сыр тёртый,gouda,second_pass generic exact alias
+сыр твердый,gouda,second_pass generic exact alias
+сыр твёрдый,gouda,second_pass generic exact alias
+сыр твердый тертый,gouda,second_pass generic exact alias
+сыр твёрдый тёртый,gouda,second_pass generic exact alias
+сыр грюйер тертый,gouda,second_pass close exact alias
+сыр грюйер тёртый,gouda,second_pass close exact alias
+сыр эмменталь тертый,gouda,second_pass close exact alias
+сыр эмменталь тёртый,gouda,second_pass close exact alias
+сыр грюйер эмменталь тертый,gouda,second_pass close exact alias
+рис вареный,rice,second_pass cooked rice maps to rice nutrition proxy
+рис варёный,rice,second_pass cooked rice maps to rice nutrition proxy
+пшеничная лапша,egg_noodles,second_pass close exact alias
+рисовая лапша,rice_noodles,second_pass safe exact alias
+тонкая вермишель фидеос,egg_noodles,second_pass close exact alias
+гречка,buckwheat,second_pass safe exact alias
+гречка сухая,buckwheat,second_pass safe exact alias
+чечевица красная,lentils,second_pass safe exact alias
+нут вареный,chickpeas,second_pass safe exact alias
+нут варёный,chickpeas,second_pass safe exact alias
+нут вареный консервированный,chickpeas,second_pass safe exact alias
+нут варёный консервированный,chickpeas,second_pass safe exact alias
+готовая фасоль с бульоном,red_beans,second_pass safe exact alias
+фасоль белая,red_beans,second_pass close exact alias
+белая фасоль вареная,red_beans,second_pass close exact alias
+белая фасоль варёная,red_beans,second_pass close exact alias
+кокосовое молоко,coconut_milk,second_pass safe exact alias
+морепродукты,white_fish,second_pass close seafood aggregate alias
+рыбное филе,white_fish,second_pass safe exact alias
+филе белой рыбы,white_fish,second_pass safe exact alias
+моллюски вонголе,clams,second_pass safe exact alias
+орехи,mixed_nuts,second_pass aggregate exact alias
+смешанные орехи,mixed_nuts,second_pass safe exact alias
+уксус 6,vinegar,second_pass safe exact alias
+уксус 1,vinegar,second_pass safe exact alias
+сливки 33,cream,second_pass safe exact alias
+сгущенное молоко,milk,second_pass close exact alias
+сгущённое молоко,milk,second_pass close exact alias
+перцы,bell_pepper,second_pass safe exact alias
+масло для жарки,vegetable_oil,second_pass exact alias when amount provided
+хлопья чили чили,red_pepper_flakes,second_pass safe exact alias
+сушеный чеснок,garlic_powder,second_pass safe exact alias
+сушёный чеснок,garlic_powder,second_pass safe exact alias
+мука 250,wheat_flour,second_pass parser cleanup fallback
+мука маниоки 3,wheat_flour,second_pass close parser cleanup fallback
+лайм лимон,lime_juice,second_pass safe exact alias
+цедра,lemon_juice,second_pass close exact alias
+лимон уксус,lemon_juice,second_pass close exact alias
+оливковое масло 1,olive_oil,second_pass parser cleanup fallback
+лимонный сок 2,lemon_juice,second_pass parser cleanup fallback
+сальса верде,salsa,second_pass safe exact alias
+кукуруза консервированная 1 банка 300,corn,second_pass parser cleanup fallback
+кукуруза консервированная,corn,second_pass safe exact alias
+тмин зира,cumin,second_pass safe exact alias
+софрито,tomato,second_pass close sauce base alias
+паста чили аджика,hot_sauce,second_pass close exact alias
+картофель мелкий,potato,second_pass safe exact alias
+свекла,beet,second_pass safe exact alias
+свёкла,beet,second_pass safe exact alias
+свекла запеченная,beet,second_pass safe exact alias
+свёкла запечённая,beet,second_pass safe exact alias
+несоленый овощной или говяжий бульон,vegetable_broth,second_pass safe exact alias
+несолёный овощной или говяжий бульон,vegetable_broth,second_pass safe exact alias
+бульон или вода,vegetable_broth,second_pass safe exact alias
+рыба,white_fish,second_pass generic exact alias
+сардины,tuna,second_pass close fish alias
+треска филе,cod_fillet,second_pass safe exact alias
+треска филе без костей и кожи,cod_fillet,second_pass safe exact alias
+филе судака,white_fish,second_pass safe exact alias
+филе окуня или другой белой рыбы,white_fish,second_pass safe exact alias
+тунец в собственном соку без соли,tuna,second_pass safe exact alias
+тунец свежий,tuna,second_pass close exact alias
+анчоусы свежие замороженные,anchovies,second_pass safe exact alias
+стейк говяжий,beef_ground,second_pass close beef alias
+говядина для запекания,beef_ground,second_pass close beef alias
+говядина на кости,beef_ground,second_pass close beef alias
+говяжьи свиные щечки,pork_tenderloin,second_pass close exact alias
+говяжий хвост,beef_ground,second_pass close beef alias
+куриное бедро филе,chicken_thigh,second_pass safe exact alias
+курица отварная запеченная,turkey_or_chicken_breast,second_pass safe exact alias
+фарш остатки запеченного мяса,beef_ground,second_pass close exact alias
+кролик,chicken_breast,second_pass close lean meat alias
+креветки,shrimp,second_pass safe exact alias
+кальмар,calamari,second_pass safe exact alias
+мидии,mussels,second_pass safe exact alias
+маниока,potato,second_pass close starchy root alias
+маниока кассава,potato,second_pass close starchy root alias
+желтый колотый горох,lentils,second_pass close exact alias
+чёрноглазый горох,chickpeas,second_pass close legume alias
+черноглазый горох,chickpeas,second_pass close legume alias
+фасоль пинто,red_beans,second_pass close bean alias
+фасоль красная конс,red_beans,second_pass safe exact alias
+зеленая фасоль,green_beans,second_pass safe exact alias
+стручковая фасоль,green_beans,second_pass safe exact alias
+фасоль замороженная,green_beans,second_pass safe exact alias
+перловка,pearl_barley,second_pass safe exact alias
+булгур мелкий,bulgur,second_pass safe exact alias
+рис для паэльи,rice,second_pass safe exact alias
+сухари,breadcrumbs,second_pass safe exact alias
+панировочные сухари,breadcrumbs,second_pass safe exact alias
+белый хлеб,whole_grain_bread,second_pass close exact alias
+виноградные листья,lettuce,second_pass close leaf alias
+сердца артишоков,artichoke,second_pass safe exact alias
+сыр кефалотири халуми твердый,gouda,second_pass close cheese alias
+манчего,gouda,second_pass close cheese alias
+сыр ломтиками,gouda,second_pass generic exact alias
+сыр легкий,gouda,second_pass generic exact alias
+лёгкий сыр,gouda,second_pass generic exact alias
+легкий сыр,gouda,second_pass generic exact alias
+пармезан тертый,parmesan,second_pass safe exact alias
+хрен тертый,horseradish,second_pass safe exact alias
+сухое белое вино,wine,second_pass safe exact alias
+смесь трав,oregano,second_pass close herb alias
+чеснок сухой,garlic_powder,second_pass safe exact alias
+суш чеснок,garlic_powder,second_pass safe exact alias
+мука рисовая,rice_flour,second_pass safe exact alias
+рисовая мука,rice_flour,second_pass safe exact alias
+мука рисовая цельнозерновая,rice_flour,second_pass safe exact alias
+мука нутовая,wheat_flour,second_pass close flour alias
+овсяные хлопья бг,oats,second_pass safe exact alias
+овсяных хлопьев,oats,second_pass safe exact alias
+твердый тофу,tofu,second_pass safe exact alias
+твердого тофу,tofu,second_pass safe exact alias
+сладкого перца,bell_pepper,second_pass safe exact alias
+свежей моркови,carrot,second_pass safe exact alias
+соевого соуса,soy_sauce,second_pass safe exact alias
+сиропа топинамбура,agave_syrup,second_pass close syrup alias
+воды,water,second_pass inflected exact alias
+кокосового масла,coconut_oil,second_pass safe exact alias
+греческого йогурта,greek_yogurt,second_pass safe exact alias
+йогурт натуральный 2,greek_yogurt,second_pass close exact alias
+йогурт,greek_yogurt,second_pass close exact alias
+протеин,whey_protein,second_pass protein proxy alias
+любые ягоды,berries,second_pass safe aggregate alias
+банан спелый,banana,second_pass safe exact alias
+банан спелый сладкий,banana,second_pass safe exact alias
+арахис паста,peanut_butter,second_pass safe exact alias
+стружка кокоса,coconut_flakes,second_pass safe exact alias
+персик,peach,second_pass safe exact alias
+малина,raspberries,second_pass safe exact alias
+семечки или кунжут,sesame_seeds,second_pass close seed alias
+ягоды свеж зам,berries,second_pass safe aggregate alias
+батат,sweet_potato,second_pass safe exact alias
+брокколи,broccoli,second_pass safe exact alias
+листья романо айсберг,lettuce,second_pass safe exact alias
+багет,baguette,second_pass safe exact alias
+вустеширский соус,worcestershire,second_pass typo exact alias
+вустерширский соус,worcestershire,second_pass safe exact alias
+каперсы,capers,second_pass safe exact alias
+анчоуса,anchovies,second_pass safe exact alias
+лавр,bay_leaf,second_pass safe exact alias
+лавровый лист,bay_leaf,second_pass safe exact alias
+фунчоза,rice_noodles,second_pass close noodle alias
+рисовая бумага,rice_paper,second_pass safe exact alias
+10 листов рисовой бумаги,rice_paper,second_pass parser cleanup fallback
+черри,tomato,second_pass safe exact alias
+томатов черри,tomato,second_pass safe exact alias
+помидоры черри,tomato,second_pass safe exact alias
+оливкового масла,olive_oil,second_pass inflected exact alias
+кукурузная мука,cornmeal,second_pass safe exact alias
+томатный соус,tomato,second_pass close exact alias
+тесто для эмпанадас,wheat_flour,second_pass dough proxy alias
+яйцо для смазки,egg,second_pass safe exact alias
+матамбре тонкий говяжий пласт,beef_ground,second_pass close beef alias
+яйца вкрутую,egg,second_pass safe exact alias
+тесто,wheat_flour,second_pass dough proxy exact alias
+перец горошком,black_pepper,second_pass safe exact alias
+зира,cumin,second_pass safe exact alias
+тапиока,wheat_flour,second_pass close starch alias
+тapioca,wheat_flour,second_pass close starch alias
+бамия,green_beans,second_pass close green vegetable alias
+тыква небольшая 1 шт,pumpkin,second_pass parser cleanup fallback
+икра трески,cod_fillet,second_pass close fish alias
+огурцы,cucumber,second_pass safe exact alias
+белая фасоль крупная,red_beans,second_pass close bean alias
+капуста белокочанная,cabbage,second_pass safe exact alias
+бешамель,milk,second_pass close sauce alias
+курица кусочками,chicken_breast,second_pass safe exact alias
+лук мелкий,onion,second_pass safe exact alias
+несоленый овощной бульон,vegetable_broth,second_pass safe exact alias
+несолёный овощной бульон,vegetable_broth,second_pass safe exact alias
+свинина,pork_tenderloin,second_pass close pork alias
+сельдерей стеблевой,celery,second_pass safe exact alias
+осьминог,calamari,second_pass close seafood alias
+эскабече,vinegar,second_pass close marinade alias
+уксус белый,vinegar,second_pass safe exact alias
+перец пикильо,roasted_red_pepper,second_pass safe exact alias
+креветки в панцире,shrimp,second_pass safe exact alias
+рыба целиком,white_fish,second_pass safe exact alias
+соль крупная,salt,second_pass safe exact alias
+белок,egg_white,second_pass safe exact alias
+чернослив,raisins,second_pass close dried fruit alias
+кедровые орешки миндаль,pine_nuts,second_pass close nut alias
+вонтон листочки,rice_paper,second_pass close wrapper alias
+обертки для вонтонов,rice_paper,second_pass close wrapper alias
+филе лосося слабосоленое или свежее,salmon,second_pass safe exact alias
+лук шалот,onion,second_pass safe exact alias
+кефир или питьевой йогурт,greek_yogurt,second_pass close exact alias
+сметана 10,sour_cream,second_pass safe exact alias
+чеснок 2 зуб паста тахини,tahini,second_pass parser cleanup fallback
+консервированная,red_beans,second_pass source omitted bean alias
+тыква баттернат,pumpkin,second_pass safe exact alias
+замороженного филе трески,cod_fillet,second_pass safe exact alias
+пассаты,tomato,second_pass safe exact alias
+консерв белой фасоли по,red_beans,second_pass parser cleanup fallback
+булгура у меня цельнозерновой красный,bulgur,second_pass parser cleanup fallback
+миндального молока,almond_milk,second_pass safe exact alias
+сладкая паприка,paprika,second_pass safe exact alias
+раст масла,vegetable_oil,second_pass abbreviated exact alias
+паприка сладкая,paprika,second_pass safe exact alias
+прованские травы,oregano,second_pass close herb alias
+пшеничной муки,wheat_flour,second_pass safe exact alias
+мягкий творог,cottage_cheese,second_pass safe exact alias
+молоко 1 5 2 5 или вода,milk,second_pass parser cleanup fallback
+фарш куриной грудки,chicken_breast,second_pass safe exact alias
+вода или овощной бульон,vegetable_broth,second_pass safe exact alias
+говядина или куриная грудка,chicken_breast,second_pass close lean protein alias
+филе минтая,white_fish,second_pass safe exact alias
+мякоть говядины или индейки,turkey,second_pass close lean protein alias
+яйцо вареное,egg,second_pass safe exact alias
+цельнозерновая пшеничная мука,wheat_flour,second_pass safe exact alias
+овсяные хлопья долгой варки,oats,second_pass safe exact alias
+овсяная мука,oats,second_pass safe exact alias
+горчица,mustard,second_pass safe exact alias

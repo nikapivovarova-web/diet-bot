@@ -73,6 +73,71 @@ def test_parses_deterministic_text_ingredient_rows() -> None:
     ]
 
 
+def test_parses_second_pass_bullet_ingredients_with_household_units() -> None:
+    result = parse_ingredients(
+        _recipe(
+            raw_ingredient_text=(
+                "• куриные бёдра 1,2 кг • лимонный сок 2 ст. л. "
+                "• чеснок 2 зубчика • орегано 1 ч. л. "
+                "• соль до 1/4 ч. л., масло 2 ст. л."
+            )
+        )
+    )
+
+    assert result.parse_status == "parsed"
+    assert [(item.name, item.amount, item.unit) for item in result.ingredients] == [
+        ("куриные бёдра", 1200.0, "g"),
+        ("лимонный сок", 30.0, "ml"),
+        ("чеснок", 10.0, "g"),
+        ("орегано", 5.0, "ml"),
+        ("соль", 1.25, "ml"),
+        ("масло", 30.0, "ml"),
+    ]
+
+
+def test_ignores_amountless_seasonings_without_blocking_recipe() -> None:
+    result = parse_ingredients(
+        _recipe(raw_ingredient_text="• рыбное филе 900 г • соль, перец • масло для жарки")
+    )
+
+    assert result.parse_status == "parsed"
+    assert [(item.name, item.amount, item.unit) for item in result.ingredients] == [
+        ("рыбное филе", 900.0, "g"),
+    ]
+
+
+def test_splits_low_sodium_soy_sauce_and_added_water() -> None:
+    result = parse_ingredients(
+        _recipe(
+            raw_ingredient_text=(
+                "• соевый соус с пониженным натрием 1 ч. л. + вода 2 ст. л. "
+                "• крахмал 1 ст. л. + вода 2 ст. л."
+            )
+        )
+    )
+
+    assert result.parse_status == "parsed"
+    assert [(item.name, item.amount, item.unit) for item in result.ingredients] == [
+        ("соевый соус с пониженным натрием", 5.0, "ml"),
+        ("вода", 30.0, "ml"),
+        ("крахмал", 15.0, "ml"),
+        ("вода", 30.0, "ml"),
+    ]
+
+
+def test_splits_quantity_first_inline_lists() -> None:
+    result = parse_ingredients(
+        _recipe(raw_ingredient_text="60г киноа (сухой вес) 100г твердого тофу 90г сладкого перца")
+    )
+
+    assert result.parse_status == "parsed"
+    assert [(item.name, item.amount, item.unit) for item in result.ingredients] == [
+        ("киноа", 60.0, "g"),
+        ("твердого тофу", 100.0, "g"),
+        ("сладкого перца", 90.0, "g"),
+    ]
+
+
 def test_parses_excel_400_dash_lines_and_prefers_explicit_grams() -> None:
     result = parse_ingredients(
         _recipe(

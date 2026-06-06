@@ -29,6 +29,7 @@ def test_generate_production_rows_uses_deterministic_ids_and_recipe_keys() -> No
     assert rows.recipes[0]["import_metadata"] == {
         "candidate_id": "c001",
         "source": "https://example.test/alpha",
+        "time_policy": "source_time",
     }
 
 
@@ -50,6 +51,50 @@ def test_generate_production_rows_sets_nutrition_status_ok() -> None:
     assert rows.nutrition[0]["ingredient_count"] == 2
     assert rows.nutrition[0]["unmatched_ingredient_count"] == 0
     assert rows.nutrition[0]["calculation_notes"] == "recipe importer dry-run preview"
+
+
+def test_generate_production_rows_uses_reviewed_copy_and_default_time_policy() -> None:
+    rows = _generate(recipe_no_start=711, recipe_key_prefix="import202606_")
+    beta = rows.recipes[1]
+
+    assert beta["time_text"] == "около 35 минут (оценка: 25 активных + 10 пассивных)"
+    assert beta["active_time_min"] == 25
+    assert beta["passive_time_min"] == 10
+    assert beta["import_metadata"]["time_policy"] == "second_pass_default:stovetop_main"
+    assert "recipe importer preview row" not in beta["short_description_ru"]
+    assert "rice" in beta["short_description_ru"]
+    assert "Cook Beta Bowl." in beta["short_description_ru"]
+
+
+def test_generate_production_rows_sanitizes_user_facing_control_chars() -> None:
+    loaded, photos, classifications, ingredients, servings, mapping, nutrition = _fixtures()
+    loaded.recipes[0] = NormalizedRecipe(
+        candidate_id="c001",
+        title_ru="Alpha\x00 Bowl",
+        meal_type="breakfast",
+        duplicate_risk="low",
+        structured_ingredients="[]",
+        servings="1",
+        instructions="Cook\x00 Alpha Bowl.",
+        time="15 min",
+        source="https://example.test/alpha",
+    )
+
+    rows = generate_production_rows(
+        loaded,
+        photos,
+        classifications,
+        ingredient_results=ingredients,
+        servings_results=servings,
+        mapping_results=mapping,
+        nutrition_results=nutrition,
+        recipe_no_start=711,
+        recipe_key_prefix="import202606_",
+    )
+
+    assert "\x00" not in rows.recipes[0]["title_ru"]
+    assert "\x00" not in rows.recipes[0]["instructions_ru"]
+    assert "\x00" not in rows.recipes[0]["short_description_ru"]
 
 
 def test_generate_production_rows_photo_manifest_uses_target_photo_path() -> None:
@@ -201,7 +246,7 @@ def _recipe(candidate_id: str, title: str, meal_type: str, source: str) -> Norma
         structured_ingredients="[]",
         servings="1",
         instructions=f"Cook {title}.",
-        time="15 min",
+        time="15 min" if candidate_id == "c001" else "",
         source=source,
     )
 

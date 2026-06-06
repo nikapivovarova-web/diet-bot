@@ -99,6 +99,33 @@ def test_nutrition_calculation_sums_multiple_ingredients(tmp_path: Path) -> None
     assert result.sodium_mg == 15.5
 
 
+def test_nutrition_treats_ml_as_gram_equivalent_for_importer_audit(tmp_path: Path) -> None:
+    foods = load_curated_foods(
+        _write_foods(
+            tmp_path / "data",
+            [
+                _food(
+                    "lemon_juice",
+                    _required(
+                        energy_kcal=20,
+                        protein_g=0,
+                        fat_g=0,
+                        carbohydrate_g=7,
+                        fiber_g=0,
+                        sodium_mg=1,
+                    ),
+                )
+            ],
+        )
+    )
+
+    result = calculate_nutrition("c001", _mapping([_row("lemon_juice", 30, "ml")]), foods)
+
+    assert result.calculation_status == "ok"
+    assert result.energy_kcal == 6.0
+    assert result.sodium_mg == 0.3
+
+
 def test_nutrition_missing_food_id_blocks(tmp_path: Path) -> None:
     foods = load_curated_foods(
         _write_foods(tmp_path / "data", [_food("rice", _required(energy_kcal=200))])
@@ -115,7 +142,7 @@ def test_nutrition_missing_grams_blocks(tmp_path: Path) -> None:
         _write_foods(tmp_path / "data", [_food("rice", _required(energy_kcal=200))])
     )
 
-    result = calculate_nutrition("c001", _mapping([_row("rice", 100, "ml")]), foods)
+    result = calculate_nutrition("c001", _mapping([_row("rice", 100, "count")]), foods)
 
     assert result.calculation_status == "blocked"
     assert result.blocker_reason == "missing_grams"

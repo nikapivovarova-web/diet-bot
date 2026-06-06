@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -111,6 +112,7 @@ def generate_production_rows(
             _recipe_row(
                 recipe,
                 servings,
+                ingredient_names=[ingredient.name for ingredient in parsed_ingredients.ingredients],
                 recipe_no=recipe_no,
                 recipe_id=recipe_id,
                 recipe_key=recipe_key,
@@ -181,38 +183,50 @@ def _recipe_row(
     recipe: NormalizedRecipe,
     servings: ServingsResult,
     *,
+    ingredient_names: list[str],
     recipe_no: int,
     recipe_id: str,
     recipe_key: str,
     image_url: str,
 ) -> dict[str, object]:
     slot = _slot(recipe.meal_type)
+    title = _clean_user_text(recipe.title_ru)
+    meal_type = _clean_user_text(recipe.meal_type)
+    instructions = _clean_user_text(recipe.instructions)
+    source = _clean_user_text(recipe.source)
+    time_fields = _time_fields(recipe, slot)
     row: dict[str, object] = {
         "recipe_id": recipe_id,
         "recipe_no": recipe_no,
         "recipe_key": recipe_key,
         "slot": slot,
         "meal_slot": slot,
-        "category_ru": recipe.meal_type or slot,
-        "title_ru": recipe.title_ru,
-        "short_description_ru": _short_description(recipe, slot),
+        "category_ru": meal_type or slot,
+        "title_ru": title,
+        "short_description_ru": _short_description(
+            title=title or recipe.candidate_id,
+            slot=slot,
+            ingredient_names=ingredient_names,
+            instructions=instructions,
+        ),
         "servings": servings.servings,
         "servings_original": recipe.servings,
         "servings_cleaned": servings.servings,
         "cooking_effort": "simple",
-        "active_time_min": _first_positive_int(recipe.time),
-        "passive_time_min": 0,
+        "active_time_min": time_fields["active_time_min"],
+        "passive_time_min": time_fields["passive_time_min"],
         "equipment": "",
         "tags": f"{slot}, recipe_importer_preview",
-        "time_text": recipe.time,
-        "instructions_ru": recipe.instructions,
+        "time_text": time_fields["time_text"],
+        "instructions_ru": instructions,
         "source_name": "FoodBalance recipe importer preview",
-        "source_url": recipe.source,
+        "source_url": source,
         "image_url": image_url,
         "image_attribution": "",
         "import_metadata": {
             "candidate_id": recipe.candidate_id,
-            "source": recipe.source,
+            "source": source,
+            "time_policy": time_fields["time_policy"],
         },
     }
     return row
@@ -335,9 +349,76 @@ def _slot(value: str) -> str:
     return "main"
 
 
-def _short_description(recipe: NormalizedRecipe, slot: str) -> str:
-    title = recipe.title_ru or recipe.candidate_id
-    return f"{title}: {slot} recipe importer preview row."
+def _slot_label(slot: str) -> str:
+    return {
+        "breakfast": "завтрак",
+        "lunch": "основное блюдо",
+        "dinner": "основное блюдо",
+        "main": "основное блюдо",
+        "snack": "перекус",
+    }.get(slot, "основное блюдо")
+
+
+def _short_description(
+    *,
+    title: str,
+    slot: str,
+    ingredient_names: list[str],
+    instructions: str,
+) -> str:
+    ingredient_summary = ", ".join(
+        _clean_user_text(name)
+        for name in ingredient_names[:3]
+        if _clean_user_text(name)
+    )
+    instruction_summary = _first_instruction_sentence(instructions)
+    parts = [f"{title}: {_slot_label(slot)}"]
+    if ingredient_summary:
+        parts.append(f"ингредиенты: {ingredient_summary}")
+    if instruction_summary:
+        parts.append(instruction_summary)
+    return ". ".join(parts).rstrip(".") + "."
+
+
+def _time_fields(recipe: NormalizedRecipe, slot: str) -> dict[str, object]:
+    source_time = _clean_user_text(recipe.time)
+    active_minutes = _first_positive_int(source_time)
+    if active_minutes > 0:
+        return {
+            "time_text": source_time,
+            "active_time_min": active_minutes,
+            "passive_time_min": 0,
+            "time_policy": "source_time",
+        }
+
+    title_and_instructions = " ".join((recipe.title_ru, recipe.instructions)).lower()
+    if _looks_no_cook_or_quick_assembly(title_and_instructions):
+        return {
+            "time_text": "около 15 минут (оценка: сборка/без длительного ожидания)",
+            "active_time_min": 15,
+            "passive_time_min": 0,
+            "time_policy": "second_pass_default:no_cook_or_quick_assembly",
+        }
+    if _looks_baked_or_simmered(title_and_instructions):
+        return {
+            "time_text": "около 45 минут (оценка: 20 активных + 25 пассивных)",
+            "active_time_min": 20,
+            "passive_time_min": 25,
+            "time_policy": "second_pass_default:baked_or_simmered_main",
+        }
+    if slot in {"breakfast", "snack"}:
+        return {
+            "time_text": "около 20 минут (оценка по категории)",
+            "active_time_min": 20,
+            "passive_time_min": 0,
+            "time_policy": "second_pass_default:breakfast_or_snack",
+        }
+    return {
+        "time_text": "около 35 минут (оценка: 25 активных + 10 пассивных)",
+        "active_time_min": 25,
+        "passive_time_min": 10,
+        "time_policy": "second_pass_default:stovetop_main",
+    }
 
 
 def _first_positive_int(value: str) -> int:
@@ -345,6 +426,75 @@ def _first_positive_int(value: str) -> int:
     if not match:
         return 0
     return int(match.group(0))
+
+
+def _clean_user_text(value: str) -> str:
+    text = "".join(
+        " "
+        if unicodedata.category(character)[0] == "C"
+        and character not in {"\n", "\r", "\t"}
+        else character
+        for character in str(value or "")
+    )
+    text = text.replace("\ufffd", "").replace("???", "")
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _first_instruction_sentence(instructions: str) -> str:
+    text = _clean_user_text(instructions)
+    if not text:
+        return ""
+    match = re.search(r"(.{20,160}?[.!?])(?:\s|$)", text)
+    if match:
+        return match.group(1).strip()
+    return text[:160].strip()
+
+
+def _looks_no_cook_or_quick_assembly(text: str) -> bool:
+    if _looks_baked_or_simmered(text) or _looks_active_cooking(text):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "салат",
+            "тартар",
+            "мюсли",
+            "смешайте",
+            "заправьте",
+            "разомните",
+        )
+    )
+
+
+def _looks_baked_or_simmered(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "выпек",
+            "запек",
+            "духовк",
+            "туш",
+            "варит",
+            "варите",
+            "суп",
+            "рагу",
+        )
+    )
+
+
+def _looks_active_cooking(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "жар",
+            "обжар",
+            "грил",
+            "сковород",
+            "кип",
+            "отвар",
+            "бланш",
+        )
+    )
 
 
 def _quantity_text(amount: float, unit: str) -> str:

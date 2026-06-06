@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -16,6 +17,8 @@ LEGACY_CURATED_RECIPE_COUNT = 400
 DOCX_RECIPE_COUNT = 55
 RESTORED_R401_R610_RECIPE_COUNT = 210
 RESTORED_R666_R710_RECIPE_COUNT = 45
+SECOND_PASS_IMPORT_RECIPE_COUNT = 157
+SECOND_PASS_EXCLUDED_RECIPE_NOS = frozenset({856})
 LOW_RISK_MISSING_FOOD_RECIPE_NOS = frozenset(
     {418, 429, 435, 471, 480, 484, 493, 495, 527, 562, 572, 684, 685}
 )
@@ -24,14 +27,25 @@ TOTAL_CURATED_RECIPE_COUNT = (
     + DOCX_RECIPE_COUNT
     + RESTORED_R401_R610_RECIPE_COUNT
     + RESTORED_R666_R710_RECIPE_COUNT
+    + SECOND_PASS_IMPORT_RECIPE_COUNT
 )
-SELECTABLE_CURATED_RECIPE_COUNT = 677
+SELECTABLE_CURATED_RECIPE_COUNT = 834
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
 EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset()
 RESTORED_R401_R610_RECIPE_NOS = frozenset(range(401, 611)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
 RESTORED_R666_R710_RECIPE_NOS = frozenset(range(666, 711)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
 RESTORED_RECIPE_NOS = RESTORED_R401_R610_RECIPE_NOS | RESTORED_R666_R710_RECIPE_NOS
+SECOND_PASS_RECIPE_NOS = frozenset(range(711, 869)) - SECOND_PASS_EXCLUDED_RECIPE_NOS
+USER_FACING_RECIPE_FIELDS = (
+    "category_ru",
+    "title_ru",
+    "short_description_ru",
+    "time_text",
+    "instructions_ru",
+    "source_name",
+    "source_url",
+)
 
 
 def test_curated_recipe_data_has_full_calculation_coverage() -> None:
@@ -137,6 +151,61 @@ def test_low_risk_missing_food_recipes_are_restored_with_resolved_foods_and_phot
     } <= foods
 
 
+def test_second_pass_bulk_import_has_expected_rows_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    recipes_by_no = {int(recipe["recipe_no"]): recipe for recipe in recipes}
+    second_pass_ids = {recipes_by_no[recipe_no]["recipe_id"] for recipe_no in SECOND_PASS_RECIPE_NOS}
+
+    assert len(SECOND_PASS_RECIPE_NOS) == SECOND_PASS_IMPORT_RECIPE_COUNT
+    assert SECOND_PASS_RECIPE_NOS <= set(recipes_by_no)
+    assert set(recipes_by_no) & SECOND_PASS_EXCLUDED_RECIPE_NOS == set()
+    assert all(str(recipes_by_no[recipe_no]["recipe_key"]).startswith("second_pass") for recipe_no in SECOND_PASS_RECIPE_NOS)
+    assert all(
+        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.png"
+        for recipe_no in SECOND_PASS_RECIPE_NOS
+    )
+    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.png").exists() for recipe_no in SECOND_PASS_RECIPE_NOS)
+    assert second_pass_ids <= {row["recipe_id"] for row in nutrition}
+    assert second_pass_ids <= {row["recipe_id"] for row in ingredients}
+
+
+def test_second_pass_bulk_import_has_reviewed_user_facing_copy_and_time_policy() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    second_pass_rows = _second_pass_recipe_rows(recipes)
+
+    assert len(second_pass_rows) == SECOND_PASS_IMPORT_RECIPE_COUNT
+    assert all(row.get("time_text", "").strip() for row in second_pass_rows)
+    assert all("recipe importer preview row" not in row.get("short_description_ru", "").lower() for row in second_pass_rows)
+    assert all(row.get("short_description_ru", "").strip() for row in second_pass_rows)
+    assert all(row.get("active_time_min", 0) > 0 for row in second_pass_rows)
+    assert all(row.get("passive_time_min", 0) >= 0 for row in second_pass_rows)
+    assert {
+        row["import_metadata"].get("time_policy")
+        for row in second_pass_rows
+    } <= {
+        "second_pass_default:no_cook_or_quick_assembly",
+        "second_pass_default:breakfast_or_snack",
+        "second_pass_default:stovetop_main",
+        "second_pass_default:baked_or_simmered_main",
+    }
+
+
+def test_second_pass_bulk_import_user_facing_text_has_no_control_chars_or_placeholders() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    second_pass_rows = _second_pass_recipe_rows(recipes)
+
+    bad_values: list[tuple[int, str, str, str]] = []
+    for row in second_pass_rows:
+        for field in USER_FACING_RECIPE_FIELDS:
+            value = str(row.get(field) or "")
+            if _has_forbidden_user_facing_text(value):
+                bad_values.append((int(row["recipe_no"]), row["recipe_id"], field, value))
+
+    assert bad_values == []
+
+
 def test_green_beans_unblocks_existing_r209_recipe() -> None:
     food_by_id = {food.id: food for food in curated_foods()}
     recipes = [recipe for recipe in built_in_recipes() if "curated" in recipe.tags]
@@ -237,6 +306,24 @@ def test_docx_recipe_batch_r611_r665_foods_are_resolved() -> None:
     )
 
     assert missing_foods == []
+
+
+def _second_pass_recipe_rows(recipes: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        row
+        for row in recipes
+        if int(row["recipe_no"]) in SECOND_PASS_RECIPE_NOS
+    ]
+
+
+def _has_forbidden_user_facing_text(value: str) -> bool:
+    if "???" in value or "\ufffd" in value:
+        return True
+    return any(
+        unicodedata.category(character)[0] == "C"
+        and character not in {"\n", "\r", "\t"}
+        for character in value
+    )
 
 
 def test_curated_recipe_titles_match_corrected_main_ingredients() -> None:
