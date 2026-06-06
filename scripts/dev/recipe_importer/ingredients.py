@@ -8,7 +8,7 @@ from scripts.dev.recipe_importer.loader import NormalizedRecipe
 
 
 _TEXT_PATTERN = re.compile(
-    r"^\s*(?P<name>.+?)\s*(?:—|–|-|:)\s*(?P<quantity>.+?)\s*$"
+    r"^\s*(?P<name>.+?)\s*(?:—|–|:|\s-\s)\s*(?P<quantity>.+?)\s*$"
 )
 _QUANTITY_PATTERN = re.compile(
     r"(?:до\s*)?(?:≈|~=|~)?\s*"
@@ -20,8 +20,10 @@ _QUANTITY_PATTERN = re.compile(
     r"мл|ml|л|l|"
     r"ст\.?\s*л\.?|tbsp|tablespoons?|"
     r"ч\.?\s*л\.?|tsp|teaspoons?|"
-    r"шт\.?|штук(?:и)?|зуб(?:чик(?:а|ов)?)?|"
-    r"яйц[ао]?|кружк(?:ов|а)?|пуч(?:ок|ка)?|ломтик(?:а|ов)?|бан(?:ка|ки)"
+    r"шт\.?|штук(?:и)?|зуб\.?|зуб(?:чик(?:а|ов)?)?|"
+    r"яйц[ао]?|кружк(?:ов|а)?|пуч(?:ок|ка)?|пер(?:а|о)?|"
+    r"стеб(?:ель|ля|лей)|лист(?:а|ов|ьев)?|веточ(?:ка|ки|ек)|"
+    r"головк(?:а|и)?|стакан(?:а|ов)?|порци(?:я|и|ю)?|ломтик(?:а|ов)?|бан(?:ка|ки)"
     r")\b",
     re.IGNORECASE,
 )
@@ -31,6 +33,21 @@ _NORMALIZATION_TAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _COMMA_SPLIT_RE = re.compile(r"(?<!\d)\s*,\s*(?=[^,]*\d)")
+_PLUS_SPLIT_RE = re.compile(
+    r"\s+\+\s+(?=(?:вода|бульон|масло|оливковое масло|лимонный сок|сок)\b)",
+    re.IGNORECASE,
+)
+_INLINE_QUANTITY_SPLIT_RE = re.compile(
+    r"((?:\d+(?:[.,]\d+)?|\d+\s*/\s*\d+)\s*"
+    r"(?:кг|г|гр|грамм(?:а|ов)?|мл|л|шт\.?|ст\.?\s*л\.?|ч\.?\s*л\.?)"
+    r"(?:\s*\([^)]*\))?)"
+    r"\s+(?=[A-ZА-ЯЁ][^•\n:]{1,60}\s*(?:—|–|-)\s*\d)",
+    re.IGNORECASE,
+)
+_QUANTITY_FIRST_SPLIT_RE = re.compile(
+    r"(?<!^)\s+(?=\d+(?:[.,]\d+)?\s*(?:кг|г|гр|мл|л|шт\.?|ст\.?\s*л\.?|ч\.?\s*л\.?)\b)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -145,6 +162,7 @@ def _parse_positive_amount(value: object) -> float | None:
 
 def _ingredient_segments(value: str) -> list[str]:
     cleaned = _NORMALIZATION_TAIL_RE.sub("", value or "").strip()
+    cleaned = _strip_leading_serving_header(cleaned)
     if not cleaned:
         return []
 
@@ -155,7 +173,16 @@ def _ingredient_segments(value: str) -> list[str]:
 
     segments: list[str] = []
     for segment in raw_segments:
-        segments.extend(piece.strip() for piece in _COMMA_SPLIT_RE.split(segment) if piece.strip())
+        segment = _INLINE_QUANTITY_SPLIT_RE.sub(r"\1\n", segment)
+        if re.match(r"^\s*\d", segment):
+            segment = _QUANTITY_FIRST_SPLIT_RE.sub("\n", segment)
+        for piece in segment.splitlines():
+            for plus_piece in _PLUS_SPLIT_RE.split(piece):
+                segments.extend(
+                    comma_piece.strip()
+                    for comma_piece in _COMMA_SPLIT_RE.split(plus_piece)
+                    if comma_piece.strip()
+                )
     return segments
 
 
@@ -183,6 +210,28 @@ def _parse_text_line(line: str) -> tuple[str, float, str] | None:
         return None
     amount, unit = _normalize_amount_unit(_clean_name(name), amount, raw_unit)
     return _clean_name(name), amount, unit
+
+
+def _strip_leading_serving_header(value: str) -> str:
+    cleaned = re.sub(
+        r"^\s*\d+\s+стандарт\.\s*/\s*\d+\s+мал\.\s*порци[ияй]\s+",
+        "",
+        value or "",
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\s*\d+\s+стандарт\.\s*порци[ияй]\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\s*\d+\s+[^\d:]+/\s*\d+\s+[^:]+:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned
 
 
 def _parse_text_quantity(value: str, name: str = "") -> tuple[float, str] | None:
@@ -218,7 +267,13 @@ def _normalize_unit(unit: str) -> str:
         return "tbsp"
     if re.fullmatch(r"ч\.?\s*л\.?|tsp|teaspoons?", normalized):
         return "tsp"
-    if re.fullmatch(r"шт\.?|штук(?:и)?|зуб(?:чик(?:а|ов)?)?|яйц[ао]?|кружк(?:ов|а)?|пуч(?:ок|ка)?|ломтик(?:а|ов)?|бан(?:ка|ки)", normalized):
+    if re.fullmatch(
+        r"шт\.?|штук(?:и)?|зуб\.?|зуб(?:чик(?:а|ов)?)?|яйц[ао]?|кружк(?:ов|а)?|"
+        r"пуч(?:ок|ка)?|пер(?:а|о)?|стеб(?:ель|ля|лей)|лист(?:а|ов|ьев)?|"
+        r"веточ(?:ка|ки|ек)|головк(?:а|и)?|стакан(?:а|ов)?|порци(?:я|и|ю)?|"
+        r"ломтик(?:а|ов)?|бан(?:ка|ки)",
+        normalized,
+    ):
         return "count"
     return normalized
 
@@ -256,7 +311,9 @@ def _parse_fraction(value: str) -> float | None:
 
 def _clean_name(value: str) -> str:
     cleaned = re.sub(r"\([^)]*\)", "", value or "")
+    cleaned = cleaned.replace("*", " ")
     cleaned = re.sub(r"\s+", " ", cleaned.replace("•", " ")).strip(" .:-;")
+    cleaned = re.sub(r"\b\d+(?:[.,]\d+)?\s*$", "", cleaned).strip(" .:-;")
     return cleaned
 
 
@@ -305,11 +362,100 @@ def _count_grams(name: str, unit: str) -> float | None:
         return 25.0
     if "ломтик" in text and ("хлеб" in text or "тост" in text):
         return 35.0
+    if "стеб" in text and "сельдер" in text:
+        return 40.0
+    if "голов" in text and "чеснок" in text:
+        return 50.0
+    if "лист" in text and "фило" in text:
+        return 25.0
+    if "лист" in text and ("рисов" in text or "бумаг" in text):
+        return 10.0
+    if "лист" in text and "капуст" in text:
+        return 30.0
+    if "лист" in text and ("салат" in text or "романо" in text or "айсберг" in text):
+        return 10.0
+    if "стакан" in text and ("вод" in text or "бульон" in text):
+        return 240.0
+    if "порци" in text and ("тесто" in text or "пюре" in text):
+        return 500.0
+    if "пер" in text and "зелен" in text and "лук" in text:
+        return 5.0
+    if "бан" in text and ("кукуруз" in text or "фасол" in text or "тунец" in text):
+        return 300.0
     return None
 
 
 def _is_ignorable_amountless_line(line: str) -> bool:
-    normalized = (line or "").casefold()
+    normalized = (line or "").casefold().replace("ё", "е")
+    normalized = re.sub(r"[^0-9a-zа-я]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in {
+        "ингредиенты",
+        "начинка",
+        "основа",
+        "для соуса",
+        "для супа",
+        "для рагу",
+        "для гранолы",
+        "для запеканки",
+        "соль",
+        "перец",
+        "черный перец",
+        "белый перец",
+        "крупная соль",
+        "соль перец",
+        "соль масло",
+        "соль масло для жарки",
+        "соль оливковое масло",
+        "соль оливковое масло для жарки",
+        "соль и перец",
+        "соль и специи",
+        "соль специи",
+        "специи",
+        "сухари",
+        "панировка",
+        "зелень",
+        "петрушка",
+        "кинза",
+        "укроп",
+        "базилик",
+        "орегано",
+        "лавр",
+        "лавровый лист",
+        "мускат",
+        "мускатный орех",
+        "корица",
+        "шафран куркума",
+        "шафран",
+        "куркума",
+        "паприка",
+        "кунжут для посыпки",
+        "масло для жарки",
+        "масло для смазывания",
+        "соус для подачи",
+        "листья кукурузы или пергамент",
+        "нитка шпагат",
+        "лимон",
+        "лайм",
+        "пита овощи тцацики",
+    }:
+        return True
+    if "щепотк" in normalized and any(
+        spice in normalized
+        for spice in (
+            "корица",
+            "мускат",
+            "мускатный орех",
+            "черный перец",
+            "соль",
+            "специи",
+            "ванилин",
+            "ваниль",
+        )
+    ):
+        return True
+    if normalized.startswith("на ") and "порци" in normalized:
+        return True
     return any(
         marker in normalized
         for marker in (
