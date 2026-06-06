@@ -8,7 +8,13 @@ from pathlib import Path
 from scripts.dev.recipe_importer.apply import apply_run
 from scripts.dev.recipe_importer.classifier import classify_recipe
 from scripts.dev.recipe_importer.ingredients import parse_ingredients
-from scripts.dev.recipe_importer.loader import DuplicateRisk, LoadedInput, load_excel_400_workbook, load_photo_prep_317
+from scripts.dev.recipe_importer.loader import (
+    DuplicateRisk,
+    LoadedInput,
+    load_excel_400_workbook,
+    load_photo_prep_317,
+    load_second_pass_suitable_csv,
+)
 from scripts.dev.recipe_importer.mapping import load_alias_config, map_ingredients
 from scripts.dev.recipe_importer.nutrition import calculate_nutrition, load_curated_foods
 from scripts.dev.recipe_importer.photos import build_photo_manifest
@@ -23,6 +29,7 @@ from scripts.dev.recipe_importer.writer import write_audit_outputs
 INPUT_LOADERS = {
     "photo_prep_317": load_photo_prep_317,
     "excel_400_workbook": load_excel_400_workbook,
+    "second_pass_suitable_csv": load_second_pass_suitable_csv,
 }
 
 
