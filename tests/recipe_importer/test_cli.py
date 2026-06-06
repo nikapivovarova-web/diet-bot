@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from scripts.dev.recipe_importer.cli import main
+from tests.recipe_importer.test_loader import _write_minimal_xlsx
 
 
 def test_cli_audit_writes_expected_files(tmp_path: Path) -> None:
@@ -152,3 +153,71 @@ def test_cli_audit_writes_production_rows_only_under_out(tmp_path: Path) -> None
     recipes = json.loads((production_dir / "curated_recipes.json").read_text(encoding="utf-8"))
     assert recipes[0]["recipe_no"] == 711
     assert recipes[0]["recipe_key"] == "import202606_001"
+
+
+def test_cli_audit_accepts_excel_400_workbook_input(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "recipes.xlsx"
+    photos_dir = tmp_path / "photos"
+    data_dir = tmp_path / "data"
+    out_dir = tmp_path / "out"
+    photos_dir.mkdir()
+    data_dir.mkdir()
+    (data_dir / "curated_foods.json").write_text(
+        json.dumps(
+            [
+                {
+                    "food_id": "olive_oil",
+                    "nutrients_per_100g": {
+                        "energy_kcal": 884,
+                        "protein_g": 0,
+                        "fat_g": 100,
+                        "carbohydrate_g": 0,
+                        "fiber_g": 0,
+                        "sodium_mg": 2,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (data_dir / "curated_recipes.json").write_text("[]", encoding="utf-8")
+    (photos_dir / "recipe_1.jpg").write_bytes(b"\xff\xd8\xff")
+    _write_minimal_xlsx(
+        workbook_path,
+        sheet_name="Рецепты",
+        rows={
+            5: [
+                "1",
+                "Завтрак",
+                "Масло с хлебом",
+                "1 порция",
+                "5 мин",
+                "Olive oil — 10 г",
+                "Смешать.",
+                "Example",
+            ]
+        },
+    )
+
+    exit_code = main(
+        [
+            "audit",
+            "--input",
+            str(workbook_path),
+            "--input-format",
+            "excel_400_workbook",
+            "--photos",
+            str(photos_dir),
+            "--out",
+            str(out_dir),
+            "--data-dir",
+            str(data_dir),
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "import_ready" in (out_dir / "classification.csv").read_text(encoding="utf-8")
+    report = (out_dir / "audit_report.md").read_text(encoding="utf-8")
+    assert "- excel_400_workbook rows: 1" in report
+    assert "- import_ready: 1" in report

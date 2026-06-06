@@ -338,6 +338,36 @@ def _write_report(
     nutrition_ok = sum(
         1 for result in nutrition_results.values() if result.calculation_status == "ok"
     )
+    blocker_counts = Counter(
+        blocker
+        for result in classifications
+        for blocker in set(result.blockers)
+    )
+    review_counts = Counter(
+        reason
+        for result in classifications
+        for reason in result.review_reasons
+    )
+    top_unmapped = Counter(
+        row.ingredient_name
+        for result in mapping_results.values()
+        for row in result.rows
+        if row.mapping_status != "mapped"
+    )
+    import_ready_ids = {
+        result.candidate_id
+        for result in classifications
+        if result.classification == "import_ready"
+    }
+    c01_compatible_ready = sum(
+        1
+        for candidate_id in import_ready_ids
+        if _c01_compatible_mapping(mapping_results.get(candidate_id))
+    )
+    source_lines = [
+        f"- {name} rows: {count}"
+        for name, count in sorted(loaded.source_counts.items())
+    ]
     lines = [
         "# Recipe Importer Phase 2C Audit",
         "",
@@ -347,8 +377,7 @@ def _write_report(
         "",
         "## Counts",
         "",
-        f"- photo_ready rows: {loaded.source_counts.get('photo_ready', 0)}",
-        f"- duplicate risk rows: {loaded.source_counts.get('duplicate_risk', 0)}",
+        *source_lines,
         f"- photos found: {photo_found}",
         f"- photos missing: {len(photos) - photo_found}",
         f"- parsed ingredients: {parsed}",
@@ -358,10 +387,23 @@ def _write_report(
         f"- import_ready: {class_counts.get('import_ready', 0)}",
         f"- needs_review: {class_counts.get('needs_review', 0)}",
         f"- blocked: {class_counts.get('blocked', 0)}",
+        f"- C01-compatible import_ready: {c01_compatible_ready}",
         f"- production curated_recipes rows: {len(production_rows.recipes) if production_rows else 0}",
         f"- production curated_recipe_ingredients rows: {len(production_rows.ingredients) if production_rows else 0}",
         f"- production curated_recipe_nutrition rows: {len(production_rows.nutrition) if production_rows else 0}",
         f"- production photo_manifest rows: {len(production_rows.photo_manifest) if production_rows else 0}",
+        "",
+        "## Blockers by exact reason",
+        "",
+        *(_counter_lines(blocker_counts) or ["- none: 0"]),
+        "",
+        "## Review reasons by exact reason",
+        "",
+        *(_counter_lines(review_counts) or ["- none: 0"]),
+        "",
+        "## Top unmapped ingredients",
+        "",
+        *(_counter_lines(top_unmapped, limit=25) or ["- none: 0"]),
         "",
         "## Policy",
         "",
@@ -411,3 +453,46 @@ def _write_manifest(out_dir: Path, *, input_dir: Path, photos_dir: Path) -> None
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _counter_lines(counter: Counter[str], limit: int | None = None) -> list[str]:
+    items = counter.most_common(limit)
+    return [f"- {key}: {count}" for key, count in items]
+
+
+def _c01_compatible_mapping(mapping: IngredientMappingResult | None) -> bool:
+    if mapping is None or mapping.status != "mapped":
+        return False
+    incompatible_markers = {
+        "beef",
+        "pork",
+        "lamb",
+        "chicken",
+        "turkey",
+        "meat",
+        "ham",
+        "bacon",
+        "sausage",
+        "fish",
+        "salmon",
+        "trout",
+        "cod",
+        "tuna",
+        "shrimp",
+        "crab",
+        "squid",
+        "mussels",
+        "milk",
+        "yogurt",
+        "yoghurt",
+        "cheese",
+        "cottage_cheese",
+        "cream",
+        "kefir",
+        "butter",
+    }
+    for row in mapping.rows:
+        food_id = (row.food_id or "").lower()
+        if any(marker in food_id for marker in incompatible_markers):
+            return False
+    return True

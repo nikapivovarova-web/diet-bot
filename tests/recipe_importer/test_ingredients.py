@@ -73,6 +73,27 @@ def test_parses_deterministic_text_ingredient_rows() -> None:
     ]
 
 
+def test_parses_excel_400_dash_lines_and_prefers_explicit_grams() -> None:
+    result = parse_ingredients(
+        _recipe(
+            raw_ingredient_text="\n".join(
+                [
+                    "Овсяные хлопья — 50 г",
+                    "Авокадо спелый — 1 шт. / ≈150 г мякоти",
+                    "Мёд — 5–7 г",
+                ]
+            )
+        )
+    )
+
+    assert result.parse_status == "parsed"
+    assert [(item.name, item.amount, item.unit) for item in result.ingredients] == [
+        ("Овсяные хлопья", 50.0, "g"),
+        ("Авокадо спелый", 150.0, "g"),
+        ("Мёд", 5.0, "g"),
+    ]
+
+
 def test_blocks_ambiguous_text_ingredient_rows() -> None:
     result = parse_ingredients(_recipe(raw_ingredient_text="Olive oil to taste"))
 

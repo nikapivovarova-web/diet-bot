@@ -8,7 +8,14 @@ from scripts.dev.recipe_importer.loader import NormalizedRecipe
 
 
 _TEXT_PATTERN = re.compile(
-    r"^\s*(?P<name>.+?)\s*[-:]\s*(?P<amount>\d+(?:[.,]\d+)?)\s*(?P<unit>[^\d\s]+)?\s*$"
+    r"^\s*(?P<name>.+?)\s*(?:—|–|-|:)\s*(?P<quantity>.+?)\s*$"
+)
+_QUANTITY_PATTERN = re.compile(
+    r"(?:≈|~)?\s*"
+    r"(?P<amount>\d+(?:[.,]\d+)?)"
+    r"(?:\s*[–-]\s*\d+(?:[.,]\d+)?)?"
+    r"\s*(?P<unit>кг|kg|килограмм(?:а|ов)?|г|g|гр|грамм(?:а|ов)?|мл|ml)\b",
+    re.IGNORECASE,
 )
 
 
@@ -81,17 +88,18 @@ def _parse_text(recipe: NormalizedRecipe) -> IngredientParseResult:
         match = _TEXT_PATTERN.match(line)
         if not match:
             return _blocked(recipe.candidate_id, "ambiguous_ingredient_text")
-        amount = _parse_positive_amount(match.group("amount"))
+        quantity = _parse_text_quantity(match.group("quantity"))
+        if quantity is None:
+            return _blocked(recipe.candidate_id, "ambiguous_ingredient_text")
+        amount, unit = quantity
         name = match.group("name").strip()
         if not name:
             return _blocked(recipe.candidate_id, "missing_ingredient_name")
-        if amount is None:
-            return _blocked(recipe.candidate_id, "invalid_ingredient_amount")
         ingredients.append(
             ParsedIngredient(
                 name=name,
                 amount=amount,
-                unit=(match.group("unit") or "").strip(),
+                unit=unit,
                 raw=line,
             )
         )
@@ -114,6 +122,36 @@ def _parse_positive_amount(value: object) -> float | None:
     if amount <= 0:
         return None
     return amount
+
+
+def _parse_text_quantity(value: str) -> tuple[float, str] | None:
+    matches = list(_QUANTITY_PATTERN.finditer(value or ""))
+    if not matches:
+        return None
+
+    chosen = _prefer_grams(matches)
+    amount = _parse_positive_amount(chosen.group("amount"))
+    if amount is None:
+        return None
+    return amount, _normalize_unit(chosen.group("unit"))
+
+
+def _prefer_grams(matches: list[re.Match[str]]) -> re.Match[str]:
+    for match in reversed(matches):
+        if _normalize_unit(match.group("unit")) == "g":
+            return match
+    return matches[-1]
+
+
+def _normalize_unit(unit: str) -> str:
+    normalized = (unit or "").strip().lower()
+    if normalized in {"кг", "kg", "килограмм", "килограмма", "килограммов"}:
+        return "kg"
+    if normalized in {"г", "g", "гр", "грамм", "грамма", "граммов"}:
+        return "g"
+    if normalized in {"мл", "ml"}:
+        return "ml"
+    return normalized
 
 
 def _blocked(candidate_id: str, reason: str) -> IngredientParseResult:
