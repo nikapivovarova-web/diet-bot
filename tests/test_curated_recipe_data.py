@@ -14,7 +14,7 @@ from diet_bot.recipe_catalog import built_in_recipes
 DATA_DIR = Path(__file__).resolve().parents[1] / "src" / "diet_bot" / "data"
 LEGACY_CURATED_RECIPE_COUNT = 400
 DOCX_RECIPE_COUNT = 55
-RESTORED_R401_R610_RECIPE_COUNT = 189
+RESTORED_R401_R610_RECIPE_COUNT = 210
 RESTORED_R666_R710_RECIPE_COUNT = 45
 LOW_RISK_MISSING_FOOD_RECIPE_NOS = frozenset(
     {418, 429, 435, 471, 480, 484, 493, 495, 527, 562, 572, 684, 685}
@@ -28,31 +28,7 @@ TOTAL_CURATED_RECIPE_COUNT = (
 SELECTABLE_CURATED_RECIPE_COUNT = 677
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
-EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset(
-    {
-        416,
-        424,
-        425,
-        426,
-        427,
-        428,
-        448,
-        454,
-        496,
-        502,
-        548,
-        552,
-        585,
-        587,
-        588,
-        589,
-        590,
-        591,
-        592,
-        593,
-        594,
-    }
-)
+EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset()
 RESTORED_R401_R610_RECIPE_NOS = frozenset(range(401, 611)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
 RESTORED_R666_R710_RECIPE_NOS = frozenset(range(666, 711)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
 RESTORED_RECIPE_NOS = RESTORED_R401_R610_RECIPE_NOS | RESTORED_R666_R710_RECIPE_NOS
@@ -63,7 +39,11 @@ def test_curated_recipe_data_has_full_calculation_coverage() -> None:
     ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
 
     curated = curated_recipes()
+    curated_ids = {recipe.id for recipe in curated}
+    ingredient_ids = {row["recipe_id"] for row in ingredients}
+    nutrition_ids = {row["recipe_id"] for row in nutrition}
     assert len(curated) == TOTAL_CURATED_RECIPE_COUNT
+    assert curated_ids == ingredient_ids == nutrition_ids
     assert len(curated_foods()) >= 334
     assert all(recipe.instructions.rstrip().endswith(".") for recipe in curated)
     assert {row["calculation_status"] for row in nutrition} == {"ok"}
