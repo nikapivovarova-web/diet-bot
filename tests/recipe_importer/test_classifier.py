@@ -2,6 +2,7 @@ from scripts.dev.recipe_importer.classifier import classify_recipe
 from scripts.dev.recipe_importer.ingredients import IngredientParseResult, ParsedIngredient
 from scripts.dev.recipe_importer.loader import DuplicateRisk, NormalizedRecipe
 from scripts.dev.recipe_importer.mapping import IngredientMappingResult, IngredientMappingRow
+from scripts.dev.recipe_importer.nutrition import NutritionResult
 from scripts.dev.recipe_importer.photos import PhotoRecord
 from scripts.dev.recipe_importer.servings import ServingsResult
 
@@ -67,6 +68,20 @@ def _mapping(status: str = "mapped", blocker: str = "") -> IngredientMappingResu
     )
 
 
+def _nutrition(status: str = "ok", blocker: str = "", sodium_mg: float = 0.0) -> NutritionResult:
+    return NutritionResult(
+        candidate_id="c001",
+        calculation_status=status,
+        blocker_reason=blocker,
+        energy_kcal=10.0 if status == "ok" else 0.0,
+        protein_g=1.0 if status == "ok" else 0.0,
+        fat_g=1.0 if status == "ok" else 0.0,
+        carbohydrate_g=1.0 if status == "ok" else 0.0,
+        fiber_g=0.0,
+        sodium_mg=sodium_mg if status == "ok" else 0.0,
+    )
+
+
 def test_classifier_fail_closed_when_photo_ready_lacks_structured_recipe_data() -> None:
     recipe = _recipe(title_ru="Photo ready only", structured_ingredients="", servings="")
     photo = PhotoRecord(candidate_id="c001", found=True, status="found")
@@ -78,13 +93,14 @@ def test_classifier_fail_closed_when_photo_ready_lacks_structured_recipe_data() 
         ingredients=_parsed("blocked", "missing_ingredients"),
         servings=_servings("blocked", "invalid_servings"),
         mapping=_mapping("blocked", "unknown_ingredient_alias"),
+        nutrition=_nutrition("blocked", "mapping_not_mapped"),
     )
 
     assert result.classification == "needs_review"
     assert "missing_ingredients" in result.blockers
     assert "invalid_servings" in result.blockers
     assert "unknown_ingredient_alias" in result.blockers
-    assert "nutrition_pending" in result.review_reasons
+    assert "mapping_not_mapped" in result.blockers
 
 
 def test_classifier_blocks_missing_photo_even_with_structured_data() -> None:
@@ -98,6 +114,7 @@ def test_classifier_blocks_missing_photo_even_with_structured_data() -> None:
         ingredients=_parsed(),
         servings=_servings(),
         mapping=_mapping(),
+        nutrition=_nutrition(),
     )
 
     assert result.classification == "blocked"
@@ -121,13 +138,14 @@ def test_classifier_keeps_duplicate_risk_out_of_import_ready() -> None:
         ingredients=_parsed(),
         servings=_servings(),
         mapping=_mapping(),
+        nutrition=_nutrition(),
     )
 
     assert result.classification == "needs_review"
     assert "duplicate_risk_medium" in result.review_reasons
 
 
-def test_classifier_import_ready_requires_phase2a_gates_but_not_nutrition() -> None:
+def test_classifier_import_ready_requires_phase2a_gates_and_nutrition() -> None:
     recipe = _recipe(nutrition="")
     photo = PhotoRecord(candidate_id="c001", found=True, status="found")
 
@@ -138,8 +156,29 @@ def test_classifier_import_ready_requires_phase2a_gates_but_not_nutrition() -> N
         ingredients=_parsed(),
         servings=_servings(),
         mapping=_mapping(),
+        nutrition=_nutrition(sodium_mg=12.5),
     )
 
     assert result.classification == "import_ready"
     assert result.blockers == []
-    assert result.review_reasons == ["nutrition_pending"]
+    assert result.review_reasons == []
+    assert result.nutrition_status == "ok"
+
+
+def test_classifier_blocks_nutrition_failure() -> None:
+    recipe = _recipe(nutrition="")
+    photo = PhotoRecord(candidate_id="c001", found=True, status="found")
+
+    result = classify_recipe(
+        recipe,
+        photo,
+        duplicate_risk=None,
+        ingredients=_parsed(),
+        servings=_servings(),
+        mapping=_mapping(),
+        nutrition=_nutrition("blocked", "missing_required_nutrient:sodium_mg"),
+    )
+
+    assert result.classification == "needs_review"
+    assert result.nutrition_status == "blocked"
+    assert "missing_required_nutrient:sodium_mg" in result.blockers

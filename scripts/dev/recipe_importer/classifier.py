@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from scripts.dev.recipe_importer.ingredients import IngredientParseResult
 from scripts.dev.recipe_importer.loader import DuplicateRisk, NormalizedRecipe
 from scripts.dev.recipe_importer.mapping import IngredientMappingResult
+from scripts.dev.recipe_importer.nutrition import NutritionResult
 from scripts.dev.recipe_importer.photos import PhotoRecord
 from scripts.dev.recipe_importer.servings import ServingsResult
 
@@ -32,6 +33,7 @@ def classify_recipe(
     ingredients: IngredientParseResult,
     servings: ServingsResult,
     mapping: IngredientMappingResult,
+    nutrition: NutritionResult,
 ) -> ClassificationResult:
     blockers: list[str] = []
     review_reasons: list[str] = []
@@ -45,19 +47,16 @@ def classify_recipe(
         blockers.append(servings.blocker_reason or "invalid_servings")
     if mapping.status != "mapped":
         blockers.append(mapping.blocker_reason or "ingredients_not_mapped")
-
-    review_reasons.append("nutrition_pending")
+    if nutrition.calculation_status != "ok":
+        blockers.append(nutrition.blocker_reason or "nutrition_not_calculated")
 
     risk = (duplicate_risk.duplicate_risk if duplicate_risk else recipe.duplicate_risk).lower()
     if risk and risk not in {"low", "none"}:
         review_reasons.append(f"duplicate_risk_{risk}")
 
-    readiness_review_reasons = [
-        reason for reason in review_reasons if reason != "nutrition_pending"
-    ]
     if "missing_photo" in blockers:
         classification = "blocked"
-    elif blockers or readiness_review_reasons:
+    elif blockers or review_reasons:
         classification = "needs_review"
     else:
         classification = "import_ready"
@@ -73,5 +72,5 @@ def classify_recipe(
         parse_status=ingredients.parse_status,
         servings_status=servings.status,
         mapping_status=mapping.status,
-        nutrition_status="pending",
+        nutrition_status=nutrition.calculation_status,
     )

@@ -8,6 +8,7 @@ from scripts.dev.recipe_importer.classifier import ClassificationResult
 from scripts.dev.recipe_importer.ingredients import IngredientParseResult
 from scripts.dev.recipe_importer.loader import LoadedInput, NormalizedRecipe
 from scripts.dev.recipe_importer.mapping import IngredientMappingResult
+from scripts.dev.recipe_importer.nutrition import NutritionResult
 from scripts.dev.recipe_importer.photos import PhotoRecord
 from scripts.dev.recipe_importer.servings import ServingsResult
 
@@ -21,6 +22,7 @@ def write_audit_outputs(
     ingredient_results: dict[str, IngredientParseResult],
     servings_results: dict[str, ServingsResult],
     mapping_results: dict[str, IngredientMappingResult],
+    nutrition_results: dict[str, NutritionResult],
     input_dir: Path,
     photos_dir: Path,
     dry_run: bool,
@@ -30,6 +32,7 @@ def write_audit_outputs(
     _write_photo_manifest(out_dir / "photo_manifest.csv", photos)
     _write_structured_ingredients(out_dir / "structured_ingredients.csv", ingredient_results)
     _write_mapping_report(out_dir / "mapping_report.csv", mapping_results)
+    _write_nutrition_rows(out_dir / "nutrition_rows.csv", nutrition_results)
     _write_classifications(out_dir / "classification.csv", classifications)
     _write_review_table(out_dir / "review_table.csv", classifications)
     _write_report(
@@ -40,6 +43,7 @@ def write_audit_outputs(
         ingredient_results=ingredient_results,
         servings_results=servings_results,
         mapping_results=mapping_results,
+        nutrition_results=nutrition_results,
         input_dir=input_dir,
         photos_dir=photos_dir,
         dry_run=dry_run,
@@ -206,6 +210,41 @@ def _write_mapping_report(
                 )
 
 
+def _write_nutrition_rows(
+    path: Path,
+    nutrition_results: dict[str, NutritionResult],
+) -> None:
+    fields = [
+        "candidate_id",
+        "calculation_status",
+        "blocker_reason",
+        "energy_kcal",
+        "protein_g",
+        "fat_g",
+        "carbohydrate_g",
+        "fiber_g",
+        "sodium_mg",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for candidate_id in sorted(nutrition_results):
+            result = nutrition_results[candidate_id]
+            writer.writerow(
+                {
+                    "candidate_id": result.candidate_id,
+                    "calculation_status": result.calculation_status,
+                    "blocker_reason": result.blocker_reason,
+                    "energy_kcal": result.energy_kcal,
+                    "protein_g": result.protein_g,
+                    "fat_g": result.fat_g,
+                    "carbohydrate_g": result.carbohydrate_g,
+                    "fiber_g": result.fiber_g,
+                    "sodium_mg": result.sodium_mg,
+                }
+            )
+
+
 def _write_classifications(path: Path, classifications: list[ClassificationResult]) -> None:
     fields = [
         "candidate_id",
@@ -279,6 +318,7 @@ def _write_report(
     ingredient_results: dict[str, IngredientParseResult],
     servings_results: dict[str, ServingsResult],
     mapping_results: dict[str, IngredientMappingResult],
+    nutrition_results: dict[str, NutritionResult],
     input_dir: Path,
     photos_dir: Path,
     dry_run: bool,
@@ -288,8 +328,11 @@ def _write_report(
     parsed = sum(1 for result in ingredient_results.values() if result.parse_status == "parsed")
     valid_servings = sum(1 for result in servings_results.values() if result.status == "valid")
     mapped = sum(1 for result in mapping_results.values() if result.status == "mapped")
+    nutrition_ok = sum(
+        1 for result in nutrition_results.values() if result.calculation_status == "ok"
+    )
     lines = [
-        "# Recipe Importer Phase 2A Audit",
+        "# Recipe Importer Phase 2B Audit",
         "",
         f"input_dir: {input_dir}",
         f"photos_dir: {photos_dir}",
@@ -304,15 +347,17 @@ def _write_report(
         f"- parsed ingredients: {parsed}",
         f"- valid servings: {valid_servings}",
         f"- mapped ingredients: {mapped}",
+        f"- nutrition calculated: {nutrition_ok}",
         f"- import_ready: {class_counts.get('import_ready', 0)}",
         f"- needs_review: {class_counts.get('needs_review', 0)}",
         f"- blocked: {class_counts.get('blocked', 0)}",
         "",
         "## Policy",
         "",
-        "- Phase 2A is read-only and writes only audit artifacts.",
+        "- The importer audit is read-only and writes only audit artifacts.",
+        "- Phase 2B adds read-only nutrition calculation from mapped ingredients.",
         "- Photo-ready status alone is not enough for import_ready.",
-        "- import_ready requires parsed ingredients, valid servings, mapped ingredients, photo, and low duplicate risk.",
-        "- Nutrition is intentionally pending in Phase 2A and is not a readiness blocker.",
+        "- import_ready requires parsed ingredients, valid servings, mapped ingredients, calculated nutrition with sodium, photo, and low duplicate risk.",
+        "- No production rows are generated by this audit.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
