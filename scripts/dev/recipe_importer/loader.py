@@ -128,6 +128,63 @@ def load_excel_400_workbook(workbook_path: Path) -> LoadedInput:
     )
 
 
+def load_second_pass_suitable_csv(csv_path: Path) -> LoadedInput:
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"missing required input file: {csv_path}")
+    if csv_path.is_dir():
+        raise IsADirectoryError(f"expected second-pass CSV file, got directory: {csv_path}")
+
+    rows = _read_csv(csv_path)
+    recipes: list[NormalizedRecipe] = []
+    duplicate_risks: dict[str, DuplicateRisk] = {}
+    for row in rows:
+        candidate_id = _pick(row, "candidate_id", "id", "recipe_id")
+        if not candidate_id:
+            raise ValueError("second-pass suitable CSV row is missing candidate_id")
+
+        title = _pick(row, "title", "title_ru", "name")
+        if not title:
+            raise ValueError(f"second-pass suitable CSV row {candidate_id} is missing title")
+
+        existing_match = _pick(row, "existing_catalog_match", "existing_catalog_match_id")
+        existing_match_id = _pick(row, "existing_catalog_match_id")
+        duplicate_risk = _pick(row, "duplicate_risk")
+        if existing_match:
+            duplicate_risks[candidate_id] = DuplicateRisk(
+                candidate_id=candidate_id,
+                duplicate_risk=duplicate_risk or "catalog_match",
+                duplicate_reason=f"existing_catalog_match:{existing_match_id or existing_match}",
+                possible_duplicate_candidate_ids=existing_match_id,
+            )
+
+        recipes.append(
+            NormalizedRecipe(
+                candidate_id=candidate_id,
+                title_ru=title,
+                meal_type=_pick(row, "likely_meal_slot", "meal_type", "category"),
+                duplicate_risk=duplicate_risk,
+                structured_ingredients="",
+                raw_ingredient_text=_pick(row, "cleaned_ingredients", "ingredients"),
+                servings="",
+                nutrition="",
+                instructions=_pick(row, "cleaned_instructions", "instructions"),
+                time="",
+                source=_second_pass_source(row),
+                raw=row,
+            )
+        )
+
+    return LoadedInput(
+        recipes=recipes,
+        duplicate_risks=duplicate_risks,
+        source_counts={
+            "second_pass_suitable_csv": len(recipes),
+            "second_pass_existing_catalog_matches": len(duplicate_risks),
+        },
+    )
+
+
 def _read_csv(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return [
@@ -192,6 +249,14 @@ def _pick(row: dict[str, str], *keys: str) -> str:
         if value:
             return value.strip()
     return ""
+
+
+def _second_pass_source(row: dict[str, str]) -> str:
+    page = _pick(row, "source_page")
+    source_row = _pick(row, "source_row")
+    if page or source_row:
+        return f"source_page={page};source_row={source_row}"
+    return _pick(row, "source", "source_url", "url")
 
 
 def _read_xlsx_sheet_rows(workbook_path: Path, sheet_name: str) -> dict[int, dict[str, str]]:

@@ -1,7 +1,11 @@
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from scripts.dev.recipe_importer.loader import load_excel_400_workbook, load_photo_prep_317
+from scripts.dev.recipe_importer.loader import (
+    load_excel_400_workbook,
+    load_photo_prep_317,
+    load_second_pass_suitable_csv,
+)
 
 
 def test_load_photo_prep_317_reads_photo_ready_and_duplicate_risk(tmp_path: Path) -> None:
@@ -57,6 +61,33 @@ def test_loader_preserves_raw_recipe_context_fields(tmp_path: Path) -> None:
     assert recipe.instructions == "Boil"
     assert recipe.time == "15 min"
     assert recipe.source == "https://example.test/recipe"
+
+
+def test_load_second_pass_suitable_csv_uses_csv_as_primary_source(tmp_path: Path) -> None:
+    csv_path = tmp_path / "suitable_after_second_pass.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "candidate_id,source_page,source_row,title,likely_meal_slot,duplicate_risk,existing_catalog_match,existing_catalog_match_id,ingredients,instructions,cleaned_ingredients,cleaned_instructions",
+                'c001,3,7,Empanadas,main,none,,,"* dough 100 g","Bake.","dough - 100 g","Bake 20 min."',
+                'c002,5,8,Caesar salad,salad,medium,yes,r690,"lettuce 80 g","Mix.",,',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_second_pass_suitable_csv(csv_path)
+
+    assert loaded.source_counts["second_pass_suitable_csv"] == 2
+    assert loaded.source_counts["second_pass_existing_catalog_matches"] == 1
+    assert [recipe.candidate_id for recipe in loaded.recipes] == ["c001", "c002"]
+    assert loaded.recipes[0].title_ru == "Empanadas"
+    assert loaded.recipes[0].meal_type == "main"
+    assert loaded.recipes[0].raw_ingredient_text == "dough - 100 g"
+    assert loaded.recipes[0].instructions == "Bake 20 min."
+    assert loaded.recipes[0].source == "source_page=3;source_row=7"
+    assert loaded.duplicate_risks["c002"].duplicate_reason == "existing_catalog_match:r690"
+    assert loaded.duplicate_risks["c002"].possible_duplicate_candidate_ids == "r690"
 
 
 def test_load_excel_400_workbook_reads_recipes_sheet_from_row_5(tmp_path: Path) -> None:
