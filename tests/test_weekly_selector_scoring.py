@@ -446,8 +446,8 @@ def test_recent_phase_with_insufficient_slot_pool_is_skipped_before_week_build(
     profile = _profile()
     recipes = tuple(
         _recipe_template(f"thin_breakfast_{index}", "breakfast")
-        for index in range(3)
-    ) + tuple(_recipe_template(f"thin_main_{index}", "main") for index in range(3))
+        for index in range(21)
+    ) + tuple(_recipe_template(f"thin_main_{index}", "main") for index in range(42))
     build_calls: list[str] = []
 
     def week_builder(
@@ -657,6 +657,118 @@ def test_recent_phase_with_pool_below_five_week_buffer_is_skipped(
 
     assert result.avoidance_phase == "no_recent"
     assert build_calls == ["no_recent"]
+
+
+def test_non_empty_recent_history_skips_no_recent_when_pool_below_repeat_fallback_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    recipes = _recipes_for_feasibility_pool(
+        breakfast_count=21,
+        main_count=41,
+    )
+    fallback_reasons: list[str | None] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del profile, seed, avoided_recipe_ids, avoided_recipe_keys
+        raise AssertionError(f"{selection_phase} should be skipped before week build")
+
+    def repeats_fallback(
+        profile: UserProfile,
+        seed: int,
+        **kwargs: object,
+    ) -> telegram_app._WeekPlanBuildResult:
+        del seed
+        fallback_reasons.append(kwargs.get("failure_reason"))
+        return telegram_app._WeekPlanBuildResult(
+            plans=_complete_week(profile, "fallback"),
+            avoidance_phase="repeats_fallback",
+            repeat_fallback_used=True,
+            failure_reason=kwargs.get("failure_reason"),
+        )
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", repeats_fallback)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        955,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset({"recent_recipe"}),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset({"less_recent_recipe"}),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.repeat_fallback_used is True
+    assert fallback_reasons == ["repeat_fallback_slot_pool_below_threshold:main:41<42"]
+
+
+def test_empty_recent_history_skips_no_recent_when_pool_below_repeat_fallback_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    recipes = _recipes_for_feasibility_pool(
+        breakfast_count=21,
+        main_count=41,
+    )
+    fallback_reasons: list[str | None] = []
+
+    def week_builder(
+        profile: UserProfile,
+        seed: int,
+        avoided_recipe_ids: set[str],
+        avoided_recipe_keys: set[str],
+        *,
+        selection_phase: str,
+        **_kwargs: object,
+    ) -> tuple[MealPlan, ...]:
+        del profile, seed, avoided_recipe_ids, avoided_recipe_keys
+        raise AssertionError(f"{selection_phase} should be skipped before week build")
+
+    def repeats_fallback(
+        profile: UserProfile,
+        seed: int,
+        **kwargs: object,
+    ) -> telegram_app._WeekPlanBuildResult:
+        del seed
+        fallback_reasons.append(kwargs.get("failure_reason"))
+        return telegram_app._WeekPlanBuildResult(
+            plans=_complete_week(profile, "fallback"),
+            avoidance_phase="repeats_fallback",
+            repeat_fallback_used=True,
+            failure_reason=kwargs.get("failure_reason"),
+        )
+
+    monkeypatch.setattr(telegram_app, "built_in_recipes", lambda: recipes)
+    monkeypatch.setattr(telegram_app, "_build_week_plans", week_builder)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", repeats_fallback)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        956,
+        telegram_app._RecentRecipeAvoidance(
+            full_recipe_ids=frozenset(),
+            full_recipe_keys=frozenset(),
+            reduced_recipe_ids=frozenset(),
+            reduced_recipe_keys=frozenset(),
+        ),
+    )
+
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.repeat_fallback_used is True
+    assert fallback_reasons == ["repeat_fallback_slot_pool_below_threshold:main:41<42"]
 
 
 def test_recent_fallback_reuses_recipe_cache_without_changing_weekly_signature(
