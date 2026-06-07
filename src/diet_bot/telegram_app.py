@@ -3571,22 +3571,6 @@ def _weekly_phase_feasibility(
         avoided_ids=len(avoided_recipe_ids),
         avoided_keys=len(avoided_recipe_keys),
     )
-    if phase == "no_recent":
-        result = _WeeklyPhaseFeasibility(
-            skipped=False,
-            reason="no_recent_not_gated",
-            slot_counts=(),
-        )
-        _weekly_selection_diag(
-            "phase_feasibility_end",
-            phase=phase_label,
-            raw_phase=phase,
-            skipped=result.skipped,
-            reason=result.reason,
-            slot_counts="",
-        )
-        return result
-
     safety = evaluate_safety(profile)
     if not safety.can_generate_plan:
         result = _WeeklyPhaseFeasibility(
@@ -3661,7 +3645,10 @@ def _weekly_phase_feasibility(
                 strict_counts.append(strict_count)
 
         weekly_required = slot_counts_by_name[slot_name] * WEEK_PLAN_DAYS
-        if strict_simple_constraints is not None:
+        if phase == "no_recent":
+            threshold = weekly_required * WEEKLY_REPEATS_FALLBACK_POOL_MULTIPLIER
+            strict_simple_count = min(strict_counts) if strict_counts else None
+        elif strict_simple_constraints is not None:
             threshold = (
                 weekly_required
                 * WEEKLY_RECENT_FEASIBILITY_POOL_MULTIPLIER
@@ -3696,10 +3683,15 @@ def _weekly_phase_feasibility(
             slot_counts=tuple(feasibility_counts),
         )
     else:
+        reason_prefix = (
+            "repeat_fallback_slot_pool_below_threshold"
+            if phase == "no_recent"
+            else "slot_pool_below_threshold"
+        )
         result = _WeeklyPhaseFeasibility(
             skipped=True,
             reason=(
-                "slot_pool_below_threshold:"
+                f"{reason_prefix}:"
                 f"{skipped_count.slot}:"
                 f"{_weekly_phase_slot_gating_count(skipped_count)}"
                 f"<{skipped_count.threshold}"
@@ -3827,22 +3819,29 @@ def _weekly_no_recent_repeat_fallback_reason(
         return "safety_cannot_generate"
     if not filter_foods(built_in_foods(), safety):
         return "no_safe_foods"
-    hard_exclusion_count = sum(
-        1
-        for restriction in profile.restrictions
-        if restriction.type == RestrictionType.EXCLUDED_FOOD
-    )
-    if hard_exclusion_count < 2:
-        return None
 
     feasibility = _weekly_phase_feasibility(
         profile,
         set(),
         set(),
-        phase="full_recent",
+        phase="no_recent",
         recipe_cache=recipe_cache,
     )
+    return _weekly_no_recent_repeat_fallback_reason_from_feasibility(
+        profile,
+        safety,
+        feasibility,
+    )
+
+
+def _weekly_no_recent_repeat_fallback_reason_from_feasibility(
+    profile: UserProfile,
+    safety,
+    feasibility: _WeeklyPhaseFeasibility,
+) -> str | None:
     if feasibility.reason in {"safety_cannot_generate", "no_safe_foods"}:
+        return feasibility.reason
+    if feasibility.skipped:
         return feasibility.reason
 
     for count in feasibility.slot_counts:
@@ -4993,6 +4992,7 @@ def _build_week_plans_with_recent_fallback(
     guard = _WeeklySelectionGuard()
     recipe_cache = _RecipePlanCache()
     timed_out = False
+    prechecked_no_recent_feasibility: _WeeklyPhaseFeasibility | None = None
 
     def timeout_result(exc: _WeeklySelectionTimeout) -> _WeekPlanBuildResult:
         _weekly_selection_diag(
@@ -5031,9 +5031,17 @@ def _build_week_plans_with_recent_fallback(
     if _recent_avoidance_is_empty(recent_avoidance):
         try:
             guard.check(stage="before_repeat_fallback_precheck")
-            repeat_fallback_reason = _weekly_no_recent_repeat_fallback_reason(
+            prechecked_no_recent_feasibility = _weekly_phase_feasibility(
                 profile,
+                set(),
+                set(),
+                phase="no_recent",
                 recipe_cache=recipe_cache,
+            )
+            repeat_fallback_reason = _weekly_no_recent_repeat_fallback_reason_from_feasibility(
+                profile,
+                evaluate_safety(profile),
+                prechecked_no_recent_feasibility,
             )
             guard.check(stage="after_repeat_fallback_precheck")
         except _WeeklySelectionTimeout as exc:
@@ -5062,13 +5070,21 @@ def _build_week_plans_with_recent_fallback(
         )
         avoided_recipe_id_set = set(avoided_recipe_ids)
         avoided_recipe_key_set = set(avoided_recipe_keys)
-        feasibility = _weekly_phase_feasibility(
-            profile,
-            avoided_recipe_id_set,
-            avoided_recipe_key_set,
-            phase=phase,
-            recipe_cache=recipe_cache,
-        )
+        if (
+            phase == "no_recent"
+            and prechecked_no_recent_feasibility is not None
+            and not avoided_recipe_id_set
+            and not avoided_recipe_key_set
+        ):
+            feasibility = prechecked_no_recent_feasibility
+        else:
+            feasibility = _weekly_phase_feasibility(
+                profile,
+                avoided_recipe_id_set,
+                avoided_recipe_key_set,
+                phase=phase,
+                recipe_cache=recipe_cache,
+            )
         if feasibility.skipped:
             _weekly_selection_diag(
                 "phase_end",
@@ -5081,6 +5097,8 @@ def _build_week_plans_with_recent_fallback(
                 reason=feasibility.reason,
                 **_recipe_cache_diag_counts(recipe_cache),
             )
+            if phase == "no_recent":
+                return repeats_fallback_result(feasibility.reason)
             continue
         try:
             plans = _build_week_plans(
