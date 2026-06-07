@@ -2266,7 +2266,7 @@ def _save_active_subscription(
     telegram_app.apply_subscription_payment(
         entitlement,
         f"charge-{chat_id}",
-        now=datetime(2026, 5, 8, tzinfo=UTC),
+        now=datetime.now(UTC),
     )
     entitlement.monthly_one_day_remaining = one_day_remaining
     entitlement.monthly_weekly_pdf_remaining = weekly_pdf_remaining
@@ -2958,7 +2958,7 @@ async def test_test_access_off_previews_free_menu_even_with_subscription(monkeyp
         one_day_remaining=4,
         weekly_pdf_remaining=3,
     )
-    telegram_app.grant_test_access(entitlement, now=datetime(2026, 5, 8, tzinfo=UTC))
+    telegram_app.grant_test_access(entitlement, now=datetime.now(UTC))
     telegram_app.save_entitlements(subscriptions_path, {target_chat_id: entitlement})
     PROFILE_BY_CHAT_ID[target_chat_id] = profile_with()
 
