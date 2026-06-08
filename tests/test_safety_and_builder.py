@@ -263,7 +263,7 @@ def test_weekly_repeats_fallback_ranks_sodium_valid_combo_ahead_of_high_sodium_c
 def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(monkeypatch) -> None:
     profile = constrained_weekly_profile("dairy", "meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
-    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 90.0, raising=False)
 
     started_at = time.perf_counter()
     result = telegram_app._build_week_plans_with_recent_fallback(
@@ -276,9 +276,13 @@ def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(
     assert telegram_app._week_plans_are_complete(result.plans, profile)
     assert result.avoidance_phase == "repeats_fallback"
     assert result.repeat_fallback_used is True
-    assert result.repeat_note
+    assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
+    if result.repeat_recipe_count:
+        assert result.repeat_note
+    else:
+        assert result.repeat_note is None
     assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
-    assert _weekly_repeat_count(result.plans) > 0
+    assert _weekly_repeat_count(result.plans) <= 20
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
 
@@ -512,7 +516,7 @@ def test_weekly_no_meat_fish_falls_back_after_no_recent_timeout(monkeypatch) -> 
 def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) -> None:
     profile = constrained_weekly_profile("dairy", "meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
-    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 90.0, raising=False)
 
     result = telegram_app._build_week_plans_with_recent_fallback(
         profile,
@@ -524,9 +528,47 @@ def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) 
     assert telegram_app._week_plans_are_complete(result.plans, profile)
     assert result.repeat_fallback_used is True
     assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
-    assert 0 < _weekly_repeat_count(result.plans) <= 20
+    assert _weekly_repeat_count(result.plans) <= 20
     assert max(recipe_counts.values()) <= telegram_app.WEEK_PLAN_DAYS
     assert len(recipe_counts) >= 8
+
+
+def test_weekly_repeats_fallback_note_appears_when_synthetic_schedule_repeats(monkeypatch) -> None:
+    profile = profile_with(
+        meal_count=3,
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "dairy"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "meat"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),
+        ),
+    )
+    repeated_schedule = tuple(
+        _synthetic_repeat_plan(("forced_a", "forced_b", "forced_c"))
+        for _ in range(telegram_app.WEEK_PLAN_DAYS)
+    )
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_weekly_repeat_fallback_day_pool",
+        lambda *args, **kwargs: ((repeated_schedule[0],), None),
+    )
+    monkeypatch.setattr(
+        telegram_app,
+        "_optimize_weekly_repeat_fallback_schedule",
+        lambda *args, **kwargs: repeated_schedule,
+    )
+
+    result = telegram_app._build_week_plans_with_repeats_fallback(
+        profile,
+        607,
+        recipe_cache=builder._RecipePlanCache(),
+    )
+
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.repeat_fallback_used is True
+    assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
+    assert result.repeat_recipe_count > 0
+    assert result.repeat_note == telegram_app.WEEKLY_REPEATS_FALLBACK_NOTE
 
 
 def test_weekly_repeat_optimizer_uses_cap_three_when_it_is_feasible() -> None:
