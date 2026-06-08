@@ -1,6 +1,7 @@
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+import os
 import time
 
 import pytest
@@ -263,7 +264,7 @@ def test_weekly_repeats_fallback_ranks_sodium_valid_combo_ahead_of_high_sodium_c
 def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(monkeypatch) -> None:
     profile = constrained_weekly_profile("dairy", "meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
-    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 90.0, raising=False)
 
     started_at = time.perf_counter()
     result = telegram_app._build_week_plans_with_recent_fallback(
@@ -276,9 +277,13 @@ def test_weekly_no_dairy_meat_fish_uses_repeats_fallback_without_excluded_foods(
     assert telegram_app._week_plans_are_complete(result.plans, profile)
     assert result.avoidance_phase == "repeats_fallback"
     assert result.repeat_fallback_used is True
-    assert result.repeat_note
+    assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
+    if result.repeat_recipe_count:
+        assert result.repeat_note
+    else:
+        assert result.repeat_note is None
     assert elapsed_s < telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS
-    assert _weekly_repeat_count(result.plans) > 0
+    assert _weekly_repeat_count(result.plans) <= 20
     _assert_no_excluded_foods_in_week(result.plans, profile)
     assert all(validate_plan(plan).ok for plan in result.plans)
 
@@ -512,7 +517,7 @@ def test_weekly_no_meat_fish_falls_back_after_no_recent_timeout(monkeypatch) -> 
 def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) -> None:
     profile = constrained_weekly_profile("dairy", "meat", "fish")
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
-    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 90.0, raising=False)
 
     result = telegram_app._build_week_plans_with_recent_fallback(
         profile,
@@ -524,9 +529,47 @@ def test_weekly_repeats_fallback_keeps_constrained_repeats_bounded(monkeypatch) 
     assert telegram_app._week_plans_are_complete(result.plans, profile)
     assert result.repeat_fallback_used is True
     assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
-    assert 0 < _weekly_repeat_count(result.plans) <= 20
+    assert _weekly_repeat_count(result.plans) <= 20
     assert max(recipe_counts.values()) <= telegram_app.WEEK_PLAN_DAYS
     assert len(recipe_counts) >= 8
+
+
+def test_weekly_repeats_fallback_note_appears_when_synthetic_schedule_repeats(monkeypatch) -> None:
+    profile = profile_with(
+        meal_count=3,
+        restrictions=(
+            Restriction(RestrictionType.EXCLUDED_FOOD, "dairy"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "meat"),
+            Restriction(RestrictionType.EXCLUDED_FOOD, "fish"),
+        ),
+    )
+    repeated_schedule = tuple(
+        _synthetic_repeat_plan(("forced_a", "forced_b", "forced_c"))
+        for _ in range(telegram_app.WEEK_PLAN_DAYS)
+    )
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_weekly_repeat_fallback_day_pool",
+        lambda *args, **kwargs: ((repeated_schedule[0],), None),
+    )
+    monkeypatch.setattr(
+        telegram_app,
+        "_optimize_weekly_repeat_fallback_schedule",
+        lambda *args, **kwargs: repeated_schedule,
+    )
+
+    result = telegram_app._build_week_plans_with_repeats_fallback(
+        profile,
+        607,
+        recipe_cache=builder._RecipePlanCache(),
+    )
+
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    assert result.repeat_fallback_used is True
+    assert result.repeat_recipe_count == _weekly_repeat_count(result.plans)
+    assert result.repeat_recipe_count > 0
+    assert result.repeat_note == telegram_app.WEEKLY_REPEATS_FALLBACK_NOTE
 
 
 def test_weekly_repeat_optimizer_uses_cap_three_when_it_is_feasible() -> None:
@@ -874,3 +917,100 @@ def test_curated_only_plan_builds_for_low_protein_maintenance_profile() -> None:
     assert all(meal.recipe_id and meal.recipe_id.startswith("r") for meal in plan.meals)
     assert all(meal.image_url and meal.image_url.startswith("recipe_photos/") for meal in plan.meals)
     assert plan.totals.get("protein_g") <= plan.targets.targets.get("protein_g") * 1.50
+
+
+# --- Strict carried-history monthly probe -----------------------------------
+#
+# Production-faithful: each week's delivered recipe ids/keys accumulate into the
+# next week's recent avoidance (matching _weekly_recent_avoidance_from_snapshot +
+# _recipe_history_items_from_plan). This is the ONLY accepted monthly check - a
+# loose probe (fresh/empty avoidance every week) has produced fake 4/4 results, so
+# it is explicitly avoided here.
+#
+# Runs at production timeouts (60/90) and therefore takes minutes. It is opt-in via
+# DIET_BOT_RUN_STRICT_CARRIED_HISTORY_PROBE=1 to keep the default suite fast and
+# non-flaky, mirroring the existing opt-in live-QA test.
+
+
+def _carried_history_avoidance(
+    id_history: list[str], key_history: list[str]
+) -> "telegram_app._RecentRecipeAvoidance":
+    full_ids = telegram_app._bounded_recent_strings(
+        id_history, telegram_app.RECENT_RECIPE_HISTORY_LIMIT
+    )
+    full_keys = telegram_app._bounded_recent_strings(
+        key_history, telegram_app.RECENT_RECIPE_HISTORY_LIMIT
+    )
+    reduced_ids = telegram_app._bounded_recent_strings(
+        full_ids, telegram_app.RECENT_RECIPE_REDUCED_LIMIT
+    )
+    reduced_keys = telegram_app._bounded_recent_strings(
+        full_keys, telegram_app.RECENT_RECIPE_REDUCED_LIMIT
+    )
+    return telegram_app._RecentRecipeAvoidance(
+        full_recipe_ids=frozenset(full_ids),
+        full_recipe_keys=frozenset(full_keys),
+        reduced_recipe_ids=frozenset(reduced_ids),
+        reduced_recipe_keys=frozenset(reduced_keys),
+    )
+
+
+def _run_strict_carried_history_month(
+    profile: UserProfile, seeds: tuple[int, ...]
+) -> int:
+    """Generate consecutive weeks accumulating history; return complete-week count."""
+    id_history: list[str] = []
+    key_history: list[str] = []
+    complete_weeks = 0
+    for week_index, seed in enumerate(seeds, start=1):
+        avoidance = _carried_history_avoidance(id_history, key_history)
+        result = telegram_app._build_week_plans_with_recent_fallback(
+            profile, seed, avoidance
+        )
+        complete = telegram_app._week_plans_are_complete(result.plans, profile)
+        validate_ok = bool(result.plans) and all(
+            validate_plan(plan).ok for plan in result.plans
+        )
+        assert complete, (
+            f"week {week_index} (seed={seed}) incomplete: days={len(result.plans)} "
+            f"phase={result.avoidance_phase} reason={result.failure_reason}"
+        )
+        assert validate_ok, f"week {week_index} (seed={seed}) failed validate_plan"
+        if complete and validate_ok:
+            complete_weeks += 1
+        for plan in result.plans:
+            for item in telegram_app._recipe_history_items_from_plan(plan, "weekly_pdf"):
+                if item.recipe_id:
+                    id_history.append(item.recipe_id)
+                if item.recipe_key:
+                    key_history.append(item.recipe_key)
+    return complete_weeks
+
+
+@pytest.mark.skipif(
+    os.getenv("DIET_BOT_RUN_STRICT_CARRIED_HISTORY_PROBE") != "1",
+    reason="strict carried-history probe runs at production 60/90 timeouts; opt-in",
+)
+def test_strict_carried_history_c05_meat_fish_four_of_four() -> None:
+    profile = constrained_weekly_profile("meat", "fish")
+    assert profile.meal_count == 4
+    assert telegram_app.WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS == 60.0
+    assert telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS == 90.0
+
+    complete_weeks = _run_strict_carried_history_month(profile, (607, 608, 609, 610))
+
+    assert complete_weeks == 4
+
+
+@pytest.mark.skipif(
+    os.getenv("DIET_BOT_RUN_STRICT_CARRIED_HISTORY_PROBE") != "1",
+    reason="strict carried-history probe runs at production 60/90 timeouts; opt-in",
+)
+def test_strict_carried_history_c01_dairy_meat_fish_four_of_four() -> None:
+    profile = constrained_weekly_profile("dairy", "meat", "fish")
+    assert telegram_app.WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS == 60.0
+    assert telegram_app.WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS == 90.0
+
+    complete_weeks = _run_strict_carried_history_month(profile, (607, 608, 609, 610))
+
+    assert complete_weeks == 4

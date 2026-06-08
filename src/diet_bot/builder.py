@@ -945,6 +945,11 @@ def _build_recipe_plan(
             portions = _scaled_recipe_portions(resolved, scale, used_grams, current_total, target, meal_slot=slot)
             if not portions:
                 continue
+            projected_total_energy = current_total.get("energy_kcal") + sum(
+                portion.nutrients.get("energy_kcal") for portion in portions
+            )
+            if projected_total_energy > target.get("energy_kcal") * 1.08 + 0.01:
+                continue
             selected_recipe = recipe
             selected_portions = portions
             break

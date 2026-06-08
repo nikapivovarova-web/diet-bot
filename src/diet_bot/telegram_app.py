@@ -563,10 +563,31 @@ class _WeeklySelectionGuard:
     total_started_at: float = field(default_factory=lambda: time.perf_counter())
     phase_started_at: float = field(default_factory=lambda: time.perf_counter())
     phase: str = "unknown"
+    # When > 0, cap the no_recent phase so this many seconds of total budget stay
+    # available for the repeats fallback. Set by the orchestrator only under
+    # carried-history (non-empty recent avoidance). 0 disables (default).
+    fallback_reserve_s: float = 0.0
 
     def begin_phase(self, phase: str) -> None:
         self.phase = phase
         self.phase_started_at = time.perf_counter()
+
+    def _no_recent_reserved_budget_s(self, total_timeout_s: float) -> float | None:
+        """Seconds the no_recent phase may run before the fallback reserve kicks in.
+
+        Returns None when the reserve is inactive (other phases, no reserve set,
+        or no total budget). The budget already accounts for time already spent by
+        earlier phases (full_recent/reduced_recent), so the leftover after no_recent
+        gives up always equals the configured reserve.
+        """
+        if (
+            self.phase != "no_recent"
+            or self.fallback_reserve_s <= 0
+            or total_timeout_s <= 0
+        ):
+            return None
+        already_elapsed_s = max(0.0, self.phase_started_at - self.total_started_at)
+        return max(0.0, total_timeout_s - self.fallback_reserve_s - already_elapsed_s)
 
     def check(
         self,
@@ -591,7 +612,26 @@ class _WeeklySelectionGuard:
 
         phase_elapsed_s = now - self.phase_started_at
         phase_timeout_s = _weekly_selection_phase_timeout(self.phase)
-        if phase_timeout_s > 0 and phase_elapsed_s > phase_timeout_s:
+        reserved_budget_s = self._no_recent_reserved_budget_s(total_timeout_s)
+        if reserved_budget_s is not None:
+            phase_timeout_s = (
+                reserved_budget_s
+                if phase_timeout_s <= 0
+                else min(phase_timeout_s, reserved_budget_s)
+            )
+            # Use >= so a fully-consumed reserve (budget 0) trips on the next check
+            # and routes to the fallback instead of letting no_recent run unbounded.
+            if phase_elapsed_s >= phase_timeout_s:
+                raise _WeeklySelectionTimeout(
+                    scope="phase",
+                    phase=self.phase,
+                    elapsed_s=phase_elapsed_s,
+                    timeout_s=phase_timeout_s,
+                    day_index=day_index,
+                    candidate_index=candidate_index,
+                    stage=stage,
+                )
+        elif phase_timeout_s > 0 and phase_elapsed_s > phase_timeout_s:
             raise _WeeklySelectionTimeout(
                 scope="phase",
                 phase=self.phase,
@@ -1015,6 +1055,15 @@ WEEKLY_REPEATS_FALLBACK_NOTE = (
 WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS = 8.0
 WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS = 60.0
 WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS = 90.0
+# Under carried-history (non-empty recent avoidance) the no_recent phase can burn
+# its entire phase budget and return a timeout even though total budget remains.
+# Reserve a guaranteed slice of the total budget for the repeats fallback so that,
+# when no_recent gives up, the fallback still has enough time to assemble a
+# complete week. Sized above the measured C05 fallback-alone cost (~35s) with
+# margin; the recipe cache is warm by the time the fallback runs, so real cost is
+# lower. See _WeeklySelectionGuard reserve handling and
+# _build_week_plans_with_recent_fallback routing.
+WEEKLY_REPEATS_FALLBACK_RESERVE_SECONDS = 45.0
 WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
 WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
 WEEKLY_TRAIT_REPEAT_CAP = 3
@@ -4990,6 +5039,11 @@ def _build_week_plans_with_recent_fallback(
     recent_avoidance: _RecentRecipeAvoidance,
 ) -> _WeekPlanBuildResult:
     guard = _WeeklySelectionGuard()
+    if not _recent_avoidance_is_empty(recent_avoidance):
+        # Carried-history weeks run full_recent/reduced_recent before no_recent and
+        # can exhaust the no_recent phase budget. Reserve total budget for the
+        # fallback so routing a no_recent timeout to it actually has time to finish.
+        guard.fallback_reserve_s = float(WEEKLY_REPEATS_FALLBACK_RESERVE_SECONDS)
     recipe_cache = _RecipePlanCache()
     timed_out = False
     prechecked_no_recent_feasibility: _WeeklyPhaseFeasibility | None = None
@@ -5114,7 +5168,15 @@ def _build_week_plans_with_recent_fallback(
             timed_out = True
             timeout_result(exc)
             if exc.scope == "total":
+                # Total budget genuinely exhausted: there is nowhere to run the
+                # fallback, so surface an honest timeout rather than masking it.
                 return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+            if exc.phase == "no_recent" and not _recent_avoidance_is_empty(
+                recent_avoidance
+            ):
+                # no_recent gave up but total budget remains (the reserve). Route to
+                # the fallback instead of returning an empty timeout result.
+                return repeats_fallback_result("no_recent_fallback_reserve_exhausted")
             continue
         _weekly_selection_diag(
             "phase_end",
@@ -5150,19 +5212,23 @@ def _build_week_plans_with_recent_fallback(
             )
 
     total_timeout_s = float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
-    if timed_out or (
-        total_timeout_s > 0 and time.perf_counter() - guard.total_started_at > total_timeout_s
-    ):
+    total_budget_exhausted = (
+        total_timeout_s > 0
+        and time.perf_counter() - guard.total_started_at > total_timeout_s
+    )
+    if total_budget_exhausted:
+        # Total budget gone: honest timeout for carried-history, fallback for the
+        # empty case where no_recent is the only phase (unchanged behavior).
         if _recent_avoidance_is_empty(recent_avoidance):
             return repeats_fallback_result("no_recent_timeout")
         return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+    # Total budget remains. no_recent finished incomplete (or an earlier phase timed
+    # out) but the reserve is intact, so route to the fallback rather than failing.
     if _recent_avoidance_is_empty(recent_avoidance):
+        if timed_out:
+            return repeats_fallback_result("no_recent_timeout")
         return repeats_fallback_result("no_recent_incomplete")
-    return _WeekPlanBuildResult(
-        plans=(),
-        avoidance_phase="failed",
-        failure_reason="strict_weekly_selection_failed",
-    )
+    return repeats_fallback_result("no_recent_incomplete_carried_history")
 
 def _weekly_recent_avoidance_phases(
     recent_avoidance: _RecentRecipeAvoidance,
