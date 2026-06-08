@@ -1101,6 +1101,8 @@ WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
+WEEK_PDF_UNSERVICEABLE_TEXT = "\u041d\u0435 \u043c\u043e\u0433\u0443 \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u043e \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF \u043f\u043e \u044d\u0442\u043e\u0439 \u0430\u043d\u043a\u0435\u0442\u0435: \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0436\u0435\u0441\u0442\u043a\u0438\u0435 \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f \u0438\u043b\u0438 \u043d\u0435\u0442 \u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u044b\u0445 \u0431\u043b\u044e\u0434."
+WEEK_PDF_TIMEOUT_FAILURE_TEXT = "\u041d\u0435 \u0443\u0441\u043f\u0435\u043b \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u043f\u043e\u043b\u043d\u044b\u0439 \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u044b\u0439 PDF. \u042f \u043d\u0435 \u0431\u0443\u0434\u0443 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c \u043f\u0443\u0441\u0442\u043e\u0439 \u0440\u0430\u0446\u0438\u043e\u043d."
 WEEK_PDF_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
@@ -3303,6 +3305,14 @@ def _weekly_recent_recipe_keys_from_snapshot(snapshot: WeeklyPdfRequestSnapshot)
     return tuple(str(key).strip() for key in raw_keys if str(key).strip())
 
 
+def _week_pdf_failure_text_for_build_result(build_result: _WeekPlanBuildResult) -> str:
+    if build_result.failure_reason in {"safety_cannot_generate", "no_safe_foods"}:
+        return WEEK_PDF_UNSERVICEABLE_TEXT
+    if build_result.avoidance_phase == "timeout":
+        return WEEK_PDF_TIMEOUT_FAILURE_TEXT
+    return WEEK_PDF_FAILURE_TEXT
+
+
 async def _send_week_plan(
     message: Message,
     profile: UserProfile,
@@ -3369,7 +3379,7 @@ async def _send_week_plan(
 
         if not _week_plans_are_complete(plans, profile):
             await _stop_week_pdf_status(status_task)
-            await _edit_week_pdf_status(status_message, WEEK_PDF_FAILURE_TEXT)
+            await _edit_week_pdf_status(status_message, _week_pdf_failure_text_for_build_result(build_result))
             return False
 
         first_plan = plans[0]
@@ -4031,10 +4041,10 @@ def _build_week_plans_with_repeats_fallback(
         selection_guard=selection_guard,
         search_limits=search_limits,
     )
-    if selection_guard is not None:
-        selection_guard.check(stage="after_repeats_fallback_schedule")
     repeat_count = _weekly_repeated_recipe_count(scheduled_plans)
     if not _week_plans_are_complete(scheduled_plans, profile):
+        if selection_guard is not None:
+            selection_guard.check(stage="after_repeats_fallback_schedule")
         return _WeekPlanBuildResult(
             plans=(),
             avoidance_phase="failed",
@@ -5080,6 +5090,25 @@ def _build_week_plans_with_recent_fallback(
                 selection_guard=guard,
             )
         except _WeeklySelectionTimeout as exc:
+            timeout_result(exc)
+            return final_repeats_fallback_result(f"{failure_reason}_final_fallback")
+
+    def final_repeats_fallback_result(failure_reason: str) -> _WeekPlanBuildResult:
+        _weekly_selection_diag(
+            "repeats_fallback_final_start",
+            phase="repeats_fallback",
+            seed=seed,
+            reason=failure_reason,
+        )
+        try:
+            return _build_week_plans_with_repeats_fallback(
+                profile,
+                seed,
+                recipe_cache=recipe_cache,
+                failure_reason=failure_reason,
+                selection_guard=None,
+            )
+        except _WeeklySelectionTimeout as exc:
             return timeout_result(exc)
 
     if _recent_avoidance_is_empty(recent_avoidance):
@@ -5168,9 +5197,7 @@ def _build_week_plans_with_recent_fallback(
             timed_out = True
             timeout_result(exc)
             if exc.scope == "total":
-                # Total budget genuinely exhausted: there is nowhere to run the
-                # fallback, so surface an honest timeout rather than masking it.
-                return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+                return final_repeats_fallback_result("total_timeout_final_fallback")
             if exc.phase == "no_recent" and not _recent_avoidance_is_empty(
                 recent_avoidance
             ):
@@ -5217,11 +5244,7 @@ def _build_week_plans_with_recent_fallback(
         and time.perf_counter() - guard.total_started_at > total_timeout_s
     )
     if total_budget_exhausted:
-        # Total budget gone: honest timeout for carried-history, fallback for the
-        # empty case where no_recent is the only phase (unchanged behavior).
-        if _recent_avoidance_is_empty(recent_avoidance):
-            return repeats_fallback_result("no_recent_timeout")
-        return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+        return final_repeats_fallback_result("total_timeout_final_fallback")
     # Total budget remains. no_recent finished incomplete (or an earlier phase timed
     # out) but the reserve is intact, so route to the fallback rather than failing.
     if _recent_avoidance_is_empty(recent_avoidance):
