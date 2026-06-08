@@ -563,6 +563,8 @@ class _WeeklySelectionGuard:
     total_started_at: float = field(default_factory=lambda: time.perf_counter())
     phase_started_at: float = field(default_factory=lambda: time.perf_counter())
     phase: str = "unknown"
+    total_timeout_s: float | None = None
+    phase_timeout_s: float | None = None
     # When > 0, cap the no_recent phase so this many seconds of total budget stay
     # available for the repeats fallback. Set by the orchestrator only under
     # carried-history (non-empty recent avoidance). 0 disables (default).
@@ -598,7 +600,11 @@ class _WeeklySelectionGuard:
     ) -> None:
         now = time.perf_counter()
         total_elapsed_s = now - self.total_started_at
-        total_timeout_s = float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+        total_timeout_s = (
+            float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+            if self.total_timeout_s is None
+            else float(self.total_timeout_s)
+        )
         if total_timeout_s > 0 and total_elapsed_s > total_timeout_s:
             raise _WeeklySelectionTimeout(
                 scope="total",
@@ -611,7 +617,11 @@ class _WeeklySelectionGuard:
             )
 
         phase_elapsed_s = now - self.phase_started_at
-        phase_timeout_s = _weekly_selection_phase_timeout(self.phase)
+        phase_timeout_s = (
+            _weekly_selection_phase_timeout(self.phase)
+            if self.phase_timeout_s is None
+            else float(self.phase_timeout_s)
+        )
         reserved_budget_s = self._no_recent_reserved_budget_s(total_timeout_s)
         if reserved_budget_s is not None:
             phase_timeout_s = (
@@ -1064,6 +1074,7 @@ WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS = 90.0
 # lower. See _WeeklySelectionGuard reserve handling and
 # _build_week_plans_with_recent_fallback routing.
 WEEKLY_REPEATS_FALLBACK_RESERVE_SECONDS = 45.0
+WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS = 300.0
 WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
 WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
 WEEKLY_TRAIT_REPEAT_CAP = 3
@@ -5100,16 +5111,43 @@ def _build_week_plans_with_recent_fallback(
             seed=seed,
             reason=failure_reason,
         )
+        final_timeout_s = float(WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS)
+        final_guard = (
+            _WeeklySelectionGuard(
+                total_timeout_s=final_timeout_s,
+                phase_timeout_s=final_timeout_s,
+            )
+            if final_timeout_s > 0
+            else None
+        )
         try:
             return _build_week_plans_with_repeats_fallback(
                 profile,
                 seed,
                 recipe_cache=recipe_cache,
                 failure_reason=failure_reason,
-                selection_guard=None,
+                selection_guard=final_guard,
             )
         except _WeeklySelectionTimeout as exc:
-            return timeout_result(exc)
+            timeout_result(exc)
+            retry_reason = f"{failure_reason}_unbounded_retry"
+            _weekly_selection_diag(
+                "repeats_fallback_unbounded_retry_start",
+                always=True,
+                phase="repeats_fallback",
+                seed=seed,
+                reason=retry_reason,
+            )
+            try:
+                return _build_week_plans_with_repeats_fallback(
+                    profile,
+                    seed,
+                    recipe_cache=recipe_cache,
+                    failure_reason=retry_reason,
+                    selection_guard=None,
+                )
+            except _WeeklySelectionTimeout as retry_exc:
+                return timeout_result(retry_exc)
 
     if _recent_avoidance_is_empty(recent_avoidance):
         try:

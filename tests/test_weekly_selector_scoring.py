@@ -1080,11 +1080,9 @@ def test_carried_history_no_recent_incomplete_routes_to_fallback(
     assert fallback_calls == ["no_recent_incomplete_carried_history"]
 
 
-def test_carried_history_final_fallback_timeout_stays_timeout(
+def test_carried_history_final_fallback_uses_extended_budget_after_normal_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The final fallback may wait beyond the strict phase budget, but if it also
-    # times out it must still surface an honest timeout instead of fake success.
     profile = _profile()
     seed = 600
     clock = {"now": 0.0}
@@ -1097,22 +1095,35 @@ def test_carried_history_final_fallback_timeout_stays_timeout(
         return _empty_plan(profile)
 
     fallback_calls: list[str | None] = []
+    sentinel_week = tuple(
+        _plan(profile, "fallback", 1800.0, ("f0", "f1", "f2"))
+        for _ in range(telegram_app.WEEK_PLAN_DAYS)
+    )
 
-    def fake_fallback(*args, **kwargs) -> "telegram_app._WeekPlanBuildResult":
-        del args
-        fallback_calls.append(kwargs.get("failure_reason"))
-        raise telegram_app._WeeklySelectionTimeout(
-            scope="total",
-            phase="repeats_fallback",
-            elapsed_s=4.0,
-            timeout_s=3.0,
-            stage="final_fallback",
+    def fake_fallback(
+        profile: UserProfile,
+        seed: int,
+        *,
+        recipe_cache,
+        failure_reason: str | None = None,
+        selection_guard=None,
+    ) -> "telegram_app._WeekPlanBuildResult":
+        del profile, seed, recipe_cache
+        fallback_calls.append(failure_reason)
+        assert selection_guard is not None
+        clock["now"] += 4.0
+        selection_guard.check(stage="final_fallback_after_normal_timeout")
+        return telegram_app._WeekPlanBuildResult(
+            plans=sentinel_week,
+            avoidance_phase="repeats_fallback",
+            repeat_fallback_used=True,
         )
 
     monkeypatch.setattr(telegram_app.time, "perf_counter", fake_perf_counter)
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 3.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS", 10.0, raising=False)
     monkeypatch.setattr(telegram_app, "build_one_day_plan", day_builder)
     monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", fake_fallback)
 
@@ -1122,9 +1133,70 @@ def test_carried_history_final_fallback_timeout_stays_timeout(
         _carried_history_avoidance(),
     )
 
-    assert result.plans == ()
-    assert result.avoidance_phase == "timeout"
+    assert result.plans == sentinel_week
+    assert result.avoidance_phase == "repeats_fallback"
     assert fallback_calls == ["total_timeout_final_fallback"]
+
+
+def test_carried_history_final_fallback_timeout_retries_without_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    seed = 600
+    clock = {"now": 0.0}
+
+    def fake_perf_counter() -> float:
+        return clock["now"]
+
+    def day_builder(profile: UserProfile, *, variety_seed: int, **kwargs) -> MealPlan:
+        clock["now"] += 1.0
+        return _empty_plan(profile)
+
+    fallback_calls: list[str | None] = []
+    sentinel_week = tuple(
+        _plan(profile, "fallback", 1800.0, ("f0", "f1", "f2"))
+        for _ in range(telegram_app.WEEK_PLAN_DAYS)
+    )
+
+    def fake_fallback(
+        profile: UserProfile,
+        seed: int,
+        *,
+        recipe_cache,
+        failure_reason: str | None = None,
+        selection_guard=None,
+    ) -> "telegram_app._WeekPlanBuildResult":
+        del profile, seed, recipe_cache
+        fallback_calls.append(failure_reason)
+        if selection_guard is not None:
+            clock["now"] += 4.0
+            selection_guard.check(stage="final_fallback_extended_timeout")
+        return telegram_app._WeekPlanBuildResult(
+            plans=sentinel_week,
+            avoidance_phase="repeats_fallback",
+            repeat_fallback_used=True,
+        )
+
+    monkeypatch.setattr(telegram_app.time, "perf_counter", fake_perf_counter)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_NO_RECENT_PHASE_TIMEOUT_SECONDS", 2.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 3.0, raising=False)
+    monkeypatch.setattr(telegram_app, "WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS", 3.0, raising=False)
+    monkeypatch.setattr(telegram_app, "build_one_day_plan", day_builder)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", fake_fallback)
+
+    result = telegram_app._build_week_plans_with_recent_fallback(
+        profile,
+        seed,
+        _carried_history_avoidance(),
+    )
+
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.plans == sentinel_week
+    assert fallback_calls == [
+        "total_timeout_final_fallback",
+        "total_timeout_final_fallback_unbounded_retry",
+    ]
 
 
 def test_carried_history_total_timeout_uses_final_fallback_when_serviceable(
@@ -1181,8 +1253,13 @@ def test_carried_history_total_timeout_uses_final_fallback_when_serviceable(
     assert fallback_calls == ["total_timeout_final_fallback"]
 
 
+@pytest.mark.parametrize(
+    "failure_reason",
+    ("no_safe_foods", "repeats_fallback_no_valid_day_pool"),
+)
 def test_carried_history_total_timeout_preserves_unserviceable_failure(
     monkeypatch: pytest.MonkeyPatch,
+    failure_reason: str,
 ) -> None:
     profile = _profile()
     seed = 600
@@ -1204,7 +1281,7 @@ def test_carried_history_total_timeout_preserves_unserviceable_failure(
             plans=(),
             avoidance_phase="failed",
             repeat_fallback_used=True,
-            failure_reason="no_safe_foods",
+            failure_reason=failure_reason,
         )
 
     monkeypatch.setattr(telegram_app.time, "perf_counter", fake_perf_counter)
@@ -1222,7 +1299,7 @@ def test_carried_history_total_timeout_preserves_unserviceable_failure(
 
     assert result.plans == ()
     assert result.avoidance_phase == "failed"
-    assert result.failure_reason == "no_safe_foods"
+    assert result.failure_reason == failure_reason
     assert fallback_calls == ["total_timeout_final_fallback"]
 
 
