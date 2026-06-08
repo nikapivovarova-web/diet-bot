@@ -19,6 +19,7 @@ RESTORED_R401_R610_RECIPE_COUNT = 210
 RESTORED_R666_R710_RECIPE_COUNT = 45
 SECOND_PASS_IMPORT_RECIPE_COUNT = 157
 SECOND_PASS_EXCLUDED_RECIPE_NOS = frozenset({856})
+BULK_0806_IMPORT_RECIPE_COUNT = 61
 LOW_RISK_MISSING_FOOD_RECIPE_NOS = frozenset(
     {418, 429, 435, 471, 480, 484, 493, 495, 527, 562, 572, 684, 685}
 )
@@ -28,8 +29,9 @@ TOTAL_CURATED_RECIPE_COUNT = (
     + RESTORED_R401_R610_RECIPE_COUNT
     + RESTORED_R666_R710_RECIPE_COUNT
     + SECOND_PASS_IMPORT_RECIPE_COUNT
+    + BULK_0806_IMPORT_RECIPE_COUNT
 )
-SELECTABLE_CURATED_RECIPE_COUNT = 834
+SELECTABLE_CURATED_RECIPE_COUNT = 895
 DOCX_RECIPE_KEY_PREFIX = "docx20260520_"
 DOCX_RECIPE_NOS = frozenset(range(611, 666))
 EXCLUDED_MISSING_FOOD_RECIPE_NOS = frozenset()
@@ -37,6 +39,7 @@ RESTORED_R401_R610_RECIPE_NOS = frozenset(range(401, 611)) - EXCLUDED_MISSING_FO
 RESTORED_R666_R710_RECIPE_NOS = frozenset(range(666, 711)) - EXCLUDED_MISSING_FOOD_RECIPE_NOS
 RESTORED_RECIPE_NOS = RESTORED_R401_R610_RECIPE_NOS | RESTORED_R666_R710_RECIPE_NOS
 SECOND_PASS_RECIPE_NOS = frozenset(range(711, 869)) - SECOND_PASS_EXCLUDED_RECIPE_NOS
+BULK_0806_RECIPE_NOS = frozenset(range(869, 930))
 USER_FACING_RECIPE_FIELDS = (
     "category_ru",
     "title_ru",
@@ -169,6 +172,29 @@ def test_second_pass_bulk_import_has_expected_rows_and_photos() -> None:
     assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.png").exists() for recipe_no in SECOND_PASS_RECIPE_NOS)
     assert second_pass_ids <= {row["recipe_id"] for row in nutrition}
     assert second_pass_ids <= {row["recipe_id"] for row in ingredients}
+
+
+def test_bulk_0806_import_has_expected_rows_foods_and_photos() -> None:
+    recipes = json.loads((DATA_DIR / "curated_recipes.json").read_text(encoding="utf-8"))
+    ingredients = json.loads((DATA_DIR / "curated_recipe_ingredients.json").read_text(encoding="utf-8"))
+    nutrition = json.loads((DATA_DIR / "curated_recipe_nutrition.json").read_text(encoding="utf-8"))
+    foods = json.loads((DATA_DIR / "curated_foods.json").read_text(encoding="utf-8"))
+    recipes_by_no = {int(recipe["recipe_no"]): recipe for recipe in recipes}
+    bulk_ids = {recipes_by_no[recipe_no]["recipe_id"] for recipe_no in BULK_0806_RECIPE_NOS}
+
+    assert len(BULK_0806_RECIPE_NOS) == BULK_0806_IMPORT_RECIPE_COUNT
+    assert BULK_0806_RECIPE_NOS <= set(recipes_by_no)
+    assert all(str(recipes_by_no[recipe_no]["recipe_key"]).startswith("bulk_0806_") for recipe_no in BULK_0806_RECIPE_NOS)
+    assert all(
+        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.png"
+        for recipe_no in BULK_0806_RECIPE_NOS
+    )
+    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.png").exists() for recipe_no in BULK_0806_RECIPE_NOS)
+    assert bulk_ids <= {row["recipe_id"] for row in nutrition}
+    assert bulk_ids <= {row["recipe_id"] for row in ingredients}
+    assert {"lentils_dry", "tempeh", "textured_soy_protein_dry", "adyghe_cheese"} <= {
+        row["food_id"] for row in foods
+    }
 
 
 def test_second_pass_bulk_import_has_reviewed_user_facing_copy_and_time_policy() -> None:
