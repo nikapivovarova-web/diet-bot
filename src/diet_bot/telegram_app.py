@@ -1075,6 +1075,20 @@ WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS = 90.0
 # _build_week_plans_with_recent_fallback routing.
 WEEKLY_REPEATS_FALLBACK_RESERVE_SECONDS = 45.0
 WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS = 300.0
+# Final, cheapest rung of the bounded fallback ladder. When the normal selection
+# and the extended bounded repeats fallback both time out, build a tiny pool of a
+# few distinct valid days and rotate them across the week (e.g. 3 days -> ABCABCA).
+# This is strictly cheaper than the full repeats fallback (small day pool + no beam
+# schedule search), so it finishes in seconds under a hard ceiling. The ceiling is
+# mandatory: there is NEVER an unbounded retry. A serviceable profile gets a full,
+# diverse week; a genuinely unserviceable one gets an honest failed (no_safe_foods /
+# no valid day pool), never a timeout-masked empty and never a hang.
+WEEKLY_REPEATS_ROTATION_FALLBACK_TIMEOUT_SECONDS = 45.0
+# How many distinct valid days the rotation stage aims to build before rotating.
+# Kept small so the stage stays cheap; >=2 distinct days are required so the result
+# is diverse rather than a single day repeated seven times.
+WEEKLY_REPEATS_ROTATION_DAY_POOL_SIZE = 3
+WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS = 2
 WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
 WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
 WEEKLY_TRAIT_REPEAT_CAP = 3
@@ -4071,6 +4085,129 @@ def _build_week_plans_with_repeats_fallback(
     )
 
 
+def _weekly_rotation_distinct_days(
+    day_pool: Sequence[MealPlan],
+) -> tuple[MealPlan, ...]:
+    """Distinct days from the pool, keyed by recipe signature, order preserved."""
+    distinct: list[MealPlan] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+    for plan in day_pool:
+        signature = _plan_recipe_ids(plan)
+        if not signature or signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        distinct.append(plan)
+    return tuple(distinct)
+
+
+def _weekly_rotation_schedule(
+    distinct_days: Sequence[MealPlan],
+) -> tuple[MealPlan, ...]:
+    """Rotate the distinct days across the week (3 days -> ABCABCA).
+
+    Deterministic and O(WEEK_PLAN_DAYS): no beam search. The caller guarantees at
+    least WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS distinct days, so the result is
+    always diverse, never a single day repeated.
+    """
+    if not distinct_days:
+        return ()
+    return tuple(
+        distinct_days[day_index % len(distinct_days)]
+        for day_index in range(WEEK_PLAN_DAYS)
+    )
+
+
+def _build_week_plans_with_rotation_fallback(
+    profile: UserProfile,
+    seed: int,
+    *,
+    recipe_cache: _RecipePlanCache,
+    failure_reason: str | None = None,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> _WeekPlanBuildResult:
+    """Cheapest, final rung of the bounded ladder.
+
+    Builds a tiny pool of a few distinct valid days under a hard time ceiling and
+    rotates them across the week instead of running the expensive schedule search.
+    Always terminates: it never relaxes the hard gates and never retries without a
+    guard. A serviceable profile gets a full, diverse week; an unserviceable one
+    gets an honest failed result (never a timeout-masked empty, never a hang).
+    """
+    del failure_reason
+    if selection_guard is not None:
+        selection_guard.begin_phase("repeats_fallback")
+        selection_guard.check(stage="before_rotation_fallback")
+
+    safety = evaluate_safety(profile)
+    if not safety.can_generate_plan:
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            failure_reason="safety_cannot_generate",
+        )
+    if not filter_foods(built_in_foods(), safety):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="no_safe_foods",
+        )
+
+    base_limits = _weekly_repeat_fallback_search_limits(profile, safety=safety)
+    rotation_pool_size = min(
+        base_limits.day_pool_size,
+        WEEKLY_REPEATS_ROTATION_DAY_POOL_SIZE,
+    )
+    rotation_limits = replace(
+        base_limits,
+        day_pool_size=rotation_pool_size,
+        builder_day_pool_size=min(base_limits.builder_day_pool_size, rotation_pool_size),
+    )
+    day_pool, day_pool_failure_reason = _build_weekly_repeat_fallback_day_pool(
+        profile,
+        seed,
+        recipe_cache=recipe_cache,
+        selection_guard=selection_guard,
+        search_limits=rotation_limits,
+    )
+    if selection_guard is not None:
+        selection_guard.check(stage="after_rotation_fallback_day_pool")
+
+    valid_days = tuple(
+        plan
+        for plan in day_pool
+        if _weekly_repeat_fallback_day_is_hard_valid(plan, profile)
+    )
+    distinct_days = _weekly_rotation_distinct_days(valid_days)
+    if len(distinct_days) < WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS:
+        # Cannot assemble a diverse week (e.g. only one distinct valid day exists).
+        # Surface an honest failed result rather than emitting one day repeated
+        # seven times, which the no-empty guarantee explicitly rejects.
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason=day_pool_failure_reason or "repeats_fallback_no_valid_day_pool",
+        )
+
+    week = _weekly_rotation_schedule(distinct_days)
+    if not _week_plans_are_complete(week, profile):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="repeats_fallback_rotation_incomplete_week",
+        )
+    repeat_count = _weekly_repeated_recipe_count(week)
+    return _WeekPlanBuildResult(
+        plans=week,
+        avoidance_phase="repeats_fallback",
+        repeat_fallback_used=True,
+        repeat_recipe_count=repeat_count,
+        repeat_note=WEEKLY_REPEATS_FALLBACK_NOTE if repeat_count else None,
+    )
+
+
 def _build_weekly_repeat_fallback_day_pool(
     profile: UserProfile,
     seed: int,
@@ -5130,24 +5267,39 @@ def _build_week_plans_with_recent_fallback(
             )
         except _WeeklySelectionTimeout as exc:
             timeout_result(exc)
-            retry_reason = f"{failure_reason}_unbounded_retry"
-            _weekly_selection_diag(
-                "repeats_fallback_unbounded_retry_start",
-                always=True,
-                phase="repeats_fallback",
-                seed=seed,
-                reason=retry_reason,
+            return rotation_fallback_result(f"{failure_reason}_rotation")
+
+    def rotation_fallback_result(failure_reason: str) -> _WeekPlanBuildResult:
+        # Final, cheapest rung: a few distinct valid days rotated across the week,
+        # under a hard ceiling. This replaces the old unbounded retry. There is no
+        # path here without a time limit: if even this cheap stage exhausts its
+        # bounded budget we surface an honest timeout rather than retrying forever.
+        _weekly_selection_diag(
+            "repeats_fallback_rotation_start",
+            always=True,
+            phase="repeats_fallback",
+            seed=seed,
+            reason=failure_reason,
+        )
+        rotation_timeout_s = float(WEEKLY_REPEATS_ROTATION_FALLBACK_TIMEOUT_SECONDS)
+        rotation_guard = (
+            _WeeklySelectionGuard(
+                total_timeout_s=rotation_timeout_s,
+                phase_timeout_s=rotation_timeout_s,
             )
-            try:
-                return _build_week_plans_with_repeats_fallback(
-                    profile,
-                    seed,
-                    recipe_cache=recipe_cache,
-                    failure_reason=retry_reason,
-                    selection_guard=None,
-                )
-            except _WeeklySelectionTimeout as retry_exc:
-                return timeout_result(retry_exc)
+            if rotation_timeout_s > 0
+            else None
+        )
+        try:
+            return _build_week_plans_with_rotation_fallback(
+                profile,
+                seed,
+                recipe_cache=recipe_cache,
+                failure_reason=failure_reason,
+                selection_guard=rotation_guard,
+            )
+        except _WeeklySelectionTimeout as exc:
+            return timeout_result(exc)
 
     if _recent_avoidance_is_empty(recent_avoidance):
         try:

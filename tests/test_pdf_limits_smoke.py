@@ -651,7 +651,7 @@ def _active_subscription_entitlement(
     telegram_app.apply_subscription_payment(
         entitlement,
         charge_id,
-        now=datetime(2026, 5, 10, tzinfo=UTC),
+        now=datetime.now(UTC),
     )
     entitlement.monthly_weekly_pdf_remaining = weekly_pdf_remaining
     return entitlement

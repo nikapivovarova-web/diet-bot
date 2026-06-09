@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1138,9 +1139,14 @@ def test_carried_history_final_fallback_uses_extended_budget_after_normal_timeou
     assert fallback_calls == ["total_timeout_final_fallback"]
 
 
-def test_carried_history_final_fallback_timeout_retries_without_empty_result(
+def test_carried_history_final_fallback_timeout_routes_to_bounded_rotation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The old design retried the repeats fallback once more WITHOUT a guard
+    # (unbounded) when the extended budget timed out. That mine is gone: a rung-1
+    # timeout now descends to the bounded rotation stage, which always runs under a
+    # guard. This pins the wiring -- the rotation stage is invoked with a non-None
+    # guard and no fallback is ever invoked with an unbounded (None) guard.
     profile = _profile()
     seed = 600
     clock = {"now": 0.0}
@@ -1152,13 +1158,14 @@ def test_carried_history_final_fallback_timeout_retries_without_empty_result(
         clock["now"] += 1.0
         return _empty_plan(profile)
 
-    fallback_calls: list[str | None] = []
+    repeats_calls: list[tuple[str | None, bool]] = []
+    rotation_calls: list[tuple[str | None, bool]] = []
     sentinel_week = tuple(
-        _plan(profile, "fallback", 1800.0, ("f0", "f1", "f2"))
-        for _ in range(telegram_app.WEEK_PLAN_DAYS)
+        _plan(profile, f"rot{index % 3}", 1800.0, (f"r{index % 3}a", f"r{index % 3}b", f"r{index % 3}c"))
+        for index in range(telegram_app.WEEK_PLAN_DAYS)
     )
 
-    def fake_fallback(
+    def fake_repeats_fallback(
         profile: UserProfile,
         seed: int,
         *,
@@ -1167,10 +1174,26 @@ def test_carried_history_final_fallback_timeout_retries_without_empty_result(
         selection_guard=None,
     ) -> "telegram_app._WeekPlanBuildResult":
         del profile, seed, recipe_cache
-        fallback_calls.append(failure_reason)
-        if selection_guard is not None:
-            clock["now"] += 4.0
-            selection_guard.check(stage="final_fallback_extended_timeout")
+        repeats_calls.append((failure_reason, selection_guard is None))
+        # The extended bounded fallback (rung 1) must always run under a guard, and
+        # here it exhausts that bounded budget and times out.
+        assert selection_guard is not None
+        clock["now"] += 4.0
+        selection_guard.check(stage="extended_fallback_timeout")
+        raise AssertionError("guard.check should have raised a timeout")
+
+    def fake_rotation_fallback(
+        profile: UserProfile,
+        seed: int,
+        *,
+        recipe_cache,
+        failure_reason: str | None = None,
+        selection_guard=None,
+    ) -> "telegram_app._WeekPlanBuildResult":
+        del profile, seed, recipe_cache
+        rotation_calls.append((failure_reason, selection_guard is None))
+        # The cheapest rung is still bounded: it always receives a guard.
+        assert selection_guard is not None
         return telegram_app._WeekPlanBuildResult(
             plans=sentinel_week,
             avoidance_phase="repeats_fallback",
@@ -1183,7 +1206,8 @@ def test_carried_history_final_fallback_timeout_retries_without_empty_result(
     monkeypatch.setattr(telegram_app, "WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS", 3.0, raising=False)
     monkeypatch.setattr(telegram_app, "WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS", 3.0, raising=False)
     monkeypatch.setattr(telegram_app, "build_one_day_plan", day_builder)
-    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", fake_fallback)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", fake_repeats_fallback)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_rotation_fallback", fake_rotation_fallback)
 
     result = telegram_app._build_week_plans_with_recent_fallback(
         profile,
@@ -1193,10 +1217,176 @@ def test_carried_history_final_fallback_timeout_retries_without_empty_result(
 
     assert result.avoidance_phase == "repeats_fallback"
     assert result.plans == sentinel_week
-    assert fallback_calls == [
-        "total_timeout_final_fallback",
-        "total_timeout_final_fallback_unbounded_retry",
-    ]
+    assert repeats_calls == [("total_timeout_final_fallback", False)]
+    assert rotation_calls == [("total_timeout_final_fallback_rotation", False)]
+    # No fallback (rung 1 or rotation) was ever invoked with an unbounded guard.
+    assert not any(guard_is_none for _reason, guard_is_none in repeats_calls + rotation_calls)
+
+
+def test_final_fallback_terminates_with_diverse_week_under_hostile_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Hostile conditions: the normal weekly selection and the extended bounded
+    # repeats fallback both time out immediately. The REAL cheap rotation stage must
+    # still return a full, diverse week under its own hard ceiling, within a wall
+    # clock deadline. A re-introduced unbounded path would hang past the deadline and
+    # fail this test (it runs on a daemon thread joined with a finite timeout).
+    profile = _profile()
+    seed = 600
+
+    repeats_guard_was_none: list[bool] = []
+
+    def raising_week_build(*args: object, **kwargs: object) -> tuple[MealPlan, ...]:
+        raise telegram_app._WeeklySelectionTimeout(
+            scope="total", phase="no_recent", elapsed_s=999.0, timeout_s=1.0, stage="hostile_test"
+        )
+
+    def raising_repeats_fallback(
+        profile: UserProfile,
+        seed: int,
+        *,
+        recipe_cache,
+        failure_reason: str | None = None,
+        selection_guard=None,
+    ) -> "telegram_app._WeekPlanBuildResult":
+        repeats_guard_was_none.append(selection_guard is None)
+        # An unbounded (None) guard here would be the old mine; assert it never happens.
+        assert selection_guard is not None, "unbounded repeats fallback path must not exist"
+        raise telegram_app._WeeklySelectionTimeout(
+            scope="total", phase="repeats_fallback", elapsed_s=999.0, timeout_s=1.0, stage="hostile_test"
+        )
+
+    monkeypatch.setattr(telegram_app, "_build_week_plans", raising_week_build)
+    monkeypatch.setattr(telegram_app, "_build_week_plans_with_repeats_fallback", raising_repeats_fallback)
+    # _build_week_plans_with_rotation_fallback is intentionally left REAL.
+
+    result_box: dict[str, telegram_app._WeekPlanBuildResult] = {}
+
+    def run() -> None:
+        result_box["result"] = telegram_app._build_week_plans_with_recent_fallback(
+            profile, seed, _carried_history_avoidance()
+        )
+
+    deadline_s = float(telegram_app.WEEKLY_REPEATS_ROTATION_FALLBACK_TIMEOUT_SECONDS) + 30.0
+    started_at = time.perf_counter()
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    elapsed_s = time.perf_counter() - started_at
+
+    assert not worker.is_alive(), (
+        "weekly final fallback did not terminate within the deadline "
+        "(possible unbounded path)"
+    )
+    result = result_box["result"]
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.plans, "serviceable profile must never get an empty week"
+    assert len(result.plans) == telegram_app.WEEK_PLAN_DAYS
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    distinct_signatures = {telegram_app._plan_recipe_ids(plan) for plan in result.plans}
+    assert len(distinct_signatures) >= telegram_app.WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS
+    assert elapsed_s < deadline_s
+    assert repeats_guard_was_none, "rung-1 extended fallback should have been attempted"
+    assert not any(repeats_guard_was_none), "no fallback call may use an unbounded guard"
+
+
+def test_rotation_fallback_builds_diverse_valid_week_for_serviceable_profile() -> None:
+    # The cheap rotation stage, run directly with a real guard, builds a complete,
+    # diverse, gate-valid week for a serviceable profile in well under its ceiling.
+    profile = _profile()
+    ceiling_s = float(telegram_app.WEEKLY_REPEATS_ROTATION_FALLBACK_TIMEOUT_SECONDS)
+    guard = telegram_app._WeeklySelectionGuard(total_timeout_s=ceiling_s, phase_timeout_s=ceiling_s)
+
+    started_at = time.perf_counter()
+    result = telegram_app._build_week_plans_with_rotation_fallback(
+        profile,
+        600,
+        recipe_cache=telegram_app._RecipePlanCache(),
+        failure_reason="serviceable_test",
+        selection_guard=guard,
+    )
+    elapsed_s = time.perf_counter() - started_at
+
+    assert result.avoidance_phase == "repeats_fallback"
+    assert result.plans, "serviceable profile must never get an empty week"
+    assert len(result.plans) == telegram_app.WEEK_PLAN_DAYS
+    assert telegram_app._week_plans_are_complete(result.plans, profile)
+    distinct_signatures = {telegram_app._plan_recipe_ids(plan) for plan in result.plans}
+    assert len(distinct_signatures) >= telegram_app.WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS
+    for plan in result.plans:
+        assert validate_plan(plan).ok
+    assert elapsed_s < ceiling_s
+
+
+def test_rotation_fallback_unserviceable_profile_returns_honest_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unserviceable profile (no safe foods) gets an honest failed result quickly,
+    # never a timeout and never a hang.
+    profile = _profile()
+    monkeypatch.setattr(telegram_app, "filter_foods", lambda foods, safety: [])
+    guard = telegram_app._WeeklySelectionGuard(total_timeout_s=5.0, phase_timeout_s=5.0)
+
+    started_at = time.perf_counter()
+    result = telegram_app._build_week_plans_with_rotation_fallback(
+        profile,
+        600,
+        recipe_cache=telegram_app._RecipePlanCache(),
+        selection_guard=guard,
+    )
+    elapsed_s = time.perf_counter() - started_at
+
+    assert result.plans == ()
+    assert result.avoidance_phase == "failed"
+    assert result.failure_reason == "no_safe_foods"
+    assert elapsed_s < 5.0
+
+
+def test_rotation_fallback_requires_two_distinct_days_else_honest_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A pool that can only yield a single distinct valid day must NOT be emitted as
+    # one day repeated seven times; the rotation stage returns an honest failed.
+    profile = _profile()
+    solo_day = _plan(profile, "solo", 1800.0, ("s0", "s1", "s2"))
+
+    monkeypatch.setattr(
+        telegram_app,
+        "_build_weekly_repeat_fallback_day_pool",
+        lambda *args, **kwargs: ((solo_day, solo_day), None),
+    )
+    monkeypatch.setattr(
+        telegram_app, "_weekly_repeat_fallback_day_is_hard_valid", lambda plan, prof: True
+    )
+    guard = telegram_app._WeeklySelectionGuard(total_timeout_s=5.0, phase_timeout_s=5.0)
+
+    result = telegram_app._build_week_plans_with_rotation_fallback(
+        profile,
+        600,
+        recipe_cache=telegram_app._RecipePlanCache(),
+        selection_guard=guard,
+    )
+
+    assert result.plans == ()
+    assert result.avoidance_phase == "failed"
+    assert result.failure_reason == "repeats_fallback_no_valid_day_pool"
+
+
+def test_weekly_rotation_schedule_is_abcabca_pattern() -> None:
+    day_a, day_b, day_c = object(), object(), object()
+    week = telegram_app._weekly_rotation_schedule((day_a, day_b, day_c))
+    assert week == (day_a, day_b, day_c, day_a, day_b, day_c, day_a)
+    assert len(week) == telegram_app.WEEK_PLAN_DAYS
+
+
+def test_weekly_rotation_distinct_days_dedupes_by_recipe_signature() -> None:
+    profile = _profile()
+    day_x = _plan(profile, "x", 1800.0, ("a", "b", "c"))
+    day_x_again = _plan(profile, "x", 1800.0, ("a", "b", "c"))
+    day_y = _plan(profile, "y", 1800.0, ("a", "b", "c"))
+    distinct = telegram_app._weekly_rotation_distinct_days((day_x, day_x_again, day_y))
+    assert len(distinct) == 2
+    assert telegram_app._plan_recipe_ids(distinct[0]) != telegram_app._plan_recipe_ids(distinct[1])
 
 
 def test_carried_history_total_timeout_uses_final_fallback_when_serviceable(
