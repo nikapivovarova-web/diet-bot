@@ -563,6 +563,8 @@ class _WeeklySelectionGuard:
     total_started_at: float = field(default_factory=lambda: time.perf_counter())
     phase_started_at: float = field(default_factory=lambda: time.perf_counter())
     phase: str = "unknown"
+    total_timeout_s: float | None = None
+    phase_timeout_s: float | None = None
     # When > 0, cap the no_recent phase so this many seconds of total budget stay
     # available for the repeats fallback. Set by the orchestrator only under
     # carried-history (non-empty recent avoidance). 0 disables (default).
@@ -598,7 +600,11 @@ class _WeeklySelectionGuard:
     ) -> None:
         now = time.perf_counter()
         total_elapsed_s = now - self.total_started_at
-        total_timeout_s = float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+        total_timeout_s = (
+            float(WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS)
+            if self.total_timeout_s is None
+            else float(self.total_timeout_s)
+        )
         if total_timeout_s > 0 and total_elapsed_s > total_timeout_s:
             raise _WeeklySelectionTimeout(
                 scope="total",
@@ -611,7 +617,11 @@ class _WeeklySelectionGuard:
             )
 
         phase_elapsed_s = now - self.phase_started_at
-        phase_timeout_s = _weekly_selection_phase_timeout(self.phase)
+        phase_timeout_s = (
+            _weekly_selection_phase_timeout(self.phase)
+            if self.phase_timeout_s is None
+            else float(self.phase_timeout_s)
+        )
         reserved_budget_s = self._no_recent_reserved_budget_s(total_timeout_s)
         if reserved_budget_s is not None:
             phase_timeout_s = (
@@ -1064,6 +1074,21 @@ WEEKLY_SELECTION_TOTAL_TIMEOUT_SECONDS = 90.0
 # lower. See _WeeklySelectionGuard reserve handling and
 # _build_week_plans_with_recent_fallback routing.
 WEEKLY_REPEATS_FALLBACK_RESERVE_SECONDS = 45.0
+WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS = 300.0
+# Final, cheapest rung of the bounded fallback ladder. When the normal selection
+# and the extended bounded repeats fallback both time out, build a tiny pool of a
+# few distinct valid days and rotate them across the week (e.g. 3 days -> ABCABCA).
+# This is strictly cheaper than the full repeats fallback (small day pool + no beam
+# schedule search), so it finishes in seconds under a hard ceiling. The ceiling is
+# mandatory: there is NEVER an unbounded retry. A serviceable profile gets a full,
+# diverse week; a genuinely unserviceable one gets an honest failed (no_safe_foods /
+# no valid day pool), never a timeout-masked empty and never a hang.
+WEEKLY_REPEATS_ROTATION_FALLBACK_TIMEOUT_SECONDS = 45.0
+# How many distinct valid days the rotation stage aims to build before rotating.
+# Kept small so the stage stays cheap; >=2 distinct days are required so the result
+# is diverse rather than a single day repeated seven times.
+WEEKLY_REPEATS_ROTATION_DAY_POOL_SIZE = 3
+WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS = 2
 WEEKLY_EXACT_RECIPE_REPEAT_PENALTY = 1.0
 WEEKLY_CANDIDATE_POOL_RECIPE_REPEAT_PENALTY = 0.15
 WEEKLY_TRAIT_REPEAT_CAP = 3
@@ -1101,6 +1126,8 @@ WEEK_PDF_UPLOAD_TEXT = "PDF собран. Загружаю файл в чат."
 WEEK_PDF_DONE_TEXT = "Готово. PDF отправлен ниже."
 WEEK_PDF_FALLBACK_TEXT = "PDF не удалось собрать. Отправляю рацион текстом."
 WEEK_PDF_FAILURE_TEXT = "PDF \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c \u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435."
+WEEK_PDF_UNSERVICEABLE_TEXT = "\u041d\u0435 \u043c\u043e\u0433\u0443 \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u043e \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF \u043f\u043e \u044d\u0442\u043e\u0439 \u0430\u043d\u043a\u0435\u0442\u0435: \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0436\u0435\u0441\u0442\u043a\u0438\u0435 \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f \u0438\u043b\u0438 \u043d\u0435\u0442 \u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u044b\u0445 \u0431\u043b\u044e\u0434."
+WEEK_PDF_TIMEOUT_FAILURE_TEXT = "\u041d\u0435 \u0443\u0441\u043f\u0435\u043b \u0441\u043e\u0431\u0440\u0430\u0442\u044c \u043f\u043e\u043b\u043d\u044b\u0439 \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u044b\u0439 PDF. \u042f \u043d\u0435 \u0431\u0443\u0434\u0443 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c \u043f\u0443\u0441\u0442\u043e\u0439 \u0440\u0430\u0446\u0438\u043e\u043d."
 WEEK_PDF_ACCEPTED_TEXT = "\u0413\u043e\u0442\u043e\u0432\u043b\u044e \u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u0430\u043a \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 WEEK_PDF_ALREADY_RUNNING_TEXT = "\u041d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439 PDF \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u0438\u0442\u0441\u044f. \u042f \u043f\u0440\u0438\u0448\u043b\u044e \u0435\u0433\u043e \u0441\u044e\u0434\u0430, \u043a\u043e\u0433\u0434\u0430 \u043e\u043d \u0431\u0443\u0434\u0435\u0442 \u0433\u043e\u0442\u043e\u0432."
 ONE_DAY_PLAN_STATUS_TEXT = "\u0421\u0447\u0438\u0442\u0430\u044e \u0440\u0430\u0446\u0438\u043e\u043d \u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u044e \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u0438\u044f... \U0001f9ee"
@@ -3303,6 +3330,14 @@ def _weekly_recent_recipe_keys_from_snapshot(snapshot: WeeklyPdfRequestSnapshot)
     return tuple(str(key).strip() for key in raw_keys if str(key).strip())
 
 
+def _week_pdf_failure_text_for_build_result(build_result: _WeekPlanBuildResult) -> str:
+    if build_result.failure_reason in {"safety_cannot_generate", "no_safe_foods"}:
+        return WEEK_PDF_UNSERVICEABLE_TEXT
+    if build_result.avoidance_phase == "timeout":
+        return WEEK_PDF_TIMEOUT_FAILURE_TEXT
+    return WEEK_PDF_FAILURE_TEXT
+
+
 async def _send_week_plan(
     message: Message,
     profile: UserProfile,
@@ -3369,7 +3404,7 @@ async def _send_week_plan(
 
         if not _week_plans_are_complete(plans, profile):
             await _stop_week_pdf_status(status_task)
-            await _edit_week_pdf_status(status_message, WEEK_PDF_FAILURE_TEXT)
+            await _edit_week_pdf_status(status_message, _week_pdf_failure_text_for_build_result(build_result))
             return False
 
         first_plan = plans[0]
@@ -4031,10 +4066,10 @@ def _build_week_plans_with_repeats_fallback(
         selection_guard=selection_guard,
         search_limits=search_limits,
     )
-    if selection_guard is not None:
-        selection_guard.check(stage="after_repeats_fallback_schedule")
     repeat_count = _weekly_repeated_recipe_count(scheduled_plans)
     if not _week_plans_are_complete(scheduled_plans, profile):
+        if selection_guard is not None:
+            selection_guard.check(stage="after_repeats_fallback_schedule")
         return _WeekPlanBuildResult(
             plans=(),
             avoidance_phase="failed",
@@ -4043,6 +4078,129 @@ def _build_week_plans_with_repeats_fallback(
         )
     return _WeekPlanBuildResult(
         plans=scheduled_plans,
+        avoidance_phase="repeats_fallback",
+        repeat_fallback_used=True,
+        repeat_recipe_count=repeat_count,
+        repeat_note=WEEKLY_REPEATS_FALLBACK_NOTE if repeat_count else None,
+    )
+
+
+def _weekly_rotation_distinct_days(
+    day_pool: Sequence[MealPlan],
+) -> tuple[MealPlan, ...]:
+    """Distinct days from the pool, keyed by recipe signature, order preserved."""
+    distinct: list[MealPlan] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+    for plan in day_pool:
+        signature = _plan_recipe_ids(plan)
+        if not signature or signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        distinct.append(plan)
+    return tuple(distinct)
+
+
+def _weekly_rotation_schedule(
+    distinct_days: Sequence[MealPlan],
+) -> tuple[MealPlan, ...]:
+    """Rotate the distinct days across the week (3 days -> ABCABCA).
+
+    Deterministic and O(WEEK_PLAN_DAYS): no beam search. The caller guarantees at
+    least WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS distinct days, so the result is
+    always diverse, never a single day repeated.
+    """
+    if not distinct_days:
+        return ()
+    return tuple(
+        distinct_days[day_index % len(distinct_days)]
+        for day_index in range(WEEK_PLAN_DAYS)
+    )
+
+
+def _build_week_plans_with_rotation_fallback(
+    profile: UserProfile,
+    seed: int,
+    *,
+    recipe_cache: _RecipePlanCache,
+    failure_reason: str | None = None,
+    selection_guard: _WeeklySelectionGuard | None = None,
+) -> _WeekPlanBuildResult:
+    """Cheapest, final rung of the bounded ladder.
+
+    Builds a tiny pool of a few distinct valid days under a hard time ceiling and
+    rotates them across the week instead of running the expensive schedule search.
+    Always terminates: it never relaxes the hard gates and never retries without a
+    guard. A serviceable profile gets a full, diverse week; an unserviceable one
+    gets an honest failed result (never a timeout-masked empty, never a hang).
+    """
+    del failure_reason
+    if selection_guard is not None:
+        selection_guard.begin_phase("repeats_fallback")
+        selection_guard.check(stage="before_rotation_fallback")
+
+    safety = evaluate_safety(profile)
+    if not safety.can_generate_plan:
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            failure_reason="safety_cannot_generate",
+        )
+    if not filter_foods(built_in_foods(), safety):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="no_safe_foods",
+        )
+
+    base_limits = _weekly_repeat_fallback_search_limits(profile, safety=safety)
+    rotation_pool_size = min(
+        base_limits.day_pool_size,
+        WEEKLY_REPEATS_ROTATION_DAY_POOL_SIZE,
+    )
+    rotation_limits = replace(
+        base_limits,
+        day_pool_size=rotation_pool_size,
+        builder_day_pool_size=min(base_limits.builder_day_pool_size, rotation_pool_size),
+    )
+    day_pool, day_pool_failure_reason = _build_weekly_repeat_fallback_day_pool(
+        profile,
+        seed,
+        recipe_cache=recipe_cache,
+        selection_guard=selection_guard,
+        search_limits=rotation_limits,
+    )
+    if selection_guard is not None:
+        selection_guard.check(stage="after_rotation_fallback_day_pool")
+
+    valid_days = tuple(
+        plan
+        for plan in day_pool
+        if _weekly_repeat_fallback_day_is_hard_valid(plan, profile)
+    )
+    distinct_days = _weekly_rotation_distinct_days(valid_days)
+    if len(distinct_days) < WEEKLY_REPEATS_ROTATION_MIN_DISTINCT_DAYS:
+        # Cannot assemble a diverse week (e.g. only one distinct valid day exists).
+        # Surface an honest failed result rather than emitting one day repeated
+        # seven times, which the no-empty guarantee explicitly rejects.
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason=day_pool_failure_reason or "repeats_fallback_no_valid_day_pool",
+        )
+
+    week = _weekly_rotation_schedule(distinct_days)
+    if not _week_plans_are_complete(week, profile):
+        return _WeekPlanBuildResult(
+            plans=(),
+            avoidance_phase="failed",
+            repeat_fallback_used=True,
+            failure_reason="repeats_fallback_rotation_incomplete_week",
+        )
+    repeat_count = _weekly_repeated_recipe_count(week)
+    return _WeekPlanBuildResult(
+        plans=week,
         avoidance_phase="repeats_fallback",
         repeat_fallback_used=True,
         repeat_recipe_count=repeat_count,
@@ -5080,6 +5238,67 @@ def _build_week_plans_with_recent_fallback(
                 selection_guard=guard,
             )
         except _WeeklySelectionTimeout as exc:
+            timeout_result(exc)
+            return final_repeats_fallback_result(f"{failure_reason}_final_fallback")
+
+    def final_repeats_fallback_result(failure_reason: str) -> _WeekPlanBuildResult:
+        _weekly_selection_diag(
+            "repeats_fallback_final_start",
+            phase="repeats_fallback",
+            seed=seed,
+            reason=failure_reason,
+        )
+        final_timeout_s = float(WEEKLY_REPEATS_FINAL_FALLBACK_TIMEOUT_SECONDS)
+        final_guard = (
+            _WeeklySelectionGuard(
+                total_timeout_s=final_timeout_s,
+                phase_timeout_s=final_timeout_s,
+            )
+            if final_timeout_s > 0
+            else None
+        )
+        try:
+            return _build_week_plans_with_repeats_fallback(
+                profile,
+                seed,
+                recipe_cache=recipe_cache,
+                failure_reason=failure_reason,
+                selection_guard=final_guard,
+            )
+        except _WeeklySelectionTimeout as exc:
+            timeout_result(exc)
+            return rotation_fallback_result(f"{failure_reason}_rotation")
+
+    def rotation_fallback_result(failure_reason: str) -> _WeekPlanBuildResult:
+        # Final, cheapest rung: a few distinct valid days rotated across the week,
+        # under a hard ceiling. This replaces the old unbounded retry. There is no
+        # path here without a time limit: if even this cheap stage exhausts its
+        # bounded budget we surface an honest timeout rather than retrying forever.
+        _weekly_selection_diag(
+            "repeats_fallback_rotation_start",
+            always=True,
+            phase="repeats_fallback",
+            seed=seed,
+            reason=failure_reason,
+        )
+        rotation_timeout_s = float(WEEKLY_REPEATS_ROTATION_FALLBACK_TIMEOUT_SECONDS)
+        rotation_guard = (
+            _WeeklySelectionGuard(
+                total_timeout_s=rotation_timeout_s,
+                phase_timeout_s=rotation_timeout_s,
+            )
+            if rotation_timeout_s > 0
+            else None
+        )
+        try:
+            return _build_week_plans_with_rotation_fallback(
+                profile,
+                seed,
+                recipe_cache=recipe_cache,
+                failure_reason=failure_reason,
+                selection_guard=rotation_guard,
+            )
+        except _WeeklySelectionTimeout as exc:
             return timeout_result(exc)
 
     if _recent_avoidance_is_empty(recent_avoidance):
@@ -5168,9 +5387,7 @@ def _build_week_plans_with_recent_fallback(
             timed_out = True
             timeout_result(exc)
             if exc.scope == "total":
-                # Total budget genuinely exhausted: there is nowhere to run the
-                # fallback, so surface an honest timeout rather than masking it.
-                return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+                return final_repeats_fallback_result("total_timeout_final_fallback")
             if exc.phase == "no_recent" and not _recent_avoidance_is_empty(
                 recent_avoidance
             ):
@@ -5217,11 +5434,7 @@ def _build_week_plans_with_recent_fallback(
         and time.perf_counter() - guard.total_started_at > total_timeout_s
     )
     if total_budget_exhausted:
-        # Total budget gone: honest timeout for carried-history, fallback for the
-        # empty case where no_recent is the only phase (unchanged behavior).
-        if _recent_avoidance_is_empty(recent_avoidance):
-            return repeats_fallback_result("no_recent_timeout")
-        return _WeekPlanBuildResult(plans=(), avoidance_phase="timeout")
+        return final_repeats_fallback_result("total_timeout_final_fallback")
     # Total budget remains. no_recent finished incomplete (or an earlier phase timed
     # out) but the reserve is intact, so route to the fallback rather than failing.
     if _recent_avoidance_is_empty(recent_avoidance):
