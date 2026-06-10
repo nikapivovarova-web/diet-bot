@@ -61,7 +61,7 @@ multidict==6.7.1
     # via
     #   aiohttp
     #   yarl
-openai==2.41.0
+openai==2.41.1
     # via telegram-diet-bot (pyproject.toml)
 pillow==12.2.0
     # via reportlab
