@@ -11,7 +11,7 @@ from pypdf import PdfReader
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult
-from diet_bot.pdf_renderer import _clean_text, render_week_plan_pdf, resolve_local_meal_image_path
+from diet_bot.pdf_renderer import EMOJI_RE, _clean_text, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
 
@@ -44,17 +44,21 @@ def test_week_pdf_contains_full_week_content(tmp_path: Path, sample_week_plans, 
 
     reader = PdfReader(str(pdf_path))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    first_meal_title = _clean_text(sample_week_plans[0].meals[0].name)
+    first_meal_title = _clean_text(sample_week_plans[0].meals[0].name).split(":", 1)[1].strip()
 
     assert "Рацион на неделю" in text
+    assert "Ваш расчет" in text
     assert "День 1" in text
     assert _compact_text(first_meal_title) in _compact_text(text)
-    assert "Ингредиенты:" in text
-    assert "Как приготовить:" in text
-    assert "Итого за день" in text
-    assert "●" in text
-    assert "Список покупок" in text
-    assert "ориентировочный расчёт" in text
+    assert "Ингредиенты" in text
+    assert "Примерная мера" in text
+    assert "Как приготовить" in text
+    assert "Нутриент" in text
+    assert "Факт" in text
+    assert "Цель" in text
+    assert "Список продуктов на неделю" in text
+    assert "Медицинский дисклеймер" in text
+    assert not EMOJI_RE.search(text)
 
 
 def test_local_meal_photo_can_be_resolved(sample_week_plans) -> None:
