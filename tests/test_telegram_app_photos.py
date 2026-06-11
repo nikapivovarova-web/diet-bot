@@ -1093,7 +1093,7 @@ async def test_private_start_still_sends_welcome(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_private_callback_start_flow_unchanged(monkeypatch) -> None:
+async def test_private_callback_start_shows_privacy_consent(monkeypatch) -> None:
     chat_id = 80_302
     monkeypatch.setattr(telegram_app, "Message", FakeMessage)
     message = FakeMessage(chat_id, chat_type="private")
@@ -1103,9 +1103,11 @@ async def test_private_callback_start_flow_unchanged(monkeypatch) -> None:
         await telegram_app.handle_callback(callback)
 
         assert callback.answers == [None]
-        assert chat_id in SESSION_BY_CHAT_ID
-        assert chat_id in TRIAL_CHAT_IDS
-        assert message.texts[-1][0] == start_session().current_question.prompt
+        assert chat_id not in SESSION_BY_CHAT_ID
+        assert chat_id not in TRIAL_CHAT_IDS
+        assert message.texts[-1][0] == telegram_app.PRIVACY_CONSENT_TEXT
+        callbacks = _button_callbacks(message.texts[-1][1])
+        assert callbacks[0] == telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL
     finally:
         SESSION_BY_CHAT_ID.pop(chat_id, None)
         TRIAL_CHAT_IDS.discard(chat_id)
@@ -1211,6 +1213,7 @@ def test_subscription_payment_keyboard_has_monthly_options_only() -> None:
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
     ]
 
 
@@ -1290,10 +1293,12 @@ def test_paywall_keyboard_prioritizes_relevant_extra_purchase() -> None:
     assert [(row[0].text, row[0].callback_data) for row in day_keyboard.inline_keyboard[2:]] == [
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
     ]
     assert [(row[0].text, row[0].callback_data) for row in week_keyboard.inline_keyboard[2:]] == [
         (BUY_EXTRA_ONE_DAY_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_ONE_DAY),
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
+        (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
     ]
 
 
@@ -1324,6 +1329,7 @@ async def test_active_subscription_limit_paywall_offers_only_extra_purchases(mon
         (BUY_EXTRA_ONE_DAY_TEXT, CALLBACK_BUY_EXTRA_ONE_DAY),
         (BUY_EXTRA_WEEKLY_PDF_RU_CARD_TEXT, CALLBACK_PAY_RU_EXTRA_WEEKLY_PDF),
         (BUY_EXTRA_WEEKLY_PDF_TEXT, CALLBACK_BUY_EXTRA_WEEKLY_PDF),
+        (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
     ]
 
 
@@ -1345,6 +1351,7 @@ async def test_free_limit_paywall_offers_monthly_access_only(monkeypatch, tmp_pa
     assert [(button.text, button.callback_data) for button in buttons] == [
         (PAY_WITH_RU_CARD_TEXT, CALLBACK_PAY_RU_CARD),
         (PAY_WITH_TELEGRAM_STARS_TEXT, CALLBACK_PAY_TELEGRAM_STARS),
+        (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
     ]
 
 
@@ -3693,6 +3700,7 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
     before = telegram_app.load_entitlements(subscriptions_path)[chat_id].to_dict()
     message = FakeMessage(chat_id, text=CHANGE_PROFILE_TEXT)
     try:
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.add(chat_id)
         await handle_answer(message)
 
         for answer in [
@@ -3710,6 +3718,8 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
             "нет",
         ]:
             await _handle_questionnaire_answer(message, answer)
+            if chat_id not in SESSION_BY_CHAT_ID:
+                break
 
         after = telegram_app.load_entitlements(subscriptions_path)[chat_id].to_dict()
         sent_text, markup = message.texts[-1]
@@ -3731,6 +3741,7 @@ async def test_subscriber_can_change_questionnaire_without_losing_limits(monkeyp
         PLAN_SEED_OFFSET_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_IDS_BY_CHAT_ID.pop(chat_id, None)
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
 
 
 @pytest.mark.anyio
