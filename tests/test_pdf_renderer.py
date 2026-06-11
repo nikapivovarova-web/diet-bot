@@ -11,6 +11,7 @@ from pypdf import PdfReader
 from diet_bot.curated_data import curated_foods
 from diet_bot.domain import ActivityLevel, CookingTimePreference, Goal, Sex, UserProfile
 from diet_bot.domain import Meal, MealPlan, NutritionTargets, SafetyResult
+from diet_bot import pdf_renderer
 from diet_bot.pdf_renderer import _clean_text, render_week_plan_pdf, resolve_local_meal_image_path
 from diet_bot.recipe_catalog import built_in_recipes
 from diet_bot.telegram_app import _apply_batch_carryovers, _build_week_plans, _week_plan_dates
@@ -86,6 +87,11 @@ def test_week_pdf_ignores_missing_meal_photo(
 
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 1_000
+
+
+def test_week_pdf_has_product_brand_assets() -> None:
+    assert pdf_renderer.PDF_LOGO_PATH.exists()
+    assert pdf_renderer.PDF_QR_PATH.exists()
 
 
 def test_week_pdf_contains_fixed_soup_recipe_to_the_end(tmp_path: Path, sample_week_dates) -> None:

@@ -204,6 +204,7 @@ SESSION_BY_CHAT_ID: dict[int, QuestionnaireSession] = {}
 QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID: dict[int, str] = {}
 _QUESTIONNAIRE_CALLBACK_LOCK_BY_CHAT_ID: dict[int, asyncio.Lock] = {}
 TRIAL_CHAT_IDS: set[int] = set()
+PRIVACY_CONSENT_CHAT_IDS: set[int] = set()
 PROFILE_BY_CHAT_ID: dict[int, UserProfile] = {}
 PLAN_COUNT_BY_CHAT_ID: dict[int, int] = {}
 PLAN_SEED_OFFSET_BY_CHAT_ID: dict[int, int] = {}
@@ -1163,6 +1164,26 @@ PAYMENTS_ENABLED = _RUNTIME_CONFIG.payments_enabled
 SUPPORT_CHAT_ID = _RUNTIME_CONFIG.support_chat_id
 PRIVACY_POLICY_URL = _RUNTIME_CONFIG.privacy_policy_url
 PRIVACY_POLICY_TEXT = "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438"
+PRIVACY_POLICY_BODY_TEXT = (
+    "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438 FoodBalance\n\n"
+    "\u041c\u044b \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u043c \u0434\u0430\u043d\u043d\u044b\u0435 \u0430\u043d\u043a\u0435\u0442\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0440\u0430\u0441\u0447\u0435\u0442\u0430 "
+    "\u043f\u0435\u0440\u0441\u043e\u043d\u0430\u043b\u044c\u043d\u043e\u0433\u043e \u0440\u0430\u0446\u0438\u043e\u043d\u0430, \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0438 \u0434\u043e\u0441\u0442\u0443\u043f\u0430, "
+    "\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0438 \u0438 \u0443\u043b\u0443\u0447\u0448\u0435\u043d\u0438\u044f \u0441\u0435\u0440\u0432\u0438\u0441\u0430.\n\n"
+    "\u041c\u044b \u043c\u043e\u0436\u0435\u043c \u0445\u0440\u0430\u043d\u0438\u0442\u044c \u043e\u0442\u0432\u0435\u0442\u044b \u0430\u043d\u043a\u0435\u0442\u044b, \u0441\u043b\u0443\u0436\u0435\u0431\u043d\u044b\u0435 "
+    "\u0441\u0442\u0430\u0442\u0443\u0441\u044b, \u0438\u0434\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0442\u043e\u0440\u044b \u043e\u043f\u0435\u0440\u0430\u0446\u0438\u0439 \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u044e "
+    "\u0434\u043e\u0441\u0442\u0443\u043f\u0430, \u043d\u0443\u0436\u043d\u044b\u0435 \u0434\u043b\u044f \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f \u0438 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0438.\n\n"
+    "\u0427\u0442\u043e\u0431\u044b \u0443\u0442\u043e\u0447\u043d\u0438\u0442\u044c, \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0434\u0430\u043d\u043d\u044b\u0435 \u0438\u043b\u0438 \u0437\u0430\u0434\u0430\u0442\u044c "
+    "\u0432\u043e\u043f\u0440\u043e\u0441 \u043f\u043e \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0435 \u0434\u0430\u043d\u043d\u044b\u0445, \u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 "
+    "\u0442\u0435\u0445\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0443."
+)
+PRIVACY_CONSENT_TEXT = (
+    "\u041f\u0435\u0440\u0435\u0434 \u043d\u0430\u0447\u0430\u043b\u043e\u043c \u043d\u0443\u0436\u043d\u043e \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044c "
+    "\u0441\u043e\u0433\u043b\u0430\u0441\u0438\u0435 \u0441 \u043f\u043e\u043b\u0438\u0442\u0438\u043a\u043e\u0439 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438 "
+    "FoodBalance. \u041c\u044b \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u043c \u0434\u0430\u043d\u043d\u044b\u0435 \u0430\u043d\u043a\u0435\u0442\u044b "
+    "\u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0440\u0430\u0441\u0447\u0435\u0442\u0430 \u0440\u0430\u0446\u0438\u043e\u043d\u0430, "
+    "\u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0438 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u0438 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0438."
+)
+PRIVACY_CONSENT_ACCEPT_TEXT = "\u2705 \u041f\u0440\u0438\u043d\u044f\u0442\u044c \u0438 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c"
 CALLBACK_START = "diet:start"
 CALLBACK_REPEAT = "diet:repeat"
 CALLBACK_NEW = "diet:new"
@@ -1175,10 +1196,14 @@ CALLBACK_BUY_EXTRA_ONE_DAY = "diet:buy_extra_one_day"
 CALLBACK_BUY_EXTRA_WEEKLY_PDF = "diet:buy_extra_weekly_pdf"
 CALLBACK_FEATURES = "diet:features"
 CALLBACK_PROMO_CODE = "diet:promo_code"
+CALLBACK_PRIVACY_POLICY = "diet:privacy_policy"
+CALLBACK_PRIVACY_CONSENT = "diet:privacy_consent"
+CALLBACK_PRIVACY_CONSENT_TRIAL = "diet:privacy_consent:trial"
 CALLBACK_SUPPORT = "diet:support"
 CALLBACK_ONE_DAY_PLAN = "diet:one_day"
 CALLBACK_WEEK_PLAN_PDF = "diet:week_pdf"
 CALLBACK_ANSWER_PREFIX = "diet:answer:"
+SELECTED_ANSWER_PREFIX = "\u2705 "
 STALE_QUESTIONNAIRE_CALLBACK_TEXT = "Этот вопрос уже не активен. Продолжайте с последнего вопроса."
 PAYMENT_CALLBACKS = {
     CALLBACK_PAY_TELEGRAM_STARS,
@@ -1301,6 +1326,8 @@ TRIAL_SUBSCRIPTION_TEXT = (
 BOT_COMMANDS = (
     BotCommand(command="start", description="Открыть стартовое меню"),
     BotCommand(command="plan", description="Заполнить анкету для рациона"),
+    BotCommand(command="promo", description="Ввести промокод"),
+    BotCommand(command="privacy", description="Политика конфиденциальности"),
     BotCommand(command="cancel", description="Сбросить активную анкету"),
 )
 
@@ -1376,7 +1403,25 @@ async def plan(message: Message) -> None:
     if profile is not None:
         await _send_calculation_options(message, profile)
         return
-    await _start_questionnaire(message)
+    await _start_questionnaire_with_privacy_consent(message)
+
+
+@router.message(Command("promo"))
+async def promo(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
+    if _is_support_chat(message.chat.id):
+        return
+    await _start_promo_code_request(message)
+
+
+@router.message(Command("privacy"))
+async def privacy(message: Message) -> None:
+    if await _reject_non_private_message(message):
+        return
+    if _is_support_chat(message.chat.id):
+        return
+    await _send_privacy_policy(message)
 
 
 @router.message(Command("cancel"))
@@ -1518,14 +1563,25 @@ async def handle_callback(callback: CallbackQuery) -> None:
         await _start_support_request(message)
         return
 
+    if data == CALLBACK_PRIVACY_POLICY:
+        await callback.answer()
+        await _send_privacy_policy(message)
+        return
+
     if data == CALLBACK_START:
         await callback.answer()
-        await _start_questionnaire(message, is_trial=True)
+        await _start_questionnaire_with_privacy_consent(message, is_trial=True)
         return
 
     if data == CALLBACK_NEW:
         await callback.answer()
-        await _start_questionnaire(message)
+        await _start_questionnaire_with_privacy_consent(message)
+        return
+
+    if data in {CALLBACK_PRIVACY_CONSENT, CALLBACK_PRIVACY_CONSENT_TRIAL}:
+        await callback.answer()
+        PRIVACY_CONSENT_CHAT_IDS.add(message.chat.id)
+        await _start_questionnaire(message, is_trial=data == CALLBACK_PRIVACY_CONSENT_TRIAL)
         return
 
     if data == CALLBACK_SUBSCRIBE:
@@ -1596,7 +1652,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_one_day_plan_with_access(
             message,
@@ -1611,7 +1667,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_week_plan_with_access(
             message,
@@ -1648,6 +1704,13 @@ async def handle_callback(callback: CallbackQuery) -> None:
                 return
 
             await callback.answer(answer)
+            await _mark_questionnaire_answer_selected(
+                message,
+                session.current_question,
+                option_index,
+                chat_id=message.chat.id,
+                step_index=session.step_index,
+            )
             await _handle_questionnaire_answer(message, answer)
         return
 
@@ -1735,6 +1798,12 @@ async def handle_answer(message: Message) -> None:
     if normalized_command == "myid":
         await myid(message)
         return
+    if normalized_command == "privacy":
+        await privacy(message)
+        return
+    if normalized_command == "promo":
+        await promo(message)
+        return
     if _is_support_chat(chat_id):
         SUPPORT_REQUEST_CHAT_IDS.discard(chat_id)
         PROMO_CODE_REQUEST_CHAT_IDS.discard(chat_id)
@@ -1751,14 +1820,17 @@ async def handle_answer(message: Message) -> None:
     if text == PROMO_CODE_TEXT:
         await _start_promo_code_request(message)
         return
+    if text == PRIVACY_POLICY_TEXT:
+        await _send_privacy_policy(message)
+        return
     if chat_id in PROMO_CODE_REQUEST_CHAT_IDS and normalized_command is None:
         await _handle_promo_code_request(message, text)
         return
     if text == TRY_FREE_TEXT:
-        await _start_questionnaire(message, is_trial=True)
+        await _start_questionnaire_with_privacy_consent(message, is_trial=True)
         return
     if text in {START_PLAN_TEXT, NEW_PROFILE_TEXT, CHANGE_PROFILE_TEXT}:
-        await _start_questionnaire(message)
+        await _start_questionnaire_with_privacy_consent(message)
         return
     if text == SUBSCRIBE_MONTH_TEXT:
         await _send_subscription_payment_options(message)
@@ -1777,7 +1849,7 @@ async def handle_answer(message: Message) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_one_day_plan_with_access(
             message,
@@ -1790,7 +1862,7 @@ async def handle_answer(message: Message) -> None:
         if not profile_loaded:
             return
         if profile is None:
-            await _start_questionnaire(message)
+            await _start_questionnaire_with_privacy_consent(message)
             return
         await _send_week_plan_with_access(message, profile)
         return
@@ -2033,6 +2105,21 @@ async def _handle_promo_code_request(message: Message, text: str) -> None:
     await message.answer(PROMO_CODE_NOT_FOUND_TEXT)
 
 
+async def _send_privacy_policy(message: Message) -> None:
+    SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
+    PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    await message.answer(PRIVACY_POLICY_BODY_TEXT, reply_markup=_privacy_policy_actions_keyboard())
+
+
+def _privacy_policy_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=PROMO_CODE_TEXT, callback_data=CALLBACK_PROMO_CODE)],
+            [InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)],
+        ],
+    )
+
+
 async def _handle_support_request(message: Message, text: str) -> None:
     if not text:
         await message.answer(SUPPORT_TEXT_REQUIRED)
@@ -2173,6 +2260,7 @@ async def _answer_stale_questionnaire_callback(
 
 async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> None:
     SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
+    PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
     session = start_session()
     SESSION_BY_CHAT_ID[message.chat.id] = session
     QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[message.chat.id] = secrets.token_urlsafe(6)
@@ -2186,12 +2274,26 @@ async def _start_questionnaire(message: Message, *, is_trial: bool = False) -> N
     )
 
 
+async def _start_questionnaire_with_privacy_consent(message: Message, *, is_trial: bool = False) -> None:
+    SUPPORT_REQUEST_CHAT_IDS.discard(message.chat.id)
+    PROMO_CODE_REQUEST_CHAT_IDS.discard(message.chat.id)
+    if message.chat.id in PRIVACY_CONSENT_CHAT_IDS:
+        await _start_questionnaire(message, is_trial=is_trial)
+        return
+    _clear_questionnaire_session(message.chat.id)
+    TRIAL_CHAT_IDS.discard(message.chat.id)
+    await message.answer(
+        PRIVACY_CONSENT_TEXT,
+        reply_markup=_privacy_consent_keyboard(is_trial=is_trial),
+    )
+
+
 async def _repeat_plan(message: Message, *, idempotency_key: str | None = None) -> None:
     profile_loaded, profile = await _load_profile_for_message_or_notice(message)
     if not profile_loaded:
         return
     if profile is None:
-        await _start_questionnaire(message)
+        await _start_questionnaire_with_privacy_consent(message)
         return
     await _send_one_day_plan_with_access(
         message,
@@ -6275,9 +6377,9 @@ def _profile_from_dict(raw: dict[str, object]) -> UserProfile | None:
 
 
 def _privacy_policy_button() -> InlineKeyboardButton | None:
-    if not PRIVACY_POLICY_URL:
-        return None
-    return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, url=PRIVACY_POLICY_URL)
+    if PRIVACY_POLICY_URL:
+        return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, url=PRIVACY_POLICY_URL)
+    return InlineKeyboardButton(text=PRIVACY_POLICY_TEXT, callback_data=CALLBACK_PRIVACY_POLICY)
 
 
 def _rows_with_privacy_policy(
@@ -6301,6 +6403,22 @@ def _optional_keyboard_with_privacy_policy(
     if not keyboard_rows:
         return None
     return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+def _privacy_consent_keyboard(*, is_trial: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=PRIVACY_CONSENT_ACCEPT_TEXT,
+                callback_data=CALLBACK_PRIVACY_CONSENT_TRIAL if is_trial else CALLBACK_PRIVACY_CONSENT,
+            ),
+        ],
+    ]
+    privacy_button = _privacy_policy_button()
+    if privacy_button is not None:
+        rows.append([privacy_button])
+    rows.append([InlineKeyboardButton(text=SUPPORT_TEXT, callback_data=CALLBACK_SUPPORT)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _start_keyboard() -> InlineKeyboardMarkup:
@@ -7297,22 +7415,43 @@ def _question_answer_callback_data(
 def _question_keyboard(
     question,
     *,
+    selected_index: int | None = None,
     chat_id: int | None = None,
     step_index: int | None = None,
 ) -> InlineKeyboardMarkup | None:
     if not question:
         return None
-    return _optional_keyboard_with_privacy_policy(
+    rows = [
         [
-            [
-                InlineKeyboardButton(
-                    text=option,
-                    callback_data=_question_answer_callback_data(index, chat_id=chat_id, step_index=step_index),
-                )
-            ]
-            for index, option in enumerate(question.options)
-        ],
-    )
+            InlineKeyboardButton(
+                text=f"{SELECTED_ANSWER_PREFIX}{option}" if index == selected_index else option,
+                callback_data=_question_answer_callback_data(index, chat_id=chat_id, step_index=step_index),
+            )
+        ]
+        for index, option in enumerate(question.options)
+    ]
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _mark_questionnaire_answer_selected(
+    message: Message,
+    question,
+    option_index: int,
+    *,
+    chat_id: int,
+    step_index: int,
+) -> None:
+    with suppress(TelegramAPIError, AttributeError, TypeError):
+        await message.edit_reply_markup(
+            reply_markup=_question_keyboard(
+                question,
+                selected_index=option_index,
+                chat_id=chat_id,
+                step_index=step_index,
+            ),
+        )
 
 
 async def _send_welcome_photo(message: Message) -> None:

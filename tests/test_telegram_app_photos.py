@@ -153,7 +153,7 @@ from diet_bot.telegram_app import (
     _trial_subscription_keyboard,
     _week_plan_dates,
 )
-from diet_bot.questionnaire import start_session
+from diet_bot.questionnaire import QUESTIONS, start_session
 
 PRIVACY_URL = "https://foodbalance.example/privacy"
 PRIVACY_POLICY_TEXT = "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438"
@@ -266,7 +266,9 @@ def test_photo_input_rejects_invalid_local_file_before_telegram(tmp_path: Path) 
         _photo_input(meal)
 
 
-def test_start_keyboard_has_welcome_buttons() -> None:
+def test_start_keyboard_has_welcome_buttons(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None, raising=False)
+
     keyboard = _start_keyboard()
     buttons = [row[0] for row in keyboard.inline_keyboard]
 
@@ -276,6 +278,7 @@ def test_start_keyboard_has_welcome_buttons() -> None:
         (FEATURES_TEXT, CALLBACK_FEATURES),
         (PROMO_CODE_TEXT, CALLBACK_PROMO_CODE),
         (SUPPORT_TEXT, CALLBACK_SUPPORT),
+        (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
     ]
     assert "FoodBalance" in WELCOME_TEXT
     assert WELCOME_PHOTO_PATH.exists()
@@ -289,8 +292,20 @@ def test_start_keyboard_includes_privacy_url_when_configured(monkeypatch) -> Non
     assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(keyboard)
 
 
+def test_start_keyboard_includes_privacy_callback_when_url_absent(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None, raising=False)
+
+    keyboard = _start_keyboard()
+
+    assert (PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY) in [
+        (button.text, button.callback_data)
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+
 @pytest.mark.anyio
-async def test_questionnaire_start_exposes_privacy_before_sensitive_question(monkeypatch) -> None:
+async def test_questionnaire_start_does_not_repeat_privacy_between_questions(monkeypatch) -> None:
     monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", PRIVACY_URL, raising=False)
     message = FakeMessage()
 
@@ -298,7 +313,85 @@ async def test_questionnaire_start_exposes_privacy_before_sensitive_question(mon
 
     sent_text, markup = message.texts[-1]
     assert sent_text == start_session().current_question.prompt
-    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) in _button_text_urls(markup)
+    buttons = [] if markup is None else _button_text_urls(markup)
+    assert (PRIVACY_POLICY_TEXT, PRIVACY_URL) not in buttons
+
+
+@pytest.mark.anyio
+async def test_free_trial_callback_shows_privacy_consent_before_first_question(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None, raising=False)
+    chat_id = 51_004
+    message = FakeMessage(chat_id)
+    callback = FakeCallback(telegram_app.CALLBACK_START, message)
+
+    try:
+        await telegram_app.handle_callback(callback)
+
+        text, reply_markup = message.texts[-1]
+        buttons = [
+            (button.text, button.callback_data)
+            for row in reply_markup.inline_keyboard
+            for button in row
+        ]
+        assert text == telegram_app.PRIVACY_CONSENT_TEXT
+        assert buttons == [
+            (telegram_app.PRIVACY_CONSENT_ACCEPT_TEXT, telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL),
+            (telegram_app.PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY),
+            (telegram_app.SUPPORT_TEXT, telegram_app.CALLBACK_SUPPORT),
+        ]
+        assert chat_id not in telegram_app.SESSION_BY_CHAT_ID
+        assert chat_id not in telegram_app.TRIAL_CHAT_IDS
+    finally:
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_privacy_consent_acceptance_continues_to_first_question(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None, raising=False)
+    chat_id = 51_005
+    message = FakeMessage(chat_id)
+    callback = FakeCallback(telegram_app.CALLBACK_PRIVACY_CONSENT_TRIAL, message)
+
+    try:
+        await telegram_app.handle_callback(callback)
+
+        text, reply_markup = message.texts[-1]
+        assert text == start_session().current_question.prompt
+        assert chat_id in telegram_app.PRIVACY_CONSENT_CHAT_IDS
+        assert chat_id in telegram_app.SESSION_BY_CHAT_ID
+        assert chat_id in telegram_app.TRIAL_CHAT_IDS
+        buttons = [] if reply_markup is None else [
+            (button.text, button.callback_data)
+            for row in reply_markup.inline_keyboard
+            for button in row
+        ]
+        assert (telegram_app.PRIVACY_POLICY_TEXT, telegram_app.CALLBACK_PRIVACY_POLICY) not in buttons
+    finally:
+        telegram_app.SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.TRIAL_CHAT_IDS.discard(chat_id)
+        telegram_app.PRIVACY_CONSENT_CHAT_IDS.discard(chat_id)
+
+
+@pytest.mark.anyio
+async def test_privacy_policy_callback_is_reachable_without_external_url(monkeypatch) -> None:
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "PRIVACY_POLICY_URL", None, raising=False)
+    message = FakeMessage(51_006)
+    callback = FakeCallback(telegram_app.CALLBACK_PRIVACY_POLICY, message)
+
+    await telegram_app.handle_callback(callback)
+
+    text, reply_markup = message.texts[-1]
+    assert "FoodBalance" in text
+    assert (telegram_app.SUPPORT_TEXT, telegram_app.CALLBACK_SUPPORT) in [
+        (button.text, button.callback_data)
+        for row in reply_markup.inline_keyboard
+        for button in row
+    ]
 
 
 @pytest.mark.anyio
@@ -782,6 +875,8 @@ async def test_support_message_is_sent_to_admin_chat_with_context(monkeypatch, t
     chat_id = 80_102
     support_chat_id = -100_555_111
     subscriptions_path = tmp_path / "subscriptions.json"
+    monkeypatch.setenv("DIET_BOT_STORAGE_BACKEND", "json")
+    monkeypatch.delenv("DIET_BOT_DATABASE_URL", raising=False)
     monkeypatch.setattr(telegram_app, "SUBSCRIPTIONS_STATE_FILE", subscriptions_path)
     monkeypatch.setattr(telegram_app, "SUPPORT_CHAT_ID", support_chat_id)
     _save_active_subscription(
@@ -2026,6 +2121,7 @@ class FakeMessage:
         self.texts = []
         self.documents = []
         self.edits = []
+        self.edited_reply_markups = []
 
     async def answer_photo(self, **kwargs) -> None:
         self.photos.append(kwargs)
@@ -2036,6 +2132,9 @@ class FakeMessage:
 
     async def answer_document(self, **kwargs) -> None:
         self.documents.append(kwargs)
+
+    async def edit_reply_markup(self, reply_markup=None):
+        self.edited_reply_markups.append(reply_markup)
 
 
 class FakeCallback:
@@ -2865,6 +2964,8 @@ async def test_set_bot_commands_registers_start_menu_commands() -> None:
     assert [(command.command, command.description) for command in bot.commands] == [
         ("start", "Открыть стартовое меню"),
         ("plan", "Заполнить анкету для рациона"),
+        ("promo", "Ввести промокод"),
+        ("privacy", "Политика конфиденциальности"),
         ("cancel", "Сбросить активную анкету"),
     ]
     assert "myid" not in [command.command for command in bot.commands]
@@ -3207,6 +3308,23 @@ async def test_questionnaire_completion_save_failure_preserves_state_without_pla
         RECENT_RECIPE_KEYS_BY_CHAT_ID.pop(chat_id, None)
 
 
+def test_question_keyboard_marks_selected_answer_with_product_check() -> None:
+    chat_id = 91_030
+    telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[chat_id] = "owner-token"
+    try:
+        keyboard = telegram_app._question_keyboard(
+            SimpleNamespace(options=("male", "female")),
+            selected_index=1,
+            chat_id=chat_id,
+            step_index=2,
+        )
+    finally:
+        telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.pop(chat_id, None)
+
+    buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert buttons[:2] == ["male", f"{telegram_app.SELECTED_ANSWER_PREFIX}female"]
+
+
 @pytest.mark.anyio
 async def test_current_questionnaire_callback_advances_normally(monkeypatch, tmp_path) -> None:
     chat_id = 91_031
@@ -3231,6 +3349,39 @@ async def test_current_questionnaire_callback_advances_normally(monkeypatch, tmp
         SESSION_BY_CHAT_ID.pop(chat_id, None)
         PROFILE_BY_CHAT_ID.pop(chat_id, None)
         getattr(telegram_app, "QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID", {}).pop(chat_id, None)
+
+
+@pytest.mark.anyio
+async def test_answer_callback_marks_selected_option_and_keeps_owner_token(monkeypatch, tmp_path) -> None:
+    chat_id = 91_030
+    monkeypatch.setattr(telegram_app, "Message", FakeMessage)
+    monkeypatch.setattr(telegram_app, "STATE_FILE", tmp_path / "history.json")
+    message = FakeMessage(chat_id)
+    session = telegram_app.QuestionnaireSession({"age": "32"}, step_index=1)
+    SESSION_BY_CHAT_ID[chat_id] = session
+    telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID[chat_id] = "owner-token"
+    callback_data = telegram_app._question_answer_callback_data(
+        1,
+        chat_id=chat_id,
+        step_index=session.step_index,
+    )
+    callback = FakeCallback(callback_data, message, user_id=chat_id)
+
+    try:
+        await telegram_app.handle_callback(callback)
+    finally:
+        SESSION_BY_CHAT_ID.pop(chat_id, None)
+        telegram_app.QUESTIONNAIRE_SESSION_TOKEN_BY_CHAT_ID.pop(chat_id, None)
+
+    selected_answer = QUESTIONS[1].options[1]
+    assert callback.answers[-1] == selected_answer
+    assert message.edited_reply_markups
+    assert f"{telegram_app.SELECTED_ANSWER_PREFIX}{selected_answer}" in [
+        button.text
+        for row in message.edited_reply_markups[-1].inline_keyboard
+        for button in row
+    ]
+    assert message.texts[-1][0] == QUESTIONS[2].prompt
 
 
 @pytest.mark.anyio
