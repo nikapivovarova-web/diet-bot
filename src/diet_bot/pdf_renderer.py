@@ -42,6 +42,8 @@ from .shopping import build_week_shopping_groups
 
 
 DATA_DIR = Path(__file__).with_name("data")
+PDF_LOGO_PATH = DATA_DIR / "foodbalance_pdf_logo.png"
+PDF_QR_PATH = DATA_DIR / "foodbalance_pdf_qr.png"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PAGE_SIZE = A4
 PAGE_WIDTH, PAGE_HEIGHT = PAGE_SIZE
@@ -158,7 +160,7 @@ def _cover_page(
     meal_count = sum(len(plan.meals) for plan in plans)
     story: list = [
         Spacer(1, 7 * mm),
-        _p("FoodBalance", styles["Brand"]),
+        _cover_brand_header(styles, doc_width),
         Spacer(1, 6 * mm),
         _p("Рацион на неделю", styles["Title"]),
         _p(date_range, styles["Subtitle"]),
@@ -173,7 +175,64 @@ def _cover_page(
             story.append(_calculation_line(line, styles, doc_width))
         else:
             story.append(Spacer(1, 2 * mm))
+    qr_block = _cover_qr_block(styles, doc_width)
+    if qr_block is not None:
+        story.append(Spacer(1, 5 * mm))
+        story.append(qr_block)
     return story
+
+
+def _cover_brand_header(styles: dict[str, ParagraphStyle], doc_width: float) -> Table:
+    logo = _asset_image(PDF_LOGO_PATH, 24 * mm, 24 * mm)
+    brand = _p("FoodBalance", styles["Brand"])
+    if logo is None:
+        return Table([[brand]], colWidths=[doc_width], hAlign="LEFT")
+    table = Table([[logo, brand]], colWidths=[30 * mm, doc_width - 30 * mm], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ],
+        ),
+    )
+    return table
+
+
+def _cover_qr_block(styles: dict[str, ParagraphStyle], doc_width: float) -> Table | None:
+    qr = _asset_image(PDF_QR_PATH, 28 * mm, 28 * mm)
+    if qr is None:
+        return None
+    table = Table(
+        [[qr, _p("@FOODBALANCERU_BOT", styles["FinePrint"])]],
+        colWidths=[34 * mm, doc_width - 34 * mm],
+        hAlign="LEFT",
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ],
+        ),
+    )
+    return table
+
+
+def _asset_image(path: Path, max_width: float, max_height: float) -> Image | None:
+    if not path.exists():
+        return None
+    try:
+        reader = ImageReader(str(path))
+        width, height = reader.getSize()
+    except Exception:
+        return None
+    if not width or not height:
+        return None
+    scale = min(max_width / width, max_height / height)
+    return Image(str(path), width=width * scale, height=height * scale)
 
 
 def _summary_table(plan: MealPlan, meal_count: int, styles: dict[str, ParagraphStyle]) -> Table:
