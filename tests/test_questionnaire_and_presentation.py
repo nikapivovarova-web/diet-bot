@@ -18,7 +18,7 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
         "похудение",
         "умеренная",
         "4",
-        "до 15 минут",
+        "Побыстрее и попроще",
         "яблоко",
         "лактоза",
         "ХПН",
@@ -34,7 +34,7 @@ def test_questionnaire_builds_profile_from_russian_answers() -> None:
     assert profile.age == 32
     assert profile.sex == Sex.MALE
     assert profile.goal == Goal.LOSE
-    assert profile.cooking_time == CookingTimePreference.QUICK
+    assert profile.cooking_time == CookingTimePreference.SIMPLE
     assert ConditionCode.LACTOSE_INTOLERANCE in profile.conditions
     assert ConditionCode.CKD in profile.conditions
     assert profile.restrictions[0].value == "яблоко"
@@ -46,7 +46,14 @@ def test_button_questions_have_options() -> None:
     assert questions["sex"].options == ("👨 Мужчина", "👩 Женщина")
     assert questions["goal"].options == ("⬇️ Похудение", "⚖️ Поддержание", "💪 Набор")
     assert questions["meal_count"].options == ("3", "4", "5")
-    assert questions["cooking_time"].options == ("до 15 минут", "15–30 минут", "более 30 минут")
+    assert questions["cooking_time"].prompt == "Какие рецепты вам больше подходят?"
+    assert questions["cooking_time"].options == (
+        "Побыстрее и попроще",
+        "Можно чуть интереснее",
+    )
+    assert "до 15 минут" not in questions["cooking_time"].options
+    assert "15–30 минут" not in questions["cooking_time"].options
+    assert "более 30 минут" not in questions["cooking_time"].options
     assert "⚡ Очень высокая" in questions["activity"].options
     assert questions["allergies"].options == ("Нет",)
     assert questions["intolerances"].options == ("Нет",)
