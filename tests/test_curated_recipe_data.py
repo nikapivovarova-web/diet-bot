@@ -166,10 +166,10 @@ def test_second_pass_bulk_import_has_expected_rows_and_photos() -> None:
     assert set(recipes_by_no) & SECOND_PASS_EXCLUDED_RECIPE_NOS == set()
     assert all(str(recipes_by_no[recipe_no]["recipe_key"]).startswith("second_pass") for recipe_no in SECOND_PASS_RECIPE_NOS)
     assert all(
-        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.png"
+        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.jpg"
         for recipe_no in SECOND_PASS_RECIPE_NOS
     )
-    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.png").exists() for recipe_no in SECOND_PASS_RECIPE_NOS)
+    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.jpg").exists() for recipe_no in SECOND_PASS_RECIPE_NOS)
     assert second_pass_ids <= {row["recipe_id"] for row in nutrition}
     assert second_pass_ids <= {row["recipe_id"] for row in ingredients}
 
@@ -186,10 +186,10 @@ def test_bulk_0806_import_has_expected_rows_foods_and_photos() -> None:
     assert BULK_0806_RECIPE_NOS <= set(recipes_by_no)
     assert all(str(recipes_by_no[recipe_no]["recipe_key"]).startswith("bulk_0806_") for recipe_no in BULK_0806_RECIPE_NOS)
     assert all(
-        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.png"
+        recipes_by_no[recipe_no].get("image_url") == f"recipe_photos/r{recipe_no}.jpg"
         for recipe_no in BULK_0806_RECIPE_NOS
     )
-    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.png").exists() for recipe_no in BULK_0806_RECIPE_NOS)
+    assert all((DATA_DIR / f"recipe_photos/r{recipe_no}.jpg").exists() for recipe_no in BULK_0806_RECIPE_NOS)
     assert bulk_ids <= {row["recipe_id"] for row in nutrition}
     assert bulk_ids <= {row["recipe_id"] for row in ingredients}
     assert {"lentils_dry", "tempeh", "textured_soy_protein_dry", "adyghe_cheese"} <= {
